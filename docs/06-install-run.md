@@ -71,7 +71,7 @@ corepack pnpm install
 2. （可选）校验组合配置（不启动）：`npx @deepseek-ai/dsh --profile desktop --dump-config`，确认输出包含 `mobile-remote` 行。
 3. **重启 DSH Desktop**（插件随进程加载）。日志出现 `mobile-remote: lanBridge 已监听 0.0.0.0:3080 → 127.0.0.1:<port>/m/api` 即桥已工作。
 
-**web 版（`dsh --profile web`）**：步骤 1 同上（profile 换 `web`），步骤 3 为重启 `dsh web` 进程；web 版无回环限制时可让 webserver 直绑 0.0.0.0（见 §4 警示与 §4b）。
+**web 版（`dsh --profile web`）**：步骤 1 同上（profile 换 `web`），步骤 3 为重启 `dsh web` 进程；**web 版 webserver 默认即 `0.0.0.0:3080`**（局域网直连开箱即用；无需覆盖 webserver 行，见 §4 警示）。注：web 版直连 webserver 时插件路由在同一个 webserver 上；桌面版见 §4b LAN 桥。
 
 ## 4. 变更配置（口令/路径/充值地址）
 
@@ -90,11 +90,11 @@ corepack pnpm install
 口令生成建议：`node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"`
 
 > ⚠️ **webserver 行覆盖的坑（重要，来自实测 issue）**：cordis patch 对**已有行**是**整体替换 config 对象（非合并）**——若你写 `- id: webserver` + `config: {host: 0.0.0.0}`，DSH 自带行的其余字段（如 `port: !!js ctx.webStartup.port ?? 3080`）会被**顶掉**，而 `port` 是必填 → 启动校验即报 `$port missing required value`（`--dump-config` 与 smoke 测试都不会暴露，只有真启动才报）。
-> **因此**：① 覆盖已有行时**必须写全全部必填字段**（如 webserver 覆盖示例必须同时给出 `port`）；② **桌面版（0.1.1-rc.2）webserver 的 `host` 不可改为 0.0.0.0**（DesktopWebServer 构造器对非回环 host 直接 throw，用户 patch 无法覆盖）——移动端访问请用 **§4b 的 lanBridge**，不要覆盖 webserver 行。
+> **因此**：① **web 版完全不需要覆盖 webserver 行**（默认已是 `host: 0.0.0.0, port: 3080`）；② 若出于自定义（如改端口）确要覆盖，**必须写全全部必填字段**（`host` + `port`）；③ **桌面版（0.1.1-rc.2）webserver 的 `host` 不可改为 0.0.0.0**（DesktopWebServer 构造器对非回环 host 直接 throw，用户 patch 无法覆盖）——移动端访问请用 **§4b 的 lanBridge**，不要覆盖 webserver 行。
 
 ## 4b. 局域网直连（同一 WiFi，v3.0.0 新增：桌面版终于可以连了）
 
-> **背景**：DSH Desktop（0.1.1-rc.2 起）强制 web 服务只听 `127.0.0.1`（内核硬限制，改不了），手机无法直连；web 版 DSH 无此限制。v3.0.0 起插件内置 **LAN 桥**：在 DSH 进程内自建监听，把 `/m` 请求转发给回环服务——手机走局域网 IP 即可连，**无需穿透、无需额外工具、不改 DSH**。
+> **背景**：DSH Desktop（0.1.1-rc.2 起）强制 web 服务只听 `127.0.0.1`（内核硬限制，改不了），手机无法直连；**web 版默认即监听 `0.0.0.0:3080`**（局域网直连开箱即用，无需覆盖任何行）。v3.0.0 起插件内置 **LAN 桥**：桌面版在 DSH 进程内自建监听，把 `/m` 请求转发给回环服务——手机走局域网 IP 即可连，**无需穿透、无需额外工具、不改 DSH**。
 
 1. **开桥**：`cordis.patch.yml` 的 `mobile-remote` 行 `config` 加：
 ```yaml

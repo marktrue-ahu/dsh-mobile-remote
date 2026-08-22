@@ -87,10 +87,10 @@ npx @deepseek-ai/dsh web
           host: 0.0.0.0
 ```
 
-> ⚠️ **不要覆盖 webserver 行**：桌面版（0.1.1-rc.2）webserver 强制回环（覆盖 host 会直接报错），且 cordis patch 对已有行是**整体替换 config**——若确需覆盖（仅 web 版），必须写全必填字段（`host` + `port`，见下），缺一即启动报 `$port missing required value`（`--dump-config`/smoke 测不出来，只有真启动才暴露）。
+> ⚠️ **不要覆盖 webserver 行**：桌面版（0.1.1-rc.2）webserver 强制回环（覆盖 host 直接报错），移动端用上方 LAN 桥；**web 版默认已是 `0.0.0.0:3080`，无需覆盖**——仅当你想改端口时才写覆盖行，且**必须写全必填字段**（`host` + `port`），否则启动报 `$port missing required value`（`--dump-config`/smoke 测不出来，只有真启动才暴露）。
 
 ```yaml
-# 仅 web 版适用：固定 webserver 端口（覆盖已有行必须写全字段！）
+# 仅 web 版需要改端口时适用：覆盖 webserver 行必须写全字段！
 - id: webserver
   config:
     host: 0.0.0.0

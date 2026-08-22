@@ -3,7 +3,7 @@
 ## 连接类
 
 **Q：手机连不上（连接失败 / 超时）？**
-1. 确认电脑端 DSH 已启动；**桌面版（0.1.1-rc.2）webserver 强制只听 127.0.0.1，手机必须走插件 LAN 桥**（`lanBridge.enabled: true`，默认 `0.0.0.0:3080`，见 docs/06 §4b）；web 版才用 `webserver: {host: 0.0.0.0}`（且覆盖 webserver 行必须写全 `port` 必填字段，见 docs/06 §4 警示）
+1. 确认电脑端 DSH 已启动；**桌面版（0.1.1-rc.2）webserver 强制只听 127.0.0.1，手机必须走插件 LAN 桥**（`lanBridge.enabled: true`，默认 `0.0.0.0:3080`，见 docs/06 §4b）；**web 版默认即 `0.0.0.0:3080`，开箱即用无需覆盖**（自定义改端口时覆盖 webserver 行必须写全 `host`+`port`，见 docs/06 §4 警示）
 2. 手机和电脑必须在同一网络（同一 WiFi / 虚拟组网）
 3. 口令是否正确（`cordis.patch.yml` 的 `authToken`）；改了口令要重启桌面端
 4. **Windows 防火墙（最常见）**：路由器重启/换网后 Windows 会把网络重新识别为「公用」，默认拦截入站 3080。修复：

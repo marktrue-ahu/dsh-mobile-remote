@@ -40,7 +40,7 @@
 - 连接信息仅存手机本地，不上传任何第三方。
 ## 5. 常见问题（FAQ）
 **Q1 连接失败/超时**
-- 电脑端 DSH 是否运行？**桌面版请确认插件 LAN 桥已启用**（`lanBridge.enabled: true`，默认 `0.0.0.0:3080`，见 docs/06 §4b；web 版才用 `webserver host: 0.0.0.0`，且覆盖行须写全必填字段）？
+- 电脑端 DSH 是否运行？**桌面版请确认插件 LAN 桥已启用**（`lanBridge.enabled: true`，默认 `0.0.0.0:3080`，见 docs/06 §4b）；web 版默认即 `0.0.0.0:3080` 无需配置（改端口时覆盖 webserver 行须写全 `host`+`port`）？
 - 手机与电脑是否同一网络？口令是否正确（改过需重启桌面端）？
 - Windows 防火墙若拦截 3080，放行 `node`/`DeepSeek Harness`。
 **Q2 扫码没反应**
