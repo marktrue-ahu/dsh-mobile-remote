@@ -2264,6 +2264,11 @@ class _MsgImageState extends State<_MsgImage> {
     final boxW = 236.0;
     final boxH = (boxW / ratio).clamp(80.0, 480.0);
     final line = DshColors.line(context);
+    // v3.0.0(版本二)：GIF 动图 Flutter 原生支持（MultiFrameImageStreamCompleter 逐帧播放），
+    // 无需第三方包；超大 GIF（长边>4096 或 >16MB）解码耗 CPU/首帧慢，加"GIF·原图较大"角标提醒
+    final isGif = widget.image['mediaType'] == 'image/gif';
+    final bigGif = isGif &&
+        ((w > 0 && h > 0 && (w > 4096 || h > 4096)) || (_bytes?.length ?? 0) > 16 * 1024 * 1024);
     return GestureDetector(
       onTap: _bytes != null ? _openFull : null,
       child: ClipRRect(
@@ -2275,7 +2280,26 @@ class _MsgImageState extends State<_MsgImage> {
           child: _loading
               ? const Center(child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)))
               : _bytes != null
-                  ? Image.memory(_bytes!, fit: BoxFit.contain, gaplessPlayback: true)
+                  ? Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        Image.memory(_bytes!, fit: BoxFit.contain, gaplessPlayback: true),
+                        if (bigGif)
+                          Positioned(
+                            right: 4,
+                            bottom: 4,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: Colors.black.withValues(alpha: 0.55),
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Text(L10n.t('GIF·原图较大', 'GIF · large file'),
+                                  style: const TextStyle(fontSize: 9.5, color: Colors.white)),
+                            ),
+                          ),
+                      ],
+                    )
                   : InkWell(
                       onTap: _load,
                       child: Center(

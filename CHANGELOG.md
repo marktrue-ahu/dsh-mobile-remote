@@ -19,6 +19,14 @@
 - **气泡图片"显示不全"**：气泡高度按 `(236/ratio).clamp(80, 236)` 计算——竖图（比例≈0.46）被压成 236×236 方形，再配合 `BoxFit.cover` → 只显示图片中间一条（点开全屏才全）。修复：比例上限放宽到 0.3~3.0、高度上限 480，渲染改 `BoxFit.contain`——竖图完整显示，不再裁切。
 - **图+文发送后输入框文字残留**：文本路径有 `_inputCtrl.clear()`，图片路径 `_sendImages` 发送成功（含排队持存）后未清空输入框——用户误以为没发出去会重复点发送。修复：accepted 后清空（仅当输入框文字未改动时）。
 
+### 图像链路 v2（2026-08-23，App 3.0.0+7）——tool/result 嵌套图片 + GIF 动图
+- **tool/result 嵌套图片（对齐 PC 端 contentParts 语义）**：实测内核 `read_image` 等工具结果的图片块**嵌套在 `tool-result.content` 内**（非消息顶层，此前 `imagesOf` 顶层收集漏掉 → 移动端助手消息只有占位/空白）。修复：
+  - 插件新增 `imagesOfNested()`（递归展开 tool-result.content），`assistant/message` 与 `tool/result` 摘要改用——SSE/history 事件摘要均带出嵌套图片引用（`{attachmentId, mediaType, width?, height?, name?}`，≤20 张）；
+  - `tool/result` 摘要重写：文本跨全部 content 块合并（原仅 content[0]）、callId/name/isError 从各块聚合；
+  - **App 零改动**：助手气泡本就有 `_ImagesGrid` 渲染（与用户图同套组件：宽高比/全屏/重试/LRU），摘要带出来后自动显示——与 PC 端"消息内容图片统一渲染"同构。旧版 App 忽略新字段，无破坏。
+- **GIF 动图**：**核实 Flutter 原生支持**（SDK `MultiFrameImageStreamCompleter` 按 codec 逐帧调度播放，`Image.memory` 即动图；v1 边界写的"GIF 静态展示"是错误认知，已更正——**无需第三方包**）。仅增加：超大 GIF（长边>4096 或 >16MB）气泡右下角「GIF·原图较大」角标（解码耗 CPU/首帧慢提醒）；播放本身零改动。
+- **验证**：单元 12/12 PASS——用真实采样的 read_image tool/result 事件（嵌套图）与构造 assistant/message（嵌套+顶层混合）验证摘要 images[] 输出、callId/name 回退、纯文本消息无 images 字段、用户消息顶层收集回归。
+
 ### 队列"发送出去/删不掉"修复（移动端 ↔ 内核队列一致性）
 - **根因三层**：① 内核语义——`followup` 只入 `next-turn`,当前 turn 结束的瞬间 agent 循环即开新 turn 认领(与 PC 端一致)；② App 丢弃内核权威 `session/queue` 帧(`store.dart` 只处理 question/approval),dock 全靠 400ms 节流 REST + 20s 轮询,存在陈旧窗口——消息已被认领行仍显示；③ 删除 TOCTOU——被认领后内核返回 `queue-item-not-found`,而 `ApiException` 不带错误码,无法区分语义;④ **移动端与 PC 端观感差异**——PC 端 queued 行只进 Queue Dock、不渲染进对话窗口,移动端则插入乐观气泡,看起来"消息被发送出去了"
 - **方案 A（移动端排队语义改造,与 PC 端观感对齐）**：运行中 `followup` **不再进内核 next-turn**（内核会在当前轮结束瞬间自动认领执行 = "被发送出去"的根源）——改为**插件侧持存**（`~/.dsh/mobile-remote/held-queue.json`,重启不丢）:
