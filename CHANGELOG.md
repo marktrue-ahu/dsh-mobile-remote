@@ -24,7 +24,7 @@
   - 插件新增 `imagesOfNested()`（递归展开 tool-result.content），`assistant/message` 与 `tool/result` 摘要改用——SSE/history 事件摘要均带出嵌套图片引用（`{attachmentId, mediaType, width?, height?, name?}`，≤20 张）；
   - `tool/result` 摘要重写：文本跨全部 content 块合并（原仅 content[0]）、callId/name/isError 从各块聚合；
   - **App 零改动**：助手气泡本就有 `_ImagesGrid` 渲染（与用户图同套组件：宽高比/全屏/重试/LRU），摘要带出来后自动显示——与 PC 端"消息内容图片统一渲染"同构。旧版 App 忽略新字段，无破坏。
-- **GIF 动图**：**核实 Flutter 原生支持**（SDK `MultiFrameImageStreamCompleter` 按 codec 逐帧调度播放，`Image.memory` 即动图；v1 边界写的"GIF 静态展示"是错误认知，已更正——**无需第三方包**）。仅增加：超大 GIF（长边>4096 或 >16MB）气泡右下角「GIF·原图较大」角标（解码耗 CPU/首帧慢提醒）；播放本身零改动。
+- **GIF 动图（结论修正）**：动态播放链路已就绪——Flutter 原生支持（`MultiFrameImageStreamCompleter` 逐帧播放）、App 上传原始字节（日志实锤 24114B = 2×12057B 完整 GIF）、插件字节嗅探正确纠正为 `image/gif`、大图角标已加；**但发送后显示静态**——实测（复刻 PC 内核 RPC 注入同一 GIF）：内核附件规范化（`normalizeImage`，`canPassThroughNormalization` 明确把 `image/gif` 排除在直通外）取首帧重编码为静态 PNG（143B），且 PC 与移动端产物为**同一 sha256**——**移动端 = PC 端 = 内核设计**。"发出后动图"需内核（DSH 上游）保留动画附件，本插件/App 无法改内核（适配约束）；若无上游支持，v1 边界"GIF 静态展示"即为正确预期。
 - **验证**：单元 12/12 PASS——用真实采样的 read_image tool/result 事件（嵌套图）与构造 assistant/message（嵌套+顶层混合）验证摘要 images[] 输出、callId/name 回退、纯文本消息无 images 字段、用户消息顶层收集回归。
 
 ### 队列"发送出去/删不掉"修复（移动端 ↔ 内核队列一致性）
