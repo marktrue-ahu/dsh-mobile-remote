@@ -25,6 +25,7 @@ graph LR
 | **桌面版**（DSH Desktop）| 强制 `127.0.0.1`（不可覆盖）| 启用 **LAN 桥** `0.0.0.0:3080` 后连 `http://<IP>:3080/m` | 见 §4b（桥 + 强口令门禁）|
 
 > web 版说明：0.1.1-rc.2 的 dsh-web-app 默认 webserver `host: 0.0.0.0, port: 3080`（实测 `--dump-config`）；**不需要**写 `- id: webserver` 覆盖行；更老版本（默认 127.0.0.1 时代）才需覆盖且**必须写全 `host`+`port`**（§4 警示）。
+> **实测记录（2026-08-23）**：在隔离 DSH_HOME 以 web profile 启动（`host: 0.0.0.0, port: 3081`）→ 局域网 IP `http://192.168.10.8:3081/m/api/bootstrap` 直连 **HTTP 200**（plugin v3.0.0，`server.urls[0]` 即局域网地址，auth 生效）——web 形态局域网直连实锤；与桌面版（LAN 桥）并存两条路径，均为真机验证。
 
 ## 2. 安装位置说明（以桌面版为主）
 
@@ -295,6 +296,7 @@ flutter build apk --release
 ## 9. 验收清单（已执行 ✅）
 
 - [x] `--dump-config` 含 mobile-remote 行；启动日志含 lanBridge 监听行（桌面版）
+- [x] **web 版局域网直连实测**（2026-08-23，隔离 DSH_HOME）：`0.0.0.0:3081` + 局域网 IP bootstrap 200
 - [x] 未认证 401 / 错误口令 401 / 正确口令通行
 - [x] `POST /m/api/send` 注入成功（200 + messageId；图片路径 200 + accepted:true）
 - [x] SSE 连接 + hello + 事件转发（重连退避、断线补拉、pendingFrames 回放、心跳 25s）
