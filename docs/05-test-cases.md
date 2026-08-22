@@ -1,8 +1,8 @@
 # 05 测试用例设计文档 — dsh-mobile-remote
 
-> 版本：v2.7.0 · 状态：已按实际验证结果填写（含 v2.3 问询/审批、通知删除端到端用例；连接逻辑 v2.4.2 起有单元测试，v2.6 起含链接白名单单测） · 配套：03-api.md、04-security.md
-> 环境：Windows + dsh web（web profile） + Android（DSH Remote App）
-> 前置：插件已安装并启用；访问口令为安装时生成的随机串（下文 `<TOKEN>`）。
+> 版本：v3.0.0 · 状态：已按实际验证结果填写（含 v2.3 问询/审批、通知删除端到端用例；连接逻辑 v2.4.2 起有单元测试，v2.6 起含链接白名单单测；v3.0.0 图像链路用例） · 配套：03-api.md、04-security.md
+> 环境：Windows + DSH Desktop（desktop profile，内核 0.1.1-rc.2；web profile 亦适用） + Android（DSH Remote App）
+> 前置：插件已安装并启用（LAN 桥监听 0.0.0.0:3080）；访问口令为安装时生成的随机串（下文 `<TOKEN>`）。
 ## 1. 测试范围与环境
 - 功能：认证、发消息、事件回流、历史、会话、通知、新建会话、目录、默认配置、二维码。
 - 安全：口令校验、Host 校验、loopback 限制。
@@ -178,9 +178,9 @@
 | 项目 | 内容 |
 |---|---|
 | 步骤 | `netstat`/`Get-NetTCPConnection` 查看 3080 监听地址 |
-| 预期 | `0.0.0.0:3080`（已配置局域网/Tailscale 访问时）；确认公网端口未开放 |
+| 预期 | `0.0.0.0:3080`（LAN 桥启用，局域网/虚拟组网可访问）；确认公网端口未开放 |
 
 ## 4. 回归执行建议
 
-- 每次修改插件源码后：`cd C:\Users\<用户>\.dsh\profiles\web && corepack pnpm install`（同步 file: 副本）→ 重启 dsh web → 跑 `tools/e2e-check.mjs` → 手机 App 冒烟（连接/发消息/通知/新建会话）。
+- 每次修改插件源码后：`cd C:\Users\<用户>\.dsh\profiles\desktop && corepack pnpm install`（同步 file: 副本）→ 重启 DSH Desktop → 跑 `tools/e2e-check.mjs` → 手机 App 冒烟（连接/发消息/通知/新建会话/图片发送）。
 - 修改 App 后：`flutter analyze` → `flutter test`（`test/api_logic_test.dart`：多地址合并/轮换、回环与链路本地排除，5 用例；`test/md_link_test.dart`：链接 scheme 白名单）→ `flutter build apk --release` → 覆盖安装。

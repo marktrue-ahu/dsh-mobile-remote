@@ -1,9 +1,9 @@
 # 02 系统架构设计说明书 — dsh-mobile-remote
 
-> 版本：v2.7.0 · 状态：已实现（含 v2.3 问询/审批弹窗桥、v2.4~v2.5 连接自愈、v2.6 安全加固 + 模型提供商互通） · 配套：01-PRD.md、03-api.md、04-security.md、09-compatibility.md
+> 版本：v3.0.0 · 状态：已实现（v2.3 问询/审批弹窗桥、v2.4~v2.5 连接自愈、v2.6 安全加固+模型提供商互通、v2.9/v3.0 LAN 桥 + 图像链路） · 配套：01-PRD.md、03-api.md、04-security.md、09-compatibility.md
 
 ## 1. 背景与范围
-dsh web 是 Cordis 组合出的浏览器 GUI（`dsh --profile web`），webserver 默认只绑定 `127.0.0.1`。本插件在 **web profile 的宿主侧**挂载一个 Cordis 插件，在现有 webserver 上注册 `/m` 前缀路由，提供一个**零构建的原生移动网页**，通过 dsh 的 agent/session 服务把手机操作接到运行中的 agent 上。插件不修改桌面 GUI 的任何现有 UI。
+DSH 由 Cordis 组合出宿主（desktop 版 `dsh-plugin-desktop` 或 web 版 `dsh --profile web`），webserver 默认只绑定 `127.0.0.1`（**桌面版 0.1.1-rc.2 起强制回环**，DesktopsWebServer 对非回环 host 直接 throw）。本插件在宿主侧挂载 Cordis 插件：在 webServer 上注册 `/m` 前缀路由，并在 **LAN 桥**（`lanBridge`，默认 `0.0.0.0:3080`）自建监听把移动端请求流式转发到回环 webserver——移动端形态为**原生 Flutter App**（`dsh-mobile-app`），经 `/m/api` 与插件通信。插件不修改桌面 GUI 的任何现有 UI。
 ## 2. 技术选型结论与理由
 ### 2.1 移动端形态：独立轻量页（`/m`） vs 桌面 GUI 窄屏适配
 
@@ -12,10 +12,11 @@ dsh web 是 Cordis 组合出的浏览器 GUI（`dsh --profile web`），webserve
 | 桌面 GUI 窄屏适配（client 插件 + slot） | 复用现有 React 组件、自动获得全部功能 | 三栏 AppFrame 适配工作量大；HMR 依赖 `pnpm run dev:web` watcher；触控体验难做通 | 放弃 |
 | **独立轻量页 `/m`（本方案）** | ~500 行原生 HTML/CSS/JS 覆盖全部需求；无构建；与桌面 UI 零耦合；可独立控制安全边界 | 功能需自己实现（消息流、通知、历史） | **采用** |
 
-### 2.2 外出通路：Tailscale vs cloudflared vs 裸公网
+### 2.2 外出通路：蒲公英（虚拟组网） vs 隧道/反代 vs 裸公网
 | 方案 | 认证/TLS | 成本 | 结论 |
 |---|---|---|---|
-| **Tailscale（WireGuard 组网）** | 设备身份认证 + 端到端加密，零应用层代码 | 免费个人版 | **采用**（用户已确认） |
+| **蒲公英/虚拟组网（WireGuard 组网）** | 设备身份认证 + 端到端加密，零应用层代码 | 免费版 3 成员 | **采用**（实测通过；账号可用性属个体情况，其他组网如 ZeroTier/EasyTier 同理可接） |
+| 隧道/中继类（frp/SakuraFrp，`trustedHosts`） | 需自建认证 + **必须 TLS**（自有域名须 ICP 备案） | 免费/收费 | 备选（有合规门槛） |
 | cloudflared 隧道 | TLS 自动，但公网可达需自建认证 | 免费，需额外 token 机制 | 备选 |
 | 裸公网暴露 0.0.0.0 | 无 TLS | 高危（agent 可执行 bash/pwsh ≥ RCE） | 明确禁止 |
 
@@ -34,25 +35,27 @@ Node 侧直接生成 PNG data 输出到 `<img>`，前端零依赖；避免在前
 
 ```mermaid
 graph TB
-    subgraph 手机端         M[移动浏览器 /m]
+    subgraph 手机端         M[DSH Remote App（Flutter）]
     end
-    subgraph 电脑端 dsh web 进程
-        subgraph Cordis 组合树             WS[webserver 服务<br/>node:http]
-            PL[dsh-mobile-remote 插件]
+    subgraph 电脑端 DSH 宿主进程
+        subgraph Cordis 组合树             WS[webserver 服务（强制回环）<br/>node:http]
+            PH[插件 /m 路由 + SSE]
+            BR[插件 LAN 桥 0.0.0.0:3080<br/>流式转发 /m/api*]
             AG[agents 服务<br/>AgentRegistry]
             SS[sessions 服务<br/>SessionStore]
             AL[agent loop<br/>运行中的 agent]
         end
-        PL -->|register 前缀路由 /m| WS
-        PL -->|ctx.get 惰性| AG
-        PL -->|ctx.get 惰性| SS
-        PL -->|ctx.on session/event| AL
+        PH -->|register 前缀路由 /m| WS
+        BR -->|上游请求 Host 重写为回环| WS
+        PH -->|ctx.get 惰性| AG
+        PH -->|ctx.get 惰性| SS
+        PH -->|ctx.on session/event| AL
         AG -->|followup/inbox/status| AL
     end
-    M -->|HTTP/SSE| WS
+    M -->|HTTP/SSE（局域网/组网直连桥）| BR
 ```
 
-- **插件层**（本插件）：路由注册、JSON API、SSE 事件桥、认证、二维码、静态页服务。
+- **插件层**（本插件）：路由注册、LAN 桥转发、JSON API、SSE 事件桥、认证、二维码、推送桥。
 - **服务层**（dsh 现有）：`agents`（注入消息、查状态）、`sessions`（列会话、读事件历史）、`webServer`（传输）。
 - **执行层**：agent loop 消费 inbox 消息，产出 `session/event` 事实流。
 ## 4. 模块划分
@@ -65,7 +68,7 @@ graph TB
 | SSE 事件桥 | `ctx.on('session/event', ...)` → 摘要化 → 广播到移动端连接；心跳注释帧；连接数上限 |
 | 认证 | 口令比对（常量时间，`X-Mobile-Token` 头）→ 401 语义 |
 | 二维码 | `qrcode` 生成 PNG（桌面设置页扫码用） |
-| 地址发现 | `os.networkInterfaces()` 枚举 IPv4（含 Tailscale 100.x 段，过滤虚拟网卡），port 取自 `ctx.webServer.port` |
+| 地址发现 | `os.networkInterfaces()` 枚举 IPv4（含虚拟组网段，过滤 VMware 等虚拟网卡），port 取自 `lanBridge.port`（桥监听成功时）否则 `ctx.webServer.port` |
 
 ### 4.2 客户端（`dsh-mobile-app` Flutter + `lib/client.js` 桌面模块）
 | 模块 | 职责 |
@@ -131,8 +134,8 @@ stateDiagram-v2
 
 | # | 决策 | 理由 |
 |---|---|---|
-| D1 | 绑定 `0.0.0.0` 走 profile patch 配置而非 CLI | CLI 有意拒绝 `--host 0.0.0.0`；patch 是官方配置层，Tailscale/LAN 双通必需 |
-| D2 | 口令认证默认关闭 | 信任网络层（自家 WiFi + Tailscale）；口令是可选加固而非默认摩擦 |
+| D1 | **桌面版：LAN 桥转发（回环 webserver 不动）；web 版：profile patch 绑定 0.0.0.0** | 桌面版 0.1.1-rc.2 强制 webserver 回环（patch 覆盖 host 会 throw），只能在插件内自建监听转发；web 版无此限制，patch 覆盖须写全必填字段（见 06 §4） |
+| D2 | 口令认证默认关闭 | 信任网络层（自家 WiFi + 虚拟组网）；口令是可选加固而非默认摩擦 |
 | D3 | SSE 而非轮询 | 现有 `/plugins/events` 同款模式；事件延迟 <500ms 需求 |
 | D4 | 移动页不发起新会话 | 会话创建/模型配置语义复杂（preset、模型选择），v1 只续接 |
 | D5 | 摘要下放而非全量事件 | 控制流量与渲染成本；桌面 GUI 全量能力不受影响 |
@@ -145,7 +148,7 @@ stateDiagram-v2
 ## 9. 风险与应对
 | 风险 | 影响 | 应对 |
 |---|---|---|
-| 0.0.0.0 暴露给陌生网络 | 他人可驱动 agent | 04-security.md：口令加固 + 使用场景约束（仅可信 WiFi/Tailscale） |
+| 0.0.0.0 暴露给陌生网络 | 他人可驱动 agent | 04-security.md：口令加固 + 使用场景约束（仅可信 WiFi/虚拟组网） |
 | 浏览器通知被系统拦截 | 收不到完成提醒 | 页面内横幅降级 + 用户手册说明系统设置 |
 | dsh 服务名变动（agents/sessions 接口演进） | 插件失效 | 惰态 `ctx.get` + 明确错误文案；依赖固定 rc.6 版本 |
 | SSE 在移动网络下断连 | 消息流中断 | 指数退避重连 + 重连后历史增量补齐 |
@@ -239,5 +242,5 @@ sequenceDiagram
 - Flutter 单工程；状态管理 ChangeNotifier（`store.dart` 的 `AppStore`）；SSE 用 `http` 包流式解析
 - 页面：首页（欢迎 + 最近会话） 会话 / 对话 / 通知 / 设置（对照原型 v7）
 - 本地存储：连接配置（地址/口令）、UI 偏好（工具显示、主题、工作区选择）
-- 连接自愈（v2.4.1~v2.5.1）：bootstrap `server.urls` 收集全部地址（局域网 + 蒲公英/Tailscale，排除 169.254/16 链路本地）；SSE 心跳看门狗（75s 无心跳强制重建）+ 超时即轮换（黑洞地址约 10s 故障切换）；下拉刷新「探测 → 自愈 → 拉数据」
+- 连接自愈（v2.4.1~v2.5.1）：bootstrap `server.urls` 收集全部地址（局域网 + 蒲公英/虚拟组网，排除 169.254/16 链路本地与 VMware 虚拟网卡）；SSE 心跳看门狗（45s 无心跳强制重建）+ 超时即轮换（黑洞地址约 10s 故障切换）；下拉刷新「探测 → 自愈 → 拉数据」；SSE 周期断连经实测系手机息屏 Doze（屏亮自动重连+唤醒重同步，非缺陷）
 - 通知：App 内通知中心实时角标（SSE 推送）；后台系统级提醒依赖 Phase 2 推送桥（App 不保活长连接）

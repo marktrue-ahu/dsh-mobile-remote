@@ -58,7 +58,7 @@
 
 > 🤖 **让 DSH 的 agent 自动安装**：直接告诉 agent「按本仓库 docs/06 安装 dsh-mobile-remote 插件」即可。agent 默认会采用下面的「方式一」，拉取的就是**当前正式版**（main 分支永远保持完整可发布状态，版本号与最新 Release 一致）。需要与手机 App 精确配对时，把依赖写成 `"dsh-mobile-remote": "github:201222-L/dsh-mobile-remote#v3.0.0"`。
 
-### 方式一：命令行 dsh web
+### 方式一：命令行 dsh web（web 版流程）
 
 ```powershell
 # 1. 在 profile 声明插件
@@ -73,14 +73,24 @@ corepack pnpm install
 npx @deepseek-ai/dsh web
 ```
 
-### 方式二：DeepSeek Harness 桌面端
+### 方式二：DeepSeek Harness 桌面端（当前主线）
 
-安装插件后重启桌面端即可（同一 profile，自动加载）。
+安装插件后**重启 DSH Desktop** 即可（desktop profile 自动加载；移动端经插件 **LAN 桥**，默认 `0.0.0.0:3080`，见 「LAN 桥」节与 docs/06 §4b）。
 
-### 固定端口（推荐）
+### LAN 桥（桌面版必开，手机局域网直连）
 
 ```yaml
-# cordis.patch.yml
+# cordis.patch.yml（mobile-remote 行 config 内）
+        lanBridge:
+          enabled: true
+          port: 3080
+          host: 0.0.0.0
+```
+
+> ⚠️ **不要覆盖 webserver 行**：桌面版（0.1.1-rc.2）webserver 强制回环（覆盖 host 会直接报错），且 cordis patch 对已有行是**整体替换 config**——若确需覆盖（仅 web 版），必须写全必填字段（`host` + `port`，见下），缺一即启动报 `$port missing required value`（`--dump-config`/smoke 测不出来，只有真启动才暴露）。
+
+```yaml
+# 仅 web 版适用：固定 webserver 端口（覆盖已有行必须写全字段！）
 - id: webserver
   config:
     host: 0.0.0.0
@@ -113,15 +123,17 @@ npx @deepseek-ai/dsh web
 
 ### Server酱（微信推送，最省事）
 
-1. 手机微信扫码打开 https://sct.ftqq.com → 获取 SendKey
+1. 手机微信扫码打开 https://sc3.ft07.com/sendkey → 复制 **API URL**（形如 `https://<uid>.push.ft07.com/send/<key>.send`，免备案；老 Turbo 接口 sctapi.ftqq.com 已不可用，2026-08 实测）
 2. 配置：
 
 ```yaml
 pushUrls:
   - name: 微信
-    url: https://sctapi.ftqq.com/<SendKey>.send
+    url: https://<uid>.push.ft07.com/send/<sendkey>.send
     format: serverchan
 ```
+
+> ⚠️ Server酱³ 免费版**每天限 5 条**（AUTH 40001），需更多条数请升级。
 
 ### ntfy（安卓系统通知栏，原生弹窗）
 
@@ -154,7 +166,7 @@ pushUrls:
 
 ## 手机使用
 
-0. **下载 App**：[GitHub Releases](https://github.com/201222-L/dsh-mobile-remote/releases/latest) 下载 `app-release.apk` 安装（或按 dsh-mobile-app/README 自行构建）
+0. **下载 App**：[GitHub Releases](https://github.com/201222-L/dsh-mobile-remote/releases/latest) 下载 `DSH-Remote-vX.Y.Z.apk` 安装（或按 dsh-mobile-app/README 自行构建）
 1. 与电脑同一 WiFi；**人不在家**用蒲公英组网等虚拟组网方案（已实测，见 docs/06 §5，App 自动切换地址）
 2. 打开 App →「扫码连接」对准桌面 dsh 设置页二维码（或手动输地址+口令）
 3. 首页直接发消息派活；对话页实时流式回复；通知页看完成/提问/失败

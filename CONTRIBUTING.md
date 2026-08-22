@@ -11,7 +11,7 @@
 
 ## 开发环境
 
-- **插件**：Node.js 18+；在 `~/.dsh/profiles/web` 以 `file:` 依赖引入（见 docs/06-install-run.md）
+- **插件**：Node.js 18+；在 `~/.dsh/profiles/<desktop|web>` 以 `file:` 依赖引入（见 docs/06-install-run.md；桌面版移动端用 LAN 桥）
 - **App**：Flutter 3.47+ + Android SDK；`flutter analyze` 必须零问题
 
 ## 代码约定
@@ -35,7 +35,7 @@
 
 ## 发布新版本（维护者清单）
 
-**版本号统一原则**：App 版本（pubspec）= 插件版本（package.json）= git tag（如 `v2.6.0` = App 2.6.0 + 插件 2.6.0）。**任何一端改动都要三处一起 bump 到同一个新版本号。**
+**版本号统一原则**：App 版本（pubspec）= 插件版本（package.json）= git tag（如 `v3.0.0` = App 3.0.0+6 + 插件 3.0.0）。**任何一端改动都要三处一起 bump 到同一个新版本号。**
 
 **main 分支完整性约定**：main **永远保持完整可发布状态**——每次合并前必须完成：版本号已 bump、CHANGELOG 已更新、`flutter analyze`/`node --check` 通过；不推半成品。这样"拉最新 main"（普通用户让 agent 自动安装的默认路径）拿到的永远是当前正式版，与最新 Release 一致。破坏性/实验性改动走分支或 PR，不进 main。
 
