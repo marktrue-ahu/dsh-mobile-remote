@@ -2133,6 +2133,15 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget _buildItem(_MsgItem item) {
     switch (item.kind) {
       case _MsgKind.user:
+        // v3.0.0(热修 06)：对齐 PC 端——用户消息先出图片卡片、再出文本；服务端 blocksToText
+        // 为 image 块生成的「[图片]」占位行由图卡渲染替代（带图时不再展示，避免与真实图重复）。
+        final images = item.images;
+        final text = images.isNotEmpty
+            ? item.text
+                .replaceAll(RegExp(r'^\[图片\]$', multiLine: true), '')
+                .replaceAll(RegExp(r'\n{2,}'), '\n')
+                .trim()
+            : item.text;
         return Align(
           alignment: Alignment.centerRight,
           child: Container(
@@ -2147,8 +2156,8 @@ class _ChatScreenState extends State<ChatScreen> {
               crossAxisAlignment: CrossAxisAlignment.end,
               mainAxisSize: MainAxisSize.min,
               children: [
-                if (item.text.isNotEmpty) Text(item.text, style: const TextStyle(fontSize: 15, height: 1.5)),
-                if (item.images.isNotEmpty) _ImagesGrid(images: item.images, sessionId: _mySessionId ?? ''),
+                if (images.isNotEmpty) _ImagesGrid(images: images, sessionId: _mySessionId ?? ''),
+                if (text.isNotEmpty) Text(text, style: const TextStyle(fontSize: 15, height: 1.5)),
               ],
             ),
           ),
