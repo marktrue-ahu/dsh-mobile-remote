@@ -70,5 +70,13 @@ void main() {
       expect(isDefinitiveSendRejection('attachment-error'), isTrue);
       expect(isDefinitiveSendRejection('invalid-requestId'), isTrue);
     });
+
+    test('认证/限流/Host 拒绝（热修 08：投递前明确拒绝）→ 直接判失败并保留草稿', () {
+      expect(isDefinitiveSendRejection('auth-required'), isTrue);
+      expect(isDefinitiveSendRejection('rate-limited'), isTrue);
+      expect(isDefinitiveSendRejection('host-not-allowed'), isTrue);
+      expect(isDefinitiveSendRejection('loopback-only'), isTrue);
+      expect(isDefinitiveSendRejection('method-not-allowed'), isTrue);
+    });
   });
 }

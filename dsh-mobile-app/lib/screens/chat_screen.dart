@@ -31,7 +31,12 @@ bool isDefinitiveSendRejection(String? code) => switch (code) {
       'attachment-error' ||
       'send-failed' ||
       'bad-request' ||
-      'not-found' =>
+      'not-found' ||
+      'auth-required' ||
+      'rate-limited' ||
+      'host-not-allowed' ||
+      'loopback-only' ||
+      'method-not-allowed' =>
         true,
       _ => false,
     };

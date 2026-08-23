@@ -22,7 +22,7 @@ if (!mod) {
   console.error("FAIL: 无法导入插件模块（先同步 profile 副本或设 DSH_MOBILE_PLUGIN）");
   process.exit(1);
 }
-const { blocksToText, receiptExpired, summarizeEvent } = mod;
+const { blocksToText, receiptExpired, pruneReceiptMap, summarizeEvent } = mod;
 
 let pass = 0;
 let fail = 0;
@@ -73,6 +73,27 @@ const check = (name, cond, extra = "") => {
   check("恰好在 TTL 边界不过期", receiptExpired(Date.now() - ttl, Date.now(), ttl) === false);
   check("超过 TTL 过期", receiptExpired(Date.now() - ttl - 1, Date.now(), ttl) === true);
   check("默认 TTL 为 15 分钟", receiptExpired(Date.now() - 16 * 60 * 1000, Date.now()) === true);
+}
+
+// 5. pruneReceiptMap：未访问的旧回执也会被清理（热修 08）
+{
+  const ttl = 15 * 60 * 1000;
+  const now = Date.now();
+  const mk = (at) => ({ status: "done", result: { ok: true }, at });
+  const m = new Map([
+    ["a", mk(now - 1)],                          // 新
+    ["b", mk(now - ttl)],                        // 恰好边界 → 保留
+    ["c", mk(now - ttl - 1)],                    // 超时 → 清除
+    ["d", mk(now - 16 * 60 * 1000)],             // 旧 → 清除
+  ]);
+  const changed = pruneReceiptMap(m, now, ttl);
+  check("全量清理：过期已删、边界保留", !m.has("c") && !m.has("d") && m.has("a") && m.has("b"), `剩余 ${[...m.keys()].join(",")}`);
+  check("有删除时返回 true", changed === true);
+  check("无过期时返回 false", pruneReceiptMap(m, now, ttl) === false);
+  const cap = new Map();
+  for (let i = 0; i < 5; i++) cap.set(`k${i}`, mk(now - i * 1000));
+  pruneReceiptMap(cap, now, ttl, 3);
+  check("上限裁剪到 max", cap.size === 3, `size=${cap.size}`);
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
