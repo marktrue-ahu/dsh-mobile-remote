@@ -29,6 +29,22 @@
   - 服务端：所有 JSON 响应与 `/attachment` 强制 `connection: close`（SSE 除外）——关闭复用竞态窗口；LAN 桥禁用上游连接池（`agent: false`）、响应头强制 close（SSE 保持 keep-alive）；桥 upstream 错误路径补 warn 日志（此前 reset/销毁全静默，排障无迹可查）。
 - **验证**：本机经桥同构重放（2 图 1.26MB + 文本）200/0.48s——服务端链路健康，问题在响应回程与客户端判定；`node --check` 与 `flutter analyze` 通过；服务端修复随 DSH 重启生效，App 修复随下个 APK（3.0.0+8）生效。
 
+### 发送回执幂等化与限额统一（2026-08-23 热修 05，App 3.0.0+9）
+
+- **背景（P0 修正）**：热修 04 的客户端"对账"（按历史文本+图片数/队列文本猜测是否送达）存在**静默丢草稿**风险——空文本图片发送（只发截图）会跳过文本比对、命中任意同图数旧消息即判"已送达"并清空待发图片；同文本旧消息同理。送达确认的正确层级是**协议层回执**，不是客户端启发式判断。
+- **服务端（requestId 幂等回执）**：
+  - `/send` 支持 `requestId`（UUID 形态校验，非法 400）；投递**之前**占位 in-progress，处理完成后记录结果快照；同一 `sessionId+requestId` 重复请求**直接返回第一次结果、不再二次投递**（处理中重复请求回 409 `receipt-pending`）；
+  - 新增 `GET /m/api/send-receipt`（只查不投）；回执 TTL 15 分钟、上限 2000 条，持久化 `~/.dsh/mobile-remote/send-receipts.json`（重启恢复，处理中状态不跨重启保留）；边界文档化：单进程内 + TTL 幂等，超期同 id 重试可能重复投递一次；
+  - 测试钩子：`DSH_MOBILE_REMOTE_DROP_RESPONSE=1` —— /send 处理后销毁连接不回包，用于模拟"服务端已接收但回程断开"。
+- **App**：
+  - requestId 与**草稿内容绑定**（文本+图片路径签名）：失败重试复用同一 id（服务端幂等，不重复投递）；草稿被编辑才换新 id；
+  - 传输层错误（reset/超时）或 409 → 有界轮询回执（4×1.2s）：`done` → 清草稿+「已送达，请勿重复发送」；`error` → 明确失败；查不到 → 保留草稿+「发送结果未知：请稍后点重试，重试不会重复发送」；服务端明确拒绝（400/413/404/500）→ 直接失败并重置 requestId；
+  - 图片发送同一套机制；**移除热修 04 的 `_reconcileSent` 启发式对账**；
+  - **限额统一**：客户端图片总量上限 40MB（64MB HTTP body 扣 base64 膨胀与 JSON 开销后的安全值）——超限客户端明确提示，不再落到服务端 413；内核侧 200MB 能力不变（PC 端同源）。
+- **保留热修 04**：`connection: close` / 桥 `agent: false` / 桥错误日志——缓解半关连接复用，但不作为送达保证。
+- **测试**：`tools/hotfix05-check.mjs`（无投递用例：非法 requestId 400、未命中回执 404、缺参 400、>64MB 声明 413；`DSH_MOBILE_LIVE=1` 追加：文本/空文本图片发送+回执 done+同 id 重试结果一致）；`flutter analyze` 零问题、`node --check` 通过。
+- **验证方法**（如何证明"不重复发送、不静默丢草稿"）：① 同 requestId 重试返回相同 messageId（不二次投递）；② `DSH_MOBILE_REMOTE_DROP_RESPONSE=1` 重启后真机发送 → App 显示「已送达」且草稿清空（回程断开不影响判定）；③ 断网发送 → App 保留草稿提示「结果未知」，恢复网络后点重试仅投递一次。
+
 ### 图像链路 v2（2026-08-23，App 3.0.0+7）——tool/result 嵌套图片 + GIF 动图
 - **tool/result 嵌套图片（对齐 PC 端 contentParts 语义）**：实测内核 `read_image` 等工具结果的图片块**嵌套在 `tool-result.content` 内**（非消息顶层，此前 `imagesOf` 顶层收集漏掉 → 移动端助手消息只有占位/空白）。修复：
   - 插件新增 `imagesOfNested()`（递归展开 tool-result.content），`assistant/message` 与 `tool/result` 摘要改用——SSE/history 事件摘要均带出嵌套图片引用（`{attachmentId, mediaType, width?, height?, name?}`，≤20 张）；

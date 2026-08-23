@@ -82,6 +82,10 @@ class _ChatScreenState extends State<ChatScreen> {
   final Set<String> _feedbackInFlight = {};
   // v3.0.0 图像链路：待发送图片（XFile 原始文件，不压缩——与 PC 端一致）
   final List<XFile> _pendingImages = [];
+  // v3.0.0(热修 05)：待确认发送的 requestId 与草稿签名——内容未变的重试复用同一 id
+  // （服务端幂等不重复投递）；内容变化后重新生成。
+  String? _pendingRequestId;
+  String? _pendingSignature;
   bool _pickingImages = false; // 选图在途锁（相册多选期间防重复触发）
 
   // ── 分段历史浏览（超长会话的安全阀，仅当无限模式不可用时启用） ──
@@ -1153,40 +1157,27 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  /// v3.0.0(热修 04)：发送失败后的「对账」——判断消息是否实际已送达。
-  /// 网络层报错≠未送达：「Connection reset by peer」可能发生在响应回程，
-  /// 此时消息已入会话（或已入排队持存），再报失败、留着草稿只会诱导重复发送。
-  /// 判据：history 近 20 条 user/message 文本精确匹配 + 图片数一致；
-  /// 或队列（内核 inbox / 插件持存）存在同文本行（持存行的「[图片] ×N」后缀剥离）。
-  /// 对账自身失败时保守返回 false（按未送达处理，保留草稿供重试）。
-  Future<bool> _reconcileSent(String sessionId, String text, int imageCount) async {
-    final t = text.trim();
-    try {
-      final events = await api.history(sessionId, limit: 20, timeout: const Duration(seconds: 8));
-      for (final e in events) {
-        if (e.type != 'user/message') continue;
-        final d = e.data;
-        if (d == null) continue;
-        final et = (d['text'] as String? ?? '').trim();
-        if (t.isNotEmpty && et != t) continue;
-        if ((d['images'] as List? ?? const []).length != imageCount) continue;
-        return true;
+  /// v3.0.0(热修 05)：草稿签名（文本+待发图片路径）——签名变化才换新 requestId。
+  String _composerSignature(String text) => '$text|${_pendingImages.map((f) => f.path).join(',')}';
+
+  /// v3.0.0(热修 05)：发送结果未知（reset/超时/409）后的回执查询——有界轮询。
+  /// 返回 null＝未确认（保守）；非 null＝服务端回执 { status: done|error, result }。
+  /// 「已送达」的判据改为服务端 requestId 回执（幂等），替代热修 04 的启发式对账
+  /// （后者会把空文本图片/同文本旧消息误判为已送达 → 静默丢草稿）。
+  Future<Map<String, dynamic>?> _resolveUnknownSend(String sessionId, String requestId) async {
+    for (var i = 0; i < 4; i++) {
+      try {
+        final receipt = await api.sendReceipt(sessionId, requestId, timeout: const Duration(seconds: 3));
+        final status = receipt['status'] as String?;
+        if (status == 'done' || status == 'error') return receipt;
+        // in-progress：稍后再查
+      } catch (_) {
+        // receipt-not-found（第一次请求根本没到服务端）或网络再失败 → 保守未确认
+        return null;
       }
-    } catch (_) {
-      // 历史拉取失败 → 仍尝试队列对账
+      await Future.delayed(const Duration(milliseconds: 1200));
     }
-    try {
-      final rows = await api.queue(sessionId, timeout: const Duration(seconds: 8));
-      for (final row in rows) {
-        final rt = (row['text'] as String? ?? '')
-          .trim()
-          .replaceFirst(RegExp(r' \[图片\] ×\d+$'), '')
-          .trim();
-        if (t.isNotEmpty && rt != t) continue;
-        return true;
-      }
-    } catch (_) {}
-    return false;
+    return null;
   }
 
   Future<void> _send([String? preset, String mode = 'followup']) async {
@@ -1208,6 +1199,14 @@ class _ChatScreenState extends State<ChatScreen> {
     // v3.0.0：运行中排队（followup）→ 消息**不进对话窗口**（与 PC 端一致：仅进 Queue Dock，
     // 被 agent 认领执行时 user/message 回显才上屏）——乐观气泡只保留给「立即生效」的发送
     final queued = mode != 'steer' && widget.store.agentStatus == 'running';
+    // v3.0.0(热修 05)：requestId 与草稿内容绑定——内容未变的重试复用同一 id
+    // （服务端幂等，重复投递最多一次）；内容变化（文本/图片改动）则换新 id。
+    final signature = _composerSignature(text);
+    if (_pendingRequestId == null || _pendingSignature != signature) {
+      _pendingRequestId = genRequestId();
+      _pendingSignature = signature;
+    }
+    final requestId = _pendingRequestId!;
     // 收起键盘，输入框回到原位
     FocusScope.of(context).unfocus();
     // agent 忙时提示（避免用户以为没反应而重复发送）；插队时不提示排队
@@ -1221,7 +1220,9 @@ class _ChatScreenState extends State<ChatScreen> {
     _inputCtrl.clear();
     _scrollToBottom(force: true);
     try {
-      final (mid, note) = await api.send(id, text, mode: mode);
+      final (mid, note) = await api.send(id, text, mode: mode, requestId: requestId);
+      _pendingRequestId = null;
+      _pendingSignature = null;
       AppLog.instance.log('Chat: 发送成功 mid=$mid${note != null ? ' note=$note' : ''}');
       if (!mounted) return;
       // v2.7.2 review：mounted 检查之后才刷新队列（发送成功=新消息入队）
@@ -1257,26 +1258,62 @@ class _ChatScreenState extends State<ChatScreen> {
         if (idx != -1) _items[idx] = _items[idx].copyWith(messageId: mid);
       });
     } catch (e) {
-      AppLog.instance.log('Chat: 发送失败（$mode）→ $e');
+      AppLog.instance.log('Chat: 发送异常（$mode）→ $e');
       if (!mounted) return;
-      // v3.0.0(热修 04)：对账——网络层报错≠未送达。已送达：只提示不误导；
-      // 未送达：撤回乐观气泡、恢复输入框草稿，用户可安全重发。
-      final landed = await _reconcileSent(id, text, 0);
+      final definitive = e is ApiException && e.code != 'receipt-pending';
+      if (definitive) {
+        // v3.0.0(热修 05)：服务端明确拒绝（400/413/404/500…）＝未送达——
+        // 重置 requestId（下次点击是全新尝试），恢复草稿供重发。
+        _pendingRequestId = null;
+        _pendingSignature = null;
+        setState(() {
+          if (!queued) {
+            _items.removeWhere((m) => m.kind == _MsgKind.user && m.messageId == null && m.text == text);
+            _items.insert(0, _MsgItem.divider('⚠ ${L10n.t('发送失败：', 'Send failed: ')}$e'));
+          }
+        });
+        _inputCtrl.text = text;
+        _inputCtrl.selection = TextSelection.collapsed(offset: text.length);
+        showToast(context, '${L10n.t('发送失败：', 'Send failed: ')}$e');
+        return;
+      }
+      // v3.0.0(热修 05)：结果未知（reset/超时/409）→ 同一 requestId 查回执（幂等），
+      // 不再按文本/图片数启发式猜测。
+      final receipt = await _resolveUnknownSend(id, requestId);
       if (!mounted) return;
-      if (landed) {
+      if (receipt != null && receipt['status'] == 'done') {
+        _pendingRequestId = null;
+        _pendingSignature = null;
         _scheduleQueueRefresh();
         showToast(context, L10n.t('已送达：刚才网络波动，请勿重复发送', 'Delivered despite a network hiccup — do not resend'));
         return;
       }
+      if (receipt != null && receipt['status'] == 'error') {
+        _pendingRequestId = null;
+        _pendingSignature = null;
+        final rmap = receipt['result'] is Map ? receipt['result'] as Map : const {};
+        final msg = '${L10n.t('发送失败：', 'Send failed: ')}${rmap['detail'] ?? ''}';
+        setState(() {
+          if (!queued) {
+            _items.removeWhere((m) => m.kind == _MsgKind.user && m.messageId == null && m.text == text);
+            _items.insert(0, _MsgItem.divider('⚠ $msg'));
+          }
+        });
+        _inputCtrl.text = text;
+        _inputCtrl.selection = TextSelection.collapsed(offset: text.length);
+        showToast(context, msg);
+        return;
+      }
+      // 未确认：保留 requestId 供幂等重试；撤回乐观气泡、恢复草稿
       setState(() {
         if (!queued) {
           _items.removeWhere((m) => m.kind == _MsgKind.user && m.messageId == null && m.text == text);
-          _items.insert(0, _MsgItem.divider('⚠ ${L10n.t('发送失败：', 'Send failed: ')}$e'));
+          _items.insert(0, _MsgItem.divider('⚠ ${L10n.t('发送结果未知：', 'Outcome unknown: ')}$e'));
         }
       });
       _inputCtrl.text = text;
       _inputCtrl.selection = TextSelection.collapsed(offset: text.length);
-      showToast(context, '${L10n.t('发送失败：', 'Send failed: ')}$e');
+      showToast(context, L10n.t('发送结果未知：请稍后点重试，重试不会重复发送', 'Outcome unknown — retry later; retries will not duplicate'));
     } finally {
       if (mounted) setState(() => _sending = false);
     }
@@ -1287,13 +1324,21 @@ class _ChatScreenState extends State<ChatScreen> {
     if (_pendingImages.isEmpty) return;
     setState(() => _sending = true);
     FocusScope.of(context).unfocus();
+    // v3.0.0(热修 05)：requestId 声明在 try 外——catch 需要它判断「是否已发起请求」
+    // （发送前校验/读图阶段的异常不能走进回执流程）。
+    String? requestId;
     try {
       // 限额（与 PC 端同源数字：内核 imageLimits）
       final limits = widget.store.catalog?.imageLimits ?? const {};
       final maxBytes = ((limits['maxImageBytes'] as num?)?.toInt() ?? 20 * 1024 * 1024);
       // v3.0.0：兜底对齐内核默认（DEFAULT_MAX_MESSAGE_IMAGE_BYTES = 200MB；此前误写 20MB，
       // catalog 缺失时总大小被错误限制在单张额度）
-      final maxTotal = ((limits['maxMessageImageBytes'] as num?)?.toInt() ?? 200 * 1024 * 1024);
+      final catalogMax = ((limits['maxMessageImageBytes'] as num?)?.toInt() ?? 200 * 1024 * 1024);
+      // v3.0.0(热修 05)：客户端传输天花板 40MB——服务端 HTTP body 上限 64MB，
+      // base64 膨胀（×4/3）加 JSON 开销后仍有富余；超限在客户端明确提示，
+      // 不再落到服务端 413。内核侧 200MB 能力不受影响（PC 端同源）。
+      const transportCeiling = 40 * 1024 * 1024;
+      final maxTotal = catalogMax > transportCeiling ? transportCeiling : catalogMax;
       final mediaTypes = (limits['mediaTypes'] as List?)?.map((e) => e.toString()).toSet() ??
           {'image/png', 'image/jpeg', 'image/webp', 'image/gif'};
       // 模型能力（服务端也会校验，此处前置拦截给用户明确提示）
@@ -1339,8 +1384,16 @@ class _ChatScreenState extends State<ChatScreen> {
         showToast(context, L10n.t('没有可发送的图片', 'No image to send'));
         return;
       }
+      final signature = _composerSignature(text);
+      if (_pendingRequestId == null || _pendingSignature != signature) {
+        _pendingRequestId = genRequestId();
+        _pendingSignature = signature;
+      }
+      requestId = _pendingRequestId!;
       AppLog.instance.log('Chat: 发送(图) → $id : ${images.length} 张, 共 $total 字节${mode == 'steer' ? '（插队）' : ''}');
-      final (accepted, note) = await api.sendImages(id, text, images, mode: mode);
+      final (accepted, note) = await api.sendImages(id, text, images, mode: mode, requestId: requestId);
+      _pendingRequestId = null;
+      _pendingSignature = null;
       if (!mounted) return;
       _scheduleQueueRefresh();
       if (!accepted) {
@@ -1359,20 +1412,41 @@ class _ChatScreenState extends State<ChatScreen> {
       // v3.0.0：发送成功（含排队持存）即清空输入框——此前文字残留，用户误以为没发出而重复发送
       if (_inputCtrl.text == text) _inputCtrl.clear();
     } catch (e) {
-      AppLog.instance.log('Chat: 发送(图)失败 → $e');
+      AppLog.instance.log('Chat: 发送(图)异常 → $e');
       if (!mounted) return;
-      // v3.0.0(热修 04)：对账——reset 可能发生在响应回程，消息已入会话（含排队持存）
-      // 时按成功清空草稿并提示勿重发；真未送达才保留可重试。
-      final landed = await _reconcileSent(id, text, _pendingImages.length);
+      if (requestId == null) {
+        // 发送前校验/读图阶段异常：未发出任何请求 → 按普通失败处理
+        showToast(context, '${L10n.t('发送失败：', 'Send failed: ')}$e');
+        return;
+      }
+      final definitive = e is ApiException && e.code != 'receipt-pending';
+      if (definitive) {
+        // v3.0.0(热修 05)：服务端明确拒绝＝未送达——重置 requestId，保留草稿供重发。
+        _pendingRequestId = null;
+        _pendingSignature = null;
+        showToast(context, '${L10n.t('发送失败：', 'Send failed: ')}$e');
+        return;
+      }
+      final receipt = await _resolveUnknownSend(id, requestId);
       if (!mounted) return;
-      if (landed) {
+      if (receipt != null && receipt['status'] == 'done') {
+        _pendingRequestId = null;
+        _pendingSignature = null;
         setState(() => _pendingImages.clear());
         if (_inputCtrl.text == text) _inputCtrl.clear();
         _scheduleQueueRefresh();
         showToast(context, L10n.t('已送达：刚才网络波动，请勿重复发送', 'Delivered despite a network hiccup — do not resend'));
         return;
       }
-      showToast(context, '${L10n.t('发送失败：', 'Send failed: ')}$e');
+      if (receipt != null && receipt['status'] == 'error') {
+        _pendingRequestId = null;
+        _pendingSignature = null;
+        final rmap = receipt['result'] is Map ? receipt['result'] as Map : const {};
+        showToast(context, '${L10n.t('发送失败：', 'Send failed: ')}${rmap['detail'] ?? ''}');
+        return;
+      }
+      // 未确认：保留 requestId 与草稿供幂等重试
+      showToast(context, L10n.t('发送结果未知：请稍后点重试，重试不会重复发送', 'Outcome unknown — retry later; retries will not duplicate'));
     } finally {
       if (mounted) setState(() => _sending = false);
     }
@@ -3212,3 +3286,5 @@ class _ApprovalCardState extends State<_ApprovalCard> {
     );
   }
 }
+
+
