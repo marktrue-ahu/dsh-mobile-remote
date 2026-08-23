@@ -17,6 +17,16 @@ import '../fmt.dart';
 import 'sheets.dart';
 import 'session_tools_sheet.dart';
 
+/// v3.0.0(热修 07)：发送异常后的草稿恢复决策——仅当输入框仍为空（本次发送清空后的预期
+/// 状态）才回填旧草稿；发送期间用户输入的新内容一律保留（绝不覆盖，见 Codex review）。
+String draftAfterFailure(String current, String fallback) =>
+    current.trim().isEmpty ? fallback : current;
+
+/// v3.0.0(热修 07)：草稿签名——会话 + 最终生效模式 + 文本 + 图片路径；任一变化即换新
+/// requestId（例：排队发送结果未知后改用插队 → 新 requestId → 插队真正执行而非回放旧结果）。
+String composerSignature(String sessionId, String mode, String text, List<String> imagePaths) =>
+    '$sessionId|$mode|$text|${imagePaths.join(',')}';
+
 /// Phase 2(A4)：统一「打开会话页」流程——切换会话 + 刷新会话配置 + 推入 ChatScreen。
 /// 返回后执行 [onReturn]（各调用点差异：刷新列表 / 恢复原会话）。
 Future<void> openChat(BuildContext context, AppStore store, String sessionId,
@@ -1158,7 +1168,13 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   /// v3.0.0(热修 05)：草稿签名（文本+待发图片路径）——签名变化才换新 requestId。
-  String _composerSignature(String text) => '$text|${_pendingImages.map((f) => f.path).join(',')}';
+  /// v3.0.0(热修 07)：发送异常后恢复草稿——只在输入框仍为空时回填（见 draftAfterFailure）。
+  void _restoreDraftIfUntouched(String fallback) {
+    final restored = draftAfterFailure(_inputCtrl.text, fallback);
+    if (restored == _inputCtrl.text) return;
+    _inputCtrl.text = restored;
+    _inputCtrl.selection = TextSelection.collapsed(offset: restored.length);
+  }
 
   /// v3.0.0(热修 05)：发送结果未知（reset/超时/409）后的回执查询——有界轮询。
   /// 返回 null＝未确认（保守）；非 null＝服务端回执 { status: done|error, result }。
@@ -1186,22 +1202,22 @@ class _ChatScreenState extends State<ChatScreen> {
     final id = _mySessionId ?? widget.store.sessionId;
     if ((text.isEmpty && _pendingImages.isEmpty) || id == null || _sending || preset != null && _pendingImages.isNotEmpty) return;
     // v3.0.0 图像链路：有待发图片 → 走图片通路（原始字节不压缩；成功/失败处理独立）
+    if (mode == 'steer' && widget.store.agentStatus != 'running') {
+      showToast(context, L10n.t('agent 空闲，已按普通消息发送', 'Agent idle — sent as a normal message'));
+      mode = 'followup';
+    }
+    // v3.0.0(热修 07)：降级提前到分流之前——最终生效模式参与 requestId 签名
     if (_pendingImages.isNotEmpty) {
       await _sendImages(id, text, mode);
       return;
     }
     AppLog.instance.log('Chat: 发送 → $id : ${text.length > 20 ? '${text.substring(0, 20)}…' : text}${mode == 'steer' ? '（插队）' : ''}');
-    // v2.7.2 插队：agent 空闲时插队无意义 → 降级普通发送并提示
-    if (mode == 'steer' && widget.store.agentStatus != 'running') {
-      showToast(context, L10n.t('agent 空闲，已按普通消息发送', 'Agent idle — sent as a normal message'));
-      mode = 'followup';
-    }
     // v3.0.0：运行中排队（followup）→ 消息**不进对话窗口**（与 PC 端一致：仅进 Queue Dock，
     // 被 agent 认领执行时 user/message 回显才上屏）——乐观气泡只保留给「立即生效」的发送
     final queued = mode != 'steer' && widget.store.agentStatus == 'running';
     // v3.0.0(热修 05)：requestId 与草稿内容绑定——内容未变的重试复用同一 id
     // （服务端幂等，重复投递最多一次）；内容变化（文本/图片改动）则换新 id。
-    final signature = _composerSignature(text);
+    final signature = composerSignature(id, mode, text, _pendingImages.map((f) => f.path).toList());
     if (_pendingRequestId == null || _pendingSignature != signature) {
       _pendingRequestId = genRequestId();
       _pendingSignature = signature;
@@ -1272,8 +1288,7 @@ class _ChatScreenState extends State<ChatScreen> {
             _items.insert(0, _MsgItem.divider('⚠ ${L10n.t('发送失败：', 'Send failed: ')}$e'));
           }
         });
-        _inputCtrl.text = text;
-        _inputCtrl.selection = TextSelection.collapsed(offset: text.length);
+        _restoreDraftIfUntouched(text);
         showToast(context, '${L10n.t('发送失败：', 'Send failed: ')}$e');
         return;
       }
@@ -1299,8 +1314,7 @@ class _ChatScreenState extends State<ChatScreen> {
             _items.insert(0, _MsgItem.divider('⚠ $msg'));
           }
         });
-        _inputCtrl.text = text;
-        _inputCtrl.selection = TextSelection.collapsed(offset: text.length);
+        _restoreDraftIfUntouched(text);
         showToast(context, msg);
         return;
       }
@@ -1311,8 +1325,7 @@ class _ChatScreenState extends State<ChatScreen> {
           _items.insert(0, _MsgItem.divider('⚠ ${L10n.t('发送结果未知：', 'Outcome unknown: ')}$e'));
         }
       });
-      _inputCtrl.text = text;
-      _inputCtrl.selection = TextSelection.collapsed(offset: text.length);
+      _restoreDraftIfUntouched(text);
       showToast(context, L10n.t('发送结果未知：请稍后点重试，重试不会重复发送', 'Outcome unknown — retry later; retries will not duplicate'));
     } finally {
       if (mounted) setState(() => _sending = false);
@@ -1384,7 +1397,7 @@ class _ChatScreenState extends State<ChatScreen> {
         showToast(context, L10n.t('没有可发送的图片', 'No image to send'));
         return;
       }
-      final signature = _composerSignature(text);
+      final signature = composerSignature(id, mode, text, _pendingImages.map((f) => f.path).toList());
       if (_pendingRequestId == null || _pendingSignature != signature) {
         _pendingRequestId = genRequestId();
         _pendingSignature = signature;
@@ -2136,12 +2149,9 @@ class _ChatScreenState extends State<ChatScreen> {
         // v3.0.0(热修 06)：对齐 PC 端——图卡与文本为**两个独立气泡**（图在上、文在下）；
         // 服务端 blocksToText 为 image 块生成的「[图片]」占位行由图卡渲染替代（带图时不再展示）。
         final images = item.images;
-        final text = images.isNotEmpty
-            ? item.text
-                .replaceAll(RegExp(r'^\[图片\]$', multiLine: true), '')
-                .replaceAll(RegExp(r'\n{2,}'), '\n')
-                .trim()
-            : item.text;
+        // v3.0.0(热修 07)：不再剥离 [图片]——占位改由服务端 user 摘要直接去除
+        // （blocksToText imagePlaceholder:false），客户端保留用户原文，不误删手打内容。
+        final text = item.text;
         Widget userBubble(Widget child) => Align(
               alignment: Alignment.centerRight,
               child: Container(
@@ -3298,5 +3308,6 @@ class _ApprovalCardState extends State<_ApprovalCard> {
     );
   }
 }
+
 
 

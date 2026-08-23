@@ -29,6 +29,14 @@
   - 服务端：所有 JSON 响应与 `/attachment` 强制 `connection: close`（SSE 除外）——关闭复用竞态窗口；LAN 桥禁用上游连接池（`agent: false`）、响应头强制 close（SSE 保持 keep-alive）；桥 upstream 错误路径补 warn 日志（此前 reset/销毁全静默，排障无迹可查）。
 - **验证**：本机经桥同构重放（2 图 1.26MB + 文本）200/0.48s——服务端链路健康，问题在响应回程与客户端判定；`node --check` 与 `flutter analyze` 通过；服务端修复随 DSH 重启生效，App 修复随下个 APK（3.0.0+8）生效。
 
+### Codex review 修复（2026-08-24 热修 07，App 3.0.0+12）
+- **P1 发送异常不覆盖新输入**：`_send` 三处异常恢复改为 `_restoreDraftIfUntouched`——仅当输入框仍为空（本次发送清空后的预期状态）才回填旧草稿；发送期间用户已输入新内容一律保留。顶层纯函数 `draftAfterFailure` 供单测。
+- **P2 回执 TTL 读取时生效**：`receiptExpired` 顶层纯函数（默认 15 分钟）；`/send` 查重前与 `/send-receipt` 查询前清理过期回执并持久化——服务闲置 15 分钟后旧回执不再被命中，与文档一致。
+- **P2 签名纳入发送语义**：`composerSignature(sessionId, mode, text, imagePaths)` 替代旧签名（会话+最终生效模式+文本+图片路径）；`steer` 空闲降级提前到图文分流之前——排队结果未知后改用插队会获得**新 requestId**，插队真正执行而非回放旧排队结果。
+- **P2 不误删用户手打 `[图片]`**：占位移除改在**服务端**——`blocksToText` 增加 `imagePlaceholder` 开关，`user/message` 摘要以 `imagePlaceholder:false` 生成文本（图由 `images[]` 图卡渲染）；客户端剥离逻辑整体移除，用户原文原样保留。旧会话历史即时按新规则（`/history` 实时重摘要）。
+- **测试**：`tools/hotfix07-unit-check.mjs` 10/10（占位开关/手打保留/images 元数据/TTL 边界）；`test/hotfix07_logic_test.dart`（草稿恢复决策 + 签名差异）；`flutter analyze` 零问题、`flutter test` 15/15、`node --check` 通过。
+- **生效边界**：服务端改动随 DSH 重启生效；`64110b3`（requestId 校验顺序）与本次一起在重启后上线；App 修复随 APK 3.0.0+12。
+
 ### 用户消息图文顺序对齐 PC 端（2026-08-23 热修 06，App 3.0.0+10；修正 +11）
 - **现象**：移动端用户气泡先文本、后图片，且文本里带服务端为 image 块生成的「[图片]」占位行（`blocksToText`）；PC 端是**图片卡片在前、文本在后，且无占位**——移动端与 PC 观感不一致、占位与图卡重复。
 - **修复**（纯展示层，协议零改动）：用户气泡重排为 `_ImagesGrid` 在前、`Text` 在后；带图时剥掉独立成行的「[图片]」占位（真实图由图卡渲染），无图消息文本原样（不误删用户手打的 [图片]），纯图消息只剩图卡。服务端不动（占位在队列预览等上下文仍有价值）。
