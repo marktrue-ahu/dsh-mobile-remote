@@ -53,4 +53,22 @@ void main() {
       );
     });
   });
+
+  group('isDefinitiveSendRejection（服务端明确拒绝 vs 需回执对账）', () {
+    test('运输/桥类错误不是明确拒绝 → 走回执对账', () {
+      expect(isDefinitiveSendRejection('bridge-unavailable'), isFalse);
+      expect(isDefinitiveSendRejection('receipt-pending'), isFalse);
+      expect(isDefinitiveSendRejection(null), isFalse);
+      expect(isDefinitiveSendRejection(''), isFalse);
+    });
+
+    test('明确拒绝错误码 → 直接判失败（不误报已送达）', () {
+      expect(isDefinitiveSendRejection('empty-text'), isTrue);
+      expect(isDefinitiveSendRejection('payload-too-large'), isTrue);
+      expect(isDefinitiveSendRejection('session-not-found'), isTrue);
+      expect(isDefinitiveSendRejection('send-failed'), isTrue);
+      expect(isDefinitiveSendRejection('attachment-error'), isTrue);
+      expect(isDefinitiveSendRejection('invalid-requestId'), isTrue);
+    });
+  });
 }

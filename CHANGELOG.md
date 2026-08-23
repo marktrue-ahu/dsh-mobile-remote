@@ -34,8 +34,9 @@
 - **P2 回执 TTL 读取时生效**：`receiptExpired` 顶层纯函数（默认 15 分钟）；`/send` 查重前与 `/send-receipt` 查询前清理过期回执并持久化——服务闲置 15 分钟后旧回执不再被命中，与文档一致。
 - **P2 签名纳入发送语义**：`composerSignature(sessionId, mode, text, imagePaths)` 替代旧签名（会话+最终生效模式+文本+图片路径）；`steer` 空闲降级提前到图文分流之前——排队结果未知后改用插队会获得**新 requestId**，插队真正执行而非回放旧排队结果。
 - **P2 不误删用户手打 `[图片]`**：占位移除改在**服务端**——`blocksToText` 增加 `imagePlaceholder` 开关，`user/message` 摘要以 `imagePlaceholder:false` 生成文本（图由 `images[]` 图卡渲染）；客户端剥离逻辑整体移除，用户原文原样保留。旧会话历史即时按新规则（`/history` 实时重摘要）。
-- **测试**：`tools/hotfix07-unit-check.mjs` 10/10（占位开关/手打保留/images 元数据/TTL 边界）；`test/hotfix07_logic_test.dart`（草稿恢复决策 + 签名差异）；`flutter analyze` 零问题、`flutter test` 15/15、`node --check` 通过。
-- **生效边界**：服务端改动随 DSH 重启生效；`64110b3`（requestId 校验顺序）与本次一起在重启后上线；App 修复随 APK 3.0.0+12。
+- **测试**：`tools/hotfix07-unit-check.mjs` 10/10（占位开关/手打保留/images 元数据/TTL 边界）；`test/hotfix07_logic_test.dart`（草稿恢复决策 + 签名差异 + 明确拒绝白名单 2 例）；`flutter analyze` 零问题、`flutter test` 17/17、`node --check` 通过。
+- **修正（+13）——桥 502 不误判定失败**：DROP_RESPONSE 真机验收发现——服务端处理完才切断回程，桥会把该切断翻译成 `502 bridge-unavailable` 返回；原代码把**所有** `ApiException`（除 receipt-pending）当"明确拒绝"，导致这种"服务端已接收但回程断开"被误报失败、不回执对账。新增 `isDefinitiveSendRejection` 错误码白名单（empty-text/payload-too-large/session-not-found/send-failed/attachment-error/invalid-requestId/bad-request/not-found/no-live-agent/agents-unavailable），仅命中才判失败；其余（bridge-unavailable/receipt-pending/传输层）一律走回执对账 → 弹「已送达，请勿重复发送」。
+- **生效边界**：服务端改动随 DSH 重启生效；`64110b3`（requestId 校验顺序）与本次一起在重启后上线；App 修复随 APK 3.0.0+13。
 
 ### 用户消息图文顺序对齐 PC 端（2026-08-23 热修 06，App 3.0.0+10；修正 +11）
 - **现象**：移动端用户气泡先文本、后图片，且文本里带服务端为 image 块生成的「[图片]」占位行（`blocksToText`）；PC 端是**图片卡片在前、文本在后，且无占位**——移动端与 PC 观感不一致、占位与图卡重复。

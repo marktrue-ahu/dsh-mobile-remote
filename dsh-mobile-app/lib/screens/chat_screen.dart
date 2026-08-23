@@ -17,6 +17,25 @@ import '../fmt.dart';
 import 'sheets.dart';
 import 'session_tools_sheet.dart';
 
+/// v3.0.0(热修 07)：服务端"明确拒绝"的错误码白名单——这些代表消息**未被投递且服务端无回执**，
+/// 可直接判失败；其余（`bridge-unavailable`、`receipt-pending`、传输层 reset/超时等）一律走回执
+/// 对账——因为服务端可能已接收（响应在回程被切断时，桥把它翻译成 502 `bridge-unavailable` 返回，
+/// 此时消息已投递，须靠回执确认送达，不能误报失败）。
+bool isDefinitiveSendRejection(String? code) => switch (code) {
+      'empty-text' ||
+      'payload-too-large' ||
+      'invalid-requestId' ||
+      'session-not-found' ||
+      'no-live-agent' ||
+      'agents-unavailable' ||
+      'attachment-error' ||
+      'send-failed' ||
+      'bad-request' ||
+      'not-found' =>
+        true,
+      _ => false,
+    };
+
 /// v3.0.0(热修 07)：发送异常后的草稿恢复决策——仅当输入框仍为空（本次发送清空后的预期
 /// 状态）才回填旧草稿；发送期间用户输入的新内容一律保留（绝不覆盖，见 Codex review）。
 String draftAfterFailure(String current, String fallback) =>
@@ -1276,7 +1295,7 @@ class _ChatScreenState extends State<ChatScreen> {
     } catch (e) {
       AppLog.instance.log('Chat: 发送异常（$mode）→ $e');
       if (!mounted) return;
-      final definitive = e is ApiException && e.code != 'receipt-pending';
+      final definitive = e is ApiException && isDefinitiveSendRejection(e.code);
       if (definitive) {
         // v3.0.0(热修 05)：服务端明确拒绝（400/413/404/500…）＝未送达——
         // 重置 requestId（下次点击是全新尝试），恢复草稿供重发。
@@ -1432,7 +1451,7 @@ class _ChatScreenState extends State<ChatScreen> {
         showToast(context, '${L10n.t('发送失败：', 'Send failed: ')}$e');
         return;
       }
-      final definitive = e is ApiException && e.code != 'receipt-pending';
+      final definitive = e is ApiException && isDefinitiveSendRejection(e.code);
       if (definitive) {
         // v3.0.0(热修 05)：服务端明确拒绝＝未送达——重置 requestId，保留草稿供重发。
         _pendingRequestId = null;
