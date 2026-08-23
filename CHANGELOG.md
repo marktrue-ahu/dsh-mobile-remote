@@ -19,6 +19,16 @@
 - **气泡图片"显示不全"**：气泡高度按 `(236/ratio).clamp(80, 236)` 计算——竖图（比例≈0.46）被压成 236×236 方形，再配合 `BoxFit.cover` → 只显示图片中间一条（点开全屏才全）。修复：比例上限放宽到 0.3~3.0、高度上限 480，渲染改 `BoxFit.contain`——竖图完整显示，不再裁切。
 - **图+文发送后输入框文字残留**：文本路径有 `_inputCtrl.clear()`，图片路径 `_sendImages` 发送成功（含排队持存）后未清空输入框——用户误以为没发出去会重复点发送。修复：accepted 后清空（仅当输入框文字未改动时）。
 
+### 发送失败误报与连接复用竞态修复（2026-08-23 热修 04，App 3.0.0+8）
+- **现象**：手机发「图片+文字」，会话里消息已出现、agent 已开始应答，但 App 弹「发送失败：Connection reset by peer」，且输入框文字与图片残留——用户会误以为没发出而重复发送。
+- **根因两层**：
+  1. **App 把「传输层报错」等同于「未送达」**：`/send` 是「服务器收到后才回包」的模型，reset 若发生在响应回程，消息实际已入会话；`_sendImages`/`_send` 的 catch 一律报失败并保留/丢弃草稿，无法区分（已实测复现：服务端 `/send hit` 正常、消息入会话、agent 应答，客户端仍报失败）。
+  2. **keep-alive 复用竞态（reset 的主要来源）**：手机 dart:io 连接池 idle 15s 与 Node 服务端 keep-alive 5s 存在半关复用窗口，复用已关 socket 即表现为 reset；LAN 桥还透传上游 keep-alive 响应头并复用上游连接，把竞态窗口又放大了两层。
+- **修复**：
+  - App：发送失败后**对账**（history 近 20 条 user/message 文本+图片数匹配，或队列同文本行）——已送达则清空草稿并提示「已送达：刚才网络波动，请勿重复发送」；真未送达才保留草稿（文本路径恢复输入框、撤回乐观气泡）供重试；`history`/`queue` 支持自定义超时（对账 8s，避免断网时久等）。
+  - 服务端：所有 JSON 响应与 `/attachment` 强制 `connection: close`（SSE 除外）——关闭复用竞态窗口；LAN 桥禁用上游连接池（`agent: false`）、响应头强制 close（SSE 保持 keep-alive）；桥 upstream 错误路径补 warn 日志（此前 reset/销毁全静默，排障无迹可查）。
+- **验证**：本机经桥同构重放（2 图 1.26MB + 文本）200/0.48s——服务端链路健康，问题在响应回程与客户端判定；`node --check` 与 `flutter analyze` 通过；服务端修复随 DSH 重启生效，App 修复随下个 APK（3.0.0+8）生效。
+
 ### 图像链路 v2（2026-08-23，App 3.0.0+7）——tool/result 嵌套图片 + GIF 动图
 - **tool/result 嵌套图片（对齐 PC 端 contentParts 语义）**：实测内核 `read_image` 等工具结果的图片块**嵌套在 `tool-result.content` 内**（非消息顶层，此前 `imagesOf` 顶层收集漏掉 → 移动端助手消息只有占位/空白）。修复：
   - 插件新增 `imagesOfNested()`（递归展开 tool-result.content），`assistant/message` 与 `tool/result` 摘要改用——SSE/history 事件摘要均带出嵌套图片引用（`{attachmentId, mediaType, width?, height?, name?}`，≤20 张）；
@@ -415,3 +425,4 @@ lanBridge:
 - `/m` 移动页：登录、发消息、SSE 流式、会话历史
 - 访问口令认证（cookie/header）、Host 校验、二维码
 - 推送桥：Server酱 / ntfy / Bark / generic
+

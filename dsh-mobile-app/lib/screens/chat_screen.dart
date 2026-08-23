@@ -2,7 +2,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
@@ -1154,6 +1153,42 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  /// v3.0.0(热修 04)：发送失败后的「对账」——判断消息是否实际已送达。
+  /// 网络层报错≠未送达：「Connection reset by peer」可能发生在响应回程，
+  /// 此时消息已入会话（或已入排队持存），再报失败、留着草稿只会诱导重复发送。
+  /// 判据：history 近 20 条 user/message 文本精确匹配 + 图片数一致；
+  /// 或队列（内核 inbox / 插件持存）存在同文本行（持存行的「[图片] ×N」后缀剥离）。
+  /// 对账自身失败时保守返回 false（按未送达处理，保留草稿供重试）。
+  Future<bool> _reconcileSent(String sessionId, String text, int imageCount) async {
+    final t = text.trim();
+    try {
+      final events = await api.history(sessionId, limit: 20, timeout: const Duration(seconds: 8));
+      for (final e in events) {
+        if (e.type != 'user/message') continue;
+        final d = e.data;
+        if (d == null) continue;
+        final et = (d['text'] as String? ?? '').trim();
+        if (t.isNotEmpty && et != t) continue;
+        if ((d['images'] as List? ?? const []).length != imageCount) continue;
+        return true;
+      }
+    } catch (_) {
+      // 历史拉取失败 → 仍尝试队列对账
+    }
+    try {
+      final rows = await api.queue(sessionId, timeout: const Duration(seconds: 8));
+      for (final row in rows) {
+        final rt = (row['text'] as String? ?? '')
+          .trim()
+          .replaceFirst(RegExp(r' \[图片\] ×\d+$'), '')
+          .trim();
+        if (t.isNotEmpty && rt != t) continue;
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
   Future<void> _send([String? preset, String mode = 'followup']) async {
     final text = (preset ?? _inputCtrl.text).trim();
     // v2.9.0 review(HIGH)：页级动作绑定本页会话，叠层聊天不回退时发错会话
@@ -1222,13 +1257,26 @@ class _ChatScreenState extends State<ChatScreen> {
         if (idx != -1) _items[idx] = _items[idx].copyWith(messageId: mid);
       });
     } catch (e) {
-      if (mounted) {
-        // 排队路径未插入气泡，失败不画错误分隔条（避免"对话里出现假消息"）
-        if (!queued) {
-          setState(() => _items.insert(0, _MsgItem.divider('⚠ ${L10n.t('发送失败：', 'Send failed: ')}$e')));
-        }
-        showToast(context, '${L10n.t('发送失败：', 'Send failed: ')}$e');
+      AppLog.instance.log('Chat: 发送失败（$mode）→ $e');
+      if (!mounted) return;
+      // v3.0.0(热修 04)：对账——网络层报错≠未送达。已送达：只提示不误导；
+      // 未送达：撤回乐观气泡、恢复输入框草稿，用户可安全重发。
+      final landed = await _reconcileSent(id, text, 0);
+      if (!mounted) return;
+      if (landed) {
+        _scheduleQueueRefresh();
+        showToast(context, L10n.t('已送达：刚才网络波动，请勿重复发送', 'Delivered despite a network hiccup — do not resend'));
+        return;
       }
+      setState(() {
+        if (!queued) {
+          _items.removeWhere((m) => m.kind == _MsgKind.user && m.messageId == null && m.text == text);
+          _items.insert(0, _MsgItem.divider('⚠ ${L10n.t('发送失败：', 'Send failed: ')}$e'));
+        }
+      });
+      _inputCtrl.text = text;
+      _inputCtrl.selection = TextSelection.collapsed(offset: text.length);
+      showToast(context, '${L10n.t('发送失败：', 'Send failed: ')}$e');
     } finally {
       if (mounted) setState(() => _sending = false);
     }
@@ -1311,9 +1359,20 @@ class _ChatScreenState extends State<ChatScreen> {
       // v3.0.0：发送成功（含排队持存）即清空输入框——此前文字残留，用户误以为没发出而重复发送
       if (_inputCtrl.text == text) _inputCtrl.clear();
     } catch (e) {
-      if (mounted) {
-        showToast(context, '${L10n.t('发送失败：', 'Send failed: ')}$e');
+      AppLog.instance.log('Chat: 发送(图)失败 → $e');
+      if (!mounted) return;
+      // v3.0.0(热修 04)：对账——reset 可能发生在响应回程，消息已入会话（含排队持存）
+      // 时按成功清空草稿并提示勿重发；真未送达才保留可重试。
+      final landed = await _reconcileSent(id, text, _pendingImages.length);
+      if (!mounted) return;
+      if (landed) {
+        setState(() => _pendingImages.clear());
+        if (_inputCtrl.text == text) _inputCtrl.clear();
+        _scheduleQueueRefresh();
+        showToast(context, L10n.t('已送达：刚才网络波动，请勿重复发送', 'Delivered despite a network hiccup — do not resend'));
+        return;
       }
+      showToast(context, '${L10n.t('发送失败：', 'Send failed: ')}$e');
     } finally {
       if (mounted) setState(() => _sending = false);
     }

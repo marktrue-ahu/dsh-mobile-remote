@@ -414,8 +414,8 @@ class Api {
   Future<Map<String, dynamic>> createSession(Map<String, dynamic> body) async => await postJson('/api/sessions', body);
 
   /// v2.7.2：排队中消息列表（对齐 PC 端 Queue Dock）。
-  Future<List<Map<String, dynamic>>> queue(String sessionId) async {
-    final data = await getJson('/api/queue?sessionId=${Uri.encodeQueryComponent(sessionId)}');
+  Future<List<Map<String, dynamic>>> queue(String sessionId, {Duration timeout = const Duration(seconds: 15)}) async {
+    final data = await getJson('/api/queue?sessionId=${Uri.encodeQueryComponent(sessionId)}', timeout: timeout);
     return (data['queue'] as List? ?? []).cast<Map<String, dynamic>>();
   }
 
@@ -481,10 +481,10 @@ class Api {
   }
   /// 拉历史。移动端默认取最近 100 条（服务端 limit 截断取尾部=最近的），
   /// 避免一次解析/渲染数百条事件导致手机卡死。
-  Future<List<ChatEvent>> history(String sessionId, {int? after, int? before, int limit = 100}) async {
+  Future<List<ChatEvent>> history(String sessionId, {int? after, int? before, int limit = 100, Duration timeout = const Duration(seconds: 15)}) async {
     final params = 'sessionId=${Uri.encodeQueryComponent(sessionId)}'
         '${after != null ? '&after=$after' : ''}${before != null ? '&before=$before' : ''}&limit=$limit';
-    final data = await getJson('/api/history?$params');
+    final data = await getJson('/api/history?$params', timeout: timeout);
     return (data['events'] as List? ?? []).map((e) => ChatEvent.fromJson(e as Map<String, dynamic>)).toList();
   }
   Future<List<AppNotification>> notifications() async {
