@@ -2133,8 +2133,8 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget _buildItem(_MsgItem item) {
     switch (item.kind) {
       case _MsgKind.user:
-        // v3.0.0(热修 06)：对齐 PC 端——用户消息先出图片卡片、再出文本；服务端 blocksToText
-        // 为 image 块生成的「[图片]」占位行由图卡渲染替代（带图时不再展示，避免与真实图重复）。
+        // v3.0.0(热修 06)：对齐 PC 端——图卡与文本为**两个独立气泡**（图在上、文在下）；
+        // 服务端 blocksToText 为 image 块生成的「[图片]」占位行由图卡渲染替代（带图时不再展示）。
         final images = item.images;
         final text = images.isNotEmpty
             ? item.text
@@ -2142,25 +2142,28 @@ class _ChatScreenState extends State<ChatScreen> {
                 .replaceAll(RegExp(r'\n{2,}'), '\n')
                 .trim()
             : item.text;
-        return Align(
-          alignment: Alignment.centerRight,
-          child: Container(
-            margin: const EdgeInsets.only(bottom: 16),
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            constraints: const BoxConstraints(maxWidth: 320),
-            decoration: BoxDecoration(
-              color: DshColors.line(context),
-              borderRadius: BorderRadius.circular(14),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.end,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (images.isNotEmpty) _ImagesGrid(images: images, sessionId: _mySessionId ?? ''),
-                if (text.isNotEmpty) Text(text, style: const TextStyle(fontSize: 15, height: 1.5)),
-              ],
-            ),
-          ),
+        Widget userBubble(Widget child) => Align(
+              alignment: Alignment.centerRight,
+              child: Container(
+                margin: const EdgeInsets.only(bottom: 4),
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                constraints: const BoxConstraints(maxWidth: 320),
+                decoration: BoxDecoration(
+                  color: DshColors.line(context),
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: child,
+              ),
+            );
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (images.isNotEmpty)
+              userBubble(_ImagesGrid(images: images, sessionId: _mySessionId ?? '')),
+            if (text.isNotEmpty)
+              userBubble(Text(text, style: const TextStyle(fontSize: 15, height: 1.5))),
+            const SizedBox(height: 12),
+          ],
         );
       case _MsgKind.assistant:
         // v2.8.0：常驻操作栏（对齐 PC 端 MessageIconActions）——复制/好的回答/有问题的回答/分支，
