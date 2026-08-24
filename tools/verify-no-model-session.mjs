@@ -56,4 +56,38 @@ if (!assistant) {
 console.log("PASS: 无 model 新会话可正常回复 =>", assistant.data?.text?.slice(0, 40));
 await j(`/api/sessions/archive`, { method: "POST", body: JSON.stringify({ sessionId: sid }) }).catch(() => {});
 console.log("PASS: 已归档测试会话");
+
+// 场景 B（P1-2 回归）：仅传 reasoningEffort、不传 model——同样必须绑定默认模型并正常回复
+const created2 = await j("/api/sessions", { method: "POST", body: JSON.stringify({ preset: "standard", cwd: "F:/dsh-outpost", reasoningEffort: "low" }) });
+if (created2.status !== 200 || !created2.body?.sessionId) {
+  console.error(`FAIL(B): 创建会话失败 ${created2.status} ${JSON.stringify(created2.body)}`);
+  process.exit(1);
+}
+const sid2 = created2.body.sessionId;
+console.log("创建会话（仅 reasoningEffort）=>", sid2);
+const sent2 = await j("/api/send", { method: "POST", body: JSON.stringify({ sessionId: sid2, text: "Reply with exactly: OK" }) });
+if (sent2.status !== 200) {
+  console.error(`FAIL(B): send ${sent2.status} ${JSON.stringify(sent2.body)}`);
+  process.exit(1);
+}
+const deadline2 = Date.now() + 90000;
+let assistant2 = null;
+let turnErr2 = null;
+while (Date.now() < deadline2) {
+  await new Promise((r) => setTimeout(r, 4000));
+  const hist = await j(`/api/history?sessionId=${sid2}&after=0&limit=100`);
+  for (const e of hist.body?.events ?? []) {
+    if (e.type === "assistant/message" && !assistant2) assistant2 = e;
+    if (e.type === "turn/end" && typeof e.data?.reason === "object" && e.data?.reason?.kind === "error") turnErr2 = e.data.reason.error;
+  }
+  if (assistant2 || turnErr2) break;
+}
+if (turnErr2 || !assistant2) {
+  console.error(`FAIL(B): ${turnErr2 ? JSON.stringify(turnErr2) : "超时未收到 assistant 回复"}`);
+  await j(`/api/sessions/archive`, { method: "POST", body: JSON.stringify({ sessionId: sid2 }) }).catch(() => {});
+  process.exit(1);
+}
+console.log("PASS(B): 仅 reasoningEffort 新会话可正常回复 =>", assistant2.data?.text?.slice(0, 40));
+await j(`/api/sessions/archive`, { method: "POST", body: JSON.stringify({ sessionId: sid2 }) }).catch(() => {});
+console.log("PASS(B): 已归档测试会话");
 process.exit(0);

@@ -422,10 +422,18 @@ class AppStore extends ChangeNotifier {
 
   Future<void> setReasoningOverride(String sessionId, String messageKey, bool expanded) async {
     (reasoningOverrides[sessionId] ??= {})[messageKey] = expanded;
-    // 软上限：每会话最多记 100 条手动状态，其余按设置默认（防无限增长）
+    // 软上限：每会话 100 条 + 全局 500 条（P2：防跨会话无限增长；先删最旧会话的最旧条目）
     final m = reasoningOverrides[sessionId]!;
     while (m.length > 100) {
       m.remove(m.keys.first);
+    }
+    var total = reasoningOverrides.values.fold(0, (s, v) => s + v.length);
+    while (total > 500) {
+      final sid0 = reasoningOverrides.keys.first;
+      final m0 = reasoningOverrides[sid0]!;
+      m0.remove(m0.keys.first);
+      if (m0.isEmpty) reasoningOverrides.remove(sid0);
+      total--;
     }
     notifyListeners();
     await _persistPrefs(_kReasoningOverrides, jsonEncode(reasoningOverrides));
