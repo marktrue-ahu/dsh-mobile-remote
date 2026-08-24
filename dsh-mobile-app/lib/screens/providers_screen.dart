@@ -239,6 +239,8 @@ class _ProviderCard extends StatelessWidget {
     final catalogModels = provider['catalogModels'] as List?;
     final subs = <String>[
       provider['id'] as String? ?? '',
+      if (provider['id'] == 'deepseek-official')
+        L10n.t('内置模型已可用，无需探测', 'Built-in models are ready; no probing needed'),
       if (baseURL != null && baseURL.isNotEmpty) baseURL,
       keyConfigured ? L10n.t('密钥已配置', 'API key set') : L10n.t('未设置密钥', 'No API key set'),
       if (catalogModels != null) '${L10n.t('目录 ', 'Catalog: ')}${catalogModels.length}${L10n.t(' 个模型', ' models')}',
@@ -401,6 +403,8 @@ class _ProviderEditorState extends State<_ProviderEditor> {
   Future<void> _probe() async {
     final ns = widget.provider['settingsNs'] as String? ?? '';
     final base = _baseCtrl.text.trim();
+    final keyEmpty = _keyCtrl.text.trim().isEmpty;
+    final hasStoredKey = widget.provider['keyConfigured'] == true;
     final err = _validBase(base);
     if (err != null) {
       setState(() => _status = err);
@@ -424,7 +428,14 @@ class _ProviderEditorState extends State<_ProviderEditor> {
       });
     } catch (e) {
       if (!mounted) return;
-      setState(() => _status = '${L10n.t('探测失败：', 'Probe failed: ')}$e');
+      var msg = '$e';
+      // v3.1.0：已存密钥不会随探测请求发送；401 时给出可操作指引（避免"411/HTTP 401"裸文案困惑）
+      if (keyEmpty && hasStoredKey && (msg.contains('401') || msg.contains('403'))) {
+        msg = '${L10n.t('该条目已保存密钥，但探测请求不会携带已存密钥——请临时填入有效 API Key 后重试；'
+            'DeepSeek 官方模型内置可用，无需探测。', 'This provider has a saved API key, but probe requests do not carry it — '
+            'temporarily paste a valid key and retry; built-in DeepSeek models work without probing.')}\n$msg';
+      }
+      setState(() => _status = '${L10n.t('探测失败：', 'Probe failed: ')}$msg');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
