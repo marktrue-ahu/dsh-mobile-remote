@@ -1,6 +1,6 @@
 # 05 测试用例设计文档 — dsh-mobile-remote
 
-> 版本：v3.1.0（未发布，v3.0.0 之前内容已按实际验证结果填写；v3.1.0 候选用例见 F-20~F-22） · 配套：03-api.md、04-security.md
+> 版本：v3.1.0（2026-08-25 发布，v3.0.0 之前内容已按实际验证结果填写；v3.1.0 用例见 F-20~F-22） · 配套：03-api.md、04-security.md
 > 环境：Windows + DSH Desktop（desktop profile，内核 0.1.1-rc.2；web profile 亦适用） + Android（DSH Remote App）
 > 前置：插件已安装并启用（LAN 桥监听 0.0.0.0:3080）；访问口令为安装时生成的随机串（下文 `<TOKEN>`）。
 ## 1. 测试范围与环境
