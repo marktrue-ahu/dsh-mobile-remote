@@ -25,6 +25,8 @@ class AppStore extends ChangeNotifier {
   String darkMode = 'system'; // system | dark | light
   bool showReasoning = false; // 活动条思考面板是否显示内容（默认关：只显示状态，防英文思考刷屏）
   bool reasoningDefaultExpanded = false; // 思维链默认展开还是折叠（默认折叠：防英文思考刷屏；单条消息仍可点按切换）
+  /// 思维链折叠手动状态（会话 -> 消息key -> 手动展开值；滚动/重进/重启持久，null=跟随设置默认）
+  Map<String, Map<String, bool>> reasoningOverrides = {};
   String language = 'zh'; // zh | en（v2.7：界面语言，持久化）
   bool balanceAlert = false; // 余额预警开关（v2.7：低于阈值提醒充值）
   double balanceThreshold = 10; // 预警阈值（元）
@@ -103,6 +105,7 @@ class AppStore extends ChangeNotifier {
   static const _kDark = 'dsh_mr_darkmode';
   static const _kReasoning = 'dsh_mr_show_reasoning';
   static const _kReasoningDefaultExpanded = 'dsh_mr_reasoning_default_expanded';
+  static const _kReasoningOverrides = 'dsh_mr_reasoning_overrides';
   static const _kWorkspace = 'dsh_mr_workspace';
   static const _kSessCache = 'dsh_mr_sessions_cache';
   static const _kLang = 'dsh_mr_language';
@@ -116,6 +119,16 @@ class AppStore extends ChangeNotifier {
     darkMode = prefs.getString(_kDark) ?? 'system';
     showReasoning = prefs.getBool(_kReasoning) ?? false;
     reasoningDefaultExpanded = prefs.getBool(_kReasoningDefaultExpanded) ?? false;
+    try {
+      final raw = prefs.getString(_kReasoningOverrides);
+      if (raw != null && raw.isNotEmpty) {
+        reasoningOverrides = (jsonDecode(raw) as Map<String, dynamic>).map(
+          (sid, v) => MapEntry(sid, (v as Map<String, dynamic>).map((k, b) => MapEntry(k, b as bool))),
+        );
+      }
+    } catch (_) {
+      // 数据损坏则忽略，全部按设置默认展开
+    }
     language = prefs.getString(_kLang) ?? 'zh';
     L10n.lang = language;
     balanceAlert = prefs.getBool(_kBalanceAlert) ?? false;
@@ -402,6 +415,20 @@ class AppStore extends ChangeNotifier {
     reasoningDefaultExpanded = v;
     notifyListeners();
     await _persistPrefs(_kReasoningDefaultExpanded, v);
+  }
+
+  bool? reasoningOverrideOf(String sessionId, String messageKey) =>
+      reasoningOverrides[sessionId]?[messageKey];
+
+  Future<void> setReasoningOverride(String sessionId, String messageKey, bool expanded) async {
+    (reasoningOverrides[sessionId] ??= {})[messageKey] = expanded;
+    // 软上限：每会话最多记 100 条手动状态，其余按设置默认（防无限增长）
+    final m = reasoningOverrides[sessionId]!;
+    while (m.length > 100) {
+      m.remove(m.keys.first);
+    }
+    notifyListeners();
+    await _persistPrefs(_kReasoningOverrides, jsonEncode(reasoningOverrides));
   }
 
   // ── 启动加载（对齐网页端 bootstrap） ──

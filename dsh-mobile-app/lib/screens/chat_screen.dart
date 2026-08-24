@@ -2218,6 +2218,7 @@ class _ChatScreenState extends State<ChatScreen> {
       case _MsgKind.assistant:
         // v2.8.0：常驻操作栏（对齐 PC 端 MessageIconActions）——复制/好的回答/有问题的回答/分支，
         // 移除长按弹面板（操作可见即用）；逻辑与 _showMessageActions 共用 _runMessageAction
+        final rk = item.messageId ?? 's${item.seq}';
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -2229,6 +2230,8 @@ class _ChatScreenState extends State<ChatScreen> {
               streaming: false,
               reasoning: item.reasoning,
               defaultExpanded: widget.store.reasoningDefaultExpanded,
+              expandedOverride: widget.store.reasoningOverrideOf(_mySessionId ?? '', rk),
+              onOverride: (v) => setState(() => widget.store.setReasoningOverride(_mySessionId ?? '', rk, v)),
             ),
             _MessageActionsBar(
               item: item,
@@ -2300,6 +2303,9 @@ class _AssistantBubble extends StatefulWidget {
   final String? reasoning;
   // 设置项：思维链默认折叠还是展开
   final bool defaultExpanded;
+  // 用户手动切换的覆盖值（null = 跟随设置项）；提升到界面层按消息持久化，列表回收重建不丢
+  final bool? expandedOverride;
+  final ValueChanged<bool>? onOverride;
   const _AssistantBubble({
     required this.text,
     this.usage,
@@ -2308,6 +2314,8 @@ class _AssistantBubble extends StatefulWidget {
     this.streaming = false,
     this.reasoning,
     this.defaultExpanded = false,
+    this.expandedOverride,
+    this.onOverride,
   });
 
   @override
@@ -2318,20 +2326,6 @@ class _AssistantBubbleState extends State<_AssistantBubble> {
   String? _parsedFor;
   List<Widget>? _blocks;
   int _parseLogs = 0; // 排障：每个气泡实例最多记 3 次解析日志
-  bool? _reasoningExpanded; // null = 尚未初始化，首次 build 用 widget.defaultExpanded 兜底
-
-  @override
-  void initState() {
-    super.initState();
-    _reasoningExpanded = widget.defaultExpanded;
-  }
-
-  @override
-  void didUpdateWidget(covariant _AssistantBubble oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    // 设置切换「默认展开」时不强制覆盖用户已手动展开/收起的状态
-    _reasoningExpanded ??= widget.defaultExpanded;
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -2391,7 +2385,7 @@ class _AssistantBubbleState extends State<_AssistantBubble> {
 
   /// 可折叠「思维链」块：标题行（图标 + 字数 + 箭头）点按切换展开/收起，内容为斜体浅灰小字。
   Widget _buildReasoningChain(BuildContext context) {
-    final expanded = _reasoningExpanded ?? widget.defaultExpanded;
+    final expanded = widget.expandedOverride ?? widget.defaultExpanded;
     final reasoning = widget.reasoning ?? '';
     final ink2 = DshColors.ink2(context);
     final ink3 = DshColors.ink3(context);
@@ -2410,7 +2404,7 @@ class _AssistantBubbleState extends State<_AssistantBubble> {
         mainAxisSize: MainAxisSize.min,
         children: [
           InkWell(
-            onTap: () => setState(() => _reasoningExpanded = !(_reasoningExpanded ?? widget.defaultExpanded)),
+            onTap: () => widget.onOverride?.call(!expanded),
             borderRadius: BorderRadius.circular(10),
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
