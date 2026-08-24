@@ -29,9 +29,14 @@ try {
 } finally {
     Pop-Location
 }
-$tgzOut = Join-Path $dist "dsh-mobile-remote-$ver.tgz"
-if (Test-Path $tgzOut) {
+$packed = Join-Path $dist "dsh-mobile-remote-$ver.tgz"
+$tgzOut = Join-Path $dist "dsh-mobile-remote-v$ver.tgz"
+if (Test-Path $packed) {
+    # 命名对齐历史发布惯例：dsh-mobile-remote-vX.Y.Z.tgz（npm pack 原生输出不含 v）
+    Move-Item $packed $tgzOut -Force
+    Write-Output ("Archived: " + $tgzOut + " (" + [math]::Round((Get-Item $tgzOut).Length / 1KB, 0) + " KB)")
+} elseif (Test-Path $tgzOut) {
     Write-Output ("Archived: " + $tgzOut + " (" + [math]::Round((Get-Item $tgzOut).Length / 1KB, 0) + " KB)")
 } else {
-    Write-Warning "Plugin tarball not found at $tgzOut - check npm pack output"
+    Write-Warning "Plugin tarball not found - check npm pack output"
 }
