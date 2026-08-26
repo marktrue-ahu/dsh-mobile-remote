@@ -259,12 +259,18 @@
 | POST | `/m/api/actions/:id/invoke` | 执行插件动作 |
 | GET | `/m/api/usage` | 会话 token 用量统计（v2.1） |
 | GET | `/m/api/workspaces` | 已注册工作区（新建会话默认目录，v2.1） |
-| GET | `/m/api/directories` | 目录浏览（盘符/子目录，v2.1） |
+| GET | `/m/api/directories` | 目录浏览（盘符/子目录，v2.1；v3.1.1 根视图响应新增 `sep` 字段） |
 | POST | `/m/api/directories` | 新建文件夹（v2.1） |
 | GET | `/m/api/diagnostics` | 环境诊断（服务端端点实测，v2.1） |
 | GET | `/m/api/balance` | DeepSeek 官方余额（服务端代查，v2.1） |
 | GET | `/m/api/qr-config` | 桌面二维码数据（loopback only，v2.1） |
 | POST | `/m/api/defaults` | 修改默认 Agent/权限预设（v2.1） |
+
+> **路径风格约定（v3.1.1，issue #5）**：`GET /m/api/directories?path=`、`POST /m/api/directories {path}` 与
+> `POST /m/api/sessions {cwd}` 的路径允许按客户端平台习惯传分隔符（Windows `\` / WSL·Linux·macOS `/`）；
+> 服务端会归一化为**当前平台**分隔符后读盘/建夹/建会话（旧版 App 在 WSL 上拼出的 `/\home` 也能命中真实目录）。
+> 根视图响应（`path` 为空）携带 `sep`（服务端真实分隔符），新版 App 据此拼接子目录，不再按 Windows 习惯硬编码 `\`；
+> 该字段为纯增量，旧版 App 忽略即可。
 
 ### 6.2 GET /m/api/catalog
 

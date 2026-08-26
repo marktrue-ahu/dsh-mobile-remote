@@ -577,7 +577,8 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
     final isAll = w == null;
     final path = w?['path'] as String? ?? '';
     final title = isAll ? L10n.t('全部工作区', 'All Workspaces') : ((w['title'] as String?) ?? path);
-    final selected = isAll ? store.workspacePath == null : store.workspacePath == path;
+    // v3.1.1(issue #5)：原始路径做展示，规范化后与 workspacePath（归一存储）匹配
+    final selected = isAll ? store.workspacePath == null : store.workspacePath == AppStore.normPath(path);
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 1),
       child: InkWell(

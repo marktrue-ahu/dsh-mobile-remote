@@ -31,6 +31,10 @@ String genRequestId() {
 /// 全局 API 单例
 final Api api = Api();
 
+/// 目录浏览结果：[dirs] 子目录名列表；[sep] 服务端路径分隔符
+/// （null = 旧版插件未返回，由调用方按根视图推断，见 sheets.dart dirSepOf）。
+typedef DirListing = ({List<String> dirs, String? sep});
+
 class Api {
   String baseUrl = '';
   String token = '';
@@ -600,10 +604,13 @@ class Api {
     return (data['workspaces'] as List? ?? []).map((e) => e as Map<String, dynamic>).toList();
   }
 
-  /// 目录浏览：path 为空返回盘符；否则返回子目录名列表。
-  Future<List<String>> directories(String path) async {
+  /// 目录浏览：path 为空返回盘符/根；否则返回子目录名列表（附服务端分隔符，v3.1.1）。
+  Future<DirListing> directories(String path) async {
     final data = await getJson('/api/directories?path=${Uri.encodeQueryComponent(path)}');
-    return (data['dirs'] as List? ?? []).map((e) => e.toString()).toList();
+    return (
+      dirs: (data['dirs'] as List? ?? []).map((e) => e.toString()).toList(),
+      sep: data['sep'] is String ? data['sep'] as String : null,
+    );
   }
 
   /// 新建文件夹。

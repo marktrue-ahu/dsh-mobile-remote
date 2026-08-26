@@ -133,7 +133,8 @@ class _SessionsScreenState extends State<SessionsScreen> {
                       const SizedBox(width: 8),
                       _FilterChip(
                         label: (w['title'] as String?) ?? (w['path'] as String? ?? ''),
-                        selected: store.workspacePath == w['path'],
+                        // v3.1.1(issue #5)：原始路径做展示，规范化后与 workspacePath（归一存储）匹配
+                        selected: store.workspacePath == AppStore.normPath(w['path'] as String? ?? ''),
                         onTap: () => store.setWorkspace(w['path'] as String?),
                       ),
                     ],

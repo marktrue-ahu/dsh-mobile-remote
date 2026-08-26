@@ -1,5 +1,31 @@
 # Changelog
 
+## v3.1.1（2026-08-26）— WSL/类 Unix 平台路径选择修复（issue #5）
+
+### 现象
+- GitHub issue #5：服务端运行在 WSL（dsh 跑在 Linux 侧）时，移动端「新建会话 → 工作目录」无法正确选择路径——从根目录 `/` 进入 `home` 会拼成 `/\home`，随后报「读取失败」（服务端 `readdir` ENOENT），后面的目录全部无法浏览/选择。
+
+### 根因
+- 目录选择器按 Windows 习惯硬编码 `\` 拼接子目录（`_openDir`），服务端为 POSIX 时 `/\home` 是非法路径；
+- 深一层：工作区路径在 App 侧被 `_normPath` 全量归一成 `\home\user` 形态——WSL 上该形态会被直接当作 cwd 发回服务端（建会话目录不存在），工作区列表展示的也是 `\` 形态（与 PC 端观感不一致）。
+
+### 服务端（lib/index.js）
+- `GET /m/api/directories` 根视图响应新增 `sep` 字段（服务端真实路径分隔符，纯增量，旧版 App 忽略即可）；
+- 新增 `normalizeServerPath`：目录浏览/新建文件夹/建会话 `cwd` 的路径参数按当前平台归一化分隔符（POSIX `\`→`/`，Windows `/`→`\`）——旧版 App 在 WSL 上拼出的 `/\home` 也能命中真实目录（兼容矩阵「插件新 + App 旧」成立）。
+
+### App（Flutter，3.1.1+16）
+- 目录选择器：新增 `joinDirPath`/`dirSepOf` 纯函数，按服务端 `sep` 拼接子目录（WSL `/`、Windows `\`），根视图文案与分组标题随之自适应（「根目录」/「所有盘符」）；
+- 工作区列表：条目保留服务端原始路径（展示与 cwd 回传用原始形态），规范化只用于匹配比较——`refreshWorkspaces`、主界面工作区弹层、会话页筛选、新建会话默认目录四处同步；
+- 新建会话默认目录：匹配改为规范化比较，不再把归一形态当作 cwd 发送。
+
+### 测试
+- `flutter test test/dirpicker_logic_test.dart`（新增 6 例：joinDirPath 两种分隔符/根视图、dirSepOf 服务端优先/根视图推断/兜底）；
+- `tools/wsl-path-check.mjs`（新增：normalizeServerPath POSIX/Windows/非字符串，8/8 通过；注：`/\home` 归一为 `//home`，POSIX 下与 `/home` 等价）；
+- `flutter analyze` 零问题、`node --check` 通过。
+
+### 生效
+- 服务端改动随 DSH 重启生效（旧版 App 即可获得 WSL 浏览修复）；App 修复随新 APK（3.1.1+16）生效。
+
 ## v3.1.0（2026-08-25）— 思维链折叠 + 流式滚动跟随修复 + 悬浮球会话标题（社区 PR #4，marktrue-ahu）
 
 ### App（Flutter）

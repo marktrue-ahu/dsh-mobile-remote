@@ -371,7 +371,7 @@ class AppStore extends ChangeNotifier {
   Map<String, dynamic>? _selectedWorkspace() {
     if (workspacePath == null) return null;
     for (final w in workspaces) {
-      if (w['path'] == workspacePath) return w;
+      if (_normPath(w['path'] as String? ?? '') == workspacePath) return w;
     }
     return null;
   }
@@ -400,7 +400,10 @@ class AppStore extends ChangeNotifier {
   String? get workspaceTitle {
     if (workspacePath == null) return null;
     for (final w in workspaces) {
-      if (w['path'] == workspacePath) return (w['title'] as String?) ?? workspacePath;
+      if (_normPath(w['path'] as String? ?? '') == workspacePath) {
+        // v3.1.1(issue #5)：展示原始路径（WSL 上不再出现归一后的 `\home\user` 形态）
+        return (w['title'] as String?) ?? (w['path'] as String?) ?? workspacePath;
+      }
     }
     return workspacePath;
   }
@@ -542,12 +545,13 @@ class AppStore extends ChangeNotifier {
   Future<void> refreshWorkspaces({bool notify = true}) async {
     try {
       final raw = await api.workspaces();
-      // 统一规范化 path，保证与 workspacePath/会话 cwd 的匹配形态一致
-      workspaces = raw
-          .map((w) => {...w, 'path': _normPath(w['path'] as String? ?? '')})
-          .toList();
+      // v3.1.1(issue #5)：条目保留服务端原始路径（展示/回传 cwd 都用原始形态）——
+      // 规范化只用于匹配比较（_normPath 统一 `/`/`\` 与大小写）；
+      // 旧实现把 path 归一成 `\` 形态存入，WSL/Linux 上会被当作 cwd 发回服务端。
+      workspaces = raw;
       // 已选工作区不再存在时回退到"全部"
-      if (workspacePath != null && !workspaces.any((w) => w['path'] == workspacePath)) {
+      if (workspacePath != null &&
+          !workspaces.any((w) => _normPath(w['path'] as String? ?? '') == workspacePath)) {
         workspacePath = null;
       }
       if (notify) notifyListeners();
