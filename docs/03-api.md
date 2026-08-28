@@ -1,6 +1,6 @@
 # 03 API 接口设计文档 — dsh-mobile-remote
 
-> 版本：v2.8.2 · 状态：已实现 · 配套：00-开发总纲.md、02-architecture.md、04-security.md、09-compatibility.md
+> 版本：v3.1.0 + Git Slice A · 状态：已实现 · 配套：00-开发总纲.md、02-architecture.md、04-security.md、09-compatibility.md
 > 前缀：`/m`（可配置项 `path`，默认 `/m`）。以下所有路径均以前缀开头。
 > 服务端 API 同时服务 Flutter App（dsh-mobile-app）与桌面设置页客户端模块；不含网页版页面（v2.1 起移除）。
 ## 1. 通用约定
@@ -42,6 +42,13 @@
 | GET | `/m/api/workspaces` | 已注册工作区 | 是 |
 | GET/POST | `/m/api/directories` | 目录浏览/新建文件夹 | 是 |
 | GET | `/m/api/diagnostics` | 环境诊断 | 是 |
+| GET | `/m/api/git/capabilities` | Git provider 能力声明 | 是 |
+| GET | `/m/api/git/context` | 解析会话/工作区对应仓库 | 是 |
+| GET | `/m/api/git/status` | 工作区状态（只读） | 是 |
+| GET | `/m/api/git/branches` | 本地/远端分支（只读） | 是 |
+| GET | `/m/api/git/graph` | 提交图（分页） | 是 |
+| GET | `/m/api/git/commit` | 提交详情 | 是 |
+| GET | `/m/api/git/diff` | 工作区/暂存/提交差异 | 是 |
 | GET | `/m/api/balance` | DeepSeek 官方余额 | 是 |
 | GET | `/m/api/qr-config` | 桌面二维码数据（loopback only） | 否（loopback） |
 | POST | `/m/api/defaults` | 修改默认 Agent/权限预设 | 是 |
@@ -219,6 +226,7 @@
 | `mobile/notify` | `{ notification: { id, kind, sessionId, title, detail, time } }`——插件"真结束"判定后推送的通知（completed / failed / needs-answer），悬浮球/App 与通知中心同源渲染（v2.7.2） |
 | `mobile/frame` | 内核瞬态帧（问询/审批）。`frame` 字段为 `question/requested`（含 `rpcId`、`questions[]`）、`question/resolved`（`questionRpcId`）、`approval/requested`（`rpcId`、`approvalId`、`toolName`、`reason?`）、`approval/resolved`（`approvalId`）。**App 断线重连时服务端补发挂起的待答帧**（`pendingFrames` 回放） |
 | `mobile/queue` | `{ sessionId, rows: [{ id, text, placement }] }`——内核队列快照（`agent/inbox/spliced` 即时镜像，v3.0.2）：认领/删除/编辑实时反映，App 端 dock 以此为权威源（`placement`: `queued` / `steering` / `context`，与 GET /queue 同款形状）；断线重连时 mux 回放当前队列 |
+| `git/changed` | `{ repositoryId }`——Git provider 轮询发现工作区状态变化，客户端刷新当前仓库只读数据 |
 
 客户端应按 `type` 分派；未知 type 一律忽略（前向兼容）。
 ### 3.7 GET /m/qr.png
@@ -237,6 +245,10 @@
 | 405 | `method-not-allowed` | 方法不支持（GET 端点收到 POST 等） |
 | 503 | `no-live-agent` | 无运行中 agent |
 | 503 | `agents-unavailable` | agents 服务不可用 |
+| 503 | `git-provider-unavailable` | DSH subprocess/git provider 不可用 |
+| 403 | `workspace-not-allowed` | 仓库不在已注册工作区边界内 |
+| 404 | `not-git-repository` | 工作区不是 Git 仓库 |
+| 400 | `git-command-failed` | Git 只读命令失败 |
 
 ## 5. 版本兼容策略
 
@@ -563,7 +575,18 @@
 - `line` 必须以 `/` 开头（否则 `400 bad-request`）；未知/畸形命令 `404 command-not-found`；服务未注册 `503 commands-unavailable`（带 detail）；服务在而会话不存在 `404 session-not-found`（与 GET 拆分语义一致）
 - `result` 为内核 settle 对象（`commandId` + `result.{kind,text}`），与 PC 端一致
 
+### 6.16 Git Slice A（只读）
 
+Git 接口由项目自有 provider 提供，执行通过 DSH `subprocess`，仓库必须位于
+`workspaceRegistry` 已注册工作区内。`repositoryId` 为规范化仓库根路径，客户端不得自行拼接
+shell 命令。Slice A 不提供切换/创建/删除分支、fetch/pull/push、stage/commit、stash 或 tags 写操作。
 
-
-
+`GET /m/api/git/capabilities` 始终返回 `{ok, git:{available,read,writes,reason,features}}`，不可用时
+由 `available=false` 明确表达；实际仓库操作在 provider 不可用时返回 `503 git-provider-unavailable`。
+`GET /m/api/git/context?sessionId=…` 返回仓库根目录和能力。
+其余接口均要求 `repositoryId`：`status` 返回分支与文件状态，`branches` 返回本地/远端分支。
+`graph` 支持 `limit/cursor` 和可选 JSON `refs`（最多 3 个 `{name,tipOid}` 引用对）；首次请求返回
+`snapshotId`、绑定的 `tips`、提交页和 `nextCursor`，后续请求必须使用同一快照的不透明游标。
+引用移动、删除、tip 不匹配、仓库变化、游标上下文错误或快照过期返回 `409 graph-stale`，客户端不得
+静默回退到全量图。`commit` 要求 `oid`，`diff` 支持 `kind=working|staged|commit`、`oid/path`。
+越过工作区边界返回 `403 workspace-not-allowed`，非 Git 目录返回 `404 not-git-repository`。

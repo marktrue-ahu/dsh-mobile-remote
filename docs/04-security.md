@@ -61,7 +61,7 @@
 **这是新增攻击面，边界在代码中强制（`lib/index.js`「LAN 桥」段）：**
 1. **只转发移动 API 面**：`pathname.startsWith(/m/api)` 之外一律 404——桌面 `/api` RPC 网关、`/m/api/qr-config`（含口令）、`/m/qr.png`（仅本机语义）、一切其他 `/m/*` 面均不转发；Host 头重写为 `127.0.0.1:<webServer.port>` 使下游 hostAllowed 自然放行（真实鉴权仍由口令把关）。
 2. **口令强制**：未配置 `authToken`、或口令短于 16 字符 → **拒绝启动桥**（仅警告不断言；schema 不设 min 以免破坏既有用户）并记日志。
-3. **资源防护**：`maxConnections=128`、headersTimeout 15s、requestTimeout 60s、upstream 15s 超时、在网连接随插件卸载销毁。
+3. **资源防护**：`maxConnections=128`、headersTimeout 15s、requestTimeout 180s、upstream SSE 60s/普通请求 180s 超时、在网连接随插件卸载销毁。
 4. **暴露条件**：桥默认关闭；开启即等于「0.0.0.0 移动 API 可达」——前置条件：可信 WiFi + ≥16 字符强口令（同 §2.1）。`/m/api/diagnostics` 的 `runtime.lanBridge.listening` 可确认监听状态（绑定失败时 QR/地址自动回退，不会指向死端口）。
 5. **与 §3 表格关系**：桥上的流量走「局域网（可信 WiFi）明文」档位，残余风险与缓解同 §3 末。
 

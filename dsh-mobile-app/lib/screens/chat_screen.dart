@@ -16,6 +16,7 @@ import '../md.dart';
 import '../fmt.dart';
 import 'sheets.dart';
 import 'session_tools_sheet.dart';
+import '../widgets/git_widgets.dart';
 
 /// v3.0.0(热修 07)：服务端"明确拒绝"的错误码白名单——这些代表消息**未被投递且服务端无回执**，
 /// 可直接判失败；其余（`bridge-unavailable`、`receipt-pending`、传输层 reset/超时等）一律走回执
@@ -1792,7 +1793,10 @@ class _ChatScreenState extends State<ChatScreen> {
           // 第一层 = [/命令] + 输入框（独占最宽）；第二层 = 模型/权限/排队胶囊 + 上下文圆环 + 发送
           SafeArea(
             top: false,
-            child: Padding(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+              Padding(
               padding: const EdgeInsets.fromLTRB(12, 4, 12, 10),
               child: Container(
                 padding: const EdgeInsets.fromLTRB(12, 8, 12, 6),
@@ -1924,6 +1928,9 @@ class _ChatScreenState extends State<ChatScreen> {
                   ],
                 ),
               ),
+              ),
+              GitQuickbar(store: store),
+              ],
             ),
           ),
         ],
@@ -3441,6 +3448,4 @@ class _ApprovalCardState extends State<_ApprovalCard> {
     );
   }
 }
-
-
 
