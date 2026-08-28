@@ -5,9 +5,38 @@
 > 前置：插件已安装并启用（LAN 桥监听 0.0.0.0:3080）；访问口令为安装时生成的随机串（下文 `<TOKEN>`）。
 ## 1. 测试范围与环境
 - 功能：认证、发消息、事件回流、历史、会话、通知、新建会话、目录、默认配置、二维码。
+- Git Slice A：能力探测、工作区边界、状态/分支/提交图/详情/diff 只读链路与 `git/changed` 刷新。
 - 安全：口令校验、Host 校验、loopback 限制。
 - 兼容：Android 深色/浅色主题。
 - 自动化：`tools/e2e-check.mjs`（Node ≥ 20，`DSH_MOBILE_TOKEN` 环境变量）覆盖核心 API 链路。
+
+### F-23 Git 能力与安全边界
+
+| 项目 | 内容 |
+|---|---|
+| 步骤 | 请求 `/api/git/capabilities`，再以已注册工作区和工作区外路径分别请求 `/api/git/context` |
+| 预期 | provider 可用时 `available/read=true,writes=false`；工作区外稳定返回 403 `workspace-not-allowed`；无 subprocess 返回 503 `git-provider-unavailable` |
+
+### F-24 Git 只读视图
+
+| 项目 | 内容 |
+|---|---|
+| 步骤 | 使用 context 的 `repositoryId` 请求 status、branches、graph、commit、diff；在电脑端修改文件 |
+| 预期 | 返回结构化状态/分支/提交/差异；SSE 收到 `git/changed` 后 App 刷新当前仓库；不出现任何 Git 写操作 |
+
+### F-25 Git 分支图深化
+
+| 项目 | 内容 |
+|---|---|
+| 步骤 | 以本地和远程引用的 `name/tipOid` 建立 1–3 个引用的图快照，按游标加载下一页；测试分叉、双亲 merge、octopus merge、多个引用同指一个提交、无共同历史和跨页父提交 |
+| 预期 | 返回选中 tip 可达提交的去重并集；分页无重复/遗漏；父线在页边界显示未完成连接并可接续；快照只读且不修改仓库 |
+
+### F-26 Git 分支图快照失效
+
+| 项目 | 内容 |
+|---|---|
+| 步骤 | 首次加载后移动、删除或改名引用，或使用错误仓库/快照/游标继续请求 |
+| 预期 | 服务端返回 `409 graph-stale`；App 保留旧图并提示显式刷新，不拼接新旧快照，也不回退到全量图 |
 ## 2. 功能测试用例
 
 ### F-01 认证：未携带凭证访问 API
