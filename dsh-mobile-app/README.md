@@ -36,6 +36,7 @@ keytool -genkeypair -v -keystore android/app/release.jks -keyalg RSA -keysize 20
 > 更换图标：把 1024×1024 PNG 覆盖到 `assets/icon-1024.png`，运行 `python tools/make_icon.py` 后重新构建。
 > **keystore 与 key.properties 已被 gitignore**：勿提交、勿丢失（丢失无法对已发布 APK 升级）。换签名 = 换应用，用户需卸载重装并重新扫码。
 > 渲染后端为 Impeller（Vulkan→GLES 自动回退）；个别旧机型异常时把 `AndroidManifest.xml` 的 `EnableImpeller` 改为 `false` 出 Skia 版。详见仓库根 `docs/09-compatibility.md`。
+> 完整的 Linux/WSL、Windows、Google 下载代理配置及常见问题排查见仓库根目录 [`docs/10-android-build.md`](../docs/10-android-build.md)。
 
 ## 兼容性
 

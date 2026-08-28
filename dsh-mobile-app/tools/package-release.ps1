@@ -40,3 +40,13 @@ if (Test-Path $packed) {
 } else {
     Write-Warning "Plugin tarball not found - check npm pack output"
 }
+
+# 3) Update manifest for the host update source.
+$manifest = Join-Path $dist 'manifest.json'
+node (Join-Path $PSScriptRoot 'gen-manifest.js') --apk $apkOut --version $ver --changelog (Join-Path $repoDir 'CHANGELOG.md') --out $manifest
+if ($LASTEXITCODE -ne 0) { Write-Error "gen-manifest.js failed with exit code $LASTEXITCODE"; exit 1 }
+if ($env:UPDATE_DIR) {
+    New-Item -ItemType Directory -Force -Path $env:UPDATE_DIR | Out-Null
+    Copy-Item $apkOut $manifest $env:UPDATE_DIR -Force
+    Write-Output ("Copied to updateDir: " + $env:UPDATE_DIR)
+}

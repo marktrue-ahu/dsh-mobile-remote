@@ -9,6 +9,7 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
+import java.security.MessageDigest
 
 class MainActivity : FlutterActivity() {
     private var floatingChannel: MethodChannel? = null
@@ -248,5 +249,46 @@ class MainActivity : FlutterActivity() {
         "zip" -> "application/zip"
         "mp4" -> "video/mp4"
         else -> "application/octet-stream"
+    }
+
+    private fun signatureSha256(pkg: String): String? = try {
+        val pm = packageManager
+        val sigs: Array<android.content.pm.Signature>? = if (Build.VERSION.SDK_INT >= 28) {
+            pm.getPackageInfo(pkg, PackageManager.GET_SIGNING_CERTIFICATES)?.signingInfo?.apkContentsSigners
+        } else {
+            @Suppress("DEPRECATION")
+            pm.getPackageInfo(pkg, PackageManager.GET_SIGNATURES)?.signatures
+        }
+        sigs?.firstOrNull()?.let { sha256Hex(it.toByteArray()) }
+    } catch (_: Exception) { null }
+
+    private fun signatureSha256OfApk(path: String): String? = try {
+        val flags = if (Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES else {
+            @Suppress("DEPRECATION")
+            PackageManager.GET_SIGNATURES
+        }
+        val info = packageManager.getPackageArchiveInfo(path, flags) ?: return null
+        val sigs: Array<android.content.pm.Signature>? = if (Build.VERSION.SDK_INT >= 28) {
+            info.signingInfo?.apkContentsSigners
+        } else {
+            @Suppress("DEPRECATION")
+            info.signatures
+        }
+        sigs?.firstOrNull()?.let { sha256Hex(it.toByteArray()) }
+    } catch (_: Exception) { null }
+
+    private fun sha256Hex(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+
+    private fun installApkFile(path: String) {
+        if (Build.VERSION.SDK_INT >= 26 && !packageManager.canRequestPackageInstalls()) {
+            startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).setData(Uri.parse("package:$packageName")))
+            throw IllegalStateException("请允许本应用安装未知应用后重试")
+        }
+        val file = File(path)
+        if (!file.exists()) throw IllegalStateException("APK 文件不存在")
+        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+        startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
     }
 }
