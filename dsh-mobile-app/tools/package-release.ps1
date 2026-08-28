@@ -13,6 +13,8 @@ if (-not (Test-Path $apk)) {
 $pubspec = Get-Content (Join-Path $appDir 'pubspec.yaml') -Raw
 $ver = ([regex]::Match($pubspec, '(?m)^version:\s*(\d+\.\d+\.\d+)')).Groups[1].Value
 if (-not $ver) { Write-Error 'Cannot parse version from pubspec.yaml'; exit 1 }
+$buildNum = ([regex]::Match($pubspec, '(?m)^version:\s*\d+\.\d+\.\d+\+(\d+)')).Groups[1].Value
+$fullVer = if ($buildNum) { "$ver+$buildNum" } else { $ver }   # manifest 版本精确到 build（热修可识别）
 $dist = Join-Path $appDir 'dist'
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 
@@ -25,13 +27,24 @@ Write-Output ("Archived: " + $apkOut + " (" + [math]::Round((Get-Item $apkOut).L
 # npm writes notices to stderr - route them away so the script exits cleanly.
 Push-Location $repoDir
 try {
-    $null = cmd /c "npm pack --pack-destination `"$dist`" 2>nul"
+    & npm pack --pack-destination $dist | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "npm pack failed with exit code $LASTEXITCODE" }
 } finally {
     Pop-Location
 }
 $tgzOut = Join-Path $dist "dsh-mobile-remote-$ver.tgz"
-if (Test-Path $tgzOut) {
-    Write-Output ("Archived: " + $tgzOut + " (" + [math]::Round((Get-Item $tgzOut).Length / 1KB, 0) + " KB)")
-} else {
-    Write-Warning "Plugin tarball not found at $tgzOut - check npm pack output"
+if (-not (Test-Path $tgzOut)) { Write-Error "Plugin tarball not found at $tgzOut"; exit 1 }
+Write-Output ("Archived: " + $tgzOut + " (" + [math]::Round((Get-Item $tgzOut).Length / 1KB, 0) + " KB)")
+
+# 3) manifest.json（共享生成器 gen-manifest.js：合法 JSON / 无 BOM / notes=CHANGELOG 最新条目全文 / sha256+size）
+# 与 package-release.sh 完全同一生成器，保证双端产出等价。
+$manifest = Join-Path $dist 'manifest.json'
+node (Join-Path $PSScriptRoot 'gen-manifest.js') --apk $apkOut --version $fullVer --changelog (Join-Path $repoDir 'CHANGELOG.md') --out $manifest
+if ($LASTEXITCODE -ne 0) { Write-Error "gen-manifest.js failed with exit code $LASTEXITCODE"; exit 1 }
+
+# 4) 可选：拷入插件 updateDir（应用「主机源」更新通道）
+if ($env:UPDATE_DIR) {
+    New-Item -ItemType Directory -Force -Path $env:UPDATE_DIR | Out-Null
+    Copy-Item $apkOut $manifest $env:UPDATE_DIR -Force
+    Write-Output ("Copied to updateDir: " + $env:UPDATE_DIR)
 }

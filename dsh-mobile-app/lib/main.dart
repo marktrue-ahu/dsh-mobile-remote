@@ -18,6 +18,7 @@ import 'screens/sessions_screen.dart';
 import 'screens/settings_screen.dart';
 import 'screens/notifications_screen.dart';
 import 'screens/sheets.dart';
+import 'updater.dart';
 
 final AppStore store = AppStore();
 
@@ -331,6 +332,8 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
     store.onSessionsChanged = () {
       if (mounted) setState(() {});
     };
+    // 3.0.0+8 自动更新：启动静默检查一次（命中后首页横幅提示，失败静默）
+    unawaited(Updater.autoCheckSilent(store));
   }
 
   void _recheck() {

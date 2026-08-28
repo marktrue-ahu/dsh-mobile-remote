@@ -12,6 +12,9 @@ import '../store.dart';
 import '../theme.dart';
 import '../toast.dart';
 import '../fmt.dart';
+import '../update_core.dart';
+import '../update_flow.dart';
+import '../updater.dart';
 import 'sheets.dart';
 import 'providers_screen.dart';
 
@@ -34,6 +37,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String _diagTime = '';
   String _appVersion = ''; // App 自身版本（package_info_plus，构建时打包）
   bool _bubbleOn = false; // 悬浮球开关状态（与服务实际运行状态同步）
+  bool _updateFlowBusy = false; // 更新流程进行中（下载/安装），防连点
 
   @override
   void initState() {
@@ -663,7 +667,42 @@ class _SettingsScreenState extends State<SettingsScreen> {
             leading: const Icon(Icons.info_outline),
             title: L10n.t('版本', 'Version'),
             sub: 'App v${_appVersion.isEmpty ? '…' : _appVersion}'
-                ' · ${L10n.t('插件', 'plugin')} v${api.pluginVersion.isEmpty ? '…' : api.pluginVersion}',
+                ' · ${L10n.t('插件', 'plugin')} v${api.pluginVersion.isEmpty ? '…' : api.pluginVersion}'
+                '${store.updateCandidate != null ? ' · ${L10n.t('有新版本', 'update available')} ${store.updateCandidate!.version}' : ''}',
+            // 有新版本时点版本行直接进入更新流程
+            onTap: store.updateCandidate != null
+                ? () {
+                    final c = store.updateCandidate;
+                    if (c != null) {
+                      unawaited(runUpdateFlow(context, store, c, onInstalled: store.clearUpdateCandidate));
+                    }
+                  }
+                : null,
+            trailing: store.updateCandidate != null
+                ? Icon(Icons.brightness_1, size: 9, color: DshColors.danger(context))
+                : null,
+          ),
+          _row(
+            leading: const Icon(Icons.sync_outlined),
+            title: L10n.t('检查更新', 'Check for updates'),
+            sub: store.updateChecking
+                ? L10n.t('检查中…', 'Checking…')
+                : L10n.t('检查 GitHub / 主机源是否有新版本', 'Check GitHub / host source for updates'),
+            trailing: TextButton(
+              onPressed: store.updateChecking || _updateFlowBusy ? null : _checkUpdate,
+              child: Text(
+                store.updateChecking ? L10n.t('检查中…', 'Checking…') : L10n.t('检查 ▸', 'Check ▸'),
+                style: TextStyle(fontSize: 12, color: brand),
+              ),
+            ),
+          ),
+          _row(
+            leading: const Icon(Icons.storage_outlined),
+            title: L10n.t('更新源', 'Update source'),
+            sub: store.updateSource == 'host' ? L10n.t('dsh 运行主机', 'dsh host') : L10n.t('GitHub Releases', 'GitHub Releases'),
+            trailing: Text(store.updateSource == 'host' ? L10n.t('主机 ▸', 'Host ▸') : L10n.t('GitHub ▸', 'GitHub ▸'),
+                style: TextStyle(fontSize: 12, color: brand)),
+            onTap: _pickUpdateSource,
           ),
           _row(
             leading: const Icon(Icons.monitor_heart_outlined),
@@ -845,6 +884,73 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
     );
     if (choice != null) await store.setLanguage(choice);
+  }
+
+  /// 手动「检查更新」：按当前更新源检查并给出明确结果。
+  Future<void> _checkUpdate() async {
+    final store = widget.store;
+    store.updateChecking = true;
+    if (mounted) setState(() {});
+    final o = await Updater.check(store);
+    store.updateChecking = false;
+    if (!mounted) return;
+    setState(() {});
+    switch (o.verdict) {
+      case UpdateVerdict.updateAvailable:
+        final c = o.candidate;
+        if (c != null) {
+          store.updateCandidate = c;
+          _updateFlowBusy = true;
+          setState(() {});
+          await runUpdateFlow(context, store, c, onInstalled: store.clearUpdateCandidate);
+          _updateFlowBusy = false;
+          if (mounted) setState(() {});
+        }
+        break;
+      case UpdateVerdict.upToDate:
+        if (o.error != null && o.error!.isNotEmpty) {
+          showToast(context, o.error!);
+        } else {
+          showToast(context, L10n.t('已是最新版本', 'Already up to date'));
+        }
+        break;
+      case UpdateVerdict.remoteOlder:
+        showToast(context,
+            L10n.t('更新源版本低于当前版本，已忽略（请检查更新源配置）', 'Update source is older than current — ignored (check source config)'));
+        break;
+    }
+  }
+
+  /// 选择更新源（GitHub Releases / dsh 运行主机）。
+  Future<void> _pickUpdateSource() async {
+    final store = widget.store;
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 14, 20, 6),
+              child: Text(L10n.t('选择更新源', 'Choose update source'),
+                  style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700)),
+            ),
+            for (final (id, name, desc) in [
+              ('github', 'GitHub Releases', L10n.t('公开分发渠道；需能访问 GitHub', 'Public releases; requires GitHub access')),
+              ('host', L10n.t('dsh 运行主机', 'dsh host'), L10n.t('主机 updateDir 里的版本（局域网/组网最快）', 'Host updateDir version (fastest on LAN/VPN)')),
+            ])
+              ListTile(
+                title: Text(name, style: TextStyle(fontSize: 14, fontWeight: store.updateSource == id ? FontWeight.w700 : FontWeight.w400)),
+                subtitle: Text(desc, style: const TextStyle(fontSize: 11.5)),
+                trailing: store.updateSource == id ? Icon(Icons.check, size: 18, color: DshColors.brand(context)) : null,
+                onTap: () => Navigator.of(ctx).pop(id),
+              ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (choice != null) await store.setUpdateSource(choice);
   }
 
   /// 应用日志：查看 / 复制 / 清空

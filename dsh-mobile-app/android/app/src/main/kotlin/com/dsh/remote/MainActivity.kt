@@ -1,11 +1,16 @@
 package com.dsh.remote
 
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
+import java.security.MessageDigest
 
 class MainActivity : FlutterActivity() {
     private var floatingChannel: MethodChannel? = null
@@ -79,6 +84,26 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+        // ── 自动更新（v3.1）：签名读取 + 触发系统安装器 ──
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "dsh/update").setMethodCallHandler { call, result ->
+            when (call.method) {
+                "ownSignatureSha256" -> result.success(signatureSha256(packageName))
+                "apkSignatureSha256" -> {
+                    val path = call.argument<String>("path") ?: ""
+                    result.success(signatureSha256OfApk(path))
+                }
+                "installApk" -> {
+                    val path = call.argument<String>("path") ?: ""
+                    try {
+                        installApkFile(path)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("install-failed", e.message, null)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -139,5 +164,73 @@ class MainActivity : FlutterActivity() {
             i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             startActivity(i)
         }
+    }
+
+    // ── 自动更新原生支持（v3.0.0+） ──
+
+    /**
+     * 已安装包签名证书 SHA-256。API 28+ 用 GET_SIGNING_CERTIFICATES（signingInfo，兼容 v2/v3 签名——
+     * AGP 9 产物 v1=false，GET_SIGNATURES 读不到）；旧版本回退 GET_SIGNATURES（v1）。读取失败返回 null（保守取消）。
+     */
+    private fun signatureSha256(pkg: String): String? {
+        return try {
+            val pm = packageManager
+            val sigs: Array<android.content.pm.Signature>? = if (Build.VERSION.SDK_INT >= 28) {
+                pm.getPackageInfo(pkg, PackageManager.GET_SIGNING_CERTIFICATES)
+                    ?.signingInfo?.apkContentsSigners
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getPackageInfo(pkg, PackageManager.GET_SIGNATURES)?.signatures
+            }
+            val sig = sigs?.firstOrNull() ?: return null
+            sha256Hex(sig.toByteArray())
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** 本地 APK 文件签名证书 SHA-256（getPackageArchiveInfo + GET_SIGNING_CERTIFICATES 兼容 v2/v3；API<28 回退 GET_SIGNATURES）。读取失败返回 null。 */
+    private fun signatureSha256OfApk(path: String): String? {
+        return try {
+            val pm = packageManager
+            val flags = if (Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES else {
+                @Suppress("DEPRECATION")
+                PackageManager.GET_SIGNATURES
+            }
+            val info = pm.getPackageArchiveInfo(path, flags) ?: return null
+            val sigs: Array<android.content.pm.Signature>? =
+                if (Build.VERSION.SDK_INT >= 28) info.signingInfo?.apkContentsSigners else {
+                    @Suppress("DEPRECATION")
+                    info.signatures
+                }
+            val sig = sigs?.firstOrNull() ?: return null
+            sha256Hex(sig.toByteArray())
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun sha256Hex(bytes: ByteArray): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
+        return digest.joinToString("") { "%02x".format(it) }
+    }
+
+    /** 拉起系统安装器（FileProvider 授权读取；Android 8+ 未知来源由系统引导）。 */
+    private fun installApkFile(path: String) {
+        if (Build.VERSION.SDK_INT >= 26 && !packageManager.canRequestPackageInstalls()) {
+            startActivity(
+                Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
+                    .setData(Uri.parse("package:$packageName"))
+            )
+            throw IllegalStateException("请允许本应用安装未知应用后重试")
+        }
+        val file = File(path)
+        if (!file.exists()) throw IllegalStateException("APK 文件不存在")
+        val uri: Uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+        val intent = Intent(Intent.ACTION_VIEW)
+            .setDataAndType(uri, "application/vnd.android.package-archive")
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        startActivity(intent)
     }
 }
