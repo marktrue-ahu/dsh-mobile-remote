@@ -3,13 +3,17 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
+
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+
 import 'logger.dart';
 import 'models.dart';
+import 'git_models.dart';
 
 class ApiException implements Exception {
   final String message;
+
   /// v3.0.0：内核错误码（如 queue-item-not-found / steer-unavailable），供 UI 区分语义
   final String? code;
   ApiException(this.message, {this.code});
@@ -35,13 +39,23 @@ final Api api = Api();
 /// （null = 旧版插件未返回，由调用方按根视图推断，见 sheets.dart dirSepOf）。
 typedef DirListing = ({List<String> dirs, String? sep});
 
-class Api {
+abstract interface class GitApi {
+  Future<GitCapability> gitCapabilities();
+  Future<GitContext> gitContext({String? sessionId, String? cwd});
+  Future<GitStatus> gitStatus(String repositoryId);
+  Future<List<GitBranch>> gitBranches(String repositoryId);
+}
+
+class Api implements GitApi {
   String baseUrl = '';
   String token = '';
+
   /// v3.0.0 review：插件挂载路径（默认 /m；由扫描地址/二维码解析，bootstrap 权威校正）。
   String path = '/m';
+
   /// 电脑端插件版本（bootstrap 返回，设置页「版本」展示用）。
   String pluginVersion = '';
+
   /// 电脑的全部候选地址（局域网 IP / Tailscale IP / 127.0.0.1）。
   /// 连接失败时按顺序轮换（外出自动切 Tailscale，回家自动切回局域网）。
   List<String> baseUrls = [];
@@ -110,7 +124,8 @@ class Api {
     final merged = <String>[_normBase(base)];
     for (final u in baseUrls) {
       final n = _normBase(u);
-      if (n.isNotEmpty && n != merged.first && merged.length < _maxUrls) merged.add(n);
+      if (n.isNotEmpty && n != merged.first && merged.length < _maxUrls)
+        merged.add(n);
     }
     baseUrls = merged;
     await prefs.setStringList(_kUrls, baseUrls);
@@ -154,19 +169,22 @@ class Api {
 
   /// v3.0.0：构造只读探测客户端——地址/路径规范化和 save() 同源逻辑，
   /// 避免"地址含 /m、路径默认 /m"拼接成 `/m/m/...` 而 404。
-  static Api forProbe(String base, String token) =>
-      Api()
-        ..baseUrl = _normBase(base)
-        ..path = _pathOf(base)
-        ..token = token;
+  static Api forProbe(String base, String token) => Api()
+    ..baseUrl = _normBase(base)
+    ..path = _pathOf(base)
+    ..token = token;
 
   /// 吸收 bootstrap 响应：合并服务器全部地址 + 记录插件版本（持久化，断线也可见）
   /// + 校正挂载路径（v3.0.0 review：服务端为权威来源）。
   void absorbBootstrap(Map<String, dynamic> d) {
-    final urls = (d['server']?['urls'] as List?)?.map((u) => u.toString()).toList() ?? const <String>[];
+    final urls =
+        (d['server']?['urls'] as List?)?.map((u) => u.toString()).toList() ??
+        const <String>[];
     mergeUrls(urls);
     final sp = d['server'];
-    if (sp is Map && sp['path'] is String && (sp['path'] as String).isNotEmpty) {
+    if (sp is Map &&
+        sp['path'] is String &&
+        (sp['path'] as String).isNotEmpty) {
       final p = (sp['path'] as String).trim();
       path = p == '/' ? '/m' : p;
       unawaited(() async {
@@ -193,7 +211,9 @@ class Api {
     try {
       final d = await getJson('/api/bootstrap');
       absorbBootstrap(d);
-      AppLog.instance.log('地址收集完成：共 ${baseUrls.length} 个 → ${baseUrls.join(' , ')}');
+      AppLog.instance.log(
+        '地址收集完成：共 ${baseUrls.length} 个 → ${baseUrls.join(' , ')}',
+      );
     } catch (_) {
       // 收集失败不影响当前连接
     }
@@ -232,13 +252,18 @@ class Api {
   }
 
   Map<String, String> get _headers => {
-        'content-type': 'application/json',
-        if (token.isNotEmpty) 'x-mobile-token': token,
-      };
+    'content-type': 'application/json',
+    if (token.isNotEmpty) 'x-mobile-token': token,
+  };
 
-  Future<Map<String, dynamic>> getJson(String path, {Duration timeout = const Duration(seconds: 15)}) async {
+  Future<Map<String, dynamic>> getJson(
+    String path, {
+    Duration timeout = const Duration(seconds: 15),
+  }) async {
     try {
-      final res = await _client.get(_uri(path), headers: _headers).timeout(timeout);
+      final res = await _client
+          .get(_uri(path), headers: _headers)
+          .timeout(timeout);
       return _decode(res);
     } catch (e) {
       AppLog.instance.log('GET $path 失败: $e');
@@ -246,8 +271,11 @@ class Api {
     }
   }
 
-  Future<Map<String, dynamic>> postJson(String path, Map<String, dynamic> body,
-      {Duration timeout = const Duration(seconds: 20)}) async {
+  Future<Map<String, dynamic>> postJson(
+    String path,
+    Map<String, dynamic> body, {
+    Duration timeout = const Duration(seconds: 20),
+  }) async {
     try {
       final res = await _client
           .post(_uri(path), headers: _headers, body: jsonEncode(body))
@@ -269,18 +297,32 @@ class Api {
     }
     if (res.statusCode != 200) {
       throw ApiException(
-          (body?['detail'] as String?) ?? (body?['error'] as String?) ?? 'HTTP ${res.statusCode}',
-          code: body?['error'] is String ? (body?['error'] as String) : null);
+        (body?['detail'] as String?) ??
+            (body?['error'] as String?) ??
+            'HTTP ${res.statusCode}',
+        code: body?['error'] is String ? (body?['error'] as String) : null,
+      );
     }
     if (body == null) throw ApiException('HTTP ${res.statusCode}');
     return body;
   }
 
   // ── 业务接口 ──
-  Future<Catalog> catalog() async => Catalog.fromJson(await getJson('/api/catalog'));
-  Future<SessionConfig> sessionConfig(String sessionId) async =>
-      SessionConfig.fromJson((await getJson('/api/session-config?sessionId=${Uri.encodeQueryComponent(sessionId)}'))['config'] as Map<String, dynamic>? ?? {});
-  Future<void> updateSessionConfig(String sessionId, Map<String, dynamic> patch) async {
+  Future<Catalog> catalog() async =>
+      Catalog.fromJson(await getJson('/api/catalog'));
+  Future<SessionConfig> sessionConfig(
+    String sessionId,
+  ) async => SessionConfig.fromJson(
+    (await getJson(
+              '/api/session-config?sessionId=${Uri.encodeQueryComponent(sessionId)}',
+            ))['config']
+            as Map<String, dynamic>? ??
+        {},
+  );
+  Future<void> updateSessionConfig(
+    String sessionId,
+    Map<String, dynamic> patch,
+  ) async {
     await postJson('/api/session-config', {'sessionId': sessionId, ...patch});
   }
 
@@ -326,13 +368,17 @@ class Api {
       if (apiKey != null && apiKey.isNotEmpty) 'apiKey': apiKey,
       if (models != null && models.isNotEmpty) 'models': models,
       if (api != null && api.isNotEmpty) 'api': api,
-      if (displayName != null && displayName.isNotEmpty) 'displayName': displayName,
+      if (displayName != null && displayName.isNotEmpty)
+        'displayName': displayName,
       if (removeKey) 'removeKey': true,
     });
   }
+
   Future<List<Session>> sessions() async {
     final data = await getJson('/api/sessions');
-    return (data['sessions'] as List? ?? []).map((e) => Session.fromJson(e as Map<String, dynamic>)).toList();
+    return (data['sessions'] as List? ?? [])
+        .map((e) => Session.fromJson(e as Map<String, dynamic>))
+        .toList();
   }
 
   /// 标记会话被打开（服务端记录活跃时间，用于"最近会话"排序）。失败静默。
@@ -347,7 +393,9 @@ class Api {
   // ── v2.7：任务（jobs）/ 子代理 / 目标 ──
   /// 会话任务列表（SSE session/jobs 帧已实时推送，此端点用于下拉刷新兜底）。
   Future<List<Map<String, dynamic>>> jobs(String sessionId) async {
-    final data = await getJson('/api/jobs?sessionId=${Uri.encodeQueryComponent(sessionId)}');
+    final data = await getJson(
+      '/api/jobs?sessionId=${Uri.encodeQueryComponent(sessionId)}',
+    );
     return (data['jobs'] as List? ?? []).cast<Map<String, dynamic>>();
   }
 
@@ -358,12 +406,17 @@ class Api {
 
   /// 子代理列表（按父会话查询，与内核 subagent.list 契约一致）。
   Future<List<Map<String, dynamic>>> subagents(String parentSessionId) async {
-    final data = await getJson('/api/subagents?parentSessionId=${Uri.encodeQueryComponent(parentSessionId)}');
+    final data = await getJson(
+      '/api/subagents?parentSessionId=${Uri.encodeQueryComponent(parentSessionId)}',
+    );
     return (data['subagents'] as List? ?? []).cast<Map<String, dynamic>>();
   }
 
   /// 中断子代理（内核契约：parentSessionId + childSessionId + mode=continuable）。
-  Future<void> subagentInterrupt(String parentSessionId, String childSessionId) async {
+  Future<void> subagentInterrupt(
+    String parentSessionId,
+    String childSessionId,
+  ) async {
     await postJson('/api/subagents/interrupt', {
       'parentSessionId': parentSessionId,
       'childSessionId': childSessionId,
@@ -372,12 +425,19 @@ class Api {
 
   /// 当前目标。
   Future<Map<String, dynamic>?> goal(String sessionId) async {
-    final data = await getJson('/api/goal?sessionId=${Uri.encodeQueryComponent(sessionId)}');
+    final data = await getJson(
+      '/api/goal?sessionId=${Uri.encodeQueryComponent(sessionId)}',
+    );
     return data['goal'] as Map<String, dynamic>?;
   }
 
   /// 目标操作：create / pause / resume / complete（sessionId 必填，与内核 goal RPC 契约一致）。
-  Future<void> goalAction(String action, {required String sessionId, String? objective, int? maxGoalRounds}) async {
+  Future<void> goalAction(
+    String action, {
+    required String sessionId,
+    String? objective,
+    int? maxGoalRounds,
+  }) async {
     await postJson('/api/goal', {
       'action': action,
       'sessionId': sessionId,
@@ -388,7 +448,10 @@ class Api {
 
   /// 归档 / 恢复会话（服务端持久化）。
   Future<void> archiveSession(String sessionId, {required bool archive}) async {
-    await postJson(archive ? '/api/sessions/archive' : '/api/sessions/unarchive', {'sessionId': sessionId});
+    await postJson(
+      archive ? '/api/sessions/archive' : '/api/sessions/unarchive',
+      {'sessionId': sessionId},
+    );
   }
 
   /// 停止（取消）会话当前运行：对齐 PC 端"停止"按钮（映射 session.cancel）。
@@ -406,15 +469,25 @@ class Api {
   }
 
   /// 消息反馈（👍/👎）：直接写内核 messageFeedback 服务（与 PC 端同一份数据）。
-  Future<void> putFeedback(String sessionId, String messageId, String rating) async {
-    await postJson('/api/feedback', {'sessionId': sessionId, 'messageId': messageId, 'rating': rating});
+  Future<void> putFeedback(
+    String sessionId,
+    String messageId,
+    String rating,
+  ) async {
+    await postJson('/api/feedback', {
+      'sessionId': sessionId,
+      'messageId': messageId,
+      'rating': rating,
+    });
   }
 
   /// v2.8.0：斜杠命令目录（对齐 PC 端 ctx.commands）。
   /// v2.9.0 review(LOW#13)：返回 (命令列表, unavailable)——服务端 commands 服务缺失时
   /// unavailable=true，UI 应提示"命令服务不可用"而非"无可用命令"。
   Future<(List<Map<String, dynamic>>, bool)> commands(String sessionId) async {
-    final data = await getJson('/api/commands?sessionId=${Uri.encodeQueryComponent(sessionId)}');
+    final data = await getJson(
+      '/api/commands?sessionId=${Uri.encodeQueryComponent(sessionId)}',
+    );
     return (
       (data['commands'] as List? ?? []).cast<Map<String, dynamic>>(),
       data['unavailable'] == true,
@@ -423,25 +496,52 @@ class Api {
 
   /// v2.8.0：执行斜杠命令（line 形如 "/plan 目标"）。
   /// 预留契约：当前命令入口走"填入输入框由用户发送"（PC 端 leadingInput 语义），本方法暂未调用。
-  Future<Map<String, dynamic>?> runCommand(String sessionId, String line) async {
-    return await postJson('/api/commands', {'sessionId': sessionId, 'line': line});
+  Future<Map<String, dynamic>?> runCommand(
+    String sessionId,
+    String line,
+  ) async {
+    return await postJson('/api/commands', {
+      'sessionId': sessionId,
+      'line': line,
+    });
   }
 
-  Future<Map<String, dynamic>> createSession(Map<String, dynamic> body) async => await postJson('/api/sessions', body);
+  Future<Map<String, dynamic>> createSession(Map<String, dynamic> body) async =>
+      await postJson('/api/sessions', body);
 
   /// v2.7.2：排队中消息列表（对齐 PC 端 Queue Dock）。
-  Future<List<Map<String, dynamic>>> queue(String sessionId, {Duration timeout = const Duration(seconds: 15)}) async {
-    final data = await getJson('/api/queue?sessionId=${Uri.encodeQueryComponent(sessionId)}', timeout: timeout);
+  Future<List<Map<String, dynamic>>> queue(
+    String sessionId, {
+    Duration timeout = const Duration(seconds: 15),
+  }) async {
+    final data = await getJson(
+      '/api/queue?sessionId=${Uri.encodeQueryComponent(sessionId)}',
+      timeout: timeout,
+    );
     return (data['queue'] as List? ?? []).cast<Map<String, dynamic>>();
   }
 
   /// v2.7.2：对排队中消息操作（edit / remove / steer，对齐 PC 端 session.updateQueue）。
-  Future<void> updateQueueMessage(String sessionId, String itemId, Map<String, dynamic> action) async {
-    await postJson('/api/messages', {'sessionId': sessionId, 'itemId': itemId, 'action': action});
+  Future<void> updateQueueMessage(
+    String sessionId,
+    String itemId,
+    Map<String, dynamic> action,
+  ) async {
+    await postJson('/api/messages', {
+      'sessionId': sessionId,
+      'itemId': itemId,
+      'action': action,
+    });
   }
+
   /// v3.0.0：返回 (messageId, note)。note=held-until-idle 表示消息被插件持存
   /// （运行中排队，任务结束才释放）——排队消息不进对话窗口，只进 dock（与 PC 端一致）。
-  Future<(String, String?)> send(String sessionId, String text, {String mode = 'followup', String? requestId}) async {
+  Future<(String, String?)> send(
+    String sessionId,
+    String text, {
+    String mode = 'followup',
+    String? requestId,
+  }) async {
     // v2.7.2：mode=steer 插队发送（插到 agent 下一步执行）；默认 followup 排队
     final r = await postJson('/api/send', {
       'sessionId': sessionId,
@@ -473,8 +573,15 @@ class Api {
 
   /// v3.0.0(热修 05)：发送回执查询——网络层错误（reset/超时）后据此判断是否已送达。
   /// 未命中返回 404 receipt-not-found（ApiException.code 同值）；命中返回 { status, result }。
-  Future<Map<String, dynamic>> sendReceipt(String sessionId, String requestId, {Duration timeout = const Duration(seconds: 8)}) async {
-    final data = await getJson('/api/send-receipt?sessionId=${Uri.encodeQueryComponent(sessionId)}&requestId=${Uri.encodeQueryComponent(requestId)}', timeout: timeout);
+  Future<Map<String, dynamic>> sendReceipt(
+    String sessionId,
+    String requestId, {
+    Duration timeout = const Duration(seconds: 8),
+  }) async {
+    final data = await getJson(
+      '/api/send-receipt?sessionId=${Uri.encodeQueryComponent(sessionId)}&requestId=${Uri.encodeQueryComponent(requestId)}',
+      timeout: timeout,
+    );
     return (data['receipt'] as Map<String, dynamic>?) ?? const {};
   }
 
@@ -482,18 +589,27 @@ class Api {
   final Map<String, Uint8List> _imgCache = {};
   final List<String> _imgOrder = [];
   static const _imgCacheMax = 64;
-  Future<Uint8List> attachmentBytes(String sessionId, String attachmentId) async {
+  Future<Uint8List> attachmentBytes(
+    String sessionId,
+    String attachmentId,
+  ) async {
     final key = '$sessionId/$attachmentId';
     final hit = _imgCache[key];
     if (hit != null) return hit;
     final res = await _client
         .get(
-          _uri('/api/attachment?sessionId=${Uri.encodeQueryComponent(sessionId)}'
-              '&attachmentId=${Uri.encodeQueryComponent(attachmentId)}'),
+          _uri(
+            '/api/attachment?sessionId=${Uri.encodeQueryComponent(sessionId)}'
+            '&attachmentId=${Uri.encodeQueryComponent(attachmentId)}',
+          ),
           headers: _headers,
         )
         .timeout(const Duration(seconds: 60));
-    if (res.statusCode != 200) throw ApiException('HTTP ${res.statusCode}', code: 'attachment-fetch-failed');
+    if (res.statusCode != 200)
+      throw ApiException(
+        'HTTP ${res.statusCode}',
+        code: 'attachment-fetch-failed',
+      );
     final bytes = res.bodyBytes;
     if (bytes.isEmpty) throw ApiException('empty attachment');
     _imgCache[key] = bytes;
@@ -505,25 +621,47 @@ class Api {
     }
     return bytes;
   }
+
   /// 拉历史。移动端默认取最近 100 条（服务端 limit 截断取尾部=最近的），
   /// 避免一次解析/渲染数百条事件导致手机卡死。
-  Future<List<ChatEvent>> history(String sessionId, {int? after, int? before, int limit = 100, Duration timeout = const Duration(seconds: 15)}) async {
-    final params = 'sessionId=${Uri.encodeQueryComponent(sessionId)}'
+  Future<List<ChatEvent>> history(
+    String sessionId, {
+    int? after,
+    int? before,
+    int limit = 100,
+    Duration timeout = const Duration(seconds: 15),
+  }) async {
+    final params =
+        'sessionId=${Uri.encodeQueryComponent(sessionId)}'
         '${after != null ? '&after=$after' : ''}${before != null ? '&before=$before' : ''}&limit=$limit';
     final data = await getJson('/api/history?$params', timeout: timeout);
-    return (data['events'] as List? ?? []).map((e) => ChatEvent.fromJson(e as Map<String, dynamic>)).toList();
+    return (data['events'] as List? ?? [])
+        .map((e) => ChatEvent.fromJson(e as Map<String, dynamic>))
+        .toList();
   }
+
   Future<List<AppNotification>> notifications() async {
     final data = await getJson('/api/notifications');
-    return (data['items'] as List? ?? []).map((e) => AppNotification.fromJson(e as Map<String, dynamic>)).toList();
+    return (data['items'] as List? ?? [])
+        .map((e) => AppNotification.fromJson(e as Map<String, dynamic>))
+        .toList();
   }
+
   Future<void> markNotifsRead({List<String>? ids, bool all = false}) async {
-    await postJson('/api/notifications/read', all ? {'all': true} : {'ids': ids ?? []});
+    await postJson(
+      '/api/notifications/read',
+      all ? {'all': true} : {'ids': ids ?? []},
+    );
   }
+
   /// 删除通知记录：指定 id 列表或全部（插件端 /notifications/delete，桌面端重启后生效）。
   Future<void> deleteNotifs({List<String>? ids, bool all = false}) async {
-    await postJson('/api/notifications/delete', all ? {'all': true} : {'ids': ids ?? []});
+    await postJson(
+      '/api/notifications/delete',
+      all ? {'all': true} : {'ids': ids ?? []},
+    );
   }
+
   /// 回答内核问询/审批（kind: question | approval | cancel），走与 PC 端 GUI 相同的 respond 通道。
   Future<Map<String, dynamic>> respond({
     required String kind,
@@ -533,19 +671,26 @@ class Api {
     String? approvalId,
     String? outcome,
   }) async {
-    final body = <String, dynamic>{'kind': kind, 'rpcId': rpcId, 'sessionId': sessionId};
+    final body = <String, dynamic>{
+      'kind': kind,
+      'rpcId': rpcId,
+      'sessionId': sessionId,
+    };
     if (answers != null) body['answers'] = answers;
     if (approvalId != null) body['approvalId'] = approvalId;
     if (outcome != null) body['outcome'] = outcome;
     return await postJson('/api/respond', body);
   }
+
   Future<double?> balance() async {
     try {
       final data = await getJson('/api/balance');
       final infos = data['balance']?['balance_infos'] as List? ?? [];
       if (infos.isEmpty) return null;
       final total = (infos.first as Map<String, dynamic>)['total_balance'];
-      return total is num ? total.toDouble() : double.tryParse(total.toString());
+      return total is num
+          ? total.toDouble()
+          : double.tryParse(total.toString());
     } on ApiException {
       rethrow;
     }
@@ -555,13 +700,18 @@ class Api {
   Future<Map<String, dynamic>?> balanceInfo() async {
     try {
       // 余额是电脑端代查官方 API，链路可能慢（官方接口抖动 + 组网隧道延迟），放宽到 25 秒
-      final data = await getJson('/api/balance', timeout: const Duration(seconds: 25));
+      final data = await getJson(
+        '/api/balance',
+        timeout: const Duration(seconds: 25),
+      );
       final infos = data['balance']?['balance_infos'] as List? ?? [];
       if (infos.isEmpty) return null;
       final first = infos.first as Map<String, dynamic>;
       final total = first['total_balance'];
       return {
-        'total': total is num ? total.toDouble() : double.tryParse(total.toString()) ?? 0,
+        'total': total is num
+            ? total.toDouble()
+            : double.tryParse(total.toString()) ?? 0,
         'currency': first['currency'] ?? 'CNY',
         'available': first['is_available'] ?? true,
       };
@@ -571,7 +721,10 @@ class Api {
   }
 
   /// 修改默认配置（Agent 预设 / 权限预设，作用于之后新建的会话）。
-  Future<void> updateDefaults({String? agentPreset, String? permissionPreset}) async {
+  Future<void> updateDefaults({
+    String? agentPreset,
+    String? permissionPreset,
+  }) async {
     await postJson('/api/defaults', {
       'agentPreset': ?agentPreset,
       'permissionPreset': ?permissionPreset,
@@ -580,7 +733,9 @@ class Api {
 
   /// 会话 token 用量统计（服务端聚合）+ 上下文窗口（request/context 事件，PC 圆环同源）。
   Future<Map<String, dynamic>> usage(String sessionId) async {
-    final data = await getJson('/api/usage?sessionId=${Uri.encodeQueryComponent(sessionId)}');
+    final data = await getJson(
+      '/api/usage?sessionId=${Uri.encodeQueryComponent(sessionId)}',
+    );
     return {
       ...(data['usage'] as Map<String, dynamic>? ?? {}),
       if (data['contextWindow'] != null) 'contextWindow': data['contextWindow'],
@@ -590,23 +745,31 @@ class Api {
   /// 移动端动作注册表（插件提供）。
   Future<List<Map<String, dynamic>>> actions() async {
     final data = await getJson('/api/actions');
-    return (data['actions'] as List? ?? []).map((e) => e as Map<String, dynamic>).toList();
+    return (data['actions'] as List? ?? [])
+        .map((e) => e as Map<String, dynamic>)
+        .toList();
   }
 
   /// 执行一个动作。
   Future<void> invokeAction(String id, Map<String, dynamic> args) async {
-    await postJson('/api/actions/${Uri.encodeQueryComponent(id)}/invoke', {'args': args});
+    await postJson('/api/actions/${Uri.encodeQueryComponent(id)}/invoke', {
+      'args': args,
+    });
   }
 
   /// 已注册工作区列表：[{path, title?}]。
   Future<List<Map<String, dynamic>>> workspaces() async {
     final data = await getJson('/api/workspaces');
-    return (data['workspaces'] as List? ?? []).map((e) => e as Map<String, dynamic>).toList();
+    return (data['workspaces'] as List? ?? [])
+        .map((e) => e as Map<String, dynamic>)
+        .toList();
   }
 
   /// 目录浏览：path 为空返回盘符/根；否则返回子目录名列表（附服务端分隔符，v3.1.1）。
   Future<DirListing> directories(String path) async {
-    final data = await getJson('/api/directories?path=${Uri.encodeQueryComponent(path)}');
+    final data = await getJson(
+      '/api/directories?path=${Uri.encodeQueryComponent(path)}',
+    );
     return (
       dirs: (data['dirs'] as List? ?? []).map((e) => e.toString()).toList(),
       sep: data['sep'] is String ? data['sep'] as String : null,
@@ -624,6 +787,86 @@ class Api {
     } catch (_) {
       return null;
     }
+  }
+
+  @override
+  Future<GitCapability> gitCapabilities() async {
+    final d = await getJson('/api/git/capabilities');
+    return GitCapability.fromJson(d['git'] as Map<String, dynamic>?);
+  }
+
+  @override
+  Future<GitContext> gitContext({String? sessionId, String? cwd}) async {
+    final q = <String, String>{
+      if (sessionId != null) 'sessionId': sessionId,
+      if (cwd != null) 'cwd': cwd,
+    };
+    final d = await getJson(
+      '/api/git/context${q.isEmpty ? '' : '?${q.entries.map((e) => '${Uri.encodeQueryComponent(e.key)}=${Uri.encodeQueryComponent(e.value)}').join('&')}'}',
+    );
+    return GitContext.fromJson(d);
+  }
+
+  @override
+  Future<GitStatus> gitStatus(String repositoryId) async => GitStatus.fromJson(
+    await getJson(
+      '/api/git/status?repositoryId=${Uri.encodeQueryComponent(repositoryId)}',
+    ),
+  );
+  @override
+  Future<List<GitBranch>> gitBranches(String repositoryId) async {
+    final d = await getJson(
+      '/api/git/branches?repositoryId=${Uri.encodeQueryComponent(repositoryId)}',
+    );
+    return (d['branches'] as List? ?? [])
+        .whereType<Map>()
+        .map((e) => GitBranch.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+  }
+
+  Future<GitGraphPage> gitGraph(
+    String repositoryId, {
+    int limit = 100,
+    String? cursor,
+    List<GitBranch> refs = const [],
+  }) async {
+    final selected = refs
+        .map((b) => {'name': b.name, 'tipOid': b.oid})
+        .toList();
+    final params = <String, String>{
+      'repositoryId': repositoryId,
+      'limit': '$limit',
+      if (cursor != null) 'cursor': cursor,
+      if (selected.isNotEmpty) 'refs': jsonEncode(selected),
+    };
+    final q = params.entries
+        .map(
+          (e) =>
+              '${Uri.encodeQueryComponent(e.key)}=${Uri.encodeQueryComponent(e.value)}',
+        )
+        .join('&');
+    final d = await getJson('/api/git/graph?$q');
+    return GitGraphPage.fromJson(d);
+  }
+
+  Future<Map<String, dynamic>> gitCommit(
+    String repositoryId,
+    String oid,
+  ) async => await getJson(
+    '/api/git/commit?repositoryId=${Uri.encodeQueryComponent(repositoryId)}&oid=${Uri.encodeQueryComponent(oid)}',
+  );
+  Future<GitDiff> gitDiff(
+    String repositoryId, {
+    String kind = 'working',
+    String? oid,
+    String? path,
+  }) async {
+    final q = StringBuffer(
+      'repositoryId=${Uri.encodeQueryComponent(repositoryId)}&kind=$kind',
+    );
+    if (oid != null) q.write('&oid=${Uri.encodeQueryComponent(oid)}');
+    if (path != null) q.write('&path=${Uri.encodeQueryComponent(path)}');
+    return GitDiff.fromJson(await getJson('/api/git/diff?$q'));
   }
 
   /// SSE 全量帧流（session/event + agent/status + hello），不做会话过滤。
@@ -659,56 +902,67 @@ class Api {
         controller.close();
       }
     });
-    _client.send(req).then((res) {
-      if (timedOut || controller.isClosed) {
-        // 晚到的响应/已取消：立即消费并释放，不留半开 socket
-        res.stream.listen((_) {}).cancel();
-        return;
-      }
-      if (res.statusCode != 200) {
-        if (!controller.isClosed) {
-          controller.addError(ApiException('SSE HTTP ${res.statusCode}'));
-          controller.close();
-        }
-        return;
-      }
-      final stream = res.stream.transform(utf8.decoder);
-      final buf = StringBuffer();
-      bodySub = stream.listen((chunk) {
-        buf.write(chunk);
-        var s = buf.toString();
-        var idx = s.indexOf('\n\n');
-        while (idx >= 0) {
-          final frame = s.substring(0, idx);
-          s = s.substring(idx + 2);
-          idx = s.indexOf('\n\n');
-          if (frame.startsWith('data: ')) {
-            onSseKeepalive?.call();
-            try {
-              controller.add(jsonDecode(frame.substring(6)) as Map<String, dynamic>);
-            } catch (_) {/* 忽略坏帧 */}
-          } else if (frame.trim() == ': ping') {
-            onSseKeepalive?.call();
+    _client
+        .send(req)
+        .then((res) {
+          if (timedOut || controller.isClosed) {
+            // 晚到的响应/已取消：立即消费并释放，不留半开 socket
+            res.stream.listen((_) {}).cancel();
+            return;
           }
-        }
-        buf
-          ..clear()
-          ..write(s);
-      }, onDone: () {
-        if (!controller.isClosed) controller.close();
-      }, onError: (e) {
-        if (!controller.isClosed) controller.addError(e);
-      }, cancelOnError: true);
-    }).catchError((e) {
-      if (!controller.isClosed) {
-        controller.addError(e);
-        controller.close();
-      }
-    }).whenComplete(() {
-      timeoutWatchdog.cancel();
-    });
+          if (res.statusCode != 200) {
+            if (!controller.isClosed) {
+              controller.addError(ApiException('SSE HTTP ${res.statusCode}'));
+              controller.close();
+            }
+            return;
+          }
+          final stream = res.stream.transform(utf8.decoder);
+          final buf = StringBuffer();
+          bodySub = stream.listen(
+            (chunk) {
+              buf.write(chunk);
+              var s = buf.toString();
+              var idx = s.indexOf('\n\n');
+              while (idx >= 0) {
+                final frame = s.substring(0, idx);
+                s = s.substring(idx + 2);
+                idx = s.indexOf('\n\n');
+                if (frame.startsWith('data: ')) {
+                  onSseKeepalive?.call();
+                  try {
+                    controller.add(
+                      jsonDecode(frame.substring(6)) as Map<String, dynamic>,
+                    );
+                  } catch (_) {
+                    /* 忽略坏帧 */
+                  }
+                } else if (frame.trim() == ': ping') {
+                  onSseKeepalive?.call();
+                }
+              }
+              buf
+                ..clear()
+                ..write(s);
+            },
+            onDone: () {
+              if (!controller.isClosed) controller.close();
+            },
+            onError: (e) {
+              if (!controller.isClosed) controller.addError(e);
+            },
+            cancelOnError: true,
+          );
+        })
+        .catchError((e) {
+          if (!controller.isClosed) {
+            controller.addError(e);
+            controller.close();
+          }
+        })
+        .whenComplete(() {
+          timeoutWatchdog.cancel();
+        });
     return controller.stream;
   }
 }
-
-

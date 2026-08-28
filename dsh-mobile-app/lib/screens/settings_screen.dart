@@ -9,6 +9,7 @@ import '../floating.dart';
 import '../l10n.dart';
 import '../logger.dart';
 import '../store.dart';
+import '../git_models.dart';
 import '../theme.dart';
 import '../toast.dart';
 import '../fmt.dart';
@@ -592,6 +593,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
           ),
         ]),
+        _card(L10n.t('Git 快捷栏', 'Git quickbar'), [
+          _row(
+            leading: const Icon(Icons.source_outlined),
+            title: L10n.t('快捷功能', 'Quick actions'),
+            sub: store.gitCapability.available ? store.gitQuickbar.map(gitSlotTitle).join(' · ') : L10n.t('当前环境不可用', 'Unavailable in this environment'),
+            trailing: Text(L10n.t('自定义 ▸', 'Customize ▸'), style: TextStyle(fontSize: 12, color: brand)),
+            onTap: () => _pickGitQuickbar(store),
+          ),
+        ]),
         _card(L10n.t('显示', 'Display'), [
           _row(
             leading: const Icon(Icons.psychology_outlined),
@@ -930,6 +940,27 @@ class _SettingsScreenState extends State<SettingsScreen> {
         child: Text(L10n.t('复制', 'Copy')),
       ),
     ]);
+  }
+
+  Future<void> _pickGitQuickbar(AppStore store) async {
+    var selected = List<String>.from(store.gitQuickbar);
+    final result = await showModalBottomSheet<List<String>>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setSheet) => SafeArea(child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Text(L10n.t('选择 3 个快捷按钮', 'Choose 3 quick actions'), style: Theme.of(ctx).textTheme.titleMedium),
+          for (final slot in gitQuickbarSlots) CheckboxListTile(
+            value: selected.contains(slot),
+            title: Text(gitSlotTitle(slot)),
+            onChanged: (v) => setSheet(() { if (v == true && selected.length < 3) selected.add(slot); else if (v == false) selected.remove(slot); }),
+          ),
+          FilledButton(onPressed: selected.length == 3 ? () => Navigator.pop(ctx, selected) : null, child: Text(L10n.t('保存', 'Save'))),
+        ]),
+      ))),
+    );
+    if (result != null) await store.setGitQuickbar(result);
   }
 
   Future<void> _copy(String text) async {
