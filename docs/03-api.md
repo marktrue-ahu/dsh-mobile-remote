@@ -578,13 +578,14 @@
 ### 6.16 Git Slice A（只读）
 
 Git 接口由项目自有 provider 提供，执行通过 DSH `subprocess`，仓库必须位于
-`workspaceRegistry` 已注册工作区内。`repositoryId` 为规范化仓库根路径，客户端不得自行拼接
+`workspaceRegistry` 已注册工作区内。`repositoryId` 为 provider 分配的不透明仓库标识，客户端不得自行拼接
 shell 命令。Slice A 不提供切换/创建/删除分支、fetch/pull/push、stage/commit、stash 或 tags 写操作。
 
 `GET /m/api/git/capabilities` 始终返回 `{ok, git:{available,read,writes,reason,features}}`，不可用时
 由 `available=false` 明确表达；实际仓库操作在 provider 不可用时返回 `503 git-provider-unavailable`。
-`GET /m/api/git/context?sessionId=…` 返回仓库根目录和能力。
+`GET /m/api/git/context?sessionId=…` 返回不透明的稳定 `repositoryId`、仓库名称和能力，不返回主机路径。
 其余接口均要求 `repositoryId`：`status` 返回分支与文件状态，`branches` 返回本地/远端分支。
+客户端不得将主机路径当作 B1 写操作的 `repositoryId`；服务端仅接受由 `context` 返回、并在授权工作区内解析的仓库标识。
 `graph` 支持 `limit/cursor` 和可选 JSON `refs`（最多 3 个 `{name,tipOid}` 引用对）；首次请求返回
 `snapshotId`、绑定的 `tips`、提交页和 `nextCursor`，后续请求必须使用同一快照的不透明游标。
 引用移动、删除、tip 不匹配、仓库变化、游标上下文错误或快照过期返回 `409 graph-stale`，客户端不得
@@ -606,6 +607,24 @@ B0 在同一 Git 移动契约下提供持久化任务查询基础设施。`GET /
 `unknown-result`。`POST /m/api/git/recovery/acknowledge` 必须携带新的控制
 `requestId`、`operationId`、`repositoryId` 和 `expectedRevision`；它只解除用户已查看事实后的
 恢复阻塞，不重放旧操作。SSE `/m/api/events` 增加 `git/operation` 帧，包含完整操作视图和单调
-`revision`；事件重复或丢失都不改变账本事实，客户端重连后必须重新查询 operationId。
+`revision`；B1 的 `git/changed` 帧仍至少包含 `repositoryId`，并可带 `changeKinds`（如 `index`、`head`）提示
+客户端刷新对应事实。事件重复或丢失都不改变账本事实，客户端重连后必须重新查询 operationId。
 B0 暂不开放 Git 写操作 endpoint；`git.capabilities.operations` 用于声明任务账本、幂等、恢复和
 取消基础设施是否可用。
+
+#### Slice B1 暂存与精确提交
+
+`POST /m/api/git/change-sets` 请求 `{repositoryId,kind}`，其中 `kind` 为 `working|staged`；响应返回
+短期 `changeSetId`、`stateVersion`、`preconditionToken` 和文件/可选 hunk 清单。客户端只提交
+`fileId` 与 `hunkId`，不得提交 patch；未跟踪、二进制和重命名首版仅支持整文件操作。
+
+`POST /m/api/git/stage` 与 `/m/api/git/unstage` 请求 `{repositoryId,requestId,changeSetId,
+preconditionToken,selections}`，`selections` 为 `[{fileId,hunkIds?}]`，立即返回 `202` 的 Git 操作任务。
+服务端在私有临时 index 中执行并通过 Git index lock 原子安装，change-set 事实变化返回
+`409 state-changed` 或 `409 hunk-stale`，不会部分应用。
+
+`POST /m/api/git/commit/preflight` 请求 `{repositoryId,message}`，响应返回 staged tree、当前 HEAD、
+本地分支、提交身份和绑定这些事实的 `preconditionToken`。随后 `POST /m/api/git/commit` 请求
+`{repositoryId,requestId,message,preconditionToken,confirm:true}`，立即返回 `202` 任务；提交任务使用
+`commit-tree` 加 expected HEAD 的 `update-ref` CAS，不运行 hooks，HEAD/tree 变化返回
+`409 state-changed`。任务成功结果包含新 commit OID、tree OID 和分支。

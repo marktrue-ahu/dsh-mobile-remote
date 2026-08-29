@@ -85,7 +85,8 @@ challenge 的消费与操作任务创建必须是同一账本事务；重复、�
 ### Slice A：基础与只读
 
 当前实现状态：已接入 mobile-remote 的 `gitService` provider seam 与 `/m/api/git/*` 只读桥；Flutter
-快捷栏、状态/分支/提交图/差异视图已落地。provider 不可用时保持可见的能力降级；写操作仍按下列 Slice B/C 规划。
+快捷栏、状态/分支/提交图/差异视图已落地。provider 不可用时保持可见的能力降级；B1 写闭环由独立
+`gitWriteService` 投影，仍不把 Git 命令或 provider DTO 暴露给 Flutter。
 
 - provider 可用性和诊断；
 - 仓库状态、当前分支和 ahead/behind；
@@ -138,6 +139,13 @@ challenge 的消费与操作任务创建必须是同一账本事务；重复、�
 - 颜色不足时保持固定节点尺寸和引用文字标签，不依赖颜色单独识别。
 - 默认 provider 的命令输出解析属于 provider 实现边界，不进入移动协议。若使用 NUL 分隔记录，必须在 provider 单元测试中验证记录边界 CR/LF 清理和尾部空记录过滤，确保 OID、分支名、远程标志和引用字段不携带 framing 字符。
 - 该方案是 Slice A 的只读增强，不扩大分支切换、提交、同步等写操作范围；服务边界遵循 [ADR 0001](../adr/0001-mobile-git-scope.md) 与 [ADR 0002](../adr/0002-git-provider-integration.md)，tip 绑定的短期图快照与分页决策见 [ADR 0005](../adr/0005-tip-bound-git-graph-snapshots.md)。
+
+### Slice B1：暂存与精确提交（已实现）
+
+- `gitWriteService` 创建短期 change-set，绑定仓库、HEAD、index tree、工作区 diff/status 事实与 TTL；
+- 客户端只选择服务端生成的 fileId/hunkId。临时 index 中执行 file/hunk stage 与 unstage，再通过 index lock 原子安装；未跟踪、二进制和重命名首版只支持整文件；
+- commit 使用预演返回的 staged tree 与 HEAD 前置条件，以 `commit-tree` 创建对象并以 `update-ref` CAS 更新当前本地分支，不运行 hooks；
+- B1 任务接入 B0 的幂等、仓库串行、取消、SSE 查询和 stale/unknown-result 语义；外部 Git 消费者仍为 detect-only；
 
 ### Slice B：日常写闭环
 

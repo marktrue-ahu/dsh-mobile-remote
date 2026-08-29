@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -39,6 +39,12 @@ function config() {
 		lanBridge: { enabled: false, port: 3080, host: "127.0.0.1" },
 	};
 }
+
+test("B1 write routes are POST-only and do not shadow GET commit details", () => {
+	const source = readFileSync(new URL("../lib/index.js", import.meta.url), "utf8");
+	assert.match(source, /if \(method === "POST" && \["\/git\/change-sets"/);
+	assert.ok(source.includes('const gitMatch = /^\\/git\\/(context|status|branches|graph|commit|diff)$/.exec(rest);'));
+});
 
 test("B0 operation list is exposed through the mobile API and capabilities", async (t) => {
 	let apply;
