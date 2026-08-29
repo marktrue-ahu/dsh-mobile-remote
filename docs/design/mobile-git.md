@@ -61,22 +61,24 @@ intent + requestId + repositoryId
        events + resumable query
 ```
 
-终态包括 `succeeded`、`failed`、`cancelled`、`conflicted` 和 `unknown-result`。手机断线或请求超时后必须先按 `operationId` 查询，不得自动重复写操作。
+B0 已在 [`lib/git-operations.js`](../../lib/git-operations.js) 落地任务模块。它提供带事务帧的追加日志、原子快照、幂等占位、状态迁移、协调域队列、取消、启动调和和事件投影。完整事务帧包含长度、校验和及单一 payload；截断尾帧不会生效。`challenge consumed + operation created` 等变化必须由一个事务提交。
 
-同一仓库同时只运行一个写任务。读取可以并发，但每个写意图都要记录创建时的仓库状态版本；执行前状态发生变化时应重新预检或返回 `state-changed`。同步过程逐段展示 fetch、pull、push，任何一步失败或冲突都停止后续阶段。
+终态包括 `succeeded`、`failed`、`cancelled`、`conflicted` 和 `unknown-result`。手机断线或请求超时后必须先按 `operationId` 查询，不得自动重复写操作。`running` 任务在重启时只能由只读调和决定；不能证明结果时进入 `unknown-result` 并阻塞对应协调域。
 
-取消只终止仍在运行的命令。已经更新的引用、工作区或远端不能因取消而宣称回滚。若仓库进入 merge/rebase/cherry-pick 等中间状态，provider 单独报告可用的 abort/continue 操作；首版只开放安全可验证的 abort，continue 与冲突编辑后置。
+同一协调域同时只运行一个写任务。读取可以并发；不同 worktree 的共享 refs 使用 common domain 协调。B0 的任务 manager 还使用实例 owner 文件和每协调域 lease 文件防止同一 provider 重入。它不能锁住终端等外部 Git 消费者，因此操作前后做事实检测，外部竞争属于 `detect-only`，不得假装回滚。
+
+每个写意图都绑定操作特定的 `preconditionToken`，而全局 `stateVersion` 只用于读视图刷新。取消先落盘 `cancelRequested` 再终止子进程；已经更新的引用、工作区或远端不能因取消而宣称回滚。若仓库进入 merge/rebase/cherry-pick 等中间状态，provider 单独报告可用的 abort/continue 操作；首版只开放安全可验证的 abort，continue 与冲突编辑后置。
 
 ## 5. 破坏性操作与确认
 
-普通移动认证只能证明调用者有权访问 mobile-remote，不能替代对具体破坏性操作的确认。服务端确认挑战需要绑定：
+普通移动认证只能证明调用者有权访问 mobile-remote，不能替代对具体破坏性操作的确认。Slice B 普通 commit 使用 UI 独立明确确认但不申请 challenge；当前 B0 唯一需要服务端 challenge 的开放破坏性操作是 merge/rebase abort。挑战绑定：
 
-- repositoryId 和当前状态版本；
-- 操作类型及完整参数；
-- 当前用户或连接身份；
-- 一次性随机值和短有效期。
+- repositoryId、协调域和操作特定 preconditionToken 摘要；
+- 操作类型及按 canonical JSON 编码的完整参数摘要；
+- 当前共享 authToken 凭据版本的不可逆摘要；
+- 一次性随机值、服务端时间和不超过两分钟的有效期。
 
-删除未合并分支、放弃改动、drop stash、reset、clean、远端删除和 force push 未携带有效挑战时必须拒绝。force push、reset、clean 和远端分支重命名/删除默认不进入首版快捷功能。
+challenge 的消费与操作任务创建必须是同一账本事务；重复、过期、参数变化或跨仓库使用都拒绝。它只防误触、旧状态、参数篡改和重放，不能抵御 authToken 泄漏。Slice B 只有 merge/rebase abort 开放服务端 challenge；删除分支、放弃改动、drop stash、reset、clean、远端删除和 force push 不提供执行端点。
 
 ## 6. 功能交付顺序
 

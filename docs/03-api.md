@@ -590,3 +590,22 @@ shell 命令。Slice A 不提供切换/创建/删除分支、fetch/pull/push、s
 引用移动、删除、tip 不匹配、仓库变化、游标上下文错误或快照过期返回 `409 graph-stale`，客户端不得
 静默回退到全量图。`commit` 要求 `oid`，`diff` 支持 `kind=working|staged|commit`、`oid/path`。
 越过工作区边界返回 `403 workspace-not-allowed`，非 Git 目录返回 `404 not-git-repository`。
+
+#### Slice B0 操作任务
+
+B0 在同一 Git 移动契约下提供持久化任务查询基础设施。`GET /m/api/git/operations` 支持
+`repositoryId`、`status`、`limit`（1–100）和不透明 `cursor`；`GET
+/m/api/git/operations/:operationId` 查询单项任务。查询响应包含 `operationId`、`requestId`、`repositoryId`、`kind`、`status`、`revision`、阶段、可取消性、结果/脱敏错误和恢复阻塞事实。
+
+`POST /m/api/git/operations/:operationId/cancel` 的 JSON 请求体必须包含新的控制
+`requestId` 和查询时的 `expectedRevision`。它只接受 `queued` 或 `running`；排队任务立即进入
+`cancelled`，运行任务先持久化取消请求再尽力终止子进程，不能宣称已回滚。重复的相同控制
+`requestId` 返回原结果，revision 不匹配返回 `409 state-changed`。
+
+任务状态为 `queued`、`running` 或终态 `succeeded`、`failed`、`cancelled`、`conflicted`、
+`unknown-result`。`POST /m/api/git/recovery/acknowledge` 必须携带新的控制
+`requestId`、`operationId`、`repositoryId` 和 `expectedRevision`；它只解除用户已查看事实后的
+恢复阻塞，不重放旧操作。SSE `/m/api/events` 增加 `git/operation` 帧，包含完整操作视图和单调
+`revision`；事件重复或丢失都不改变账本事实，客户端重连后必须重新查询 operationId。
+B0 暂不开放 Git 写操作 endpoint；`git.capabilities.operations` 用于声明任务账本、幂等、恢复和
+取消基础设施是否可用。
