@@ -579,7 +579,7 @@
 
 Git 接口由项目自有 provider 提供，执行通过 DSH `subprocess`，仓库必须位于
 `workspaceRegistry` 已注册工作区内。`repositoryId` 为 provider 分配的不透明仓库标识，客户端不得自行拼接
-shell 命令。Slice A 不提供切换/创建/删除分支、fetch/pull/push、stage/commit、stash 或 tags 写操作。
+shell 命令。Slice A 是只读基础；B1/B2 已另外提供受保护的 stage/commit 与本地分支写操作，仍不提供删除分支、fetch/pull/push、stash 或 tags 写操作。
 
 `GET /m/api/git/capabilities` 始终返回 `{ok, git:{available,read,writes,reason,features}}`，不可用时
 由 `available=false` 明确表达；实际仓库操作在 provider 不可用时返回 `503 git-provider-unavailable`。
@@ -609,8 +609,10 @@ B0 在同一 Git 移动契约下提供持久化任务查询基础设施。`GET /
 恢复阻塞，不重放旧操作。SSE `/m/api/events` 增加 `git/operation` 帧，包含完整操作视图和单调
 `revision`；B1 的 `git/changed` 帧仍至少包含 `repositoryId`，并可带 `changeKinds`（如 `index`、`head`）提示
 客户端刷新对应事实。事件重复或丢失都不改变账本事实，客户端重连后必须重新查询 operationId。
-B0 暂不开放 Git 写操作 endpoint；`git.capabilities.operations` 用于声明任务账本、幂等、恢复和
-取消基础设施是否可用。
+B0 不定义具体 Git 写操作；B1/B2 写端点复用 B0 任务账本。所有返回 `202` 的执行端点统一返回 accepted DTO：
+`{ok:true,accepted:true,operationId,requestId,status,deduplicated,queryUrl,queryLink,operation}`。
+其中 `queryUrl`/`queryLink` 是可直接 GET 的相对链接 `/git/operations/:operationId`；客户端应按该链接查询，不能把 `operation` 快照当作最终结果。
+`git.capabilities.operations` 用于声明任务账本、幂等、恢复和取消基础设施是否可用。
 
 #### Slice B1 暂存与精确提交
 
@@ -628,3 +630,23 @@ preconditionToken,selections}`，`selections` 为 `[{fileId,hunkIds?}]`，立即
 `{repositoryId,requestId,message,preconditionToken,confirm:true}`，立即返回 `202` 任务；提交任务使用
 `commit-tree` 加 expected HEAD 的 `update-ref` CAS，不运行 hooks，HEAD/tree 变化返回
 `409 state-changed`。任务成功结果包含新 commit OID、tree OID 和分支。
+
+#### Slice B2 本地分支与受保护切换
+
+`POST /m/api/git/branches/preflight` 的 `action` 只能为 `create|rename`（缺失或其他值均为
+`400 invalid-argument`）。预检返回规范化的 `params`；执行请求必须携带**同一个** `params` 对象，另加
+`{repositoryId,requestId,preconditionToken}`。创建参数为 `{name,startOid,remoteRef?}`（默认从当前 HEAD，
+远端起点必须是已验证且仍存在的精确 `refs/remotes/<remote>/<branch>`）；rename 参数为
+`{oldName,name,oldOid}`。创建成功不会自动切换。
+
+`POST /m/api/git/branch-rename` 使用 `{repositoryId,requestId,params:{oldName,name,oldOid},preconditionToken}`，
+只重命名本地分支，不修改远端引用。非法/重复/不存在分支分别返回稳定的 `invalid-argument`、
+`branch-exists` 或 `branch-not-found`。
+
+`POST /m/api/git/branch-switch/preflight` 的 action 固定为 `switch`，使用 `targetBranch` 或已验证的
+`targetRef`。远端引用必须是 provider 精确验证的 `refs/remotes/<remote>/<branch>`；远端切换必须明确
+`localName`，该值同时成为规范 `params.targetBranch`，不会隐式猜测本地名称。返回目标 OID 与影响摘要。
+干净工作区或 Git 可安全携带的改动返回 `safe:true` 和 token；存在覆盖风险时返回 `safe:false` 及
+`allowedActions: ["commit","computer","cancel"]`，不签发强制切换 token。`POST /m/api/git/branch-switch`
+必须提交预检返回的同一 `params`，只执行无 force 的安全切换；所有分支写操作均作为 B0 Git 操作任务返回
+`202` accepted DTO。

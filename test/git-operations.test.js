@@ -169,6 +169,107 @@ test("unknown-result blocks a domain until an explicit recovery acknowledgement"
 	} finally { manager.stop(); cleanup(); }
 });
 
+test("a blocked dual-domain operation blocks a single-domain follower", async () => {
+	const { manager, cleanup } = await managerFixture();
+	try {
+		manager.registerExecutor("uncertain-dual", async () => { throw new GitOperationError("unknown-result", "uncertain"); });
+		manager.registerExecutor("ok-dual", async () => ({ status: "succeeded" }));
+		const blocker = await manager.submit({ repositoryId: "repo", requestId: request(20), kind: "uncertain-dual", coordinationDomains: ["b", "a"], preconditionToken: "p" });
+		await new Promise((resolve) => setImmediate(resolve));
+		const follower = await manager.submit({ repositoryId: "repo", requestId: request(21), kind: "ok-dual", coordinationDomain: "b", preconditionToken: "p" });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(manager.get(follower.operationId).status, "queued");
+		assert.deepEqual(manager.get(blocker.operationId).coordinationDomains, ["a", "b"]);
+	} finally { manager.stop(); cleanup(); }
+});
+
+test("disjoint multi-domain operations run concurrently", async () => {
+	const { manager, cleanup } = await managerFixture();
+	try {
+		let active = 0; let maximum = 0;
+		manager.registerExecutor("disjoint", async () => {
+			maximum = Math.max(maximum, ++active);
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			active--;
+			return { status: "succeeded" };
+		});
+		await Promise.all([
+			manager.submit({ repositoryId: "r1", requestId: request(22), kind: "disjoint", coordinationDomains: ["a", "b"], preconditionToken: "p" }),
+			manager.submit({ repositoryId: "r2", requestId: request(23), kind: "disjoint", coordinationDomains: ["c", "d"], preconditionToken: "p" }),
+		]);
+		await new Promise((resolve) => setTimeout(resolve, 35));
+		assert.equal(maximum, 2);
+	} finally { manager.stop(); cleanup(); }
+});
+
+test("domain order is normalized and shared-domain FIFO is preserved", async () => {
+	const { manager, cleanup } = await managerFixture();
+	try {
+		const starts = []; let release;
+		const gate = new Promise((resolve) => { release = resolve; });
+		manager.registerExecutor("ordered", async ({ operation }) => { starts.push(operation.params.name); if (operation.params.name === "first") await gate; return { status: "succeeded" }; });
+		const first = await manager.submit({ repositoryId: "repo", requestId: request(24), kind: "ordered", params: { name: "first" }, coordinationDomains: ["b", "a", "a"], preconditionToken: "p" });
+		const second = await manager.submit({ repositoryId: "repo", requestId: request(25), kind: "ordered", params: { name: "second" }, coordinationDomains: ["a", "b"], preconditionToken: "p" });
+		const duplicate = await manager.submit({ repositoryId: "repo", requestId: request(24), kind: "ordered", params: { name: "first" }, coordinationDomains: ["a", "b"], preconditionToken: "p" });
+		assert.equal(duplicate.deduplicated, true);
+		assert.deepEqual(first.coordinationDomains, ["a", "b"]);
+		assert.deepEqual(second.coordinationDomains, ["a", "b"]);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.deepEqual(starts, ["first"]);
+		release();
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.deepEqual(starts, ["first", "second"]);
+	} finally { manager.stop(); cleanup(); }
+});
+
+test("queued cancellation removes a multi-domain operation from every queue", async () => {
+	const { manager, cleanup } = await managerFixture();
+	try {
+		let release; const gate = new Promise((resolve) => { release = resolve; }); const starts = [];
+		manager.registerExecutor("cancel-dual", async ({ operation }) => { starts.push(operation.params.name); if (operation.params.name === "first") await gate; return { status: "succeeded" }; });
+		await manager.submit({ repositoryId: "repo", requestId: request(26), kind: "cancel-dual", params: { name: "first" }, coordinationDomains: ["a", "b"], preconditionToken: "p" });
+		const cancelled = await manager.submit({ repositoryId: "repo", requestId: request(27), kind: "cancel-dual", params: { name: "cancelled" }, coordinationDomains: ["a", "b"], preconditionToken: "p" });
+		const view = manager.get(cancelled.operationId);
+		assert.equal((await manager.cancel(cancelled.operationId, { requestId: request(28), expectedRevision: view.revision })).status, "cancelled");
+		release();
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.deepEqual(starts, ["first"]);
+	} finally { manager.stop(); cleanup(); }
+});
+
+test("unknown-result blocks every domain and acknowledgement releases only its blocker", async () => {
+	const { manager, cleanup } = await managerFixture();
+	try {
+		manager.registerExecutor("uncertain-all", async () => { throw new GitOperationError("unknown-result", "uncertain"); });
+		manager.registerExecutor("ok-all", async () => ({ status: "succeeded" }));
+		const uncertain = await manager.submit({ repositoryId: "repo", requestId: request(29), kind: "uncertain-all", coordinationDomains: ["a", "b"], preconditionToken: "p" });
+		await new Promise((resolve) => setImmediate(resolve));
+		const a = await manager.submit({ repositoryId: "repo", requestId: request(30), kind: "ok-all", coordinationDomain: "a", preconditionToken: "p" });
+		const b = await manager.submit({ repositoryId: "repo", requestId: request(31), kind: "ok-all", coordinationDomain: "b", preconditionToken: "p" });
+		assert.equal(manager.get(a.operationId).recoveryBlocked, true);
+		assert.equal(manager.get(b.operationId).recoveryBlocked, true);
+		const view = manager.get(uncertain.operationId);
+		await manager.acknowledgeRecovery({ repositoryId: "repo", operationId: uncertain.operationId, requestId: request(32), expectedRevision: view.revision, facts: { confirmed: true, stateVersion: "v", observedAt: Date.now() } });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(manager.get(a.operationId).status, "succeeded");
+		assert.equal(manager.get(b.operationId).status, "succeeded");
+	} finally { manager.stop(); cleanup(); }
+});
+
+test("legacy coordinationDomain-only records remain runnable", async () => {
+	const f = fixture();
+	try {
+		const ledger = new OperationLedger({ filePath: f.filePath });
+		ledger.transaction([{ type: "operation.created", operationId: "legacy-op", requestKey: "actor:legacy-request", requestDigest: "legacy", operation: { operationId: "legacy-op", requestId: request(33), repositoryId: "repo", coordinationDomain: "repo", kind: "legacy", params: {}, status: "queued", revision: 1, createdAt: 1, updatedAt: 1 } }]);
+		const manager = createGitOperationManager({ filePath: f.filePath });
+		await manager.start();
+		manager.registerExecutor("legacy", async () => ({ status: "succeeded" }));
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(manager.get("legacy-op").status, "succeeded");
+		manager.stop();
+	} finally { f.cleanup(); }
+});
+
 test("recovery facts can be checked against provider read-only facts", async () => {
 	const { manager, cleanup } = await managerFixture({ verifyRecoveryFacts: async ({ facts }) => facts.stateVersion === "current" });
 	try {
@@ -177,6 +278,57 @@ test("recovery facts can be checked against provider read-only facts", async () 
 		await new Promise((resolve) => setImmediate(resolve));
 		const view = manager.get(op.operationId);
 		await assert.rejects(() => manager.acknowledgeRecovery({ repositoryId: "repo", operationId: op.operationId, requestId: request(19), expectedRevision: view.revision, facts: { confirmed: true, stateVersion: "stale", observedAt: Date.now() } }), (error) => error.code === "state-changed");
+	} finally { manager.stop(); cleanup(); }
+});
+
+test("acknowledged follower unlock survives manager restart replay", async () => {
+	const f = fixture();
+	try {
+		const first = createGitOperationManager({ filePath: f.filePath });
+		await first.start();
+		first.registerExecutor("restart-uncertain", async () => { throw new GitOperationError("unknown-result", "uncertain"); });
+		const blocker = await first.submit({ repositoryId: "repo", requestId: request(34), kind: "restart-uncertain", preconditionToken: "p" });
+		await new Promise((resolve) => setImmediate(resolve));
+		const follower = await first.submit({ repositoryId: "repo", requestId: request(35), kind: "restart-follower", preconditionToken: "p" });
+		assert.equal(first.get(follower.operationId).recoveryBlocked, true);
+		const blockerView = first.get(blocker.operationId);
+		await first.acknowledgeRecovery({ repositoryId: "repo", operationId: blocker.operationId, requestId: request(36), expectedRevision: blockerView.revision, facts: { confirmed: true, stateVersion: "v", observedAt: Date.now() } });
+		assert.equal(first.get(follower.operationId).recoveryBlocked, undefined);
+		first.stop();
+
+		const second = createGitOperationManager({ filePath: f.filePath });
+		try {
+			await second.start();
+			second.registerExecutor("restart-follower", async () => ({ status: "succeeded" }));
+			await new Promise((resolve) => setImmediate(resolve));
+			assert.equal(second.get(follower.operationId).status, "succeeded");
+		} finally { second.stop(); }
+	} finally { f.cleanup(); }
+});
+
+test("concurrent recovery acknowledgements recheck state after fact verification", async () => {
+	let verified = 0;
+	let releaseVerification;
+	const bothVerified = new Promise((resolve) => { releaseVerification = resolve; });
+	const { manager, cleanup } = await managerFixture({ verifyRecoveryFacts: async () => {
+		verified++;
+		if (verified === 2) releaseVerification();
+		await bothVerified;
+		return true;
+	} });
+	try {
+		manager.registerExecutor("race-uncertain", async () => { throw new GitOperationError("unknown-result", "uncertain"); });
+		const blocker = await manager.submit({ repositoryId: "repo", requestId: request(37), kind: "race-uncertain", preconditionToken: "p" });
+		await new Promise((resolve) => setImmediate(resolve));
+		const view = manager.get(blocker.operationId);
+		const facts = { confirmed: true, stateVersion: "v", observedAt: Date.now() };
+		const results = await Promise.allSettled([
+			manager.acknowledgeRecovery({ repositoryId: "repo", operationId: blocker.operationId, requestId: request(38), expectedRevision: view.revision, facts }),
+			manager.acknowledgeRecovery({ repositoryId: "repo", operationId: blocker.operationId, requestId: request(39), expectedRevision: view.revision, facts }),
+		]);
+		assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+		assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+		assert.ok(["state-changed", "idempotency-conflict"].includes(results.find((result) => result.status === "rejected").reason.code));
 	} finally { manager.stop(); cleanup(); }
 });
 

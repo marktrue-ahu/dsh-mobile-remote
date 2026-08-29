@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createGitOperationManager } from "../lib/git-operations.js";
+import { acceptedOperationResponse } from "../lib/git-write-service.js";
 
 function response() {
 	const res = new EventEmitter();
@@ -40,9 +41,28 @@ function config() {
 	};
 }
 
+test("accepted operation DTO is stable and queryable", () => {
+	const dto = acceptedOperationResponse({ operationId: "op/1", requestId: "req-12345678", status: "queued", deduplicated: true });
+	assert.deepEqual(dto, {
+		ok: true, accepted: true, operationId: "op/1", requestId: "req-12345678", status: "queued", deduplicated: true,
+		queryUrl: "/git/operations/op%2F1", queryLink: "/git/operations/op%2F1",
+		operation: { operationId: "op/1", requestId: "req-12345678", status: "queued", deduplicated: true },
+	});
+});
+
+test("B2 route contracts are explicit", () => {
+	const source = readFileSync(new URL("../lib/index.js", import.meta.url), "utf8");
+	assert.match(source, /action must be create or rename/);
+	assert.ok(source.includes('rest === "/git/branch-switch/preflight" ? "switch"'));
+	assert.match(source, /acceptedOperationResponse\(value/);
+	assert.match(source, /params must be the preflight params object/);
+	assert.match(source, /const params = body\.params/);
+});
+
 test("B1 write routes are POST-only and do not shadow GET commit details", () => {
 	const source = readFileSync(new URL("../lib/index.js", import.meta.url), "utf8");
 	assert.match(source, /if \(method === "POST" && \["\/git\/change-sets"/);
+	for (const route of ["/git/branches/preflight", "/git/branches", "/git/branch-switch/preflight", "/git/branch-switch", "/git/branch-rename"]) assert.ok(source.includes(`"${route}"`), `missing B2 route ${route}`);
 	assert.ok(source.includes('const gitMatch = /^\\/git\\/(context|status|branches|graph|commit|diff)$/.exec(rest);'));
 });
 

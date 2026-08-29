@@ -65,7 +65,7 @@ B0 已在 [`lib/git-operations.js`](../../lib/git-operations.js) 落地任务模
 
 终态包括 `succeeded`、`failed`、`cancelled`、`conflicted` 和 `unknown-result`。手机断线或请求超时后必须先按 `operationId` 查询，不得自动重复写操作。`running` 任务在重启时只能由只读调和决定；不能证明结果时进入 `unknown-result` 并阻塞对应协调域。
 
-同一协调域同时只运行一个写任务。读取可以并发；不同 worktree 的共享 refs 使用 common domain 协调。B0 的任务 manager 还使用实例 owner 文件和每协调域 lease 文件防止同一 provider 重入。它不能锁住终端等外部 Git 消费者，因此操作前后做事实检测，外部竞争属于 `detect-only`，不得假装回滚。
+同一协调域同时只运行一个写任务。读取可以并发；不同 worktree 的共享 refs 使用 `common` 协调域；工作区/index/head 相关操作使用 `worktree` 协调域，涉及远端 tracking branch 的切换同时占用 common + worktree。B0 的任务 manager 还使用实例 owner 文件和每协调域 lease 文件防止同一 provider 重入。它不能锁住终端等外部 Git 消费者，因此操作前后做事实检测，外部竞争属于 `detect-only`，不得假装回滚。
 
 每个写意图都绑定操作特定的 `preconditionToken`，而全局 `stateVersion` 只用于读视图刷新。取消先落盘 `cancelRequested` 再终止子进程；已经更新的引用、工作区或远端不能因取消而宣称回滚。若仓库进入 merge/rebase/cherry-pick 等中间状态，provider 单独报告可用的 abort/continue 操作；首版只开放安全可验证的 abort，continue 与冲突编辑后置。
 
@@ -85,8 +85,8 @@ challenge 的消费与操作任务创建必须是同一账本事务；重复、�
 ### Slice A：基础与只读
 
 当前实现状态：已接入 mobile-remote 的 `gitService` provider seam 与 `/m/api/git/*` 只读桥；Flutter
-快捷栏、状态/分支/提交图/差异视图已落地。provider 不可用时保持可见的能力降级；B1 写闭环由独立
-`gitWriteService` 投影，仍不把 Git 命令或 provider DTO 暴露给 Flutter。
+快捷栏、状态/分支/提交图/差异视图已落地。provider 不可用时保持可见的能力降级；B1/B2 写闭环由独立
+`gitWriteService` 投影，仍不把 Git 命令或 provider DTO 暴露给 Flutter。Slice A 本身仍只读，写能力不属于其交付范围。
 
 - provider 可用性和诊断；
 - 仓库状态、当前分支和 ahead/behind；
@@ -146,6 +146,12 @@ challenge 的消费与操作任务创建必须是同一账本事务；重复、�
 - 客户端只选择服务端生成的 fileId/hunkId。临时 index 中执行 file/hunk stage 与 unstage，再通过 index lock 原子安装；未跟踪、二进制和重命名首版只支持整文件；
 - commit 使用预演返回的 staged tree 与 HEAD 前置条件，以 `commit-tree` 创建对象并以 `update-ref` CAS 更新当前本地分支，不运行 hooks；
 - B1 任务接入 B0 的幂等、仓库串行、取消、SSE 查询和 stale/unknown-result 语义；外部 Git 消费者仍为 detect-only；
+
+### Slice B2：本地分支与受保护切换（已实现）
+
+- 本地分支创建、重命名和无 force 切换均由任务账本执行；创建默认从当前 HEAD，也可使用 provider 已验证的 commit 或远端精确引用作为起点，创建不会自动切换；远端切换必须显式提供 `localName`，并以该名称创建 tracking branch；
+- 受保护切换先检查当前 HEAD、目标 OID、工作区状态和 Git 中间态。Git 可安全携带改动时允许无 force 切换；存在覆盖风险时不签发 token，只返回提交、转电脑或取消入口；
+- 分支名称通过 Git ref 规则校验，重命名只影响本地 ref/config，不触碰远端；所有 token 在执行前重新检查，外部变化使用 `state-changed`/`unknown-result` 语义；
 
 ### Slice B：日常写闭环
 
