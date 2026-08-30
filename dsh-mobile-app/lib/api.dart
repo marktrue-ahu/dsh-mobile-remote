@@ -10,13 +10,29 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'logger.dart';
 import 'models.dart';
 import 'git_models.dart';
+import 'git_write_models.dart';
+
+Map<String, dynamic> _jsonMap(Object? value) =>
+    value is Map ? Map<String, dynamic>.from(value) : <String, dynamic>{};
 
 class ApiException implements Exception {
   final String message;
 
-  /// v3.0.0：内核错误码（如 queue-item-not-found / steer-unavailable），供 UI 区分语义
+  /// 内核/移动契约稳定错误码，供 UI 区分语义。
   final String? code;
-  ApiException(this.message, {this.code});
+  final int? statusCode;
+  final bool retryable;
+  final bool requiresRefresh;
+  final List<String> nextActions;
+
+  ApiException(
+    this.message, {
+    this.code,
+    this.statusCode,
+    this.retryable = false,
+    this.requiresRefresh = false,
+    this.nextActions = const [],
+  });
   @override
   String toString() => message;
 }
@@ -46,7 +62,93 @@ abstract interface class GitApi {
   Future<List<GitBranch>> gitBranches(String repositoryId);
 }
 
-class Api implements GitApi {
+abstract interface class GitWriteApi {
+  Future<GitChangeSet> createGitChangeSet(String repositoryId, String kind);
+  Future<GitAcceptedOperation> submitGitSelection({
+    required String repositoryId,
+    required GitChangeSet changeSet,
+    required List<GitFileSelection> selections,
+    required String requestId,
+    bool unstage,
+  });
+  Future<GitPreflight> gitCommitPreflight(String repositoryId, String message);
+  Future<GitAcceptedOperation> submitGitCommit({
+    required String repositoryId,
+    required GitPreflight preflight,
+    required String message,
+    required String requestId,
+  });
+  Future<GitPreflight> gitBranchPreflight(
+    String repositoryId, {
+    required String action,
+    String? name,
+    String? oldName,
+    String? startOid,
+    String? remoteRef,
+    String? targetBranch,
+    String? targetRef,
+    String? localName,
+  });
+  Future<GitAcceptedOperation> submitGitBranch({
+    required String repositoryId,
+    required GitPreflight preflight,
+    required String requestId,
+  });
+  Future<GitRemotes> gitRemotes(String repositoryId);
+  Future<GitPreflight> gitRemotePreflight(
+    String repositoryId, {
+    required String kind,
+    String? remote,
+    String? branch,
+    String? localBranch,
+    String? strategy,
+    bool? setUpstream,
+  });
+  Future<GitAcceptedOperation> submitGitRemote({
+    required String repositoryId,
+    required GitPreflight preflight,
+    required String requestId,
+  });
+  Future<GitPreflight> gitAbortPreflight(String repositoryId);
+  Future<GitConfirmation> issueGitConfirmation({
+    required String repositoryId,
+    required GitPreflight preflight,
+    required String confirmationRequestId,
+  });
+  Future<GitAcceptedOperation> submitGitAbort({
+    required String repositoryId,
+    required GitPreflight preflight,
+    required GitConfirmation confirmation,
+    required String requestId,
+  });
+  Future<GitOperation> gitOperation(String operationId);
+  Future<GitOperationPage> gitOperations({
+    String? repositoryId,
+    String? status,
+    String? cursor,
+    int limit,
+  });
+  Future<GitAcceptedOperation> cancelGitOperation(
+    GitOperation operation, {
+    required String requestId,
+  });
+  Future<GitOperation> handoffGitOperation(
+    GitOperation operation, {
+    required String target,
+    required String requestId,
+  });
+  Future<GitOperation> acknowledgeGitRecovery(
+    GitOperation operation, {
+    required String stateVersion,
+    required String requestId,
+  });
+}
+
+class Api implements GitApi, GitWriteApi {
+  final http.Client _client;
+
+  Api({http.Client? client}) : _client = client ?? http.Client();
+
   String baseUrl = '';
   String token = '';
 
@@ -67,8 +169,7 @@ class Api implements GitApi {
   static const _maxUrls = 8;
 
   /// 共享 HTTP 客户端：SSE 重连复用同一连接池，避免每次 new Client 泄漏
-  /// socket/定时器导致内存耗尽闪退。
-  final http.Client _client = http.Client();
+  /// socket/定时器导致内存耗尽闪退。构造注入仅用于契约测试。
 
   /// 地址归一：只保留 scheme://host[:port]（路径剥掉）——挂载路径由 [_pathOf] 单独解析。
   static String _normBase(String s) {
@@ -275,10 +376,15 @@ class Api implements GitApi {
     String path,
     Map<String, dynamic> body, {
     Duration timeout = const Duration(seconds: 20),
+    Map<String, String> headers = const {},
   }) async {
     try {
       final res = await _client
-          .post(_uri(path), headers: _headers, body: jsonEncode(body))
+          .post(
+            _uri(path),
+            headers: {..._headers, ...headers},
+            body: jsonEncode(body),
+          )
           .timeout(timeout);
       return _decode(res);
     } catch (e) {
@@ -291,20 +397,35 @@ class Api implements GitApi {
     // v2.9.0 review(LOW#7)：非 JSON 错误体（反代 HTML 页等）不再抛 FormatException，回退 HTTP <status>
     Map<String, dynamic>? body;
     try {
-      body = jsonDecode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
+      final decoded = jsonDecode(utf8.decode(res.bodyBytes));
+      body = decoded is Map ? Map<String, dynamic>.from(decoded) : null;
     } catch (_) {
       body = null;
     }
-    if (res.statusCode != 200) {
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      final detail = body?['detail'];
+      final error = body?['error'];
+      final rawNextActions = body?['nextActions'];
+      final nextActions = rawNextActions is List
+          ? rawNextActions
+                .map((item) => item.toString())
+                .toList(growable: false)
+          : const <String>[];
       throw ApiException(
-        (body?['detail'] as String?) ??
-            (body?['error'] as String?) ??
-            'HTTP ${res.statusCode}',
-        code: body?['error'] is String ? (body?['error'] as String) : null,
+        detail is String && detail.isNotEmpty
+            ? detail
+            : error is String && error.isNotEmpty
+            ? error
+            : 'HTTP ${res.statusCode}',
+        code: body?['errorCode']?.toString() ?? body?['error']?.toString(),
+        statusCode: res.statusCode,
+        retryable: body?['retryable'] == true,
+        requiresRefresh: body?['requiresRefresh'] == true,
+        nextActions: nextActions,
       );
     }
-    if (body == null) throw ApiException('HTTP ${res.statusCode}');
-    return body;
+    // A successful endpoint may legitimately return 204 with no JSON body.
+    return body ?? <String, dynamic>{};
   }
 
   // ── 业务接口 ──
@@ -867,6 +988,351 @@ class Api implements GitApi {
     if (oid != null) q.write('&oid=${Uri.encodeQueryComponent(oid)}');
     if (path != null) q.write('&path=${Uri.encodeQueryComponent(path)}');
     return GitDiff.fromJson(await getJson('/api/git/diff?$q'));
+  }
+
+  static const _gitContractHeaders = <String, String>{
+    'x-dsh-git-contract': '2.0',
+  };
+
+  Future<Map<String, dynamic>> _gitPost(
+    String route,
+    Map<String, dynamic> body,
+  ) => postJson(route, body, headers: _gitContractHeaders);
+
+  GitAcceptedOperation _accepted(Map<String, dynamic> json) {
+    final value = GitAcceptedOperation.fromJson(json);
+    if (!value.accepted || value.operation.operationId.isEmpty) {
+      throw ApiException(
+        'Git write response did not contain an accepted operation',
+        code: 'provider-invalid-response',
+      );
+    }
+    return value;
+  }
+
+  GitPreflight _preflight(
+    Map<String, dynamic> json, {
+    required String repositoryId,
+    required String operationKind,
+  }) {
+    final value = GitPreflight.fromJson(json);
+    if (value.repositoryId != repositoryId ||
+        value.operationKind != operationKind) {
+      throw ApiException(
+        'Git preflight response does not match the requested repository or operation',
+        code: 'provider-invalid-response',
+      );
+    }
+    return value;
+  }
+
+  @override
+  Future<GitChangeSet> createGitChangeSet(
+    String repositoryId,
+    String kind,
+  ) async {
+    final json = await _gitPost('/api/git/change-sets', {
+      'repositoryId': repositoryId,
+      'kind': kind,
+    });
+    return GitChangeSet.fromJson(_jsonMap(json['changeSet']));
+  }
+
+  @override
+  Future<GitAcceptedOperation> submitGitSelection({
+    required String repositoryId,
+    required GitChangeSet changeSet,
+    required List<GitFileSelection> selections,
+    required String requestId,
+    bool unstage = false,
+  }) async => _accepted(
+    await _gitPost(unstage ? '/api/git/unstage' : '/api/git/stage', {
+      'repositoryId': repositoryId,
+      'requestId': requestId,
+      'changeSetId': changeSet.changeSetId,
+      'selections': selections.map((selection) => selection.toJson()).toList(),
+      'preconditionToken': changeSet.preconditionToken,
+    }),
+  );
+
+  @override
+  Future<GitPreflight> gitCommitPreflight(
+    String repositoryId,
+    String message,
+  ) async {
+    final json = await _gitPost('/api/git/commit/preflight', {
+      'repositoryId': repositoryId,
+      'message': message,
+    });
+    final value = _jsonMap(json['preflight']);
+    value.putIfAbsent('operationKind', () => 'git.commit');
+    value['message'] = message;
+    return _preflight(
+      value,
+      repositoryId: repositoryId,
+      operationKind: 'git.commit',
+    );
+  }
+
+  @override
+  Future<GitAcceptedOperation> submitGitCommit({
+    required String repositoryId,
+    required GitPreflight preflight,
+    required String message,
+    required String requestId,
+  }) async => _accepted(
+    await _gitPost('/api/git/commit', {
+      'repositoryId': repositoryId,
+      'requestId': requestId,
+      'message': message,
+      'preconditionToken': preflight.preconditionToken,
+      'confirm': true,
+    }),
+  );
+
+  @override
+  Future<GitPreflight> gitBranchPreflight(
+    String repositoryId, {
+    required String action,
+    String? name,
+    String? oldName,
+    String? startOid,
+    String? remoteRef,
+    String? targetBranch,
+    String? targetRef,
+    String? localName,
+  }) async {
+    if (!const {'create', 'rename', 'switch'}.contains(action)) {
+      throw ArgumentError.value(action, 'action');
+    }
+    final switching = action == 'switch';
+    final json = await _gitPost(
+      switching
+          ? '/api/git/branch-switch/preflight'
+          : '/api/git/branches/preflight',
+      {
+        'repositoryId': repositoryId,
+        if (!switching) 'action': action,
+        if (name != null) 'name': name,
+        if (oldName != null) 'oldName': oldName,
+        if (startOid != null) 'startOid': startOid,
+        if (remoteRef != null) 'remoteRef': remoteRef,
+        if (targetBranch != null) 'targetBranch': targetBranch,
+        if (targetRef != null) 'targetRef': targetRef,
+        if (localName != null) 'localName': localName,
+      },
+    );
+    final value = _jsonMap(json['preflight']);
+    value.putIfAbsent('operationKind', () => 'git.branch-$action');
+    return _preflight(
+      value,
+      repositoryId: repositoryId,
+      operationKind: 'git.branch-$action',
+    );
+  }
+
+  @override
+  Future<GitAcceptedOperation> submitGitBranch({
+    required String repositoryId,
+    required GitPreflight preflight,
+    required String requestId,
+  }) async {
+    final action = preflight.action;
+    final route = action == 'switch'
+        ? '/api/git/branch-switch'
+        : action == 'rename'
+        ? '/api/git/branch-rename'
+        : '/api/git/branches';
+    return _accepted(
+      await _gitPost(route, {
+        'repositoryId': repositoryId,
+        'requestId': requestId,
+        'params': preflight.params,
+        'preconditionToken': preflight.preconditionToken,
+      }),
+    );
+  }
+
+  @override
+  Future<GitRemotes> gitRemotes(
+    String repositoryId,
+  ) async => GitRemotes.fromJson(
+    await getJson(
+      '/api/git/remotes?repositoryId=${Uri.encodeQueryComponent(repositoryId)}',
+    ),
+  );
+
+  @override
+  Future<GitPreflight> gitRemotePreflight(
+    String repositoryId, {
+    required String kind,
+    String? remote,
+    String? branch,
+    String? localBranch,
+    String? strategy,
+    bool? setUpstream,
+  }) async {
+    const allowed = {'fetch', 'pull', 'push', 'sync'};
+    if (!allowed.contains(kind)) throw ArgumentError.value(kind, 'kind');
+    final json = await _gitPost('/api/git/$kind/preflight', {
+      'repositoryId': repositoryId,
+      if (remote != null) 'remote': remote,
+      if (branch != null) 'branch': branch,
+      if (localBranch != null) 'localBranch': localBranch,
+      if (strategy != null && (kind == 'pull' || kind == 'sync'))
+        'strategy': strategy,
+      if (setUpstream != null && (kind == 'push' || kind == 'sync'))
+        'setUpstream': setUpstream,
+    });
+    return _preflight(
+      _jsonMap(json['preflight']),
+      repositoryId: repositoryId,
+      operationKind: 'git.$kind',
+    );
+  }
+
+  @override
+  Future<GitAcceptedOperation> submitGitRemote({
+    required String repositoryId,
+    required GitPreflight preflight,
+    required String requestId,
+  }) async {
+    final kind = preflight.action;
+    if (!const {'fetch', 'pull', 'push', 'sync'}.contains(kind)) {
+      throw ArgumentError.value(kind, 'preflight.operationKind');
+    }
+    return _accepted(
+      await _gitPost('/api/git/$kind', {
+        'repositoryId': repositoryId,
+        'requestId': requestId,
+        'params': preflight.params,
+        'preconditionToken': preflight.preconditionToken,
+      }),
+    );
+  }
+
+  @override
+  Future<GitPreflight> gitAbortPreflight(String repositoryId) async {
+    final json = await _gitPost('/api/git/abort/preflight', {
+      'repositoryId': repositoryId,
+    });
+    return GitPreflight.fromJson(_jsonMap(json['preflight']));
+  }
+
+  @override
+  Future<GitConfirmation> issueGitConfirmation({
+    required String repositoryId,
+    required GitPreflight preflight,
+    required String confirmationRequestId,
+  }) async => GitConfirmation.fromJson(
+    await _gitPost('/api/git/confirmations', {
+      'repositoryId': repositoryId,
+      'confirmationRequestId': confirmationRequestId,
+      'operationType': 'git.abort',
+      'params': preflight.params,
+      'preconditionToken': preflight.preconditionToken,
+    }),
+  );
+
+  @override
+  Future<GitAcceptedOperation> submitGitAbort({
+    required String repositoryId,
+    required GitPreflight preflight,
+    required GitConfirmation confirmation,
+    required String requestId,
+  }) async => _accepted(
+    await _gitPost('/api/git/abort', {
+      'repositoryId': repositoryId,
+      'requestId': requestId,
+      'params': preflight.params,
+      'preconditionToken': preflight.preconditionToken,
+      'challengeId': confirmation.challengeId,
+    }),
+  );
+
+  @override
+  Future<GitOperation> gitOperation(String operationId) async {
+    final json = await getJson(
+      '/api/git/operations/${Uri.encodeComponent(operationId)}',
+    );
+    return GitOperation.fromJson(_jsonMap(json['operation']));
+  }
+
+  @override
+  Future<GitOperationPage> gitOperations({
+    String? repositoryId,
+    String? status,
+    String? cursor,
+    int limit = 100,
+  }) async {
+    final query = <String, String>{
+      if (repositoryId != null) 'repositoryId': repositoryId,
+      if (status != null) 'status': status,
+      if (cursor != null) 'cursor': cursor,
+      'limit': '$limit',
+    };
+    final encoded = query.entries
+        .map(
+          (entry) =>
+              '${Uri.encodeQueryComponent(entry.key)}=${Uri.encodeQueryComponent(entry.value)}',
+        )
+        .join('&');
+    return GitOperationPage.fromJson(
+      await getJson('/api/git/operations?$encoded'),
+    );
+  }
+
+  @override
+  Future<GitAcceptedOperation> cancelGitOperation(
+    GitOperation operation, {
+    required String requestId,
+  }) async => _accepted(
+    await _gitPost(
+      '/api/git/operations/${Uri.encodeComponent(operation.operationId)}/cancel',
+      {'requestId': requestId, 'expectedRevision': operation.revision},
+    ),
+  );
+
+  @override
+  Future<GitOperation> handoffGitOperation(
+    GitOperation operation, {
+    required String target,
+    required String requestId,
+  }) async {
+    if (!const {'computer', 'model'}.contains(target)) {
+      throw ArgumentError.value(target, 'target');
+    }
+    final json = await _gitPost(
+      '/api/git/operations/${Uri.encodeComponent(operation.operationId)}/handoff',
+      {
+        'repositoryId': operation.repositoryId,
+        'target': target,
+        'reason': 'conflict',
+        'requestId': requestId,
+        'expectedRevision': operation.revision,
+      },
+    );
+    return GitOperation.fromJson(_jsonMap(json['operation']));
+  }
+
+  @override
+  Future<GitOperation> acknowledgeGitRecovery(
+    GitOperation operation, {
+    required String stateVersion,
+    required String requestId,
+  }) async {
+    final json = await _gitPost('/api/git/recovery/acknowledge', {
+      'repositoryId': operation.repositoryId,
+      'operationId': operation.operationId,
+      'requestId': requestId,
+      'expectedRevision': operation.revision,
+      'facts': {
+        'confirmed': true,
+        'stateVersion': stateVersion,
+        'observedAt': DateTime.now().millisecondsSinceEpoch,
+      },
+    });
+    return GitOperation.fromJson(json);
   }
 
   /// SSE 全量帧流（session/event + agent/status + hello），不做会话过滤。

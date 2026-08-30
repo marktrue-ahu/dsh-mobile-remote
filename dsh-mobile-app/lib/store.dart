@@ -11,10 +11,31 @@ import 'l10n.dart';
 import 'logger.dart';
 import 'models.dart';
 import 'git_models.dart';
+import 'git_operation_store.dart';
+import 'git_write_models.dart';
 
 class AppStore extends ChangeNotifier {
   final GitApi _gitApi;
-  AppStore({GitApi? apiClient}) : _gitApi = apiClient ?? api;
+  final GitWriteApi _gitWriteApi;
+  late final GitOperationStore gitOperations;
+  bool _disposed = false;
+
+  AppStore({GitApi? apiClient, GitWriteApi? gitWriteApi})
+    : _gitApi = apiClient ?? api,
+      _gitWriteApi =
+          gitWriteApi ??
+          (apiClient is GitWriteApi ? apiClient as GitWriteApi : api) {
+    gitOperations = GitOperationStore(
+      api: _gitWriteApi,
+      onTerminal: (operation) async {
+        if (!_disposed && operation.repositoryId == gitContext?.repositoryId) {
+          await refreshGit();
+        }
+      },
+    )..addListener(_onGitOperationChanged);
+  }
+
+  void _onGitOperationChanged() => notifyListeners();
   // ── 数据 ──
   String? sessionId; // 当前会话
   Catalog? catalog;
@@ -246,6 +267,9 @@ class AppStore extends ChangeNotifier {
           return;
         }
         gitBranches = sortGitBranches(branches);
+        if (capability.writes) {
+          unawaited(gitOperations.refreshRepository(context.repositoryId));
+        }
       }
       if (notify) notifyListeners();
     } catch (_) {
@@ -257,6 +281,231 @@ class AppStore extends ChangeNotifier {
       }
       if (notify) notifyListeners();
     }
+  }
+
+  void _assertActiveRepository(String repositoryId) {
+    if (gitContext?.repositoryId != repositoryId) {
+      throw StateError('Git operation no longer matches the active repository');
+    }
+  }
+
+  Future<GitChangeSet> loadGitChangeSet(String kind) {
+    final repositoryId = gitContext?.repositoryId;
+    if (repositoryId == null) throw StateError('Git repository unavailable');
+    return _gitWriteApi.createGitChangeSet(repositoryId, kind);
+  }
+
+  Future<GitOperation> submitGitSelection(
+    GitChangeSet changeSet,
+    List<GitFileSelection> selections, {
+    bool unstage = false,
+  }) {
+    _assertActiveRepository(changeSet.repositoryId);
+    if (selections.isEmpty) throw ArgumentError('selections must not be empty');
+    if ((unstage && changeSet.kind != 'staged') ||
+        (!unstage && changeSet.kind != 'working')) {
+      throw ArgumentError('selection kind does not match the operation');
+    }
+    return gitOperations.submit(
+      changeSet.repositoryId,
+      (requestId) => _gitWriteApi.submitGitSelection(
+        repositoryId: changeSet.repositoryId,
+        changeSet: changeSet,
+        selections: selections,
+        requestId: requestId,
+        unstage: unstage,
+      ),
+    );
+  }
+
+  Future<GitPreflight> prepareGitCommit(String message) {
+    final repositoryId = gitContext?.repositoryId;
+    if (repositoryId == null) throw StateError('Git repository unavailable');
+    if (message.trim().isEmpty)
+      throw ArgumentError('message must not be empty');
+    return _gitWriteApi.gitCommitPreflight(repositoryId, message);
+  }
+
+  Future<GitOperation> submitGitCommit(GitPreflight preflight, String message) {
+    _assertActiveRepository(preflight.repositoryId);
+    if (preflight.operationKind != 'git.commit') {
+      throw ArgumentError('commit preflight is required');
+    }
+    final preparedMessage = preflight.data['message'];
+    if (preparedMessage is String && preparedMessage != message) {
+      throw StateError('commit message changed; run preflight again');
+    }
+    if (!(preflight.preconditionToken?.isNotEmpty ?? false)) {
+      throw StateError('commit preflight token is missing');
+    }
+    return gitOperations.submit(
+      preflight.repositoryId,
+      (requestId) => _gitWriteApi.submitGitCommit(
+        repositoryId: preflight.repositoryId,
+        preflight: preflight,
+        message: message,
+        requestId: requestId,
+      ),
+    );
+  }
+
+  Future<GitPreflight> prepareGitBranch({
+    required String action,
+    String? name,
+    String? oldName,
+    String? startOid,
+    String? remoteRef,
+    String? targetBranch,
+    String? targetRef,
+    String? localName,
+  }) {
+    final repositoryId = gitContext?.repositoryId;
+    if (repositoryId == null) throw StateError('Git repository unavailable');
+    if (!const {'create', 'rename', 'switch'}.contains(action)) {
+      throw ArgumentError.value(action, 'action');
+    }
+    return _gitWriteApi.gitBranchPreflight(
+      repositoryId,
+      action: action,
+      name: name,
+      oldName: oldName,
+      startOid: startOid,
+      remoteRef: remoteRef,
+      targetBranch: targetBranch,
+      targetRef: targetRef,
+      localName: localName,
+    );
+  }
+
+  Future<GitOperation?> submitGitBranch(GitPreflight preflight) {
+    _assertActiveRepository(preflight.repositoryId);
+    if (preflight.noop) return Future<GitOperation?>.value(null);
+    if (!preflight.canSubmit || preflight.params.isEmpty) {
+      throw StateError('branch preflight is not executable');
+    }
+    return gitOperations.submit(
+      preflight.repositoryId,
+      (requestId) => _gitWriteApi.submitGitBranch(
+        repositoryId: preflight.repositoryId,
+        preflight: preflight,
+        requestId: requestId,
+      ),
+    );
+  }
+
+  Future<GitRemotes> loadGitRemotes() {
+    final repositoryId = gitContext?.repositoryId;
+    if (repositoryId == null) throw StateError('Git repository unavailable');
+    return _gitWriteApi.gitRemotes(repositoryId);
+  }
+
+  Future<GitPreflight> prepareGitRemote({
+    required String kind,
+    String? remote,
+    String? branch,
+    String? strategy,
+    bool? setUpstream,
+  }) {
+    final repositoryId = gitContext?.repositoryId;
+    if (repositoryId == null) throw StateError('Git repository unavailable');
+    return _gitWriteApi.gitRemotePreflight(
+      repositoryId,
+      kind: kind,
+      remote: remote,
+      branch: branch,
+      localBranch: gitStatus?.branch == 'HEAD' ? null : gitStatus?.branch,
+      strategy: strategy,
+      setUpstream: setUpstream,
+    );
+  }
+
+  Future<GitOperation> submitGitRemote(GitPreflight preflight) {
+    _assertActiveRepository(preflight.repositoryId);
+    if (!preflight.canSubmit || preflight.params.isEmpty) {
+      throw StateError('remote preflight is not executable');
+    }
+    return gitOperations.submit(
+      preflight.repositoryId,
+      (requestId) => _gitWriteApi.submitGitRemote(
+        repositoryId: preflight.repositoryId,
+        preflight: preflight,
+        requestId: requestId,
+      ),
+    );
+  }
+
+  Future<GitPreflight> prepareGitAbort(String repositoryId) {
+    if (gitContext?.repositoryId != repositoryId) {
+      throw StateError('Git operation no longer matches the active repository');
+    }
+    return _gitWriteApi.gitAbortPreflight(repositoryId);
+  }
+
+  Future<GitOperation> submitGitAbort(GitPreflight preflight) async {
+    _assertActiveRepository(preflight.repositoryId);
+    if (preflight.operationKind != 'git.abort' || !preflight.canSubmit) {
+      throw StateError('abort preflight is not executable');
+    }
+    final confirmation = await _gitWriteApi.issueGitConfirmation(
+      repositoryId: preflight.repositoryId,
+      preflight: preflight,
+      confirmationRequestId: genRequestId(),
+    );
+    _assertActiveRepository(preflight.repositoryId);
+    return gitOperations.submit(
+      preflight.repositoryId,
+      (requestId) => _gitWriteApi.submitGitAbort(
+        repositoryId: preflight.repositoryId,
+        preflight: preflight,
+        confirmation: confirmation,
+        requestId: requestId,
+      ),
+    );
+  }
+
+  Future<GitOperation> cancelGitOperation(GitOperation operation) =>
+      gitOperations.cancel(operation);
+
+  Future<GitOperation> handoffGitOperation(
+    GitOperation operation,
+    String target,
+  ) => gitOperations.handoff(operation, target);
+
+  Future<({String stateVersion, String summary})> inspectGitRecovery(
+    GitOperation operation,
+  ) async {
+    if (gitContext?.repositoryId != operation.repositoryId) {
+      throw StateError('Git operation no longer matches the active repository');
+    }
+    final values = await Future.wait<Object>([
+      _gitApi.gitStatus(operation.repositoryId),
+      _gitWriteApi.gitRemotes(operation.repositoryId),
+    ]);
+    final status = values[0] as GitStatus;
+    final remotes = values[1] as GitRemotes;
+    _assertActiveRepository(operation.repositoryId);
+    gitStatus = status;
+    notifyListeners();
+    final counts = jsonEncode(status.counts);
+    return (
+      stateVersion:
+          '${remotes.stateVersion}:${status.branch}:${status.ahead}:${status.behind}:$counts',
+      summary:
+          '分支 ${status.branch} · ahead ${status.ahead} / behind ${status.behind} · '
+          '暂存 ${status.counts['staged'] ?? 0} · 未暂存 ${status.counts['unstaged'] ?? 0} · '
+          '远端事实 ${remotes.stateVersion.length > 10 ? remotes.stateVersion.substring(0, 10) : remotes.stateVersion}',
+    );
+  }
+
+  Future<GitOperation> acknowledgeGitOperation(
+    GitOperation operation,
+    String stateVersion,
+  ) {
+    _assertActiveRepository(operation.repositoryId);
+    if (stateVersion.trim().isEmpty) {
+      throw ArgumentError('stateVersion must not be empty');
+    }
+    return gitOperations.acknowledge(operation, stateVersion);
   }
 
   void _persistSessions() {
@@ -941,11 +1190,20 @@ class AppStore extends ChangeNotifier {
       refreshNotifs(notify: false);
       unawaited(refreshCatalog());
       unawaited(refreshWorkspaces());
+      unawaited(gitOperations.loadTracked());
+      final repositoryId = gitContext?.repositoryId;
+      if (repositoryId != null && gitCapability.writes) {
+        unawaited(gitOperations.refreshRepository(repositoryId));
+      }
       return;
     }
     if (type == 'notifications/changed') {
       // 通知被增删（如移动端删除记录）：刷新列表与未读角标
       refreshNotifs();
+      return;
+    }
+    if (type == 'git/operation') {
+      gitOperations.applyFrame(frame);
       return;
     }
     if (type == 'git/changed') {
@@ -1198,7 +1456,11 @@ class AppStore extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
     disposeBridge();
+    gitOperations
+      ..removeListener(_onGitOperationChanged)
+      ..dispose();
     super.dispose();
   }
 }
