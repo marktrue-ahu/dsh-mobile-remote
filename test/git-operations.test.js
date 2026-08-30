@@ -72,6 +72,22 @@ test("same requestId is idempotent, but changed parameters are rejected", async 
 	} finally { manager.stop(); cleanup(); }
 });
 
+test("confirmation consumption is durable and atomic with operation creation", async () => {
+	const f = await managerFixture();
+	try {
+		f.manager.registerExecutor("confirmed", async () => ({ status: "succeeded" }));
+		const first = await f.manager.submit({ repositoryId: "repo", requestId: request(20), kind: "confirmed", preconditionToken: "p", confirmation: { challengeId: "challenge-1", requestId: request(20), coordinationDigest: "domain" } });
+		assert.equal(first.confirmation.challengeId, "challenge-1");
+		await assert.rejects(() => f.manager.submit({ repositoryId: "repo", requestId: request(21), kind: "confirmed", preconditionToken: "p", confirmation: { challengeId: "challenge-1", requestId: request(21) } }), (error) => error.code === "confirmation-required");
+		f.manager.stop();
+		const restored = createGitOperationManager({ filePath: f.filePath });
+		await restored.start();
+		try {
+			await assert.rejects(() => restored.submit({ repositoryId: "repo", requestId: request(22), kind: "confirmed", preconditionToken: "p", confirmation: { challengeId: "challenge-1", requestId: request(22) } }), (error) => error.code === "confirmation-required");
+		} finally { restored.stop(); }
+	} finally { f.manager.stop(); f.cleanup(); }
+});
+
 test("precondition failures remain visible and executor progress cannot mutate state", async () => {
 	const { manager, cleanup } = await managerFixture();
 	try {
@@ -352,7 +368,7 @@ test("corrupt complete log frames disable the manager instead of silently skippi
 	} finally { f.cleanup(); }
 });
 
-test("stop releases provider-owned leases after requesting cancellation", async () => {
+test("stop retains provider-owned leases until cancellation settles", async () => {
 	const f = fixture();
 	const first = createGitOperationManager({ filePath: f.filePath });
 	let release;
@@ -362,6 +378,11 @@ test("stop releases provider-owned leases after requesting cancellation", async 
 		await first.submit({ repositoryId: "repo", requestId: request(17), kind: "hang", preconditionToken: "p" });
 		await new Promise((resolve) => setImmediate(resolve));
 		first.stop();
+		const blocked = createGitOperationManager({ filePath: f.filePath });
+		await assert.rejects(() => blocked.start(), (error) => error.code === "provider-ambiguous");
+		blocked.stop();
+		release?.();
+		await new Promise((resolve) => setImmediate(resolve));
 		const second = createGitOperationManager({ filePath: f.filePath });
 		await second.start();
 		second.stop();

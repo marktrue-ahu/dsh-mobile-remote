@@ -63,7 +63,14 @@ test("B1 write routes are POST-only and do not shadow GET commit details", () =>
 	const source = readFileSync(new URL("../lib/index.js", import.meta.url), "utf8");
 	assert.match(source, /if \(method === "POST" && \["\/git\/change-sets"/);
 	for (const route of ["/git/branches/preflight", "/git/branches", "/git/branch-switch/preflight", "/git/branch-switch", "/git/branch-rename"]) assert.ok(source.includes(`"${route}"`), `missing B2 route ${route}`);
-	assert.ok(source.includes('const gitMatch = /^\\/git\\/(context|status|branches|graph|commit|diff)$/.exec(rest);'));
+	assert.ok(source.includes('const gitMatch = /^\\/git\\/(context|status|branches|remotes|graph|commit|diff)$/.exec(rest);'));
+});
+
+test("B3 routes require the mobile contract and expose staged sync operations", () => {
+	const source = readFileSync(new URL("../lib/index.js", import.meta.url), "utf8");
+	for (const route of ["/git/fetch/preflight", "/git/fetch", "/git/pull/preflight", "/git/pull", "/git/push/preflight", "/git/push", "/git/sync/preflight", "/git/sync", "/git/abort/preflight", "/git/abort", "/git/confirmations"]) assert.ok(source.includes(`"${route}"`), `missing B3 route ${route}`);
+	assert.match(source, /requireGitContract\(req, res\)/);
+	assert.match(source, /acceptedOperationResponse\(value, `\/git\/operations/);
 });
 
 test("B0 operation list is exposed through the mobile API and capabilities", async (t) => {

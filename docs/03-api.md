@@ -46,6 +46,12 @@
 | GET | `/m/api/git/context` | 解析会话/工作区对应仓库 | 是 |
 | GET | `/m/api/git/status` | 工作区状态（只读） | 是 |
 | GET | `/m/api/git/branches` | 本地/远端分支（只读） | 是 |
+| GET | `/m/api/git/remotes` | 已配置远端与同步目标（只读） | 是 |
+| POST | `/m/api/git/fetch` | 明确目标 fetch 任务 | 是 |
+| POST | `/m/api/git/pull` | fetch 后 merge/rebase 任务 | 是 |
+| POST | `/m/api/git/push` | 明确目标非 force push 任务 | 是 |
+| POST | `/m/api/git/sync` | fetch→pull→push 分阶段任务 | 是 |
+| POST | `/m/api/git/abort` | 经挑战确认的 merge/rebase abort | 是 |
 | GET | `/m/api/git/graph` | 提交图（分页） | 是 |
 | GET | `/m/api/git/commit` | 提交详情 | 是 |
 | GET | `/m/api/git/diff` | 工作区/暂存/提交差异 | 是 |
@@ -579,7 +585,7 @@
 
 Git 接口由项目自有 provider 提供，执行通过 DSH `subprocess`，仓库必须位于
 `workspaceRegistry` 已注册工作区内。`repositoryId` 为 provider 分配的不透明仓库标识，客户端不得自行拼接
-shell 命令。Slice A 是只读基础；B1/B2 已另外提供受保护的 stage/commit 与本地分支写操作，仍不提供删除分支、fetch/pull/push、stash 或 tags 写操作。
+shell 命令。Slice A 是只读基础；B1/B2 提供受保护的 stage/commit 与本地分支写操作；B3 增加明确目标的 fetch/pull/push/sync 及冲突 abort，仍不提供删除分支、stash、tags、force push 或手机端冲突编辑。
 
 `GET /m/api/git/capabilities` 始终返回 `{ok, git:{available,read,writes,reason,features}}`，不可用时
 由 `available=false` 明确表达；实际仓库操作在 provider 不可用时返回 `503 git-provider-unavailable`。
@@ -650,3 +656,31 @@ preconditionToken,selections}`，`selections` 为 `[{fileId,hunkIds?}]`，立即
 `allowedActions: ["commit","computer","cancel"]`，不签发强制切换 token。`POST /m/api/git/branch-switch`
 必须提交预检返回的同一 `params`，只执行无 force 的安全切换；所有分支写操作均作为 B0 Git 操作任务返回
 `202` accepted DTO。
+
+#### Slice B3 远端同步
+
+B3 的写请求必须携带 `X-DSH-Git-Contract: 2.x`（或等价的
+`X-DSH-Git-Mobile-Contract`）版本声明；缺失或主版本不兼容返回
+`409 client-incompatible`。所有执行端点只接受预检返回的规范 `params` 和短期
+`preconditionToken`，不接受远端 URL、任意 refspec、OID 或命令选项。
+
+- `GET /m/api/git/remotes?repositoryId=…` 返回已配置 remote、脱敏 URL、remote-tracking 分支和本地 upstream；远端凭据不进入 DTO、账本或错误。
+- `POST /m/api/git/fetch/preflight` 请求 `{repositoryId,remote,branch}`，随后
+  `POST /m/api/git/fetch` 执行只更新对应 `refs/remotes/<remote>/<branch>` 的 fetch。
+- `POST /m/api/git/pull/preflight` 请求 `{repositoryId,remote?,branch?,localBranch?,strategy?}`，随后
+  `POST /m/api/git/pull` 执行 fetch→固定 OID 的 merge/rebase 两阶段；默认策略为 merge。
+- `POST /m/api/git/push/preflight` 请求 `{repositoryId,remote,branch,localBranch?,setUpstream?}`，随后
+  `POST /m/api/git/push` 执行明确的 `refs/heads/<local>:refs/heads/<branch>` 普通 push；目标不存在时允许创建该单一目标 ref。
+  force/force-with-lease 永不支持；只有远端确认成功后才写入 upstream 配置。
+- `POST /m/api/git/sync/preflight` 与 `POST /m/api/git/sync` 执行非原子的
+  fetch→pull→push；新建的远端目标会跳过没有目标可取的 fetch/integrate 阶段，直接以普通 push 创建单一目标 ref。
+  操作查询中的 `stages[]` 保存每阶段状态、跳过原因、前后事实和副作用；任一阶段失败、冲突、取消或不确定都会停止后续阶段并保留部分成功结果。
+- `POST /m/api/git/abort/preflight` 返回当前 merge/rebase 中间态的影响摘要；随后先经
+  `POST /m/api/git/confirmations` 签发一次性挑战，再由 `POST /m/api/git/abort` 创建独立 abort 任务；签发记录可跨服务重启幂等复用，挑战消费和任务创建在同一持久化账本事务中完成。
+  abort 不由普通 cancel 隐式执行。
+- `POST /m/api/git/operations/:operationId/handoff` 的 `target` 为 `computer|model`，只记录冲突交接意图；移动端不自动 continue、commit 或 push。
+
+所有 B3 执行端点返回 `202` accepted DTO。fetch/pull/push/sync/abort 使用不同协调域：
+fetch/push 序列化 common domain，pull/sync/abort 同时序列化 common 与 worktree domain。
+远端认证、网络、远端拒绝、非 fast-forward 分别映射为稳定错误；连接中断或结果无法
+从读事实证明时进入 `unknown-result`，而不是自动重试。

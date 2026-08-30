@@ -78,7 +78,7 @@ B0 已在 [`lib/git-operations.js`](../../lib/git-operations.js) 落地任务模
 - 当前共享 authToken 凭据版本的不可逆摘要；
 - 一次性随机值、服务端时间和不超过两分钟的有效期。
 
-challenge 的消费与操作任务创建必须是同一账本事务；重复、过期、参数变化或跨仓库使用都拒绝。它只防误触、旧状态、参数篡改和重放，不能抵御 authToken 泄漏。Slice B 只有 merge/rebase abort 开放服务端 challenge；删除分支、放弃改动、drop stash、reset、clean、远端删除和 force push 不提供执行端点。
+签发记录按 confirmationRequestId 持久化，可跨服务重启幂等复用；challenge 的消费与操作任务创建必须是同一账本事务；重复、过期、参数变化或跨仓库使用都拒绝。它只防误触、旧状态、参数篡改和重放，不能抵御 authToken 泄漏。Slice B 只有 merge/rebase abort 开放服务端 challenge；删除分支、放弃改动、drop stash、reset、clean、远端删除和 force push 不提供执行端点。
 
 ## 6. 功能交付顺序
 
@@ -152,6 +152,13 @@ challenge 的消费与操作任务创建必须是同一账本事务；重复、�
 - 本地分支创建、重命名和无 force 切换均由任务账本执行；创建默认从当前 HEAD，也可使用 provider 已验证的 commit 或远端精确引用作为起点，创建不会自动切换；远端切换必须显式提供 `localName`，并以该名称创建 tracking branch；
 - 受保护切换先检查当前 HEAD、目标 OID、工作区状态和 Git 中间态。Git 可安全携带改动时允许无 force 切换；存在覆盖风险时不签发 token，只返回提交、转电脑或取消入口；
 - 分支名称通过 Git ref 规则校验，重命名只影响本地 ref/config，不触碰远端；所有 token 在执行前重新检查，外部变化使用 `state-changed`/`unknown-result` 语义；
+
+### Slice B3：远端同步（已实现）
+
+- remote/branch 是 provider 校验后的明确同步目标；移动端不能提交 URL、任意 refspec、OID、force 或命令选项；remote URL 在 DTO、账本和错误中脱敏；
+- fetch 只更新对应 remote-tracking ref，pull 先 fetch 再对固定 fetched OID 做无 hook 的 merge/rebase，push 使用明确 local-to-remote refs 且不允许 force；目标不存在时 push 可创建单一远端 ref，sync 在无远端目标时跳过 fetch/integrate 后创建该 ref；setUpstream 仅在 push 成功后写入；
+- fetch、pull、push、sync、abort 都是 B0 后台任务，阶段事实通过 SSE/operation 查询暴露。sync 是 fetch→integrate→push 的非原子编排，跳过、部分成功、失败和冲突均保留；
+- merge/rebase 冲突进入 `conflicted` 并阻塞协调域，只允许独立且带确认挑战的 abort、电脑/模型交接或只读查询；普通 cancel 不隐式 abort，无法证明远端结果时进入 `unknown-result`。
 
 ### Slice B：日常写闭环
 
