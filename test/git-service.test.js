@@ -56,8 +56,9 @@ function git(cwd, ...args) {
 
 function subprocess() {
 	return {
-		spawn({ argv, cwd }) {
-			const child = spawn(argv[0], argv.slice(1), { cwd });
+		spawn({ argv, cwd, env, signal }) {
+			const child = spawn(argv[0], argv.slice(1), { cwd, env: { ...process.env, ...(env ?? {}) } });
+			if (signal) signal.addEventListener("abort", () => child.kill("SIGTERM"), { once: true });
 			let stdout = "";
 			let stderr = "";
 			child.stdout.on("data", (value) => { stdout += value; });

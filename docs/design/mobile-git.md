@@ -61,29 +61,32 @@ intent + requestId + repositoryId
        events + resumable query
 ```
 
-终态包括 `succeeded`、`failed`、`cancelled`、`conflicted` 和 `unknown-result`。手机断线或请求超时后必须先按 `operationId` 查询，不得自动重复写操作。
+B0 已在 [`lib/git-operations.js`](../../lib/git-operations.js) 落地任务模块。它提供带事务帧的追加日志、原子快照、幂等占位、状态迁移、协调域队列、取消、启动调和和事件投影。完整事务帧包含长度、校验和及单一 payload；截断尾帧不会生效。`challenge consumed + operation created` 等变化必须由一个事务提交。
 
-同一仓库同时只运行一个写任务。读取可以并发，但每个写意图都要记录创建时的仓库状态版本；执行前状态发生变化时应重新预检或返回 `state-changed`。同步过程逐段展示 fetch、pull、push，任何一步失败或冲突都停止后续阶段。
+终态包括 `succeeded`、`failed`、`cancelled`、`conflicted` 和 `unknown-result`。手机断线或请求超时后必须先按 `operationId` 查询，不得自动重复写操作。`running` 任务在重启时只能由只读调和决定；不能证明结果时进入 `unknown-result` 并阻塞对应协调域。
 
-取消只终止仍在运行的命令。已经更新的引用、工作区或远端不能因取消而宣称回滚。若仓库进入 merge/rebase/cherry-pick 等中间状态，provider 单独报告可用的 abort/continue 操作；首版只开放安全可验证的 abort，continue 与冲突编辑后置。
+同一协调域同时只运行一个写任务。读取可以并发；不同 worktree 的共享 refs 使用 `common` 协调域；工作区/index/head 相关操作使用 `worktree` 协调域，涉及远端 tracking branch 的切换同时占用 common + worktree。B0 的任务 manager 还使用实例 owner 文件和每协调域 lease 文件防止同一 provider 重入。它不能锁住终端等外部 Git 消费者，因此操作前后做事实检测，外部竞争属于 `detect-only`，不得假装回滚。
+
+每个写意图都绑定操作特定的 `preconditionToken`，而全局 `stateVersion` 只用于读视图刷新。取消先落盘 `cancelRequested` 再终止子进程；已经更新的引用、工作区或远端不能因取消而宣称回滚。若仓库进入 merge/rebase/cherry-pick 等中间状态，provider 单独报告可用的 abort/continue 操作；首版只开放安全可验证的 abort，continue 与冲突编辑后置。
 
 ## 5. 破坏性操作与确认
 
-普通移动认证只能证明调用者有权访问 mobile-remote，不能替代对具体破坏性操作的确认。服务端确认挑战需要绑定：
+普通移动认证只能证明调用者有权访问 mobile-remote，不能替代对具体破坏性操作的确认。Slice B 普通 commit 使用 UI 独立明确确认但不申请 challenge；当前 B0 唯一需要服务端 challenge 的开放破坏性操作是 merge/rebase abort。挑战绑定：
 
-- repositoryId 和当前状态版本；
-- 操作类型及完整参数；
-- 当前用户或连接身份；
-- 一次性随机值和短有效期。
+- repositoryId、协调域和操作特定 preconditionToken 摘要；
+- 操作类型及按 canonical JSON 编码的完整参数摘要；
+- 当前共享 authToken 凭据版本的不可逆摘要；
+- 一次性随机值、服务端时间和不超过两分钟的有效期。
 
-删除未合并分支、放弃改动、drop stash、reset、clean、远端删除和 force push 未携带有效挑战时必须拒绝。force push、reset、clean 和远端分支重命名/删除默认不进入首版快捷功能。
+签发记录按 confirmationRequestId 持久化，可跨服务重启幂等复用；challenge 的消费与操作任务创建必须是同一账本事务；重复、过期、参数变化或跨仓库使用都拒绝。它只防误触、旧状态、参数篡改和重放，不能抵御 authToken 泄漏。Slice B 只有 merge/rebase abort 开放服务端 challenge；删除分支、放弃改动、drop stash、reset、clean、远端删除和 force push 不提供执行端点。
 
 ## 6. 功能交付顺序
 
 ### Slice A：基础与只读
 
 当前实现状态：已接入 mobile-remote 的 `gitService` provider seam 与 `/m/api/git/*` 只读桥；Flutter
-快捷栏、状态/分支/提交图/差异视图已落地。provider 不可用时保持可见的能力降级；写操作仍按下列 Slice B/C 规划。
+快捷栏、状态/分支/提交图/差异视图已落地。provider 不可用时保持可见的能力降级；B1/B2 写闭环由独立
+`gitWriteService` 投影，仍不把 Git 命令或 provider DTO 暴露给 Flutter。Slice A 本身仍只读，写能力不属于其交付范围。
 
 - provider 可用性和诊断；
 - 仓库状态、当前分支和 ahead/behind；
@@ -136,6 +139,26 @@ intent + requestId + repositoryId
 - 颜色不足时保持固定节点尺寸和引用文字标签，不依赖颜色单独识别。
 - 默认 provider 的命令输出解析属于 provider 实现边界，不进入移动协议。若使用 NUL 分隔记录，必须在 provider 单元测试中验证记录边界 CR/LF 清理和尾部空记录过滤，确保 OID、分支名、远程标志和引用字段不携带 framing 字符。
 - 该方案是 Slice A 的只读增强，不扩大分支切换、提交、同步等写操作范围；服务边界遵循 [ADR 0001](../adr/0001-mobile-git-scope.md) 与 [ADR 0002](../adr/0002-git-provider-integration.md)，tip 绑定的短期图快照与分页决策见 [ADR 0005](../adr/0005-tip-bound-git-graph-snapshots.md)。
+
+### Slice B1：暂存与精确提交（已实现）
+
+- `gitWriteService` 创建短期 change-set，绑定仓库、HEAD、index tree、工作区 diff/status 事实与 TTL；
+- 客户端只选择服务端生成的 fileId/hunkId。临时 index 中执行 file/hunk stage 与 unstage，再通过 index lock 原子安装；未跟踪、二进制和重命名首版只支持整文件；
+- commit 使用预演返回的 staged tree 与 HEAD 前置条件，以 `commit-tree` 创建对象并以 `update-ref` CAS 更新当前本地分支，不运行 hooks；
+- B1 任务接入 B0 的幂等、仓库串行、取消、SSE 查询和 stale/unknown-result 语义；外部 Git 消费者仍为 detect-only；
+
+### Slice B2：本地分支与受保护切换（已实现）
+
+- 本地分支创建、重命名和无 force 切换均由任务账本执行；创建默认从当前 HEAD，也可使用 provider 已验证的 commit 或远端精确引用作为起点，创建不会自动切换；远端切换必须显式提供 `localName`，并以该名称创建 tracking branch；
+- 受保护切换先检查当前 HEAD、目标 OID、工作区状态和 Git 中间态。Git 可安全携带改动时允许无 force 切换；存在覆盖风险时不签发 token，只返回提交、转电脑或取消入口；
+- 分支名称通过 Git ref 规则校验，重命名只影响本地 ref/config，不触碰远端；所有 token 在执行前重新检查，外部变化使用 `state-changed`/`unknown-result` 语义；
+
+### Slice B3：远端同步（已实现）
+
+- remote/branch 是 provider 校验后的明确同步目标；移动端不能提交 URL、任意 refspec、OID、force 或命令选项；remote URL 在 DTO、账本和错误中脱敏；
+- fetch 只更新对应 remote-tracking ref，pull 先 fetch 再对固定 fetched OID 做无 hook 的 merge/rebase，push 使用明确 local-to-remote refs 且不允许 force；目标不存在时 push 可创建单一远端 ref，sync 在无远端目标时跳过 fetch/integrate 后创建该 ref；setUpstream 仅在 push 成功后写入；
+- fetch、pull、push、sync、abort 都是 B0 后台任务，阶段事实通过 SSE/operation 查询暴露。sync 是 fetch→integrate→push 的非原子编排，跳过、部分成功、失败和冲突均保留；
+- merge/rebase 冲突进入 `conflicted` 并阻塞协调域，只允许独立且带确认挑战的 abort、电脑/模型交接或只读查询；普通 cancel 不隐式 abort，无法证明远端结果时进入 `unknown-result`。
 
 ### Slice B：日常写闭环
 

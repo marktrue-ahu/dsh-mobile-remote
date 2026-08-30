@@ -46,6 +46,12 @@
 | GET | `/m/api/git/context` | 解析会话/工作区对应仓库 | 是 |
 | GET | `/m/api/git/status` | 工作区状态（只读） | 是 |
 | GET | `/m/api/git/branches` | 本地/远端分支（只读） | 是 |
+| GET | `/m/api/git/remotes` | 已配置远端与同步目标（只读） | 是 |
+| POST | `/m/api/git/fetch` | 明确目标 fetch 任务 | 是 |
+| POST | `/m/api/git/pull` | fetch 后 merge/rebase 任务 | 是 |
+| POST | `/m/api/git/push` | 明确目标非 force push 任务 | 是 |
+| POST | `/m/api/git/sync` | fetch→pull→push 分阶段任务 | 是 |
+| POST | `/m/api/git/abort` | 经挑战确认的 merge/rebase abort | 是 |
 | GET | `/m/api/git/graph` | 提交图（分页） | 是 |
 | GET | `/m/api/git/commit` | 提交详情 | 是 |
 | GET | `/m/api/git/diff` | 工作区/暂存/提交差异 | 是 |
@@ -578,15 +584,103 @@
 ### 6.16 Git Slice A（只读）
 
 Git 接口由项目自有 provider 提供，执行通过 DSH `subprocess`，仓库必须位于
-`workspaceRegistry` 已注册工作区内。`repositoryId` 为规范化仓库根路径，客户端不得自行拼接
-shell 命令。Slice A 不提供切换/创建/删除分支、fetch/pull/push、stage/commit、stash 或 tags 写操作。
+`workspaceRegistry` 已注册工作区内。`repositoryId` 为 provider 分配的不透明仓库标识，客户端不得自行拼接
+shell 命令。Slice A 是只读基础；B1/B2 提供受保护的 stage/commit 与本地分支写操作；B3 增加明确目标的 fetch/pull/push/sync 及冲突 abort，仍不提供删除分支、stash、tags、force push 或手机端冲突编辑。
 
 `GET /m/api/git/capabilities` 始终返回 `{ok, git:{available,read,writes,reason,features}}`，不可用时
 由 `available=false` 明确表达；实际仓库操作在 provider 不可用时返回 `503 git-provider-unavailable`。
-`GET /m/api/git/context?sessionId=…` 返回仓库根目录和能力。
+`GET /m/api/git/context?sessionId=…` 返回不透明的稳定 `repositoryId`、仓库名称和能力，不返回主机路径。
 其余接口均要求 `repositoryId`：`status` 返回分支与文件状态，`branches` 返回本地/远端分支。
+客户端不得将主机路径当作 B1 写操作的 `repositoryId`；服务端仅接受由 `context` 返回、并在授权工作区内解析的仓库标识。
 `graph` 支持 `limit/cursor` 和可选 JSON `refs`（最多 3 个 `{name,tipOid}` 引用对）；首次请求返回
 `snapshotId`、绑定的 `tips`、提交页和 `nextCursor`，后续请求必须使用同一快照的不透明游标。
 引用移动、删除、tip 不匹配、仓库变化、游标上下文错误或快照过期返回 `409 graph-stale`，客户端不得
 静默回退到全量图。`commit` 要求 `oid`，`diff` 支持 `kind=working|staged|commit`、`oid/path`。
 越过工作区边界返回 `403 workspace-not-allowed`，非 Git 目录返回 `404 not-git-repository`。
+
+#### Slice B0 操作任务
+
+B0 在同一 Git 移动契约下提供持久化任务查询基础设施。`GET /m/api/git/operations` 支持
+`repositoryId`、`status`、`limit`（1–100）和不透明 `cursor`；`GET
+/m/api/git/operations/:operationId` 查询单项任务。查询响应包含 `operationId`、`requestId`、`repositoryId`、`kind`、`status`、`revision`、阶段、可取消性、结果/脱敏错误和恢复阻塞事实。
+
+`POST /m/api/git/operations/:operationId/cancel` 的 JSON 请求体必须包含新的控制
+`requestId` 和查询时的 `expectedRevision`。它只接受 `queued` 或 `running`；排队任务立即进入
+`cancelled`，运行任务先持久化取消请求再尽力终止子进程，不能宣称已回滚。重复的相同控制
+`requestId` 返回原结果，revision 不匹配返回 `409 state-changed`。
+
+任务状态为 `queued`、`running` 或终态 `succeeded`、`failed`、`cancelled`、`conflicted`、
+`unknown-result`。`POST /m/api/git/recovery/acknowledge` 必须携带新的控制
+`requestId`、`operationId`、`repositoryId` 和 `expectedRevision`；它只解除用户已查看事实后的
+恢复阻塞，不重放旧操作。SSE `/m/api/events` 增加 `git/operation` 帧，包含完整操作视图和单调
+`revision`；B1 的 `git/changed` 帧仍至少包含 `repositoryId`，并可带 `changeKinds`（如 `index`、`head`）提示
+客户端刷新对应事实。事件重复或丢失都不改变账本事实，客户端重连后必须重新查询 operationId。
+B0 不定义具体 Git 写操作；B1/B2 写端点复用 B0 任务账本。所有返回 `202` 的执行端点统一返回 accepted DTO：
+`{ok:true,accepted:true,operationId,requestId,status,deduplicated,queryUrl,queryLink,operation}`。
+其中 `queryUrl`/`queryLink` 是可直接 GET 的相对链接 `/git/operations/:operationId`；客户端应按该链接查询，不能把 `operation` 快照当作最终结果。
+`git.capabilities.operations` 用于声明任务账本、幂等、恢复和取消基础设施是否可用。
+
+#### Slice B1 暂存与精确提交
+
+`POST /m/api/git/change-sets` 请求 `{repositoryId,kind}`，其中 `kind` 为 `working|staged`；响应返回
+短期 `changeSetId`、`stateVersion`、`preconditionToken` 和文件/可选 hunk 清单。客户端只提交
+`fileId` 与 `hunkId`，不得提交 patch；未跟踪、二进制和重命名首版仅支持整文件操作。
+
+`POST /m/api/git/stage` 与 `/m/api/git/unstage` 请求 `{repositoryId,requestId,changeSetId,
+preconditionToken,selections}`，`selections` 为 `[{fileId,hunkIds?}]`，立即返回 `202` 的 Git 操作任务。
+服务端在私有临时 index 中执行并通过 Git index lock 原子安装，change-set 事实变化返回
+`409 state-changed` 或 `409 hunk-stale`，不会部分应用。
+
+`POST /m/api/git/commit/preflight` 请求 `{repositoryId,message}`，响应返回 staged tree、当前 HEAD、
+本地分支、提交身份和绑定这些事实的 `preconditionToken`。随后 `POST /m/api/git/commit` 请求
+`{repositoryId,requestId,message,preconditionToken,confirm:true}`，立即返回 `202` 任务；提交任务使用
+`commit-tree` 加 expected HEAD 的 `update-ref` CAS，不运行 hooks，HEAD/tree 变化返回
+`409 state-changed`。任务成功结果包含新 commit OID、tree OID 和分支。
+
+#### Slice B2 本地分支与受保护切换
+
+`POST /m/api/git/branches/preflight` 的 `action` 只能为 `create|rename`（缺失或其他值均为
+`400 invalid-argument`）。预检返回规范化的 `params`；执行请求必须携带**同一个** `params` 对象，另加
+`{repositoryId,requestId,preconditionToken}`。创建参数为 `{name,startOid,remoteRef?}`（默认从当前 HEAD，
+远端起点必须是已验证且仍存在的精确 `refs/remotes/<remote>/<branch>`）；rename 参数为
+`{oldName,name,oldOid}`。创建成功不会自动切换。
+
+`POST /m/api/git/branch-rename` 使用 `{repositoryId,requestId,params:{oldName,name,oldOid},preconditionToken}`，
+只重命名本地分支，不修改远端引用。非法/重复/不存在分支分别返回稳定的 `invalid-argument`、
+`branch-exists` 或 `branch-not-found`。
+
+`POST /m/api/git/branch-switch/preflight` 的 action 固定为 `switch`，使用 `targetBranch` 或已验证的
+`targetRef`。远端引用必须是 provider 精确验证的 `refs/remotes/<remote>/<branch>`；远端切换必须明确
+`localName`，该值同时成为规范 `params.targetBranch`，不会隐式猜测本地名称。返回目标 OID 与影响摘要。
+干净工作区或 Git 可安全携带的改动返回 `safe:true` 和 token；存在覆盖风险时返回 `safe:false` 及
+`allowedActions: ["commit","computer","cancel"]`，不签发强制切换 token。`POST /m/api/git/branch-switch`
+必须提交预检返回的同一 `params`，只执行无 force 的安全切换；所有分支写操作均作为 B0 Git 操作任务返回
+`202` accepted DTO。
+
+#### Slice B3 远端同步
+
+B3 的写请求必须携带 `X-DSH-Git-Contract: 2.x`（或等价的
+`X-DSH-Git-Mobile-Contract`）版本声明；缺失或主版本不兼容返回
+`409 client-incompatible`。所有执行端点只接受预检返回的规范 `params` 和短期
+`preconditionToken`，不接受远端 URL、任意 refspec、OID 或命令选项。
+
+- `GET /m/api/git/remotes?repositoryId=…` 返回已配置 remote、脱敏 URL、remote-tracking 分支和本地 upstream；远端凭据不进入 DTO、账本或错误。
+- `POST /m/api/git/fetch/preflight` 请求 `{repositoryId,remote,branch}`，随后
+  `POST /m/api/git/fetch` 执行只更新对应 `refs/remotes/<remote>/<branch>` 的 fetch。
+- `POST /m/api/git/pull/preflight` 请求 `{repositoryId,remote?,branch?,localBranch?,strategy?}`，随后
+  `POST /m/api/git/pull` 执行 fetch→固定 OID 的 merge/rebase 两阶段；默认策略为 merge。
+- `POST /m/api/git/push/preflight` 请求 `{repositoryId,remote,branch,localBranch?,setUpstream?}`，随后
+  `POST /m/api/git/push` 执行明确的 `refs/heads/<local>:refs/heads/<branch>` 普通 push；目标不存在时允许创建该单一目标 ref。
+  force/force-with-lease 永不支持；只有远端确认成功后才写入 upstream 配置。
+- `POST /m/api/git/sync/preflight` 与 `POST /m/api/git/sync` 执行非原子的
+  fetch→pull→push；新建的远端目标会跳过没有目标可取的 fetch/integrate 阶段，直接以普通 push 创建单一目标 ref。
+  操作查询中的 `stages[]` 保存每阶段状态、跳过原因、前后事实和副作用；任一阶段失败、冲突、取消或不确定都会停止后续阶段并保留部分成功结果。
+- `POST /m/api/git/abort/preflight` 返回当前 merge/rebase 中间态的影响摘要；随后先经
+  `POST /m/api/git/confirmations` 签发一次性挑战，再由 `POST /m/api/git/abort` 创建独立 abort 任务；签发记录可跨服务重启幂等复用，挑战消费和任务创建在同一持久化账本事务中完成。
+  abort 不由普通 cancel 隐式执行。
+- `POST /m/api/git/operations/:operationId/handoff` 的 `target` 为 `computer|model`，只记录冲突交接意图；移动端不自动 continue、commit 或 push。
+
+所有 B3 执行端点返回 `202` accepted DTO。fetch/pull/push/sync/abort 使用不同协调域：
+fetch/push 序列化 common domain，pull/sync/abort 同时序列化 common 与 worktree domain。
+远端认证、网络、远端拒绝、非 fast-forward 分别映射为稳定错误；连接中断或结果无法
+从读事实证明时进入 `unknown-result`，而不是自动重试。
