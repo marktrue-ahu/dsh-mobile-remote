@@ -1026,6 +1026,33 @@ class Api implements GitApi, GitWriteApi {
     return value;
   }
 
+  GitOperation _operation(
+    Map<String, dynamic> json, {
+    String? expectedOperationId,
+  }) {
+    final value = GitOperation.fromJson(json);
+    if (value.operationId.isEmpty ||
+        (expectedOperationId != null &&
+            value.operationId != expectedOperationId)) {
+      throw ApiException(
+        'Git response did not contain the requested operation',
+        code: 'provider-invalid-response',
+      );
+    }
+    return value;
+  }
+
+  GitConfirmation _confirmation(Map<String, dynamic> json) {
+    final value = GitConfirmation.fromJson(json);
+    if (value.challengeId.isEmpty || value.expiresAt <= 0) {
+      throw ApiException(
+        'Git confirmation response did not contain a valid challenge',
+        code: 'provider-invalid-response',
+      );
+    }
+    return value;
+  }
+
   @override
   Future<GitChangeSet> createGitChangeSet(
     String repositoryId,
@@ -1216,7 +1243,11 @@ class Api implements GitApi, GitWriteApi {
     final json = await _gitPost('/api/git/abort/preflight', {
       'repositoryId': repositoryId,
     });
-    return GitPreflight.fromJson(_jsonMap(json['preflight']));
+    return _preflight(
+      _jsonMap(json['preflight']),
+      repositoryId: repositoryId,
+      operationKind: 'git.abort',
+    );
   }
 
   @override
@@ -1224,7 +1255,7 @@ class Api implements GitApi, GitWriteApi {
     required String repositoryId,
     required GitPreflight preflight,
     required String confirmationRequestId,
-  }) async => GitConfirmation.fromJson(
+  }) async => _confirmation(
     await _gitPost('/api/git/confirmations', {
       'repositoryId': repositoryId,
       'confirmationRequestId': confirmationRequestId,
@@ -1255,7 +1286,10 @@ class Api implements GitApi, GitWriteApi {
     final json = await getJson(
       '/api/git/operations/${Uri.encodeComponent(operationId)}',
     );
-    return GitOperation.fromJson(_jsonMap(json['operation']));
+    return _operation(
+      _jsonMap(json['operation']),
+      expectedOperationId: operationId,
+    );
   }
 
   @override
@@ -1312,7 +1346,10 @@ class Api implements GitApi, GitWriteApi {
         'expectedRevision': operation.revision,
       },
     );
-    return GitOperation.fromJson(_jsonMap(json['operation']));
+    return _operation(
+      _jsonMap(json['operation']),
+      expectedOperationId: operation.operationId,
+    );
   }
 
   @override
@@ -1332,7 +1369,7 @@ class Api implements GitApi, GitWriteApi {
         'observedAt': DateTime.now().millisecondsSinceEpoch,
       },
     });
-    return GitOperation.fromJson(json);
+    return _operation(json, expectedOperationId: operation.operationId);
   }
 
   /// SSE 全量帧流（session/event + agent/status + hello），不做会话过滤。
