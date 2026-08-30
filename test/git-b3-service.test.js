@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -254,6 +254,112 @@ test("B3 rebase conflict exposes a rebase abort target", async () => {
 		assert.equal(conflict.status, "conflicted", JSON.stringify(conflict));
 		const abort = await f.writes.abortPreflight({ repositoryId: f.repositoryId });
 		assert.equal(abort.params.kind, "rebase");
+	} finally { f.cleanup(); }
+});
+
+test("B3 confirmed rebase abort restores the original branch", async () => {
+	const f = await fixture();
+	try {
+		const originalHead = localCommit(f, "local rebase abort\n", "local rebase abort");
+		peerCommit(f, "remote rebase abort\n", "remote rebase abort");
+		const pull = await f.writes.pullPreflight({ repositoryId: f.repositoryId, remote: "origin", branch: "main", strategy: "rebase" });
+		const pullOp = await f.writes.submitPull({ repositoryId: f.repositoryId, requestId: request("rebase-abort-pull"), params: pull.params, preconditionToken: pull.preconditionToken });
+		assert.equal((await waitFor(f.operations, pullOp.operationId)).status, "conflicted");
+		const abort = await f.writes.abortPreflight({ repositoryId: f.repositoryId });
+		const challenge = await f.writes.issueConfirmation({ repositoryId: f.repositoryId, confirmationRequestId: request("rebase-abort-challenge"), operationType: "git.abort", params: abort.params, preconditionToken: abort.preconditionToken });
+		const abortOp = await f.writes.submitAbort({ repositoryId: f.repositoryId, requestId: request("rebase-abort"), params: abort.params, preconditionToken: abort.preconditionToken, challengeId: challenge.challengeId });
+		const done = await waitFor(f.operations, abortOp.operationId);
+		assert.equal(done.status, "succeeded", JSON.stringify(done));
+		assert.equal(git(f.root, "branch", "--show-current"), "main");
+		assert.equal(git(f.root, "rev-parse", "HEAD"), originalHead);
+		assert.equal(git(f.root, "status", "--porcelain"), "");
+	} finally { f.cleanup(); }
+});
+
+test("B3 pull merge does not execute repository hooks", async () => {
+	const f = await fixture();
+	try {
+		writeFileSync(join(f.root, "local.txt"), "local\n");
+		git(f.root, "add", "local.txt");
+		git(f.root, "commit", "-m", "local side");
+		writeFileSync(join(f.peer, "remote.txt"), "remote\n");
+		git(f.peer, "add", "remote.txt");
+		git(f.peer, "commit", "-m", "remote side");
+		git(f.peer, "push", "origin", "main");
+		const marker = join(f.root, "hook-ran");
+		writeFileSync(join(f.root, ".git", "hooks", "post-merge"), `#!/bin/sh\necho ran > ${JSON.stringify(marker)}\n`);
+		chmodSync(join(f.root, ".git", "hooks", "post-merge"), 0o755);
+		const pull = await f.writes.pullPreflight({ repositoryId: f.repositoryId, remote: "origin", branch: "main", strategy: "merge" });
+		const operation = await f.writes.submitPull({ repositoryId: f.repositoryId, requestId: request("no-hooks"), params: pull.params, preconditionToken: pull.preconditionToken });
+		assert.equal((await waitFor(f.operations, operation.operationId)).status, "succeeded");
+		assert.equal(existsSync(marker), false);
+	} finally { f.cleanup(); }
+});
+
+test("B3 sync refuses to push a local commit created after integration", async () => {
+	const f = await fixture();
+	try {
+		writeFileSync(join(f.root, "local.txt"), "local\n");
+		git(f.root, "add", "local.txt");
+		git(f.root, "commit", "-m", "local side");
+		writeFileSync(join(f.peer, "remote.txt"), "remote\n");
+		git(f.peer, "add", "remote.txt");
+		git(f.peer, "commit", "-m", "remote side");
+		git(f.peer, "push", "origin", "main");
+		const remoteBefore = git(f.bare, "rev-parse", "refs/heads/main");
+		const preflight = await f.writes.syncPreflight({ repositoryId: f.repositoryId, remote: "origin", branch: "main", strategy: "merge" });
+		const original = f.git.runCommand.bind(f.git);
+		let mergeCompleted = false;
+		let statusAfterMerge = 0;
+		let externalOid;
+		f.git.runCommand = async (argv, root, signal, options) => {
+			if (mergeCompleted && argv.includes("status") && ++statusAfterMerge === 2) {
+				git(f.root, "commit", "--allow-empty", "-m", "external after integration");
+				externalOid = git(f.root, "rev-parse", "HEAD");
+			}
+			const value = await original(argv, root, signal, options);
+			if (argv.includes("merge") && !argv.includes("merge-base")) mergeCompleted = true;
+			return value;
+		};
+		const operation = await f.writes.submitSync({ repositoryId: f.repositoryId, requestId: request("sync-concurrent-local"), params: preflight.params, preconditionToken: preflight.preconditionToken });
+		const done = await waitFor(f.operations, operation.operationId);
+		assert.ok(externalOid);
+		assert.equal(done.status, "failed", JSON.stringify(done));
+		assert.equal(done.errorCode, "state-changed");
+		assert.equal(git(f.bare, "rev-parse", "refs/heads/main"), remoteBefore);
+		assert.notEqual(git(f.bare, "rev-parse", "refs/heads/main"), externalOid);
+	} finally { f.cleanup(); }
+});
+
+test("B3 propagates provider failure from ancestor checks", async () => {
+	const f = await fixture();
+	try {
+		const before = git(f.root, "rev-parse", "HEAD");
+		peerCommit(f, "remote ancestor failure\n");
+		const preflight = await f.writes.pullPreflight({ repositoryId: f.repositoryId, remote: "origin", branch: "main", strategy: "merge" });
+		const original = f.git.runCommand.bind(f.git);
+		let injected = false;
+		f.git.runCommand = async (argv, ...rest) => {
+			if (!injected && argv.includes("merge-base") && argv.includes("--is-ancestor")) { injected = true; throw new GitOperationError("provider-unavailable", "injected provider failure"); }
+			return original(argv, ...rest);
+		};
+		const operation = await f.writes.submitPull({ repositoryId: f.repositoryId, requestId: request("ancestor-provider"), params: preflight.params, preconditionToken: preflight.preconditionToken });
+		const done = await waitFor(f.operations, operation.operationId);
+		assert.equal(done.status, "failed", JSON.stringify(done));
+		assert.equal(done.errorCode, "provider-unavailable");
+		assert.equal(git(f.root, "rev-parse", "HEAD"), before);
+	} finally { f.cleanup(); }
+});
+
+test("B3 branch validation preserves provider errors", async () => {
+	const f = await fixture();
+	try {
+		const original = f.git.runCommand.bind(f.git);
+		f.git.runCommand = async (argv, ...rest) => {
+			if (argv.includes("check-ref-format")) throw new GitOperationError("provider-unavailable", "injected provider failure");
+			return original(argv, ...rest);
+		};
+		await assert.rejects(() => f.writes.pullPreflight({ repositoryId: f.repositoryId, remote: "origin", branch: "main", strategy: "merge" }), (error) => error.code === "provider-unavailable");
 	} finally { f.cleanup(); }
 });
 

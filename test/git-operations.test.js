@@ -88,6 +88,26 @@ test("confirmation consumption is durable and atomic with operation creation", a
 	} finally { f.manager.stop(); f.cleanup(); }
 });
 
+test("expired confirmation requests and replay records are pruned", async () => {
+	let clock = 1_000;
+	const f = await managerFixture({ now: () => clock });
+	try {
+		f.manager.registerExecutor("confirmed-expiry", async () => ({ status: "succeeded" }));
+		f.manager.recordConfirmation({ key: "repo:old", challengeId: "challenge-old", requestDigest: "digest-old", expiresAt: 1_100, summary: "old" });
+		const operation = await f.manager.submit({ repositoryId: "repo", requestId: request(63), kind: "confirmed-expiry", preconditionToken: "p", confirmation: { challengeId: "challenge-old", requestId: request(63), expiresAt: 1_100 } });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(f.manager.get(operation.operationId).status, "succeeded");
+		clock = 1_200;
+		f.manager.recordConfirmation({ key: "repo:new", challengeId: "challenge-new", requestDigest: "digest-new", expiresAt: 1_300, summary: "new" });
+		assert.equal(f.manager.getConfirmation("repo:old"), undefined);
+		f.manager.stop();
+		const restored = new OperationLedger({ filePath: f.filePath });
+		assert.equal(restored.state.confirmationRequests["repo:old"], undefined);
+		assert.equal(restored.state.confirmations["challenge-old"], undefined);
+		assert.equal(restored.state.confirmationRequests["repo:new"].challengeId, "challenge-new");
+	} finally { f.manager.stop(); f.cleanup(); }
+});
+
 test("precondition failures remain visible and executor progress cannot mutate state", async () => {
 	const { manager, cleanup } = await managerFixture();
 	try {
@@ -164,6 +184,23 @@ test("queued cancellation is terminal and running cancellation is delegated to e
 		release();
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.equal(manager.get(first.operationId).status, "cancelled");
+	} finally { manager.stop(); cleanup(); }
+});
+
+test("a recovery-exempt operation bypasses blocked followers in every domain", async () => {
+	const { manager, cleanup } = await managerFixture();
+	try {
+		manager.registerExecutor("uncertain-recovery", async () => { throw new GitOperationError("unknown-result", "uncertain"); });
+		manager.registerExecutor("blocked-follower", async () => ({ status: "succeeded" }));
+		manager.registerExecutor("recovery-abort", async () => ({ status: "succeeded" }));
+		const blocker = await manager.submit({ repositoryId: "repo", requestId: request(60), kind: "uncertain-recovery", coordinationDomains: ["common", "worktree"], preconditionToken: "p" });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(manager.get(blocker.operationId).status, "unknown-result");
+		const follower = await manager.submit({ repositoryId: "repo", requestId: request(61), kind: "blocked-follower", coordinationDomains: ["common", "worktree"], preconditionToken: "p" });
+		const recovery = await manager.submit({ repositoryId: "repo", requestId: request(62), kind: "recovery-abort", coordinationDomains: ["common", "worktree"], preconditionToken: "p", recoveryExempt: true });
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		assert.equal(manager.get(recovery.operationId).status, "succeeded");
+		assert.equal(manager.get(follower.operationId).status, "queued");
 	} finally { manager.stop(); cleanup(); }
 });
 

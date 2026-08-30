@@ -66,6 +66,14 @@ test("B1 write routes are POST-only and do not shadow GET commit details", () =>
 	assert.ok(source.includes('const gitMatch = /^\\/git\\/(context|status|branches|remotes|graph|commit|diff)$/.exec(rest);'));
 });
 
+test("B1 and B2 routes reject unsupported request fields", () => {
+	const source = readFileSync(new URL("../lib/index.js", import.meta.url), "utf8");
+	assert.match(source, /rest === "\/git\/change-sets" \? new Set\(\["repositoryId", "kind"\]\)/);
+	assert.match(source, /new Set\(\["repositoryId", "requestId", "changeSetId", "selections", "preconditionToken"\]\)/);
+	assert.match(source, /new Set\(\["repositoryId", "targetRef", "targetBranch", "localName"\]\)/);
+	assert.match(source, /if \(rejectUnknownKeys\(body, allowed, res\)\) return/);
+});
+
 test("B3 routes require the mobile contract and expose staged sync operations", () => {
 	const source = readFileSync(new URL("../lib/index.js", import.meta.url), "utf8");
 	for (const route of ["/git/fetch/preflight", "/git/fetch", "/git/pull/preflight", "/git/pull", "/git/push/preflight", "/git/push", "/git/sync/preflight", "/git/sync", "/git/abort/preflight", "/git/abort", "/git/confirmations"]) assert.ok(source.includes(`"${route}"`), `missing B3 route ${route}`);

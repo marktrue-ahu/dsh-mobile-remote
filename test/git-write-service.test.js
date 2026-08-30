@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import { createGitService } from "../lib/git-service.js";
-import { createGitOperationManager } from "../lib/git-operations.js";
+import { createGitOperationManager, GitOperationError } from "../lib/git-operations.js";
 import { createGitWriteService } from "../lib/git-write-service.js";
 
 function git(cwd, ...args) {
@@ -97,6 +97,56 @@ test("B2 renames only the local branch and preserves its commit", async () => {
 		assert.equal(git(f.root, "config", "--get", "branch.renamed.remote"), "origin");
 		assert.equal(git(f.root, "config", "--get", "branch.renamed.merge"), "refs/heads/main");
 		assert.equal(spawnSync("git", ["-C", f.root, "config", "--get-regexp", "^branch\\.main\\."], { encoding: "utf8" }).status, 1);
+	} finally { f.cleanup(); }
+});
+
+test("B2 rejects a rename when its current-branch state changes while queued", async () => {
+	const f = await fixture({ preconditionSecret: Buffer.alloc(32, 12) });
+	let release;
+	try {
+		git(f.root, "branch", "holder");
+		const preflight = await f.writes.branchPreflight({ repositoryId: f.repositoryId, action: "rename", oldName: "holder", name: "renamed" });
+		const domains = await f.git.writeDomains(f.repositoryId);
+		const gate = new Promise((resolve) => { release = resolve; });
+		f.operations.registerExecutor("test.hold-common", async () => { await gate; return { status: "succeeded" }; });
+		const hold = await f.operations.submit({ repositoryId: f.repositoryId, requestId: "b2-hold-common", kind: "test.hold-common", coordinationDomain: domains.commonDomain, preconditionToken: "p" });
+		while (f.operations.get(hold.operationId).status !== "running") await new Promise((resolve) => setImmediate(resolve));
+		const operation = await f.writes.submitBranch({ repositoryId: f.repositoryId, requestId: "b2-rename-stale-current", action: "rename", params: preflight.params, preconditionToken: preflight.preconditionToken });
+		assert.deepEqual(f.operations.get(operation.operationId).coordinationDomains, [domains.commonDomain, domains.worktreeDomain].sort());
+		git(f.root, "switch", "holder");
+		release();
+		const done = await waitFor(f.operations, operation.operationId);
+		assert.equal(done.status, "failed", JSON.stringify(done));
+		assert.equal(done.errorCode, "state-changed");
+		assert.equal(git(f.root, "branch", "--show-current"), "holder");
+		assert.equal(git(f.root, "rev-parse", "refs/heads/holder"), preflight.oldOid);
+		assert.notEqual(spawnSync("git", ["-C", f.root, "show-ref", "--verify", "refs/heads/renamed"], { encoding: "utf8" }).status, 0);
+	} finally { release?.(); f.cleanup(); }
+});
+
+test("B2 branch switch does not execute post-checkout hooks", async () => {
+	const f = await fixture();
+	try {
+		git(f.root, "branch", "feature");
+		const marker = `${f.root}/switch-hook-ran`;
+		writeFileSync(`${f.root}/.git/hooks/post-checkout`, `#!/bin/sh\necho ran > ${JSON.stringify(marker)}\n`);
+		chmodSync(`${f.root}/.git/hooks/post-checkout`, 0o755);
+		const preflight = await f.writes.branchPreflight({ repositoryId: f.repositoryId, action: "switch", targetBranch: "feature" });
+		const operation = await f.writes.submitBranch({ repositoryId: f.repositoryId, requestId: "b2-switch-no-hooks", action: "switch", params: preflight.params, preconditionToken: preflight.preconditionToken });
+		assert.equal((await waitFor(f.operations, operation.operationId)).status, "succeeded");
+		assert.equal(existsSync(marker), false);
+	} finally { f.cleanup(); }
+});
+
+test("B2 branch validators preserve provider errors", async () => {
+	const f = await fixture();
+	try {
+		const original = f.git.runCommand.bind(f.git);
+		f.git.runCommand = async (argv, ...rest) => {
+			if (argv.includes("check-ref-format")) throw new GitOperationError("provider-unavailable", "injected provider failure");
+			return original(argv, ...rest);
+		};
+		await assert.rejects(() => f.writes.branchPreflight({ repositoryId: f.repositoryId, action: "create", name: "feature" }), (error) => error.code === "provider-unavailable");
 	} finally { f.cleanup(); }
 });
 
@@ -285,6 +335,40 @@ test("B2 rejects tampered and expired signed branch tokens", async () => {
 		clock += 10 * 60 * 1000 + 1;
 		await assert.rejects(() => f.writes.submitBranch({ repositoryId: f.repositoryId, requestId: "b2-expired", action: "create", params: preflight.params, preconditionToken: preflight.preconditionToken }), (error) => error.code === "state-changed");
 	} finally { f.cleanup(); }
+});
+
+test("B1 accepted stage work survives write-service reconstruction", async () => {
+	const secret = Buffer.alloc(32, 13);
+	const f = await fixture({ preconditionSecret: secret });
+	const makeOperations = () => {
+		const value = { executors: new Map(), checker: null, submitted: null,
+			isAvailable: () => true,
+			registerExecutor(kind, executor) { value.executors.set(kind, executor); },
+			addPreconditionChecker(checker) { value.checker = checker; return () => {}; },
+			async submit(operation) { value.submitted = structuredClone(operation); return operation; },
+		};
+		return value;
+	};
+	let producer;
+	let consumer;
+	try {
+		f.writes.stop();
+		writeFileSync(`${f.root}/tracked.txt`, "reconstructed stage\n");
+		const firstOperations = makeOperations();
+		producer = createGitWriteService({ git: f.git, operations: firstOperations, preconditionSecret: secret });
+		const changes = await producer.createChangeSet({ repositoryId: f.repositoryId, kind: "working" });
+		await producer.submitStage({ repositoryId: f.repositoryId, requestId: "b1-stage-reconstructed", changeSetId: changes.changeSetId, selections: [{ fileId: changes.files[0].fileId }], preconditionToken: changes.preconditionToken });
+		const persisted = firstOperations.submitted;
+		producer.stop();
+		producer = null;
+		const secondOperations = makeOperations();
+		consumer = createGitWriteService({ git: f.git, operations: secondOperations, preconditionSecret: secret });
+		const operation = { ...persisted, operationId: "persisted-stage", status: "queued" };
+		await secondOperations.checker(operation);
+		const outcome = await secondOperations.executors.get("git.stage")({ operation, signal: new AbortController().signal, update() {} });
+		assert.equal(outcome.status, "succeeded", JSON.stringify(outcome));
+		assert.match(git(f.root, "diff", "--cached"), /reconstructed stage/);
+	} finally { producer?.stop(); consumer?.stop(); f.cleanup(); }
 });
 
 test("B1 write operations reject host paths instead of treating them as repository IDs", async () => {
