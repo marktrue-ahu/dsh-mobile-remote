@@ -7,6 +7,7 @@ import '../git_models.dart';
 import '../git_graph_logic.dart' as graph_logic;
 import '../store.dart';
 import '../theme.dart';
+import 'git_write_widgets.dart';
 
 void _showGitSheet(BuildContext context, WidgetBuilder builder) {
   showModalBottomSheet<void>(
@@ -24,13 +25,11 @@ void _showGitSheet(BuildContext context, WidgetBuilder builder) {
 
 class _GitSheetHeader extends StatelessWidget {
   final String title;
-  final String? subtitle;
 
-  const _GitSheetHeader({required this.title, this.subtitle});
+  const _GitSheetHeader({required this.title});
 
   @override
   Widget build(BuildContext context) {
-    final ink3 = DshColors.ink3(context);
     return Padding(
       padding: const EdgeInsets.fromLTRB(18, 10, 18, 8),
       child: Column(
@@ -51,14 +50,6 @@ class _GitSheetHeader extends StatelessWidget {
             textAlign: TextAlign.center,
             style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
           ),
-          if (subtitle != null) ...[
-            const SizedBox(height: 3),
-            Text(
-              subtitle!,
-              textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 11.5, height: 1.35, color: ink3),
-            ),
-          ],
         ],
       ),
     );
@@ -123,112 +114,23 @@ class GitQuickbar extends StatelessWidget {
 
   void _open(BuildContext context, String slot) {
     if (slot == 'current-branch') {
-      _showGitSheet(context, (_) => _BranchSheet(store: store));
+      _showGitSheet(context, (_) => GitBranchWriteSheet(store: store));
     } else if (slot == 'graph') {
       _showGitSheet(context, (_) => _GraphSheet(store: store));
+    } else if (slot == 'sync-status' && store.gitCapability.writes) {
+      _showGitSheet(context, (_) => GitSyncSheet(store: store));
+    } else if ((slot == 'diff' || slot == 'status') &&
+        store.gitCapability.writes) {
+      _showGitSheet(
+        context,
+        (_) => GitStatusWriteSheet(store: store, showDiff: slot == 'diff'),
+      );
     } else if (slot == 'diff' || slot == 'status' || slot == 'sync-status') {
       _showGitSheet(
         context,
         (_) => _StatusSheet(store: store, showDiff: slot == 'diff'),
       );
     }
-  }
-}
-
-class _BranchSheet extends StatelessWidget {
-  final AppStore store;
-
-  const _BranchSheet({required this.store});
-
-  @override
-  Widget build(BuildContext context) {
-    final brand = DshColors.brand(context);
-    final ink3 = DshColors.ink3(context);
-    final branches = AppStore.sortGitBranches(store.gitBranches);
-    final localBranches = branches.where((branch) => !branch.remote).toList();
-    final remoteBranches = branches.where((branch) => branch.remote).toList();
-
-    Widget branchTile(GitBranch branch) {
-      final shortOid = branch.oid.length > 8
-          ? branch.oid.substring(0, 8)
-          : branch.oid;
-      return ListTile(
-        dense: true,
-        minVerticalPadding: 7,
-        contentPadding: const EdgeInsets.symmetric(horizontal: 6),
-        horizontalTitleGap: 12,
-        leading: Icon(
-          branch.remote ? Icons.cloud_outlined : Icons.account_tree,
-          size: 20,
-          color: branch.remote ? ink3 : brand,
-        ),
-        title: Text(
-          branch.displayName,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
-        ),
-        subtitle: Text(shortOid, style: TextStyle(fontSize: 11.5, color: ink3)),
-        trailing: branch.displayName == store.gitStatus?.branch
-            ? Icon(Icons.check, size: 18, color: brand)
-            : const SizedBox(width: 18),
-      );
-    }
-
-    Widget groupTitle(String title) => Padding(
-      padding: const EdgeInsets.only(top: 12, bottom: 4),
-      child: Text(
-        title,
-        style: TextStyle(
-          fontSize: 12,
-          fontWeight: FontWeight.w700,
-          color: DshColors.ink2(context),
-        ),
-      ),
-    );
-
-    List<Widget> branchRows(List<GitBranch> values) => [
-      for (var i = 0; i < values.length; i++) ...[
-        branchTile(values[i]),
-        if (i < values.length - 1) const Divider(height: 1),
-      ],
-    ];
-
-    return SafeArea(
-      child: SizedBox(
-        height: MediaQuery.of(context).size.height * 0.62,
-        child: Column(
-          children: [
-            const _GitSheetHeader(title: '分支', subtitle: '只读视图；切换分支将在后续版本提供'),
-            Expanded(
-              child: ListView(
-                padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-                children: [
-                  if (localBranches.isNotEmpty) ...[
-                    groupTitle('本地分支'),
-                    ...branchRows(localBranches),
-                  ],
-                  if (remoteBranches.isNotEmpty) ...[
-                    groupTitle('远程分支'),
-                    ...branchRows(remoteBranches),
-                  ],
-                  if (branches.isEmpty)
-                    Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 20),
-                      child: Center(
-                        child: Text(
-                          '暂无分支',
-                          style: TextStyle(fontSize: 13, color: ink3),
-                        ),
-                      ),
-                    ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
   }
 }
 
