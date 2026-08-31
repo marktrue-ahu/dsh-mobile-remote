@@ -138,6 +138,33 @@ void main() {
     },
   );
 
+  testWidgets('local branch switch opens confirmation and submits', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(800, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final fake = FakeGitApi();
+    final store = await makeStore(fake);
+    addTearDown(store.dispose);
+
+    await tester.pumpWidget(harness(GitBranchWriteSheet(store: store)));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('feature'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('切换分支？'), findsOneWidget);
+    await tester.tap(find.text('确认'));
+    await tester.pump(const Duration(milliseconds: 500));
+
+    expect(fake.lastSubmittedPreflight?.params['targetBranch'], 'feature');
+    expect(
+      store.gitOperations.operations.values.any(
+        (operation) => operation.kind == 'git.branch-switch',
+      ),
+      isTrue,
+    );
+  });
+
   testWidgets('protected branch switch offers no force action', (tester) async {
     await tester.binding.setSurfaceSize(const Size(800, 1000));
     addTearDown(() => tester.binding.setSurfaceSize(null));

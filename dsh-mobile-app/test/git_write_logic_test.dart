@@ -179,6 +179,39 @@ void main() {
     expect(accepted.operation.status, 'queued');
   });
 
+  test('branch preflight fills service-owned context fields', () async {
+    final client = MockClient((request) async {
+      expect(request.url.path, '/m/api/git/branch-switch/preflight');
+      return http.Response(
+        jsonEncode({
+          'preflight': {
+            'action': 'switch',
+            'safe': true,
+            'noop': true,
+            'targetBranch': 'main',
+            'targetOid': 'deadbeef',
+            'stateVersion': 'state-1',
+            'preconditionToken': null,
+          },
+        }),
+        200,
+      );
+    });
+    final api = Api(client: client)
+      ..baseUrl = 'http://localhost:3080'
+      ..path = '/m';
+
+    final preflight = await api.gitBranchPreflight(
+      'repo-1',
+      action: 'switch',
+      targetBranch: 'main',
+    );
+
+    expect(preflight.repositoryId, 'repo-1');
+    expect(preflight.operationKind, 'git.branch-switch');
+    expect(preflight.noop, isTrue);
+  });
+
   test('remote preflight preserves implicit upstream omission', () async {
     late Map<String, dynamic> captured;
     final client = MockClient((request) async {

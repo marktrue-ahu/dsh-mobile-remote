@@ -1150,6 +1150,9 @@ class Api implements GitApi, GitWriteApi {
       },
     );
     final value = _jsonMap(json['preflight']);
+    // Branch preflight responses intentionally omit transport context; the
+    // request already binds the response to this repository and action.
+    value.putIfAbsent('repositoryId', () => repositoryId);
     value.putIfAbsent('operationKind', () => 'git.branch-$action');
     return _preflight(
       value,
