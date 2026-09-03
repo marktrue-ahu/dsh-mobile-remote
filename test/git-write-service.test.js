@@ -227,6 +227,26 @@ test("B2 switches cleanly without force", async () => {
 	} finally { f.cleanup(); }
 });
 
+test("B2 switch between branches with different trees reports success", async () => {
+	const f = await fixture();
+	try {
+		// 真实场景：目标分支与当前分支树不同（feature 上新增提交）。此前的成功校验
+		// 要求 facts.indexTree === expected.indexTree（切换前索引树），切换后索引树必然
+		// 改变 → 误判 unknown-result，进而阻塞协调域让后续操作永远排队。
+		git(f.root, "branch", "feature");
+		git(f.root, "switch", "feature");
+		writeFileSync(`${f.root}/feature-only.txt`, "feature content\n");
+		git(f.root, "add", "feature-only.txt");
+		git(f.root, "commit", "-m", "feature commit");
+		git(f.root, "switch", "main");
+		const preflight = await f.writes.branchPreflight({ repositoryId: f.repositoryId, action: "switch", targetBranch: "feature" });
+		const operation = await f.writes.submitBranch({ repositoryId: f.repositoryId, requestId: "b2-branch-tree-diff", action: "switch", params: { targetBranch: preflight.targetBranch, targetRef: preflight.targetRef, targetOid: preflight.targetOid }, preconditionToken: preflight.preconditionToken });
+		assert.equal((await waitFor(f.operations, operation.operationId)).status, "succeeded");
+		assert.equal(git(f.root, "branch", "--show-current"), "feature");
+		assert.equal(git(f.root, "rev-parse", "HEAD"), preflight.targetOid);
+	} finally { f.cleanup(); }
+});
+
 test("B2 does not report success when switch post-facts mismatch", async () => {
 	const base = subprocess();
 	const f = await fixture({ subprocess: { spawn(spec) {
