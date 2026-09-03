@@ -1,9 +1,11 @@
 // 设置页（对齐网页端 settings screen）：连接/默认配置/账户/显示/关于
 import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
+
 import '../api.dart';
 import '../floating.dart';
 import '../l10n.dart';
@@ -13,13 +15,20 @@ import '../git_models.dart';
 import '../theme.dart';
 import '../toast.dart';
 import '../fmt.dart';
+import '../update_core.dart';
+import '../update_flow.dart';
+import '../updater.dart';
 import 'sheets.dart';
 import 'providers_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
   final AppStore store;
   final Future<void> Function() onReconfigure;
-  const SettingsScreen({super.key, required this.store, required this.onReconfigure});
+  const SettingsScreen({
+    super.key,
+    required this.store,
+    required this.onReconfigure,
+  });
 
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
@@ -35,6 +44,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String _diagTime = '';
   String _appVersion = ''; // App 自身版本（package_info_plus，构建时打包）
   bool _bubbleOn = false; // 悬浮球开关状态（与服务实际运行状态同步）
+  bool _updateFlowBusy = false; // 更新流程进行中（下载/安装），防连点
 
   @override
   void initState() {
@@ -53,7 +63,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
     // v2.7.2：偏好是开但服务没跑（清理后台/重启后）→ 自动拉起，开关保持开
     if (want && !on && canOverlay) {
       await Floating.start();
-      unawaited(Floating.setBalanceAlert(widget.store.balanceAlert, widget.store.balanceThreshold));
+      unawaited(
+        Floating.setBalanceAlert(
+          widget.store.balanceAlert,
+          widget.store.balanceThreshold,
+        ),
+      );
     }
     // v2.7.2 review(M7)：权限被撤销时开关显示关（此前 want||on 会假开——球实际不在）
     if (mounted) setState(() => _bubbleOn = on || (want && canOverlay));
@@ -69,8 +84,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
           context: context,
           builder: (ctx) => AlertDialog(
             title: Text(L10n.t('需要悬浮窗权限', 'Overlay permission needed')),
-            content: Text(L10n.t('开启悬浮球需要在系统设置中允许「显示在其他应用上层」。\n点击【去开启】跳转系统设置。',
-                'The floating bubble needs the "display over other apps" permission.\nTap Open Settings to grant it.')),
+            content: Text(
+              L10n.t(
+                '开启悬浮球需要在系统设置中允许「显示在其他应用上层」。\n点击【去开启】跳转系统设置。',
+                'The floating bubble needs the "display over other apps" permission.\nTap Open Settings to grant it.',
+              ),
+            ),
             actions: [
               TextButton(
                 onPressed: () => Navigator.of(ctx).pop(false),
@@ -93,7 +112,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
       } catch (e) {
         if (mounted) {
           setState(() => _bubbleOn = false);
-          showToast(context, '${L10n.t('悬浮球启动失败：', 'Bubble start failed: ')}$e');
+          showToast(
+            context,
+            '${L10n.t('悬浮球启动失败：', 'Bubble start failed: ')}$e',
+          );
         }
         return;
       }
@@ -141,7 +163,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
           children: [
             Padding(
               padding: const EdgeInsets.fromLTRB(20, 14, 20, 6),
-              child: Text(L10n.t('选择连接地址', 'Choose address'), style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700)),
+              child: Text(
+                L10n.t('选择连接地址', 'Choose address'),
+                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+              ),
             ),
             // 候选地址随使用动态累积（局域网/组网/历史地址），列表区可滚动防溢出
             Flexible(
@@ -152,11 +177,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     ListTile(
                       dense: true,
                       leading: Icon(
-                        c == current ? Icons.check_circle : Icons.circle_outlined,
+                        c == current
+                            ? Icons.check_circle
+                            : Icons.circle_outlined,
                         size: 18,
-                        color: c == current ? DshColors.brand(context) : DshColors.ink3(context),
+                        color: c == current
+                            ? DshColors.brand(context)
+                            : DshColors.ink3(context),
                       ),
-                      title: Text(c, style: TextStyle(fontSize: 13.5, color: c == current ? DshColors.brand(context) : null)),
+                      title: Text(
+                        c,
+                        style: TextStyle(
+                          fontSize: 13.5,
+                          color: c == current ? DshColors.brand(context) : null,
+                        ),
+                      ),
                       onTap: () => Navigator.of(ctx).pop(c),
                     ),
                 ],
@@ -173,11 +208,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (err != null) {
       ScaffoldMessenger.of(context)
         ..clearSnackBars()
-        ..showSnackBar(SnackBar(
-          content: Text(err),
-          duration: const Duration(milliseconds: 2000),
-          behavior: SnackBarBehavior.floating,
-        ));
+        ..showSnackBar(
+          SnackBar(
+            content: Text(err),
+            duration: const Duration(milliseconds: 2000),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
     } else {
       showToast(context, L10n.t('已切换 → ', 'Switched to ') + choice);
     }
@@ -204,7 +241,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
         final total = (b['total'] as num?)?.toDouble() ?? double.infinity;
         if (total < widget.store.balanceThreshold && !_alertShown) {
           _alertShown = true;
-          showToast(context, L10n.t('余额不足 ¥', 'Low balance ¥') + total.toStringAsFixed(1) + L10n.t('，建议及时充值', ' — consider topping up'));
+          showToast(
+            context,
+            L10n.t('余额不足 ¥', 'Low balance ¥') +
+                total.toStringAsFixed(1) +
+                L10n.t('，建议及时充值', ' — consider topping up'),
+          );
         }
       }
     } catch (e) {
@@ -218,7 +260,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   /// 阈值显示格式：整数不带小数（¥10），非整数两位（¥12.50）。
-  String _fmtThreshold(double v) => v == v.roundToDouble() ? v.round().toString() : v.toStringAsFixed(2);
+  String _fmtThreshold(double v) =>
+      v == v.roundToDouble() ? v.round().toString() : v.toStringAsFixed(2);
 
   /// 余额预警阈值选择：¥5 / ¥10 / ¥20 / ¥50 / 自定义输入。
   Future<void> _pickThreshold() async {
@@ -237,45 +280,67 @@ class _SettingsScreenState extends State<SettingsScreen> {
               padding: const EdgeInsets.fromLTRB(20, 16, 20, 4),
               child: Align(
                 alignment: Alignment.centerLeft,
-                child: Text(L10n.t('余额预警阈值', 'Low-balance threshold'),
-                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                child: Text(
+                  L10n.t('余额预警阈值', 'Low-balance threshold'),
+                  style: const TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
               ),
             ),
-            ...presets.map((p) => ListTile(
-                  dense: true,
-                  title: Text('¥${_fmtThreshold(p)}', style: const TextStyle(fontSize: 15)),
-                  trailing: p == current
-                      ? Icon(Icons.check, size: 18, color: brand)
-                      : null,
-                  onTap: () => Navigator.of(ctx).pop(p),
-                )),
+            ...presets.map(
+              (p) => ListTile(
+                dense: true,
+                title: Text(
+                  '¥${_fmtThreshold(p)}',
+                  style: const TextStyle(fontSize: 15),
+                ),
+                trailing: p == current
+                    ? Icon(Icons.check, size: 18, color: brand)
+                    : null,
+                onTap: () => Navigator.of(ctx).pop(p),
+              ),
+            ),
             ListTile(
               dense: true,
-              title: Text(L10n.t('自定义…', 'Custom…'), style: const TextStyle(fontSize: 15)),
+              title: Text(
+                L10n.t('自定义…', 'Custom…'),
+                style: const TextStyle(fontSize: 15),
+              ),
               onTap: () async {
                 Navigator.of(ctx).pop();
-                final ctrl = TextEditingController(text: current == current.roundToDouble()
-                    ? current.round().toString()
-                    : current.toStringAsFixed(2));
+                final ctrl = TextEditingController(
+                  text: current == current.roundToDouble()
+                      ? current.round().toString()
+                      : current.toStringAsFixed(2),
+                );
                 final v = await showDialog<String>(
                   context: context,
                   builder: (dctx) => AlertDialog(
-                    title: Text(L10n.t('自定义阈值（元）', 'Custom threshold (¥)'),
-                        style: const TextStyle(fontSize: 16)),
+                    title: Text(
+                      L10n.t('自定义阈值（元）', 'Custom threshold (¥)'),
+                      style: const TextStyle(fontSize: 16),
+                    ),
                     content: TextField(
                       controller: ctrl,
                       autofocus: true,
-                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                      keyboardType: const TextInputType.numberWithOptions(
+                        decimal: true,
+                      ),
                       decoration: const InputDecoration(hintText: '10'),
                     ),
                     actions: [
                       TextButton(
-                          onPressed: () => Navigator.of(dctx).pop(),
-                          child: Text(L10n.t('取消', 'Cancel'))),
+                        onPressed: () => Navigator.of(dctx).pop(),
+                        child: Text(L10n.t('取消', 'Cancel')),
+                      ),
                       TextButton(
                         onPressed: () => Navigator.of(dctx).pop(ctrl.text),
-                        child: Text(L10n.t('确定', 'OK'),
-                            style: TextStyle(color: brand)),
+                        child: Text(
+                          L10n.t('确定', 'OK'),
+                          style: TextStyle(color: brand),
+                        ),
                       ),
                     ],
                   ),
@@ -285,11 +350,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   if (parsed != null && parsed > 0) {
                     await widget.store.setBalanceThreshold(parsed);
                     if (mounted) {
-                      showToast(context,
-                          L10n.t('阈值已设为 ¥', 'Threshold set to ¥') + _fmtThreshold(parsed));
+                      showToast(
+                        context,
+                        L10n.t('阈值已设为 ¥', 'Threshold set to ¥') +
+                            _fmtThreshold(parsed),
+                      );
                     }
                   } else if (mounted) {
-                    showToast(context, L10n.t('请输入大于 0 的金额', 'Enter an amount greater than 0'));
+                    showToast(
+                      context,
+                      L10n.t('请输入大于 0 的金额', 'Enter an amount greater than 0'),
+                    );
                   }
                 }
               },
@@ -307,7 +378,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   /// 余额状态行（build 时求值：语言切换后即时换语言）。
   String get _balanceLabel {
     if (_busy) return L10n.t('查询中…', 'Loading…');
-    if (_balanceError != null) return '${L10n.t('查询失败：', 'Failed: ')}$_balanceError';
+    if (_balanceError != null)
+      return '${L10n.t('查询失败：', 'Failed: ')}$_balanceError';
     final b = _balance;
     if (b == null) return L10n.t('无数据', 'No data');
     return '${L10n.t('实时 · 币种 ', 'Live · ')}${b['currency']}${b['available'] == false ? L10n.t(' · 不可用', ' · unavailable') : ''}';
@@ -321,7 +393,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       setState(() {
         _diag = d;
         _diagLoaded = true;
-        _diagTime = '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}';
+        _diagTime =
+            '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}';
       });
     } catch (e) {
       // 刷新失败：清空旧数据，明确显示「检测失败」而非静默展示过期结果
@@ -339,8 +412,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (d == null) return L10n.t('检测失败', 'Check failed');
     final buf = StringBuffer();
     final runtime = d['runtime'] as Map<String, dynamic>? ?? {};
-    buf.writeln('${L10n.t('运行形态: ', 'Mode: ')}${runtime['form']}${runtime['authEnabled'] == true ? L10n.t(' · 口令已启用', ' · auth on') : L10n.t(' · 口令未启用', ' · auth off')}');
-    buf.writeln('${L10n.t('监听: ', 'Listen: ')}${runtime['host']}:${runtime['port']}');
+    buf.writeln(
+      '${L10n.t('运行形态: ', 'Mode: ')}${runtime['form']}${runtime['authEnabled'] == true ? L10n.t(' · 口令已启用', ' · auth on') : L10n.t(' · 口令未启用', ' · auth off')}',
+    );
+    buf.writeln(
+      '${L10n.t('监听: ', 'Listen: ')}${runtime['host']}:${runtime['port']}',
+    );
     buf.writeln('${L10n.t('进程目录: ', 'CWD: ')}${runtime['cwd']}');
     buf.writeln();
     final services = d['services'] as Map<String, dynamic>? ?? {};
@@ -359,7 +436,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     });
     final plugin = d['plugin'] as Map<String, dynamic>? ?? {};
     buf.writeln();
-    buf.writeln('${L10n.t('插件: ', 'Plugin: ')}${plugin['name']} v${plugin['version']}');
+    buf.writeln(
+      '${L10n.t('插件: ', 'Plugin: ')}${plugin['name']} v${plugin['version']}',
+    );
     return buf.toString();
   }
 
@@ -369,7 +448,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       decoration: BoxDecoration(
         color: DshColors.surface(context),
         borderRadius: BorderRadius.circular(DshTheme.radiusMd),
-        boxShadow: Theme.of(context).brightness == Brightness.dark ? DshTheme.shadowDark : DshTheme.shadow,
+        boxShadow: Theme.of(context).brightness == Brightness.dark
+            ? DshTheme.shadowDark
+            : DshTheme.shadow,
       ),
       child: Padding(
         padding: const EdgeInsets.fromLTRB(16, 6, 16, 4),
@@ -395,17 +476,29 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  Widget _row({required Widget leading, required String title, String? sub, Widget? trailing, VoidCallback? onTap}) {
+  Widget _row({
+    required Widget leading,
+    required String title,
+    String? sub,
+    Widget? trailing,
+    VoidCallback? onTap,
+  }) {
     final ink3 = DshColors.ink3(context);
     final line = DshColors.line(context);
     return InkWell(
       onTap: onTap,
       child: Container(
         padding: const EdgeInsets.symmetric(vertical: 12),
-        decoration: BoxDecoration(border: Border(bottom: BorderSide(color: line, width: 1))),
+        decoration: BoxDecoration(
+          border: Border(bottom: BorderSide(color: line, width: 1)),
+        ),
         child: Row(
           children: [
-            Icon(leading is Icon ? leading.icon : Icons.circle, size: 15, color: ink3),
+            Icon(
+              leading is Icon ? leading.icon : Icons.circle,
+              size: 15,
+              color: ink3,
+            ),
             const SizedBox(width: 10),
             Expanded(
               child: Column(
@@ -415,7 +508,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   if (sub != null)
                     Padding(
                       padding: const EdgeInsets.only(top: 1),
-                      child: Text(sub, style: TextStyle(fontSize: 11, color: ink3)),
+                      child: Text(
+                        sub,
+                        style: TextStyle(fontSize: 11, color: ink3),
+                      ),
                     ),
                 ],
               ),
@@ -439,12 +535,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
     String permName(String? id) => permNameOf(id) ?? '…';
     String presetName(String? id) => switch (id) {
-          'standard' => L10n.t('标准模式', 'Standard'),
-          'code' => L10n.t('PTC 模式', 'PTC'),
-          'minimal' => L10n.t('极简模式', 'Minimal'),
-          'cordis' => L10n.t('创造模式', 'Creative'),
-          _ => '…',
-        };
+      'standard' => L10n.t('标准模式', 'Standard'),
+      'code' => L10n.t('PTC 模式', 'PTC'),
+      'minimal' => L10n.t('极简模式', 'Minimal'),
+      'cordis' => L10n.t('创造模式', 'Creative'),
+      _ => '…',
+    };
 
     return ListView(
       padding: const EdgeInsets.all(16),
@@ -454,8 +550,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
             leading: const Icon(Icons.computer_outlined),
             title: L10n.t('电脑地址', 'PC address'),
             sub: api.baseUrls.length > 1
-                ? L10n.t('${api.baseUrl} · 共 ${api.baseUrls.length} 个地址自动切换 · 点按手动切换',
-                    '${api.baseUrl} · ${api.baseUrls.length} addresses · tap to switch')
+                ? L10n.t(
+                    '${api.baseUrl} · 共 ${api.baseUrls.length} 个地址自动切换 · 点按手动切换',
+                    '${api.baseUrl} · ${api.baseUrls.length} addresses · tap to switch',
+                  )
                 : api.baseUrl,
             onTap: () => _pickAddress(),
             // 连接状态实时显示（修复：旧版写死「已连接」，断线也显示绿色已连接）
@@ -497,7 +595,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
             leading: const Icon(Icons.settings_outlined),
             title: L10n.t('重新配置连接', 'Reconfigure connection'),
             sub: L10n.t('更换电脑地址或访问口令', 'Change PC address or token'),
-            trailing: Text(L10n.t('配置 ▸', 'Configure ▸'), style: TextStyle(fontSize: 12, color: brand)),
+            trailing: Text(
+              L10n.t('配置 ▸', 'Configure ▸'),
+              style: TextStyle(fontSize: 12, color: brand),
+            ),
             onTap: () => widget.onReconfigure(),
           ),
         ]),
@@ -506,23 +607,33 @@ class _SettingsScreenState extends State<SettingsScreen> {
             leading: const Icon(Icons.security_outlined),
             title: L10n.t('默认权限预设', 'Default permission'),
             sub: L10n.t('作用于之后新建的会话', 'Applies to new sessions'),
-            trailing: Text(permName(store.catalog?.defaults['permissionPreset'] as String?),
-                style: TextStyle(fontSize: 12, color: brand)),
+            trailing: Text(
+              permName(store.catalog?.defaults['permissionPreset'] as String?),
+              style: TextStyle(fontSize: 12, color: brand),
+            ),
             onTap: () => _pickDefaultPerm(store),
           ),
           _row(
             leading: const Icon(Icons.bolt_outlined),
             title: L10n.t('默认 Agent 预设', 'Default agent preset'),
             sub: L10n.t('作用于之后新建的会话', 'Applies to new sessions'),
-            trailing: Text(presetName(store.catalog?.defaults['agentPreset'] as String?),
-                style: TextStyle(fontSize: 12, color: brand)),
+            trailing: Text(
+              presetName(store.catalog?.defaults['agentPreset'] as String?),
+              style: TextStyle(fontSize: 12, color: brand),
+            ),
             onTap: () => _pickDefaultPreset(store),
           ),
           _row(
             leading: const Icon(Icons.dns_outlined),
             title: L10n.t('模型提供商', 'Model providers'),
-            sub: L10n.t('与 PC 端「设置 → 模型」同一配置通道', 'Same channel as PC Settings → Models'),
-            trailing: Text(L10n.t('管理', 'Manage'), style: TextStyle(fontSize: 12, color: brand)),
+            sub: L10n.t(
+              '与 PC 端「设置 → 模型」同一配置通道',
+              'Same channel as PC Settings → Models',
+            ),
+            trailing: Text(
+              L10n.t('管理', 'Manage'),
+              style: TextStyle(fontSize: 12, color: brand),
+            ),
             onTap: () {
               // Phase 2：与模型弹层共用提供商页打开入口
               openProviders(context, store);
@@ -538,14 +649,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text(
-                  _balance != null ? '¥${(_balance!['total'] as num).toStringAsFixed(2)}' : '—',
+                  _balance != null
+                      ? '¥${(_balance!['total'] as num).toStringAsFixed(2)}'
+                      : '—',
                   style: TextStyle(
                     fontSize: 16,
                     fontWeight: FontWeight.w600,
                     // 预警开启且低于阈值 → 红色警示
-                    color: (store.balanceAlert &&
+                    color:
+                        (store.balanceAlert &&
                             (_balance?['total'] as num?)?.toDouble() != null &&
-                            ((_balance!['total'] as num).toDouble() < store.balanceThreshold))
+                            ((_balance!['total'] as num).toDouble() <
+                                store.balanceThreshold))
                         ? danger
                         : brand,
                   ),
@@ -555,7 +670,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 if (_busy)
                   const Padding(
                     padding: EdgeInsets.all(7),
-                    child: SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
+                    child: SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
                   )
                 else
                   GestureDetector(
@@ -572,10 +691,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
             leading: const Icon(Icons.add_card_outlined),
             title: L10n.t('充值', 'Top up'),
             sub: L10n.t('跳转 DeepSeek 开放平台', 'Go to DeepSeek Open Platform'),
-            trailing: Text(L10n.t('去充值 ▸', 'Top up ▸'), style: TextStyle(fontSize: 12, color: brand)),
+            trailing: Text(
+              L10n.t('去充值 ▸', 'Top up ▸'),
+              style: TextStyle(fontSize: 12, color: brand),
+            ),
             onTap: () => launchUrl(
               // 以电脑端插件配置为准（catalog.rechargeUrl），缺省回退官方充值页
-              Uri.parse(store.catalog?.rechargeUrl ?? 'https://platform.deepseek.com/top_up'),
+              Uri.parse(
+                store.catalog?.rechargeUrl ??
+                    'https://platform.deepseek.com/top_up',
+              ),
               mode: LaunchMode.externalApplication,
             ),
           ),
@@ -583,7 +708,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
             leading: const Icon(Icons.notifications_active_outlined),
             title: L10n.t('余额预警', 'Low-balance alert'),
             // v2.7.1：副标题动态显示当前阈值
-            sub: L10n.t('余额低于 ¥', 'Remind to top up when balance is below ¥') +
+            sub:
+                L10n.t('余额低于 ¥', 'Remind to top up when balance is below ¥') +
                 _fmtThreshold(store.balanceThreshold) +
                 L10n.t(' 时提醒充值（点此修改）', ' — tap to change'),
             onTap: _pickThreshold,
@@ -597,8 +723,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _row(
             leading: const Icon(Icons.source_outlined),
             title: L10n.t('快捷功能', 'Quick actions'),
-            sub: store.gitCapability.available ? store.gitQuickbar.map(gitSlotTitle).join(' · ') : L10n.t('当前环境不可用', 'Unavailable in this environment'),
-            trailing: Text(L10n.t('自定义 ▸', 'Customize ▸'), style: TextStyle(fontSize: 12, color: brand)),
+            sub: store.gitCapability.available
+                ? store.gitQuickbar.map(gitSlotTitle).join(' · ')
+                : L10n.t('当前环境不可用', 'Unavailable in this environment'),
+            trailing: Text(
+              L10n.t('自定义 ▸', 'Customize ▸'),
+              style: TextStyle(fontSize: 12, color: brand),
+            ),
             onTap: () => _pickGitQuickbar(store),
           ),
         ]),
@@ -606,8 +737,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _row(
             leading: const Icon(Icons.psychology_outlined),
             title: L10n.t('思考内容', 'Thinking content'),
-            sub: L10n.t('活动条思考状态展开时是否显示思考原文（默认关：只显示状态）',
-                'Show raw thinking text when expanded (default off: status only)'),
+            sub: L10n.t(
+              '活动条思考状态展开时是否显示思考原文（默认关：只显示状态）',
+              'Show raw thinking text when expanded (default off: status only)',
+            ),
             trailing: DshSwitch(
               value: store.showReasoning,
               onChanged: (v) => store.setShowReasoning(v),
@@ -616,8 +749,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _row(
             leading: const Icon(Icons.account_tree_outlined),
             title: L10n.t('思维链默认展开', 'Thinking chain default expanded'),
-            sub: L10n.t('回复里的「思维链」块默认折叠还是展开（单条消息仍可点按切换）',
-                'Whether the thinking-chain block in replies is expanded by default (each message stays toggleable)'),
+            sub: L10n.t(
+              '回复里的「思维链」块默认折叠还是展开（单条消息仍可点按切换）',
+              'Whether the thinking-chain block in replies is expanded by default (each message stays toggleable)',
+            ),
             trailing: DshSwitch(
               value: store.reasoningDefaultExpanded,
               onChanged: (v) => store.setReasoningDefaultExpanded(v),
@@ -640,14 +775,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 };
                 store.setDarkMode(next);
               },
-              child: Text(
-                switch (store.darkMode) {
-                  'dark' => L10n.t('深色', 'Dark'),
-                  'light' => L10n.t('浅色', 'Light'),
-                  _ => L10n.t('跟随系统', 'System'),
-                },
-                style: TextStyle(fontSize: 13, color: brand),
-              ),
+              child: Text(switch (store.darkMode) {
+                'dark' => L10n.t('深色', 'Dark'),
+                'light' => L10n.t('浅色', 'Light'),
+                _ => L10n.t('跟随系统', 'System'),
+              }, style: TextStyle(fontSize: 13, color: brand)),
             ),
           ),
           _row(
@@ -663,18 +795,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _row(
             leading: const Icon(Icons.bubble_chart_outlined),
             title: L10n.t('悬浮球', 'Floating bubble'),
-            sub: L10n.t('桌面悬浮球：agent 运行/通知/余额低时亮起，单击展开面板（默认关）',
-                'Floating bubble: lights up on activity, tap to open panel (off by default)'),
-            trailing: DshSwitch(
-              value: _bubbleOn,
-              onChanged: _toggleBubble,
+            sub: L10n.t(
+              '桌面悬浮球：agent 运行/通知/余额低时亮起，单击展开面板（默认关）',
+              'Floating bubble: lights up on activity, tap to open panel (off by default)',
             ),
+            trailing: DshSwitch(value: _bubbleOn, onChanged: _toggleBubble),
           ),
           _row(
             leading: const Icon(Icons.help_outline),
             title: L10n.t('悬浮球操作说明', 'Bubble guide'),
             sub: L10n.t('状态含义与手势操作', 'Status meaning and gestures'),
-            trailing: Text(L10n.t('查看 ▸', 'View ▸'), style: TextStyle(fontSize: 12, color: brand)),
+            trailing: Text(
+              L10n.t('查看 ▸', 'View ▸'),
+              style: TextStyle(fontSize: 12, color: brand),
+            ),
             onTap: _showBubbleGuide,
           ),
         ]),
@@ -682,25 +816,96 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _row(
             leading: const Icon(Icons.info_outline),
             title: L10n.t('版本', 'Version'),
-            sub: 'App v${_appVersion.isEmpty ? '…' : _appVersion}'
-                ' · ${L10n.t('插件', 'plugin')} v${api.pluginVersion.isEmpty ? '…' : api.pluginVersion}',
+            sub:
+                'App v${_appVersion.isEmpty ? '…' : _appVersion}'
+                ' · ${L10n.t('插件', 'plugin')} v${api.pluginVersion.isEmpty ? '…' : api.pluginVersion}'
+                '${store.updateCandidate != null ? ' · ${L10n.t('有新版本', 'update available')} ${store.updateCandidate!.version}' : ''}',
+            // 有新版本时点版本行直接进入更新流程
+            onTap: store.updateCandidate != null
+                ? () {
+                    final c = store.updateCandidate;
+                    if (c != null) {
+                      unawaited(
+                        runUpdateFlow(
+                          context,
+                          store,
+                          c,
+                          onInstalled: store.clearUpdateCandidate,
+                        ),
+                      );
+                    }
+                  }
+                : null,
+            trailing: store.updateCandidate != null
+                ? Icon(
+                    Icons.brightness_1,
+                    size: 9,
+                    color: DshColors.danger(context),
+                  )
+                : null,
+          ),
+          _row(
+            leading: const Icon(Icons.sync_outlined),
+            title: L10n.t('检查更新', 'Check for updates'),
+            sub: store.updateChecking
+                ? L10n.t('检查中…', 'Checking…')
+                : L10n.t(
+                    '检查 GitHub / 主机源是否有新版本',
+                    'Check GitHub / host source for updates',
+                  ),
+            trailing: TextButton(
+              onPressed: store.updateChecking || _updateFlowBusy
+                  ? null
+                  : _checkUpdate,
+              child: Text(
+                store.updateChecking
+                    ? L10n.t('检查中…', 'Checking…')
+                    : L10n.t('检查 ▸', 'Check ▸'),
+                style: TextStyle(fontSize: 12, color: brand),
+              ),
+            ),
+          ),
+          _row(
+            leading: const Icon(Icons.storage_outlined),
+            title: L10n.t('更新源', 'Update source'),
+            sub: store.updateSource == 'host'
+                ? L10n.t('dsh 运行主机', 'dsh host')
+                : L10n.t('GitHub Releases', 'GitHub Releases'),
+            trailing: Text(
+              store.updateSource == 'host'
+                  ? L10n.t('主机 ▸', 'Host ▸')
+                  : L10n.t('GitHub ▸', 'GitHub ▸'),
+              style: TextStyle(fontSize: 12, color: brand),
+            ),
+            onTap: _pickUpdateSource,
           ),
           _row(
             leading: const Icon(Icons.monitor_heart_outlined),
             title: L10n.t('环境诊断', 'Diagnostics'),
-            sub: _diagLoaded ? '${L10n.t('检测完成 · ', 'Done · ')}$_diagTime' : L10n.t('检测当前环境各项能力', 'Check environment capabilities'),
+            sub: _diagLoaded
+                ? '${L10n.t('检测完成 · ', 'Done · ')}$_diagTime'
+                : L10n.t('检测当前环境各项能力', 'Check environment capabilities'),
             trailing: TextButton(
               onPressed: _openDiag,
-              child: Text(L10n.t('查看 ▸', 'View ▸'), style: TextStyle(fontSize: 12, color: brand)),
+              child: Text(
+                L10n.t('查看 ▸', 'View ▸'),
+                style: TextStyle(fontSize: 12, color: brand),
+              ),
             ),
           ),
           _row(
             leading: const Icon(Icons.article_outlined),
             title: L10n.t('应用日志', 'App log'),
-            sub: L10n.t('启动/连接/加载事件（排障用）', 'Startup/connection/load events (troubleshooting)'),
+            sub: L10n.t(
+              '启动/连接/加载事件（排障用）',
+              'Startup/connection/load events (troubleshooting)',
+            ),
             trailing: TextButton(
               onPressed: _openLog,
-              child: Text(L10n.t('查看 ▸', 'View ▸'), style: TextStyle(fontSize: 12, color: brand)),
+              child: Text(
+                L10n.t('查看 ▸', 'View ▸'),
+                style: TextStyle(fontSize: 12, color: brand),
+              ),
             ),
           ),
         ]),
@@ -767,38 +972,65 @@ class _SettingsScreenState extends State<SettingsScreen> {
     showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: Text(L10n.t('悬浮球操作说明', 'Floating bubble guide'), style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+        title: Text(
+          L10n.t('悬浮球操作说明', 'Floating bubble guide'),
+          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+        ),
         content: SingleChildScrollView(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             mainAxisSize: MainAxisSize.min,
             children: [
-              _guideSection(
-                L10n.t('状态', 'Status'),
-                [
-                  (L10n.t('灰色鲸鱼', 'Gray whale'), L10n.t('一切正常，空闲', 'All good, idle')),
-                  (L10n.t('蓝色鲸鱼', 'Blue whale'), L10n.t('agent 运行中 / 有新通知 / 余额不足', 'Agent running / new notification / low balance')),
-                  (L10n.t('红色角标', 'Red badge'), L10n.t('未读通知数（60 秒后自动消退）', 'Unread count (clears after 60s)')),
-                ],
-              ),
+              _guideSection(L10n.t('状态', 'Status'), [
+                (
+                  L10n.t('灰色鲸鱼', 'Gray whale'),
+                  L10n.t('一切正常，空闲', 'All good, idle'),
+                ),
+                (
+                  L10n.t('蓝色鲸鱼', 'Blue whale'),
+                  L10n.t(
+                    'agent 运行中 / 有新通知 / 余额不足',
+                    'Agent running / new notification / low balance',
+                  ),
+                ),
+                (
+                  L10n.t('红色角标', 'Red badge'),
+                  L10n.t('未读通知数（60 秒后自动消退）', 'Unread count (clears after 60s)'),
+                ),
+              ]),
               const SizedBox(height: 10),
-              _guideSection(
-                L10n.t('手势', 'Gestures'),
-                [
-                  (L10n.t('单击', 'Tap'), L10n.t('展开 / 收起面板', 'Open / close panel')),
-                  (L10n.t('拖动', 'Drag'), L10n.t('移动位置，松手贴边，5 秒无操作自动缩进', 'Move; snaps to edge, auto-hides after 5s')),
-                  (L10n.t('双击', 'Double tap'), L10n.t('打开 App', 'Open the app')),
-                  (L10n.t('长按', 'Long press'), L10n.t('退出悬浮球', 'Exit the bubble')),
-                ],
-              ),
+              _guideSection(L10n.t('手势', 'Gestures'), [
+                (
+                  L10n.t('单击', 'Tap'),
+                  L10n.t('展开 / 收起面板', 'Open / close panel'),
+                ),
+                (
+                  L10n.t('拖动', 'Drag'),
+                  L10n.t(
+                    '移动位置，松手贴边，5 秒无操作自动缩进',
+                    'Move; snaps to edge, auto-hides after 5s',
+                  ),
+                ),
+                (L10n.t('双击', 'Double tap'), L10n.t('打开 App', 'Open the app')),
+                (
+                  L10n.t('长按', 'Long press'),
+                  L10n.t('退出悬浮球', 'Exit the bubble'),
+                ),
+              ]),
               const SizedBox(height: 10),
-              _guideSection(
-                L10n.t('面板', 'Panel'),
-                [
-                  (L10n.t('内容', 'Content'), L10n.t('运行中会话 / 最近通知 / 打开 App / 去充值', 'Active sessions / notifications / open app / top up')),
-                  (L10n.t('关闭', 'Close'), L10n.t('点面板外任意位置', 'Tap anywhere outside')),
-                ],
-              ),
+              _guideSection(L10n.t('面板', 'Panel'), [
+                (
+                  L10n.t('内容', 'Content'),
+                  L10n.t(
+                    '运行中会话 / 最近通知 / 打开 App / 去充值',
+                    'Active sessions / notifications / open app / top up',
+                  ),
+                ),
+                (
+                  L10n.t('关闭', 'Close'),
+                  L10n.t('点面板外任意位置', 'Tap anywhere outside'),
+                ),
+              ]),
             ],
           ),
         ),
@@ -818,7 +1050,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(title, style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: DshColors.brand(context))),
+        Text(
+          title,
+          style: TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w700,
+            color: DshColors.brand(context),
+          ),
+        ),
         const SizedBox(height: 4),
         for (final (k, v) in rows)
           Padding(
@@ -826,8 +1065,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('$k：', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: ink2)),
-                Expanded(child: Text(v, style: TextStyle(fontSize: 13, color: ink3))),
+                Text(
+                  '$k：',
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: ink2,
+                  ),
+                ),
+                Expanded(
+                  child: Text(v, style: TextStyle(fontSize: 13, color: ink3)),
+                ),
               ],
             ),
           ),
@@ -846,17 +1094,29 @@ class _SettingsScreenState extends State<SettingsScreen> {
           children: [
             Padding(
               padding: const EdgeInsets.fromLTRB(20, 14, 20, 6),
-              child: Text(L10n.t('选择语言', 'Choose language'),
-                  style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700)),
+              child: Text(
+                L10n.t('选择语言', 'Choose language'),
+                style: const TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
             ),
             for (final (id, name) in [('zh', '中文'), ('en', 'English')])
               ListTile(
-                title: Text(name,
-                    style: TextStyle(
-                        fontSize: 14,
-                        fontWeight: store.language == id ? FontWeight.w700 : FontWeight.w400,
-                        color: store.language == id ? brand : null)),
-                trailing: store.language == id ? Icon(Icons.check, size: 18, color: brand) : null,
+                title: Text(
+                  name,
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: store.language == id
+                        ? FontWeight.w700
+                        : FontWeight.w400,
+                    color: store.language == id ? brand : null,
+                  ),
+                ),
+                trailing: store.language == id
+                    ? Icon(Icons.check, size: 18, color: brand)
+                    : null,
                 onTap: () => Navigator.of(ctx).pop(id),
               ),
             const SizedBox(height: 8),
@@ -865,6 +1125,116 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
     );
     if (choice != null) await store.setLanguage(choice);
+  }
+
+  /// 手动「检查更新」：按当前更新源检查并给出明确结果。
+  Future<void> _checkUpdate() async {
+    final store = widget.store;
+    store.updateChecking = true;
+    if (mounted) setState(() {});
+    final o = await Updater.check(store);
+    store.updateChecking = false;
+    if (!mounted) return;
+    setState(() {});
+    switch (o.verdict) {
+      case UpdateVerdict.updateAvailable:
+        final c = o.candidate;
+        if (c != null) {
+          store.updateCandidate = c;
+          _updateFlowBusy = true;
+          setState(() {});
+          await runUpdateFlow(
+            context,
+            store,
+            c,
+            onInstalled: store.clearUpdateCandidate,
+          );
+          _updateFlowBusy = false;
+          if (mounted) setState(() {});
+        }
+        break;
+      case UpdateVerdict.upToDate:
+        if (o.error != null && o.error!.isNotEmpty) {
+          showToast(context, o.error!);
+        } else {
+          showToast(context, L10n.t('已是最新版本', 'Already up to date'));
+        }
+        break;
+      case UpdateVerdict.remoteOlder:
+        showToast(
+          context,
+          L10n.t(
+            '更新源版本低于当前版本，已忽略（请检查更新源配置）',
+            'Update source is older than current — ignored (check source config)',
+          ),
+        );
+        break;
+    }
+  }
+
+  /// 选择更新源（GitHub Releases / dsh 运行主机）。
+  Future<void> _pickUpdateSource() async {
+    final store = widget.store;
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 14, 20, 6),
+              child: Text(
+                L10n.t('选择更新源', 'Choose update source'),
+                style: const TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+            for (final (id, name, desc) in [
+              (
+                'github',
+                'GitHub Releases',
+                L10n.t(
+                  '公开分发渠道；需能访问 GitHub',
+                  'Public releases; requires GitHub access',
+                ),
+              ),
+              (
+                'host',
+                L10n.t('dsh 运行主机', 'dsh host'),
+                L10n.t(
+                  '主机 updateDir 里的版本（局域网/组网最快）',
+                  'Host updateDir version (fastest on LAN/VPN)',
+                ),
+              ),
+            ])
+              ListTile(
+                title: Text(
+                  name,
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: store.updateSource == id
+                        ? FontWeight.w700
+                        : FontWeight.w400,
+                  ),
+                ),
+                subtitle: Text(desc, style: const TextStyle(fontSize: 11.5)),
+                trailing: store.updateSource == id
+                    ? Icon(
+                        Icons.check,
+                        size: 18,
+                        color: DshColors.brand(context),
+                      )
+                    : null,
+                onTap: () => Navigator.of(ctx).pop(id),
+              ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (choice != null) await store.setUpdateSource(choice);
   }
 
   /// 应用日志：查看 / 复制 / 清空
@@ -885,7 +1255,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
           // v3.0.0：日志倒序展示——最新日志在最上面，不用每次翻到底部
           child: SelectableText(
             text.isEmpty ? L10n.t('（暂无日志）', '(No logs)') : _reverseLog(text),
-            style: TextStyle(fontSize: 11.5, height: 1.6, color: DshColors.ink(context), fontFamily: 'monospace'),
+            style: TextStyle(
+              fontSize: 11.5,
+              height: 1.6,
+              color: DshColors.ink(context),
+              fontFamily: 'monospace',
+            ),
           ),
         ),
       ),
@@ -930,7 +1305,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
         child: SingleChildScrollView(
           child: SelectableText(
             _diagText,
-            style: TextStyle(fontSize: 13, height: 1.7, color: DshColors.ink(context)),
+            style: TextStyle(
+              fontSize: 13,
+              height: 1.7,
+              color: DshColors.ink(context),
+            ),
           ),
         ),
       ),
@@ -947,18 +1326,39 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final result = await showModalBottomSheet<List<String>>(
       context: context,
       isScrollControlled: true,
-      builder: (ctx) => StatefulBuilder(builder: (ctx, setSheet) => SafeArea(child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Text(L10n.t('选择 3 个快捷按钮', 'Choose 3 quick actions'), style: Theme.of(ctx).textTheme.titleMedium),
-          for (final slot in gitQuickbarSlots) CheckboxListTile(
-            value: selected.contains(slot),
-            title: Text(gitSlotTitle(slot)),
-            onChanged: (v) => setSheet(() { if (v == true && selected.length < 3) selected.add(slot); else if (v == false) selected.remove(slot); }),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheet) => SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  L10n.t('选择 3 个快捷按钮', 'Choose 3 quick actions'),
+                  style: Theme.of(ctx).textTheme.titleMedium,
+                ),
+                for (final slot in gitQuickbarSlots)
+                  CheckboxListTile(
+                    value: selected.contains(slot),
+                    title: Text(gitSlotTitle(slot)),
+                    onChanged: (v) => setSheet(() {
+                      if (v == true && selected.length < 3)
+                        selected.add(slot);
+                      else if (v == false)
+                        selected.remove(slot);
+                    }),
+                  ),
+                FilledButton(
+                  onPressed: selected.length == 3
+                      ? () => Navigator.pop(ctx, selected)
+                      : null,
+                  child: Text(L10n.t('保存', 'Save')),
+                ),
+              ],
+            ),
           ),
-          FilledButton(onPressed: selected.length == 3 ? () => Navigator.pop(ctx, selected) : null, child: Text(L10n.t('保存', 'Save'))),
-        ]),
-      ))),
+        ),
+      ),
     );
     if (result != null) await store.setGitQuickbar(result);
   }

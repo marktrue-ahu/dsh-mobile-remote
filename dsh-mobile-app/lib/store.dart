@@ -13,6 +13,7 @@ import 'models.dart';
 import 'git_models.dart';
 import 'git_operation_store.dart';
 import 'git_write_models.dart';
+import 'update_core.dart';
 
 class AppStore extends ChangeNotifier {
   final GitApi _gitApi;
@@ -57,6 +58,9 @@ class AppStore extends ChangeNotifier {
   bool balanceAlert = false; // 余额预警开关（v2.7：低于阈值提醒充值）
   double balanceThreshold = 10; // 预警阈值（元）
   bool floatingEnabled = false; // 悬浮球开关（v2.7.2：持久化，清理后台/重启后记住）
+  String updateSource = 'github'; // 自动更新源：'github' | 'host'（持久化，默认 GitHub）
+  UpdateCandidate? updateCandidate; // 最近一次检查命中的候选（null = 无）
+  bool updateChecking = false; // 「检查更新」进行中（手动按钮状态）
 
   /// 已注册工作区（PC 端 workspaceRegistry）：[{id, path, title}]。
   List<Map<String, dynamic>> workspaces = [];
@@ -162,6 +166,7 @@ class AppStore extends ChangeNotifier {
   static const _kBalanceThreshold = 'dsh_mr_balance_threshold';
   static const _kFloating = 'dsh_mr_floating';
   static const _kGitQuickbar = 'dsh_mr_git_quickbar';
+  static const _kUpdateSource = 'dsh_mr_update_source';
 
   Future<void> loadPrefs() async {
     final prefs = await SharedPreferences.getInstance();
@@ -188,6 +193,8 @@ class AppStore extends ChangeNotifier {
     balanceAlert = prefs.getBool(_kBalanceAlert) ?? false;
     balanceThreshold = prefs.getDouble(_kBalanceThreshold) ?? 10;
     floatingEnabled = prefs.getBool(_kFloating) ?? false;
+    final src = prefs.getString(_kUpdateSource);
+    updateSource = (src == 'host' || src == 'github') ? src! : 'github';
     final savedGit = prefs.getStringList(_kGitQuickbar);
     if (savedGit != null && savedGit.length == 3)
       gitQuickbar = normalizeGitSlots(savedGit);
@@ -589,6 +596,29 @@ class AppStore extends ChangeNotifier {
     floatingEnabled = v;
     notifyListeners();
     await _persistPrefs(_kFloating, v);
+  }
+
+  /// 更新源切换持久化（'github' | 'host'；切换后清除旧命中候选，下次检查按新源）。
+  Future<void> setUpdateSource(String v) async {
+    final next = (v == 'host' || v == 'github') ? v : 'github';
+    if (next == updateSource) return;
+    updateSource = next;
+    updateCandidate = null;
+    notifyListeners();
+    await _persistPrefs(_kUpdateSource, next);
+  }
+
+  /// 清除「有新版本」候选（横幅关闭 / 更新流程启动后）。
+  void clearUpdateCandidate() {
+    if (updateCandidate == null) return;
+    updateCandidate = null;
+    notifyListeners();
+  }
+
+  /// 自动检查命中后写入候选（由 updater 调用；仅状态推进，不弹窗）。
+  void setUpdateCandidate(UpdateCandidate? c) {
+    updateCandidate = c;
+    notifyListeners();
   }
 
   /// App 启动自动恢复悬浮球（v2.7.2）：上次开启过且服务没在跑 → 自动拉起。

@@ -283,6 +283,8 @@ flutter build apk --release
 > 首次构建需下载 Gradle 依赖（约 5-10 分钟）；若报 Kotlin 增量缓存损坏（`Could not close incremental caches`），`android/gradle.properties` 已设 `kotlin.incremental=false`，删除 `build` 与 `.dart_tool` 后重试。
 > 更换图标：把 1024×1024 PNG 覆盖到 `assets/icon-1024.png`，运行 `python tools/make_icon.py` 后重新构建。
 > 多品牌/兼容性注意事项见 docs/09-compatibility.md。
+> 完整构建命令、Google 下载代理配置、签名校验及 Gradle 常见问题见 [`10-android-build.md`](10-android-build.md)。
+
 ### 8.3 安装与使用
 1. 把 APK 传到手机（微信文件传输/网盘/USB），点击安装（需允许"安装未知来源应用"）。
 2. 打开 App →「扫码连接」对准电脑屏幕上的二维码（桌面 DSH 设置 →「连接移动端设备」页）；或手动输入电脑地址 + 访问口令。
@@ -292,6 +294,31 @@ flutter build apk --release
 ### 8.4 重建与更新
 - 插件/网页端改动 → 按 §3 同步并重启 DSH。
 - App 改动 → 重新 `flutter build apk --release` 并重装（同签名覆盖安装，保留连接信息）。
+
+### 8.5 App 自动更新（双更新源，v3.0.0+）
+
+> 入口：设置 → 关于 → 「更新源」（GitHub Releases / dsh 运行主机，单选持久化，默认 GitHub）+「检查更新」；自动检查在启动连接成功后静默执行一次，命中后首页横幅 + 版本行「● 有新版本」提示。更新流程：确认弹窗（版本/说明/大小/来源）→ 下载（进度可取消）→ 主机源 sha256 校验 → **签名预检**（与已装版本签名不一致即取消并提示）→ 系统安装器。
+
+**GitHub 源**：App 直连 `api.github.com/.../releases/latest`，取首个 `DSH-Remote-*.apk` 资产下载。无需配置；GitHub 不可达时明确报错（可切主机源）。
+
+**主机源部署（发布者 3 步）**：
+1. 构建并打包（Linux/WSL：`bash dsh-mobile-app/tools/package-release.sh`；Windows：`package-release.ps1`）——产出 `DSH-Remote-vX.Y.Z.apk`、`dsh-mobile-remote-vX.Y.Z.tgz`、`manifest.json`（共享生成器 `tools/gen-manifest.js`：version 含 build / sha256 / size / notes=CHANGELOG 最新条目全文）。
+2. 把 APK + `manifest.json` 拷入插件 `updateDir`（可用 `UPDATE_DIR=<路径> bash ...package-release.sh` 直接落位）。
+3. 插件配置 `updateDir`（缺省空 = 未配置该源）：
+
+```yaml
+- insert:
+    - id: mobile-remote
+      name: dsh-mobile-remote
+      config:
+        path: /m
+        authToken: <口令>              # 必须开启（更新通道同样走鉴权）
+        updateDir: ~/.dsh/mobile-remote/update/
+```
+
+重启插件（或触发 patch 热重放）后，手机 App 切「主机」源即可检查/下载。产物可用 `tools/verify-update-manifest.mjs` 校验。
+
+> 安全/兼容提醒：`authToken` 必须开启（更新通道暴露 APK 等于暴露分发面）；签名变更会导致「签名不一致」被预检拦截——正式分发请用同一 keystore，确实换签需先卸载旧版（§8.3）。
 
 ## 9. 验收清单（已执行 ✅）
 
@@ -305,5 +332,6 @@ flutter build apk --release
 - [x] Flutter App：analyze 零问题 + 正式签名 release 构建 + 真机全流程测试
 - [x] 问询弹窗端到端（手机选选项→agent 收到答案 / ✕→取消 / PC 端先答两端同步）
 - [x] 权限审批弹窗端到端（允许一次→操作继续 / 拒绝→操作被拒）
+- [x] **App 自动更新（v3.0.0+）**：双源检查（GitHub releases/latest + 主机 updateDir 端点）、版本判定单测（更新/不提示/防降级）、下载进度可取消、主机源 sha256 校验、签名预检（不一致取消）、FileProvider 拉起安装器、`gen-manifest.js` 产物经 `verify-update-manifest.mjs` 校验、`flutter analyze` 零问题
 - [x] 通知删除（单删/批量/清空）+ 诊断页服务探针（respondBridge/frameBridge ✅）
 - [x] 图像链路实机：发送/渲染/全屏/限额/类型纠正（v3.0.0 全套，见 CHANGELOG）
