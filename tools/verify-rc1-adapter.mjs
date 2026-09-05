@@ -85,6 +85,20 @@ assert.deepEqual(rc1RemoteSpec("goal.pause", {
 	method: "pause",
 	args: { agentId: "session-1", ref: { id: "goal-1", revision: 2 } },
 });
+// RC1 goal 变更方法不接收 reason；`goals/block` 在 0.1.2-rc.1 宿主不存在（应拒绝映射）。
+assert.deepEqual(rc1RemoteSpec("goal.pause", {
+	sessionId: "session-1",
+	ref: { id: "goal-1", revision: 2 },
+	reason: "ignored field must be dropped",
+}), {
+	namespace: "goals",
+	method: "pause",
+	args: { agentId: "session-1", ref: { id: "goal-1", revision: 2 } },
+});
+assert.throws(() => rc1RemoteSpec("goal.block", { sessionId: "session-1", ref: {} }), (error) => {
+	assert.equal(error.code, "rc1-method-unmapped");
+	return true;
+});
 
 assert.deepEqual(normalizeRc1ModelCatalog({
 	default: { provider: "deepseek-official", model: "deepseek-chat" },
