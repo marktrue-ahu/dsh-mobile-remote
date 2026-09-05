@@ -1,7 +1,7 @@
 # 06 部署与启用文档 — dsh-mobile-remote
 
-> 版本：v3.0.0 · 状态：已在本机安装与验证 · 配套：03-api.md、04-security.md、07-user-manual.md、09-compatibility.md
-> 适用环境：**DSH 0.1.1-rc.2（DSH Desktop v2.0.2）**。桌面版 webserver 强制只听 `127.0.0.1`，移动端经插件 **LAN 桥**（默认 `0.0.0.0:3080`）接入；web 版 DSH 无回环限制，可直接让 webserver 绑 0.0.0.0。
+> 版本：v3.1.1 基线 · 状态：RC1 适配实施中，完整矩阵待实测 · 配套：03-api.md、04-security.md、07-user-manual.md、09-compatibility.md
+> 适用环境：**DSH 0.1.1-rc.2 与 0.1.2-rc.1**。桌面版 webserver 强制只听 `127.0.0.1`，移动端经插件 **LAN 桥**（默认 `0.0.0.0:3080`）接入；web 版 DSH 无回环限制，可直接让 webserver 绑 0.0.0.0。RC1 的 Host Remote 由插件自动选择 Typert Gateway，旧版继续使用 apiProxy。
 
 ## 1. 部署拓扑
 
@@ -73,6 +73,8 @@ corepack pnpm install
 > 版本匹配规则：**App 与插件同版本 = 完美配对**；不同版本也能用（谁旧谁吃亏，但都不崩），详见 README「版本与兼容」。实际配对在 App 设置 → 关于 → 版本查看。
 > 方式 B 依赖网络能访问 GitHub 与 npm（含插件依赖 `qrcode`、`@deepseek-ai/*` 的公开解析；后者桌面端为内置打包、公开 npm 可解析性未逐一验证，遇解析失败请改用方式 A/C）。
 > 更新插件时：方式 A 重新 `git pull` 后 `pnpm install`；方式 B 改 tag 后 `pnpm install`；方式 C 换新 tgz 重装。
+
+> RC1 安装检查：插件的 `@deepseek-ai/dsh-credentials`、`dsh-llm`、`dsh-sandbox-policy` 依赖显式允许 `0.1.0-rc.6`、`0.1.1-rc.2`、`0.1.2-rc.1` 三个已验证的 Host 包版本；`@deepseek-ai/schemastery` 使用 `^3.18.1` 以覆盖 RC1 的 3.18.2。这里使用精确 prerelease 分支，避免 npm 默认 prerelease 规则漏掉 `0.1.1-rc.2`；包管理器应优先复用宿主已安装的对应版本，避免在 profile 内重复加载一套 Host 包。安装后打开 App → 设置 → 环境诊断，确认 `protocol: "typert-rc1"`、`services.typertGateway: true`、`checks.respondBridge: true`；若仍显示 `api-proxy-legacy`，说明当前进程没有注入 RC1 Gateway 或实际运行的是旧 Host。
 
 ## 3. 启用 / 重启步骤
 

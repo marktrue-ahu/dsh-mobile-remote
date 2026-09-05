@@ -383,7 +383,7 @@
 或 `{ "all": true }`。删除移动端通知镜像中的记录（不影响 PC 端自己的通知中心）；不设墓碑——后续新事件仍会正常生成新通知。删除后经 SSE 广播 `notifications/changed` 帧，客户端刷新列表与未读角标。响应 `200 { "ok": true }`。
 ### 6.7c POST /m/api/respond（v2.3，问询/审批弹窗）
 
-回答内核人类问询（`ask_user_question` 工具）或权限审批。插件经 `apiProxy.respond` 回写，**与 PC 端 GUI 完全同一 pending 通道与校验**（`matchesQuestions`、审批决策等由内核把关）：
+回答内核人类问询（`ask_user_question` 工具）或权限审批。插件按 Host 版本选择回写通道：0.1.1-rc.2 经 `apiProxy.respond`，0.1.2-rc.1 经 Typert Gateway `$events/result`；两者都回到 Host 的 pending waterfall，移动端请求和 SSE 帧格式保持不变：
 
 **问询**（`kind: "question"`，answers 顺序与提问一致、每问必答）：
 
@@ -402,9 +402,9 @@
 { "kind": "approval", "rpcId": "...", "sessionId": "session-abc", "approvalId": "a-1", "outcome": "allowed-once" }
 ```
 
-- `outcome`：`allowed-once` | `rejected`。
+- `outcome`：`allowed-once` | `rejected` | `cancelled` | `unavailable`。
 
-**取消**（`kind: "cancel"`）：内核收到 cancelled，agent 按 `ASK_CANCELLED` 继续。
+**取消**（`kind: "cancel"`）：旧 Host 沿用 `apiProxy` 的取消语义；RC1 通过 `$events/result` 发送 `UserQuestionError`（`ASK_ABORTED`），两者都会结束当前待答卡片。
 
 响应：`200 { "ok": true, "accepted": true }`；`accepted: false` + `reason`（如 `not-pending`，PC 端已先回答）。
 
@@ -562,8 +562,6 @@
 - 映射内核 `commands.execute(agent, line, images, signal)`（0.1.1-rc.2 四参签名；本插件 `images` 恒为空数组，`signal` 为 15s 超时中止；2.8.1 的旧三参调用会把 AbortSignal 误传 images 槽，已改正）
 - `line` 必须以 `/` 开头（否则 `400 bad-request`）；未知/畸形命令 `404 command-not-found`；服务未注册 `503 commands-unavailable`（带 detail）；服务在而会话不存在 `404 session-not-found`（与 GET 拆分语义一致）
 - `result` 为内核 settle 对象（`commandId` + `result.{kind,text}`），与 PC 端一致
-
-
 
 
 
