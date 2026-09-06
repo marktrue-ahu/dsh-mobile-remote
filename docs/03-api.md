@@ -61,7 +61,7 @@
 
 ### 2.1 App 自动更新（主机源，v3.0.0+）
 
-**概念**：插件配置 `updateDir`（`~/.dsh/mobile-remote/update/` 等，见 docs/06 §8.5）里放发布脚本产出的 APK 与 `manifest.json`。**manifest 是唯一权威**——App 只读 manifest，不枚举目录。
+**概念**：插件配置 `updateDir`（默认空串 = 未配置主机源；显式配置时可使用 `~/.dsh/mobile-remote/update/` 等路径，见 docs/06 §8.5）里放发布脚本产出的 APK 与 `manifest.json`。**manifest 是唯一权威**——App 只读 manifest，不枚举目录。
 
 **`manifest.json` 契约**（由 `tools/gen-manifest.js` 统一生成，双端发布脚本共用）：
 
@@ -83,6 +83,8 @@
 - `500 update-apk-read-failed`：读取失败。
 
 > GitHub 源不经过本插件（App 直连 `api.github.com/repos/201222-L/dsh-mobile-remote/releases/latest`，取首个 `DSH-Remote-*.apk` 资产，`browser_download_url` 直连下载）。
+
+**DSH 0.1.2-rc.1 兼容边界**：更新端点直接注册到宿主 `webServer`，不依赖 Typert Gateway、SessionController、Remote Event 或旧 `/api` RPC；这些服务缺失不会阻止主机源端点。若宿主 WebServer 仅监听回环地址，手机必须通过启用并配置 authToken 的 LAN 桥访问。LAN 桥只转发 `/m/api*`，不转发宿主内部 `/api`、`/m/api/qr-config` 或二维码图片路径。
 
 ## 3. 端点详述（v1 既有端点）
 ### 3.1 GET /m/api/bootstrap
