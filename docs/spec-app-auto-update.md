@@ -58,7 +58,7 @@
 ### 更新源与配置
 
 - App 设置「更新源」为**单选持久化偏好**（`github` | `host`），默认 `github`。切换立即影响下一次「检查更新」。
-- 插件新增配置项 `updateDir`（字符串路径，默认 `~/.dsh/mobile-remote/update/`）。**manifest 是唯一权威**：App 只读 manifest，不枚举目录内 APK；插件不扫描目录里的历史版本。
+- 插件新增配置项 `updateDir`（字符串路径，默认空串 = 未配置主机源；部署者必须显式配置目录）。**manifest 是唯一权威**：App 只读 manifest，不枚举目录内 APK；插件不扫描目录里的历史版本。
 
 ### 主机源端点契约（插件侧）
 
@@ -66,7 +66,7 @@
   - 200 → `{ version: "3.0.0+8", apk: "DSH-Remote-v3.0.0.apk", sha256: "<hex>", size?: <字节>, notes?: "…" }`
   - `updateDir` 未配置 / 无 manifest / 文件缺失 → 对应错误码（App 明确提示「主机源未配置更新」）。
 - `GET {path}/api/update/apk`（现有鉴权体系）：按 manifest 的 `apk` 文件名流式下发文件字节，含 `content-length`；读取失败回 404/500。
-- 两个端点都走现有 `authToken` 鉴权，与既有安全边界一致（LAN 桥现成可用）。
+- 两个端点都走现有 `authToken` 鉴权，与既有安全边界一致。DSH 0.1.2-rc.1 的宿主 WebServer 默认可能只监听回环地址；桌面形态应通过已启用且已认证的 LAN 桥访问，LAN 桥只转发移动 API，不转发宿主内部 `/api` 或 `qr-config`。
 
 ### GitHub 源契约
 
@@ -118,9 +118,9 @@
 
 ## Testing Decisions
 
-- **主 seam（自动化必达）**：更新决策逻辑做成 **App 端纯 Dart 模块**（无 I/O：manifest / GitHub release JSON 解析、版本比较（semver + build）、需要更新判定、防降级判定、下载 URL 构造、签名校验的输入组装），在**现有 `dsh-mobile-app/test/` 单测 seam** 下用 `flutter test` 覆盖（prior art：`api_logic_test.dart`、`md_link_test.dart` —— 同款「纯逻辑模块 + 单测」形态；本轮已验证 `flutter analyze` 0 issues + 9/9 测试通道）。
+- **主 seam（自动化必达）**：更新决策逻辑做成 **App 端纯 Dart 模块**（无 I/O：manifest / GitHub release JSON 解析、版本比较（semver + build）、需要更新判定、防降级判定、下载 URL 构造、签名校验的输入组装），在**现有 `dsh-mobile-app/test/` 单测 seam** 下用 `flutter test` 覆盖（prior art：`api_logic_test.dart`、`md_link_test.dart` —— 同款「纯逻辑模块 + 单测」形态）。历史基线曾记录 `flutter analyze` 0 issues；本次 RC1 收敛任务环境未安装 Flutter，未重复执行。
   - 测例方向：`3.0.0+7` vs tag `v3.0.0` → 不更新；`3.0.0+8` vs `3.0.0+7` → 更新；`3.1.0` vs `3.0.0+999` → 更新；remote 低于 local → 异常不更新；manifest 缺 build / 非法版本 → 容错解析；GitHub 资产选择（含无 APK 资产）。
-- **副 seam（已落地）**：发布脚本生成的 `manifest.json` 由同款 verify 脚本校验（`dsh-mobile-app/tools/verify-update-manifest.mjs`：version 含 build、sha256/size 与 APK 实算一致、notes 非空、apk 文件存在）；服务端 manifest 读取 helper（`readUpdateManifest`）如需进一步提取式单测沿用 `tools/verify-*.mjs` 形态（prior art：`verify-image-sniff.mjs`）。
+- **副 seam（已落地）**：发布脚本生成的 `manifest.json` 由同款 verify 脚本校验（`dsh-mobile-app/tools/verify-update-manifest.mjs`：version 含 build、sha256/size 与 APK 实算一致、notes 非空、apk 文件存在）；服务端自动更新契约由 `test/update-routes.test.mjs` 覆盖 WebServer 注册、无 RC1 Remote 服务、认证/Host、manifest/APK 错误、校验和 LAN 桥转发边界。测试只断言外部 HTTP 行为，不依赖私有 helper 名称。
 - **明确不自动化（人工验收）**：真实 APK 下载 + 签名预检 + 系统安装器拉起 + Android 8+/11+ 授权引导 —— 需要真机/模拟器，列为发布前人工验收清单（对应 docs/06 §9 风格）。
 - 不考虑引入：widget 测试脚手架、`integration_test` 新 harness（不新增 seam 层）。
 

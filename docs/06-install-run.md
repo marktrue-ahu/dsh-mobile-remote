@@ -324,6 +324,8 @@ flutter build apk --release
 
 重启插件（或触发 patch 热重放）后，手机 App 切「主机」源即可检查/下载。产物可用 `tools/verify-update-manifest.mjs` 校验。
 
+**DSH 0.1.2-rc.1 / 桌面版网络边界**：宿主 WebServer 可能只监听 `127.0.0.1`，这不影响插件注册更新端点，但手机不能直接访问回环端口。按 §4b 启用已配置强 `authToken` 的 LAN 桥（默认 `0.0.0.0:3080`），手机访问桥地址；web 版若 WebServer 已绑定可信局域网地址则可直接访问。LAN 桥只转发移动 API，不转发宿主内部 `/api`、`/m/api/qr-config` 或二维码图片路径。主机源检查失败时停止当前检查，不自动切换 GitHub。
+
 > 安全/兼容提醒：`authToken` 必须开启（更新通道暴露 APK 等于暴露分发面）；签名变更会导致「签名不一致」被预检拦截——正式分发请用同一 keystore，确实换签需先卸载旧版（§8.3）。
 
 ## 9. 验收清单（已执行 ✅）
@@ -341,3 +343,10 @@ flutter build apk --release
 - [x] **App 自动更新（v3.0.0+）**：双源检查（GitHub releases/latest + 主机 updateDir 端点）、版本判定单测（更新/不提示/防降级）、下载进度可取消、主机源 sha256 校验、签名预检（不一致取消）、FileProvider 拉起安装器、`gen-manifest.js` 产物经 `verify-update-manifest.mjs` 校验、`flutter analyze` 零问题
 - [x] 通知删除（单删/批量/清空）+ 诊断页服务探针（respondBridge/frameBridge ✅）
 - [x] 图像链路实机：发送/渲染/全屏/限额/类型纠正（v3.0.0 全套，见 CHANGELOG）
+
+### 9.1 本次 RC1 自动更新兼容收敛
+
+- [x] Node 契约测试（`node --test test/update-routes.test.mjs`）：WebServer 路由注册、无 RC1 Remote 服务时的 manifest/APK、认证/Host/校验错误、LAN 桥允许与拒绝边界。
+- [x] 服务端模块 `node --check` 与现有 RC1 adapter 验证。
+- [ ] DSH 0.1.1-rc.2 与 0.1.2-rc.1 的 live profile/HTTP 双宿主实测：当前环境未执行，不能以静态检查代替。
+- [ ] Android 真机/系统安装器回归：本次未修改 App 更新逻辑；当前环境未提供 Flutter/真机验证条件。

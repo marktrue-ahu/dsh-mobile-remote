@@ -1,6 +1,6 @@
 # 09 兼容性说明（Compatibility）
 
-> 版本：v3.1.1 基线（RC1 适配在 `feature/dsh-0.1.2-rc1-compat` 分支实施，尚未发布新版本） · 面向：开源使用者 / 二次开发 / 多设备部署
+> 版本：v3.1.1 基线（当前集成分支已包含 DSH RC1 适配；正式发布状态以 release 记录为准） · 面向：开源使用者 / 二次开发 / 多设备部署
 
 本文回答两个问题：**App 在哪些手机上能跑**，以及**插件在什么样的 Harness 上能跑**。
 
@@ -11,7 +11,7 @@
 | 组件 | 要求 |
 |---|---|
 | 桌面端 DSH（Harness） | 支持 **v0.1.1-rc.2** 与 **v0.1.2-rc.1**；前者使用旧 `apiProxy`/`/api` Remote，后者使用 Typert Gateway/Remote Event。更低版本可能缺少 `apiProxy`、`workspaceRegistry`、`commands` 或 Gateway 服务，功能会按 §2 降级 |
-| dsh-mobile-remote 插件 | **v3.1.1 基线（与 App/git tag 版本号统一）**；RC1 适配完成前不改正式版本号；`/m/api/diagnostics` 可自检 |
+| dsh-mobile-remote 插件 | **v3.1.1 基线（与 App/git tag 版本号统一）**；当前集成代码已包含 RC1 适配；`/m/api/diagnostics` 可自检 |
 | 手机 App（Android） | v3.1.1 基线（与插件同版本 = 完美配对；不同版本可用但"谁旧谁吃亏"，详见 README「版本与兼容」）；Android 7.0+、64 位机型 |
 | 字段级兼容（v3.1.0 候选） | `reasoning`/`title` 为纯增量字段：新插件+旧 App 无影响（忽略新字段）；新 App+旧插件自动回退（不渲染折叠块 / 悬浮球标题兜底短码）——任意组合均可使用 |
 | 字段级兼容（v3.1.1） | `/m/api/directories` 根视图新增 `sep`（服务端路径分隔符）；新插件+旧 App 忽略该字段即可（旧 App 在 WSL 上仍按 `\` 拼接，由服务端`normalizeServerPath` 归一化兜底，浏览/建夹/建会话均可用）；新 App+旧插件缺少 `sep` 时按根视图推断分隔符——任意组合均可使用 |
@@ -40,6 +40,13 @@
 | `sessionController` | RC1 冷会话 `session.prompt` 的恢复与投递 | RC1 冷会话发送使用（由 `ctx.inject` 获取）；活跃会话仍沿用原有队列语义 | 优先调用进程内 `prompt`；服务缺失时回退 Typert Gateway，若两者都不可用则返回明确发送错误 |
 | `apiProxy` | 0.1.1-rc.2 的问询/审批弹窗桥 + 应答回写 | 旧版可选 | `checks.respondBridge=false`，手机不弹问询/审批卡（PC 端不受影响）；`/m/api/respond` 返回 503 |
 | `userQuestions` | （间接）问询链路 | 可选 | 无弹窗（同上） |
+
+### 2.1.1 App 自动更新主机源
+
+- 主机源由 `updateDir` 显式启用；配置为空时，manifest 端点返回 `503 update-not-configured`。文档中的 `~/.dsh/mobile-remote/update/` 是部署示例，不是代码默认值。
+- `/m/api/update/manifest` 与 `/m/api/update/apk` 直接挂载在 `webServer` 上，不依赖 `typertGateway`、`sessionController`、`apiProxy` 或 Remote Event；RC1 远程协议变化不会改变这两个端点的响应契约。
+- DSH Desktop 或其他仅回环监听的宿主，手机必须通过已启用并配置强 `authToken` 的 LAN 桥访问。LAN 桥只转发移动 API；宿主内部 `/api`、`/m/api/qr-config` 和二维码图片路径保持不可转发。
+- 主机源的认证仍由插件 Host 白名单与 `authToken`/cookie 共同控制；未配置主机源、认证失败、manifest/APK 缺失或校验失败都必须明确报错，不能伪装成 GitHub 源成功。
 
 > ⚠ **两代 Host Remote 不能只做名称替换**：0.1.1-rc.2 的 `apiProxy` 使用旧 `/api` envelope；0.1.2-rc.1 的 Typert Gateway 要求命名 `args`、严格方法签名，并通过 `$events`/`$events/result` 传递问询与审批。适配集中在 [lib/rc1-adapter.js](../lib/rc1-adapter.js) 和 `lib/index.js` 的 Remote Event 桥；业务错误不会在两条协议之间重试，避免一次移动操作重复执行。
 
