@@ -1,5 +1,51 @@
 # Changelog
 
+## v3.1.1（2026-08-26）— WSL/类 Unix 平台路径选择修复（issue #5）
+
+### 现象
+- GitHub issue #5：服务端运行在 WSL（dsh 跑在 Linux 侧）时，移动端「新建会话 → 工作目录」无法正确选择路径——从根目录 `/` 进入 `home` 会拼成 `/\home`，随后报「读取失败」（服务端 `readdir` ENOENT），后面的目录全部无法浏览/选择。
+
+### 根因
+- 目录选择器按 Windows 习惯硬编码 `\` 拼接子目录（`_openDir`），服务端为 POSIX 时 `/\home` 是非法路径；
+- 深一层：工作区路径在 App 侧被 `_normPath` 全量归一成 `\home\user` 形态——WSL 上该形态会被直接当作 cwd 发回服务端（建会话目录不存在），工作区列表展示的也是 `\` 形态（与 PC 端观感不一致）。
+
+### 服务端（lib/index.js）
+- `GET /m/api/directories` 根视图响应新增 `sep` 字段（服务端真实路径分隔符，纯增量，旧版 App 忽略即可）；
+- 新增 `normalizeServerPath`：目录浏览/新建文件夹/建会话 `cwd` 的路径参数按当前平台归一化分隔符（POSIX `\`→`/`，Windows `/`→`\`）——旧版 App 在 WSL 上拼出的 `/\home` 也能命中真实目录（兼容矩阵「插件新 + App 旧」成立）。
+
+### App（Flutter，3.1.1+16）
+- 目录选择器：新增 `joinDirPath`/`dirSepOf` 纯函数，按服务端 `sep` 拼接子目录（WSL `/`、Windows `\`），根视图文案与分组标题随之自适应（「根目录」/「所有盘符」）；
+- 工作区列表：条目保留服务端原始路径（展示与 cwd 回传用原始形态），规范化只用于匹配比较——`refreshWorkspaces`、主界面工作区弹层、会话页筛选、新建会话默认目录四处同步；
+- 新建会话默认目录：匹配改为规范化比较，不再把归一形态当作 cwd 发送。
+
+### 测试
+- `flutter test test/dirpicker_logic_test.dart`（新增 6 例：joinDirPath 两种分隔符/根视图、dirSepOf 服务端优先/根视图推断/兜底）；
+- `tools/wsl-path-check.mjs`（新增：normalizeServerPath POSIX/Windows/非字符串，8/8 通过；注：`/\home` 归一为 `//home`，POSIX 下与 `/home` 等价）；
+- `flutter analyze` 零问题、`node --check` 通过。
+
+### 生效
+- 服务端改动随 DSH 重启生效（旧版 App 即可获得 WSL 浏览修复）；App 修复随新 APK（3.1.1+16）生效。
+
+## v3.1.0（2026-08-25）— 思维链折叠 + 流式滚动跟随修复 + 悬浮球会话标题（社区 PR #4，marktrue-ahu）
+
+### App（Flutter）
+- 对话页新增「思维链折叠」：assistant 回复携带思维链正文时，正文上方渲染可折叠「思维链」块（图标 + 字数 + 箭头，点按展开/收起）；单个消息独立切换。
+- 设置 → 显示 新增「思维链默认展开」开关（持久化，默认关=折叠），控制思维链块的默认展开状态。
+- 修复流式输出不跟随滚动到底的问题：按「停留底部」钉住状态决定自动跟随，替代与增长中的 maxScrollExtent 比距离，大段 chunk 单帧推高内容后不再掉队。
+- 悬浮球「运行中的会话」改展示会话标题（超宽省略号截断），替代 session id 短码。
+
+### 服务端（lib/index.js）
+- `assistant/message` 摘要新增 `reasoning` 字段（思维链正文，仅非空时下发，≤20000 字符），供移动端折叠块使用；历史与 SSE 同步生效。
+- `/api/bootstrap` 的 agents/sessions 新增 `title` 字段（会话标题，空则兜底短码），供悬浮球「运行中会话」展示标题。
+
+### 审核中发现并修复（维护者）
+- **思维链折叠状态丢失**：手动折叠后，列表滚动回收/退出重进/重启会恢复默认展开。修复：折叠状态上移 AppStore 按会话+消息持久化（prefs，每会话 100 条 + 全局 500 条软上限）。
+- **新建会话缺模型崩溃**：`POST /sessions` 不传 model 时首轮报 `{{model}}` 组装无值。修复：无显式 model（含仅传 reasoningEffort）统一绑定内核默认模型；失败时 `handle.dispose` 拆除会话并明确报错。
+- **技能目录不注入**：插件建会话漏传 `setup`（预设组装挂载），与 PC 端 `session.create` 契约不一致。修复：`agentPresets.resolve` + `mount` 挂载，技能目录恢复注入；resolve 失败硬拒绝。
+- 模型探测报错可操作化（401/403、断连、404 中文引导）；模型提供商页新增已存密钥提示与官方 DeepSeek「内置可用」标识。
+- 诊断接口新增 notes（技能目录状态披露）；`clampText` 截断提示计入上限（输出严格 ≤ max）。
+- docs/05 新增 F-20~F-22 用例；docs/09 补充字段级兼容与降级说明。
+
 ## v3.0.0（2026-08-22）— LAN 桥：桌面版局域网直连（无需穿透）（二次 Code Review 落实集成于本版本内）
 
 ### App 自动更新（2026-08-23，App 3.0.0+8）——双更新源检查 / 下载 / 签名预检 / 安装

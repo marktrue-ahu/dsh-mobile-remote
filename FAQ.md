@@ -62,6 +62,20 @@ Android 7.0+ 各品牌均可（Flutter 原生，渲染自动回退）；实测�
 **Q：换手机 / 重装 App 后要重新连接吗？**
 要：连接信息只存手机本地。重新扫一次电脑端二维码即可（口令未变则电脑端不用动）。
 
+**Q：装了 dsh-web 的「移动端远程」后插件冲突 / 网页崩溃？怎么共存？**
+- **原因**：dsh-web 生态的 `@linxin666/dsh-remote-web-ui` 把手机页面与接口整体写死在 `/m` 前缀（不可配置），本插件默认也挂在 `/m`——两者抢同一路由前缀，请求互相覆盖导致异常/崩溃；
+- **解法**：给本插件换一个非 `/m` 的单段前缀即可共存（对方写死，只能我们让路）——在 `cordis.patch.yml` 的 mobile-remote 行 `config` 里加 `path: /mr`（或任意单段，如 `/mobile`），重启 DSH：
+  ```yaml
+  - insert:
+      - id: mobile-remote
+        name: dsh-mobile-remote
+        config:
+          path: /mr          # 避让 dsh-web 占用的 /m 前缀
+          authToken: <口令>
+          # lanBridge: { enabled: true, port: 3080, host: 0.0.0.0 }  # 桌面版需要
+  ```
+- **手机 App 无需改动**：路径经二维码 / `bootstrap` 动态获取，自动适配新前缀。
+
 **Q：为什么我装的 App 升级时提示签名不一致？**
 构建者更换了签名 keystore（签名变更 = 新应用）。卸载旧版重装，然后重新扫码。开发/自用构建回退 debug 签名，公开分发必须用同一正式 keystore（见 dsh-mobile-app/README.md）。
 

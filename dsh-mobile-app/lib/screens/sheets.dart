@@ -304,20 +304,26 @@ Future<void> showNewSessionSheet(
   String? pendingMode;
   String? pendingDir;
   // 默认工作目录 = 当前选中的工作区（未选时回退第一个已注册工作区）。
-  // v2.7.1：用已规范化的 store.workspaces 匹配（api.workspaces() 原始路径大小写/斜杠
-  // 与 workspacePath 不一致会导致匹配失败，永远回退到第一个工作区）。
+  // v3.1.1(issue #5)：条目保留服务端原始路径（规范化只用于匹配比较）——
+  // 旧实现把 path 归一成 `\` 形态存入，WSL/Linux 上 `\home\user` 会直接被当作 cwd 发回服务端。
   var ws = store.workspaces;
   if (ws.isEmpty) {
     try {
-      final raw = await api.workspaces();
-      ws = raw.map((w) => {...w, 'path': AppStore.normPath(w['path'] as String? ?? '')}).toList();
+      ws = await api.workspaces();
     } catch (_) {}
   }
   if (ws.isNotEmpty) {
     final selected = store.workspacePath;
-    pendingDir = (selected != null && ws.any((w) => w['path'] == selected))
-        ? selected
-        : ws.first['path'] as String?;
+    Map<String, dynamic>? hit;
+    if (selected != null) {
+      for (final w in ws) {
+        if (AppStore.normPath(w['path'] as String? ?? '') == selected) {
+          hit = w;
+          break;
+        }
+      }
+    }
+    pendingDir = hit?['path'] as String? ?? ws.first['path'] as String?;
   }
   if (!context.mounted) return;
 
@@ -502,6 +508,25 @@ Future<void> showNewSessionSheet(
 }
 
 // ── 目录选择器（StatefulWidget：initState 即加载，修复旧版无限转圈） ──
+
+/// v3.1.1(issue #5)：按服务端分隔符拼接当前目录与子目录名。
+/// WSL/Linux 用 `/`（旧实现写死 `\`，根 `/` 下选 home 会拼成 `/\home` → 读目录报错）。
+String joinDirPath(String current, String name, String sep) {
+  if (current.isEmpty) return name;
+  return current.endsWith(sep) ? current + name : '$current$sep$name';
+}
+
+/// v3.1.1(issue #5)：确定路径分隔符——优先服务端返回的 sep；
+/// 旧版插件未返回时按根视图推断（POSIX 根为 `/`，Windows 盘符为 `C:\`），
+/// 两者都没有时按 Windows 习惯兜底。
+String dirSepOf(List<String> roots, String? serverSep) {
+  if (serverSep != null && serverSep.isNotEmpty) return serverSep;
+  for (final r in roots) {
+    if (r.contains('/')) return '/';
+  }
+  return '\\';
+}
+
 Future<void> showDirPicker(
   BuildContext context,
   AppStore store,
@@ -531,6 +556,8 @@ class _DirPickerSheetState extends State<_DirPickerSheet> {
   String current = '';
   List<String> dirs = [];
   List<Map<String, dynamic>> workspaces = [];
+  // v3.1.1(issue #5)：路径分隔符，根视图加载时按服务端返回设置（默认 Windows 习惯）
+  String sep = '\\';
   bool loading = true;
   String? error;
 
@@ -554,10 +581,13 @@ class _DirPickerSheetState extends State<_DirPickerSheet> {
         } catch (_) {
           workspaces = [];
         }
-        dirs = await api.directories('');
+        final listing = await api.directories('');
+        dirs = listing.dirs;
+        sep = dirSepOf(dirs, listing.sep);
       } else {
         workspaces = [];
-        dirs = await api.directories(path);
+        final listing = await api.directories(path);
+        dirs = listing.dirs;
       }
     } catch (e) {
       error = '${L10n.t('读取失败：', 'Failed to read: ')}$e';
@@ -579,7 +609,7 @@ class _DirPickerSheetState extends State<_DirPickerSheet> {
       load(name);
     } else {
       dirStack.add(current);
-      load(current.endsWith('\\') ? current + name : '$current\\$name');
+      load(joinDirPath(current, name, sep));
     }
   }
 
@@ -610,7 +640,11 @@ class _DirPickerSheetState extends State<_DirPickerSheet> {
               children: [
                 Expanded(
                   child: Text(
-                    current.isEmpty ? L10n.t('根目录（选择盘符）', 'Root (choose a drive)') : current,
+                    current.isEmpty
+                        ? (sep == '/'
+                            ? L10n.t('根目录', 'Root')
+                            : L10n.t('根目录（选择盘符）', 'Root (choose a drive)'))
+                        : current,
                     style: TextStyle(fontSize: 12.5, color: ink2),
                     overflow: TextOverflow.ellipsis,
                   ),
@@ -665,7 +699,12 @@ class _DirPickerSheetState extends State<_DirPickerSheet> {
                               if (workspaces.isNotEmpty)
                                 Padding(
                                   padding: const EdgeInsets.symmetric(vertical: 4),
-                                  child: Text(L10n.t('所有盘符', 'All Drives'), style: TextStyle(fontSize: 11, color: ink3)),
+                                  child: Text(
+                                    sep == '/'
+                                        ? L10n.t('根目录', 'Root')
+                                        : L10n.t('所有盘符', 'All Drives'),
+                                    style: TextStyle(fontSize: 11, color: ink3),
+                                  ),
                                 ),
                             ],
                             if (dirs.isEmpty && !loading && error == null)

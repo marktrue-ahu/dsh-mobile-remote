@@ -224,7 +224,7 @@
 | event.type | event.data 内容 |
 |---|---|
 | `user/message` | `{ text: string }`（text blocks 拼接，≤2000 字符）；v3.0.0 起附图 `images: [{ attachmentId, mediaType, width?, height?, name? }]` |
-| `assistant/message` | `{ text: string, reasoningChars: number }`；v3.0.0 起附图 `images: [...]`（同上）；**v3.0.0 版本二**：`images` 含嵌套收集——`tool-result.content` 内的图片块（read_image 等工具结果）与顶层图一并带出（对齐 PC 端 contentParts 语义） |
+| `assistant/message` | `{ text: string, reasoningChars: number, reasoning?: string }`（`reasoning` 为思维链正文，仅当非空时下发，供移动端折叠块；≤20000 字符）；v3.0.0 起附图 `images: [...]`（同上）；**v3.0.0 版本二**：`images` 含嵌套收集——`tool-result.content` 内的图片块（read_image 等工具结果）与顶层图一并带出（对齐 PC 端 contentParts 语义） |
 | `assistant/chunk` | `{ text: string }`（仅文本 delta） |
 | `tool/result` | `{ name: string, isError: boolean, text: string }`（≤2000 字符）；v3.0.0 版本二起：文本跨全部 content 块合并、附图 `images: [...]`（嵌套收集，≤20 张） |
 | `turn/start` | `{ turn: number }` |
@@ -286,12 +286,18 @@
 | POST | `/m/api/actions/:id/invoke` | 执行插件动作 |
 | GET | `/m/api/usage` | 会话 token 用量统计（v2.1） |
 | GET | `/m/api/workspaces` | 已注册工作区（新建会话默认目录，v2.1） |
-| GET | `/m/api/directories` | 目录浏览（盘符/子目录，v2.1） |
+| GET | `/m/api/directories` | 目录浏览（盘符/子目录，v2.1；v3.1.1 根视图响应新增 `sep` 字段） |
 | POST | `/m/api/directories` | 新建文件夹（v2.1） |
 | GET | `/m/api/diagnostics` | 环境诊断（服务端端点实测，v2.1） |
 | GET | `/m/api/balance` | DeepSeek 官方余额（服务端代查，v2.1） |
 | GET | `/m/api/qr-config` | 桌面二维码数据（loopback only，v2.1） |
 | POST | `/m/api/defaults` | 修改默认 Agent/权限预设（v2.1） |
+
+> **路径风格约定（v3.1.1，issue #5）**：`GET /m/api/directories?path=`、`POST /m/api/directories {path}` 与
+> `POST /m/api/sessions {cwd}` 的路径允许按客户端平台习惯传分隔符（Windows `\` / WSL·Linux·macOS `/`）；
+> 服务端会归一化为**当前平台**分隔符后读盘/建夹/建会话（旧版 App 在 WSL 上拼出的 `/\home` 也能命中真实目录）。
+> 根视图响应（`path` 为空）携带 `sep`（服务端真实分隔符），新版 App 据此拼接子目录，不再按 Windows 习惯硬编码 `\`；
+> 该字段为纯增量，旧版 App 忽略即可。
 
 ### 6.2 GET /m/api/catalog
 

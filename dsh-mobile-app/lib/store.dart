@@ -25,6 +25,9 @@ class AppStore extends ChangeNotifier {
   final Map<String, String> agentStatusMap = {};
   String darkMode = 'system'; // system | dark | light
   bool showReasoning = false; // 活动条思考面板是否显示内容（默认关：只显示状态，防英文思考刷屏）
+  bool reasoningDefaultExpanded = false; // 思维链默认展开还是折叠（默认折叠：防英文思考刷屏；单条消息仍可点按切换）
+  /// 思维链折叠手动状态（会话 -> 消息key -> 手动展开值；滚动/重进/重启持久，null=跟随设置默认）
+  Map<String, Map<String, bool>> reasoningOverrides = {};
   String language = 'zh'; // zh | en（v2.7：界面语言，持久化）
   bool balanceAlert = false; // 余额预警开关（v2.7：低于阈值提醒充值）
   double balanceThreshold = 10; // 预警阈值（元）
@@ -105,6 +108,8 @@ class AppStore extends ChangeNotifier {
   static const _kSession = 'dsh_mr_session';
   static const _kDark = 'dsh_mr_darkmode';
   static const _kReasoning = 'dsh_mr_show_reasoning';
+  static const _kReasoningDefaultExpanded = 'dsh_mr_reasoning_default_expanded';
+  static const _kReasoningOverrides = 'dsh_mr_reasoning_overrides';
   static const _kWorkspace = 'dsh_mr_workspace';
   static const _kSessCache = 'dsh_mr_sessions_cache';
   static const _kLang = 'dsh_mr_language';
@@ -118,6 +123,17 @@ class AppStore extends ChangeNotifier {
     sessionId = prefs.getString(_kSession);
     darkMode = prefs.getString(_kDark) ?? 'system';
     showReasoning = prefs.getBool(_kReasoning) ?? false;
+    reasoningDefaultExpanded = prefs.getBool(_kReasoningDefaultExpanded) ?? false;
+    try {
+      final raw = prefs.getString(_kReasoningOverrides);
+      if (raw != null && raw.isNotEmpty) {
+        reasoningOverrides = (jsonDecode(raw) as Map<String, dynamic>).map(
+          (sid, v) => MapEntry(sid, (v as Map<String, dynamic>).map((k, b) => MapEntry(k, b as bool))),
+        );
+      }
+    } catch (_) {
+      // 数据损坏则忽略，全部按设置默认展开
+    }
     language = prefs.getString(_kLang) ?? 'zh';
     L10n.lang = language;
     balanceAlert = prefs.getBool(_kBalanceAlert) ?? false;
@@ -385,7 +401,7 @@ class AppStore extends ChangeNotifier {
   Map<String, dynamic>? _selectedWorkspace() {
     if (workspacePath == null) return null;
     for (final w in workspaces) {
-      if (w['path'] == workspacePath) return w;
+      if (_normPath(w['path'] as String? ?? '') == workspacePath) return w;
     }
     return null;
   }
@@ -414,7 +430,10 @@ class AppStore extends ChangeNotifier {
   String? get workspaceTitle {
     if (workspacePath == null) return null;
     for (final w in workspaces) {
-      if (w['path'] == workspacePath) return (w['title'] as String?) ?? workspacePath;
+      if (_normPath(w['path'] as String? ?? '') == workspacePath) {
+        // v3.1.1(issue #5)：展示原始路径（WSL 上不再出现归一后的 `\home\user` 形态）
+        return (w['title'] as String?) ?? (w['path'] as String?) ?? workspacePath;
+      }
     }
     return workspacePath;
   }
@@ -423,6 +442,34 @@ class AppStore extends ChangeNotifier {
     showReasoning = v;
     notifyListeners();
     await _persistPrefs(_kReasoning, v);
+  }
+
+  Future<void> setReasoningDefaultExpanded(bool v) async {
+    reasoningDefaultExpanded = v;
+    notifyListeners();
+    await _persistPrefs(_kReasoningDefaultExpanded, v);
+  }
+
+  bool? reasoningOverrideOf(String sessionId, String messageKey) =>
+      reasoningOverrides[sessionId]?[messageKey];
+
+  Future<void> setReasoningOverride(String sessionId, String messageKey, bool expanded) async {
+    (reasoningOverrides[sessionId] ??= {})[messageKey] = expanded;
+    // 软上限：每会话 100 条 + 全局 500 条（P2：防跨会话无限增长；先删最旧会话的最旧条目）
+    final m = reasoningOverrides[sessionId]!;
+    while (m.length > 100) {
+      m.remove(m.keys.first);
+    }
+    var total = reasoningOverrides.values.fold(0, (s, v) => s + v.length);
+    while (total > 500) {
+      final sid0 = reasoningOverrides.keys.first;
+      final m0 = reasoningOverrides[sid0]!;
+      m0.remove(m0.keys.first);
+      if (m0.isEmpty) reasoningOverrides.remove(sid0);
+      total--;
+    }
+    notifyListeners();
+    await _persistPrefs(_kReasoningOverrides, jsonEncode(reasoningOverrides));
   }
 
   // ── 启动加载（对齐网页端 bootstrap） ──
@@ -528,12 +575,13 @@ class AppStore extends ChangeNotifier {
   Future<void> refreshWorkspaces({bool notify = true}) async {
     try {
       final raw = await api.workspaces();
-      // 统一规范化 path，保证与 workspacePath/会话 cwd 的匹配形态一致
-      workspaces = raw
-          .map((w) => {...w, 'path': _normPath(w['path'] as String? ?? '')})
-          .toList();
+      // v3.1.1(issue #5)：条目保留服务端原始路径（展示/回传 cwd 都用原始形态）——
+      // 规范化只用于匹配比较（_normPath 统一 `/`/`\` 与大小写）；
+      // 旧实现把 path 归一成 `\` 形态存入，WSL/Linux 上会被当作 cwd 发回服务端。
+      workspaces = raw;
       // 已选工作区不再存在时回退到"全部"
-      if (workspacePath != null && !workspaces.any((w) => w['path'] == workspacePath)) {
+      if (workspacePath != null &&
+          !workspaces.any((w) => _normPath(w['path'] as String? ?? '') == workspacePath)) {
         workspacePath = null;
       }
       if (notify) notifyListeners();

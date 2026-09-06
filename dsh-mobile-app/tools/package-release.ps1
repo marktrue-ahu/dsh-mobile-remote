@@ -32,9 +32,18 @@ try {
 } finally {
     Pop-Location
 }
-$tgzOut = Join-Path $dist "dsh-mobile-remote-$ver.tgz"
-if (-not (Test-Path $tgzOut)) { Write-Error "Plugin tarball not found at $tgzOut"; exit 1 }
-Write-Output ("Archived: " + $tgzOut + " (" + [math]::Round((Get-Item $tgzOut).Length / 1KB, 0) + " KB)")
+$packed = Join-Path $dist "dsh-mobile-remote-$ver.tgz"
+$tgzOut = Join-Path $dist "dsh-mobile-remote-v$ver.tgz"
+if (Test-Path $packed) {
+    # 命名对齐历史发布惯例：dsh-mobile-remote-vX.Y.Z.tgz（npm pack 原生输出不含 v）
+    Move-Item $packed $tgzOut -Force
+    Write-Output ("Archived: " + $tgzOut + " (" + [math]::Round((Get-Item $tgzOut).Length / 1KB, 0) + " KB)")
+} elseif (Test-Path $tgzOut) {
+    Write-Output ("Archived: " + $tgzOut + " (" + [math]::Round((Get-Item $tgzOut).Length / 1KB, 0) + " KB)")
+} else {
+    Write-Error "Plugin tarball not found - check npm pack output"
+    exit 1
+}
 
 # 3) manifest.json（共享生成器 gen-manifest.js：合法 JSON / 无 BOM / notes=CHANGELOG 最新条目全文 / sha256+size）
 # 与 package-release.sh 完全同一生成器，保证双端产出等价。
