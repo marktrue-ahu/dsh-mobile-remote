@@ -37,6 +37,7 @@
 | `approval` | 权限策略读取（`setPolicy` 仅当存在时调用） | 可选 | 跳过策略写入 |
 | `credentials` | DeepSeek 余额查询 | 可选 | 回退环境变量 `DEEPSEEK_API_KEY`；都没有则余额不可用 |
 | `typertGateway` | RC1 Remote 调用、Remote Event 问询/审批桥 | RC1 必需（由 `ctx.inject` 获取） | `protocol` 回退为 `api-proxy-legacy`；受影响的 RC1 功能明确报错，不伪装为成功 |
+| `sessionController` | RC1 冷会话 `session.prompt` 的恢复与投递 | RC1 冷会话发送使用（由 `ctx.inject` 获取）；活跃会话仍沿用原有队列语义 | 优先调用进程内 `prompt`；服务缺失时回退 Typert Gateway，若两者都不可用则返回明确发送错误 |
 | `apiProxy` | 0.1.1-rc.2 的问询/审批弹窗桥 + 应答回写 | 旧版可选 | `checks.respondBridge=false`，手机不弹问询/审批卡（PC 端不受影响）；`/m/api/respond` 返回 503 |
 | `userQuestions` | （间接）问询链路 | 可选 | 无弹窗（同上） |
 
@@ -68,9 +69,13 @@ RC1 适配不复用 `dsh-std`，只在插件内集中转换 Host 差异。移动
 - `settings.update` 保持三个独立参数；`subagent.list`、`subagent.interrupt` 使用 RC1 的 `subagents` 命名空间；目标服务使用 `agentId` 查找会话。
 - `user-questions/request` 和 `approval/request` 经 `$events` 转成现有 `question/requested`、`approval/requested` 帧；回答经 `$events/result` 结算（RC1 下走 Typert Gateway 的**进程内 `dispatchRpc`**，不走旧版 HTTP `/api` envelope——后者被浏览器会话认证栅挡住会 401）；事件流重连不重复弹出同一个 `eventId`。
 
-当 `typertGateway` 未注入时，插件继续使用 0.1.1-rc.2 的旧 `apiProxy`/`/api` 通道。`/m/api/diagnostics` 返回 `protocol`（`typert-rc1` 或 `api-proxy-legacy`）、`services.typertGateway`、`remoteEventClientId`，用于确认实际选中的协议。已在真实 **0.1.2-rc.1** 宿主（Web CLI / Linux）验证：`protocol=typert-rc1` 生效、`$events` stream 收到 `ready`、真实 `ask_user_question` 瀑布正确转成 `question/requested` 帧；期间发现并修复了 respond 结算经旧 HTTP envelope 导致 `401` 的缺陷（详见 [docs/rc1-respond-settle-review.md](rc1-respond-settle-review.md)）。**完整兼容声明仍需**按 [RC1 兼容验收清单](rc1-acceptance-checklist.md) 在两种 Host 版本、Desktop/Web、Windows 与 WSL/Linux 环境逐项实测（当前逐项进展见 [docs/rc1-t01-t19-verification.md](rc1-t01-t19-verification.md)）。
+> 2026-09-06 增量修复：RC1 `Session` 的事件日志通过 `snapshotEvents()` 读取，旧版 Host 继续读取 `events`；配置、历史、用量路径统一经过兼容读取层。RC1 的持久化冷会话不在 live agent 注册表时，移动端发送优先调用已注入的 `sessionController.prompt`，由 Host 恢复后投递；注入服务缺失时才回退 Typert Gateway。旧版 Host 的 live-agent 排队与插队语义保持不变。RC1 的 prompt 回执只有 `accepted`，App 在缺少旧版 `messageId` 时保留乐观消息的未绑定状态，等待 SSE/历史回显合并，避免重复气泡。该修复已在真实 0.1.2-rc.1 Web CLI/Linux 运行时做定向回归，但完整兼容仍以验收清单为准。
+
+当 `typertGateway` 未注入时，插件继续使用 0.1.1-rc.2 的旧 `apiProxy`/`/api` 通道；当 RC1 的 `sessionController` 未注入时，冷会话发送回退 Gateway，并在 Gateway 也不可用时明确失败。`/m/api/diagnostics` 返回 `protocol`（`typert-rc1` 或 `api-proxy-legacy`）、`services.typertGateway`、`services.sessionController`、`remoteEventClientId`，用于确认实际选中的协议和冷会话投递能力。已在真实 **0.1.2-rc.1** 宿主（Web CLI / Linux）验证：`protocol=typert-rc1` 生效、`$events` stream 收到 `ready`、真实 `ask_user_question` 瀑布正确转成 `question/requested` 帧；期间发现并修复了 respond 结算经旧 HTTP envelope 导致 `401` 的缺陷（详见 [docs/rc1-respond-settle-review.md](rc1-respond-settle-review.md)）。**完整兼容声明仍需**按 [RC1 兼容验收清单](rc1-acceptance-checklist.md) 在两种 Host 版本、Desktop/Web、Windows 与 WSL/Linux 环境逐项实测（当前逐项进展见 [docs/rc1-t01-t19-verification.md](rc1-t01-t19-verification.md)）。
 
 ### 2.4 高度自定义化的 Harness
+
+**内核依赖必须与宿主一致。** 本插件将 `dsh-credentials`、`dsh-llm`、`dsh-sandbox-policy` 声明为 peer 包，由 DSH profile 的宿主模块回退目录提供。旧锁文件中的普通依赖副本可能优先于新宿主加载；实测旧沙箱策略包会在 RC1 组装系统提示时读取已移除的 `session.events`，使每轮失败。升级步骤见 [安装说明](06-install-run.md#21-依赖声明的两种方式)。修复此安装问题后已验证默认模型首轮回复；这不代表所有第三方插件均已兼容 RC1。
 
 - **自定义权限预设/模型/Agent 预设**：App 全部从内核动态读取（catalog、session-config），不内置白名单；未知预设名显示为「…」（后续版本可拉取预设清单美化）。
 - **第三方插件动作**：`ctx.mobileActions.register(...)` 注册后自动出现在 App 动作区（v0.1 契约：仅 text 字段）。

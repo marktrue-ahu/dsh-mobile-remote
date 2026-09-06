@@ -5,6 +5,8 @@ import {
 	modelSelectionFromRc1SessionList,
 	normalizeRc1ModelCatalog,
 	rc1RemoteSpec,
+	rc1SendRoute,
+	sessionEventsOf,
 	sessionIdFromRc1AgentId,
 } from "../lib/rc1-adapter.js";
 
@@ -126,6 +128,42 @@ assert.deepEqual(modelSelectionFromRc1SessionList({
 }, "session-1"), { provider: "p", model: "new" });
 assert.equal(sessionIdFromRc1AgentId("session:session-1"), "session-1");
 assert.equal(sessionIdFromRc1AgentId("session-1"), "session-1");
+
+// RC1 Session hides its mutable event log behind snapshotEvents(); legacy DSH
+// exposes the array as events. The compatibility seam must support both.
+const rc1Events = [{ type: "session/title", data: { title: "RC1" } }];
+assert.deepEqual(sessionEventsOf({ snapshotEvents: () => rc1Events }), rc1Events);
+assert.deepEqual(sessionEventsOf({ events: [{ type: "session/title", data: { title: "legacy" } }] }), [
+	{ type: "session/title", data: { title: "legacy" } },
+]);
+assert.deepEqual(sessionEventsOf({ snapshotEvents: () => { throw new Error("disposed"); }, events: rc1Events }), rc1Events);
+assert.deepEqual(sessionEventsOf(undefined), []);
+
+// A persisted RC1 session may be absent from agents while still addressable
+// through session.prompt, which resumes it before delivery.
+assert.deepEqual(rc1SendRoute({ gatewayAvailable: true, sessionId: "session-cold", liveAgent: undefined }), {
+	kind: "resume",
+	sessionId: "session-cold",
+});
+assert.deepEqual(rc1SendRoute({ gatewayAvailable: true, sessionId: "session-live", liveAgent: { id: "session-live" } }), {
+	kind: "live",
+	agent: { id: "session-live" },
+});
+assert.deepEqual(rc1SendRoute({ gatewayAvailable: false, sessionId: "session-cold", liveAgent: undefined }), {
+	kind: "missing",
+});
+assert.deepEqual(rc1SendRoute({ gatewayAvailable: false, sessionId: "session-live", liveAgent: { id: "session-live" } }), {
+	kind: "live",
+	agent: { id: "session-live" },
+});
+assert.deepEqual(rc1SendRoute({ gatewayAvailable: true, sessionId: "session-cold", liveAgent: null }), {
+	kind: "resume",
+	sessionId: "session-cold",
+});
+assert.deepEqual(rc1SendRoute({ gatewayAvailable: false, sessionControllerAvailable: true, sessionId: "session-cold", liveAgent: null }), {
+	kind: "resume",
+	sessionId: "session-cold",
+});
 
 assert.throws(() => rc1RemoteSpec("session.history", {}), (error) => {
 	assert.equal(error.code, "rc1-method-unmapped");

@@ -102,11 +102,12 @@
 **响应**
 
 - `200 { "ok": true, "agentId": "session-abc", "messageId": "m_<uuid>", "mode": "followup" | "steer" | "queued" }`（`mode: "queued"` 时附 `note`；图片路径 `note: "image-prompt"`）
+- RC1 冷会话（持久化但尚未注册 live agent）返回 `200 { "ok": true, "accepted": true, "agentId": "session-abc", "mode": "followup" | "steer", "note": "session-resumed" }`；RC1 `session.prompt` 回执不提供旧版 `messageId`，客户端保留乐观消息的未绑定状态，等待 SSE/历史中的 `user/message` 回显。
 - `400 { "error": "empty-text" }`：text 为空或非字符串
-- `404 { "error": "session-not-found" }`：指定会话不存在
+- `404 { "error": "session-not-found" }`：指定会话不存在，或旧版 Host 没有可用的冷会话恢复能力
 - `503 { "error": "no-live-agent" }`：无匹配的运行中 agent
 - `503 { "error": "agents-unavailable" }`：agents 服务不可用（非 web 组合或启动中）
-**语义**：服务端构造 `createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })` 后调用 `agent.followup(message)`（排队/空闲释放）或 `agent.steer(message)`（插队）；运行中 `followup` 走持存（见上）；含 `images` 时经内核 `session.prompt` 图片通道。`followup` 会持久化消息并唤醒空闲驱动器；不等待执行结果（结果经 SSE 回流）。
+**语义**：旧版 Host 服务端构造 `createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })` 后调用 `agent.followup(message)`（排队/空闲释放）或 `agent.steer(message)`（插队）；RC1 冷会话改由 `session.prompt` 恢复会话并接收内容；运行中 `followup` 走持存（见上）；含 `images` 时经内核 `session.prompt` 图片通道。消息投递不等待执行结果（结果经 SSE 回流）。
 
 ### 3.2c GET /m/api/send-receipt（v3.0.0 热修 05，发送回执查询）
 
@@ -562,6 +563,4 @@
 - 映射内核 `commands.execute(agent, line, images, signal)`（0.1.1-rc.2 四参签名；本插件 `images` 恒为空数组，`signal` 为 15s 超时中止；2.8.1 的旧三参调用会把 AbortSignal 误传 images 槽，已改正）
 - `line` 必须以 `/` 开头（否则 `400 bad-request`）；未知/畸形命令 `404 command-not-found`；服务未注册 `503 commands-unavailable`（带 detail）；服务在而会话不存在 `404 session-not-found`（与 GET 拆分语义一致）
 - `result` 为内核 settle 对象（`commandId` + `result.{kind,text}`），与 PC 端一致
-
-
 
