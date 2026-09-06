@@ -1310,7 +1310,10 @@ class _ChatScreenState extends State<ChatScreen> {
         // 同文本多条时 mid 不会挂错条目
         final idx = _items.lastIndexWhere(
             (m) => m.kind == _MsgKind.user && m.messageId == null && m.text == text);
-        if (idx != -1) _items[idx] = _items[idx].copyWith(messageId: mid);
+        // RC1 的 session.prompt 只返回 accepted，不提供旧版 followup 的
+        // messageId；保留 null 才能让后续 user/message SSE 按文本合并，避免
+        // 先写入空字符串后无法匹配而出现重复用户气泡。
+        if (idx != -1 && mid.isNotEmpty) _items[idx] = _items[idx].copyWith(messageId: mid);
       });
     } catch (e) {
       AppLog.instance.log('Chat: 发送异常（$mode）→ $e');

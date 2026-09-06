@@ -1,7 +1,7 @@
 # 06 部署与启用文档 — dsh-mobile-remote
 
-> 版本：v3.0.0 · 状态：已在本机安装与验证 · 配套：03-api.md、04-security.md、07-user-manual.md、09-compatibility.md
-> 适用环境：**DSH 0.1.1-rc.2（DSH Desktop v2.0.2）**。桌面版 webserver 强制只听 `127.0.0.1`，移动端经插件 **LAN 桥**（默认 `0.0.0.0:3080`）接入；web 版 DSH 无回环限制，可直接让 webserver 绑 0.0.0.0。
+> 版本：v3.1.1 基线 · 状态：RC1 适配实施中，完整矩阵待实测 · 配套：03-api.md、04-security.md、07-user-manual.md、09-compatibility.md
+> 适用环境：**DSH 0.1.1-rc.2 与 0.1.2-rc.1**。桌面版 webserver 强制只听 `127.0.0.1`，移动端经插件 **LAN 桥**（默认 `0.0.0.0:3080`）接入；web 版 DSH 无回环限制，可直接让 webserver 绑 0.0.0.0。RC1 的 Host Remote 由插件自动选择 Typert Gateway，旧版继续使用 apiProxy。
 
 ## 1. 部署拓扑
 
@@ -73,6 +73,12 @@ corepack pnpm install
 > 版本匹配规则：**App 与插件同版本 = 完美配对**；不同版本也能用（谁旧谁吃亏，但都不崩），详见 README「版本与兼容」。实际配对在 App 设置 → 关于 → 版本查看。
 > 方式 B 依赖网络能访问 GitHub 与 npm（含插件依赖 `qrcode`、`@deepseek-ai/*` 的公开解析；后者桌面端为内置打包、公开 npm 可解析性未逐一验证，遇解析失败请改用方式 A/C）。
 > 更新插件时：方式 A 重新 `git pull` 后 `pnpm install`；方式 B 改 tag 后 `pnpm install`；方式 C 换新 tgz 重装。
+
+> RC1 安装检查：`@deepseek-ai/dsh-credentials`、`dsh-llm`、`dsh-sandbox-policy` 是宿主提供的 `peerDependencies`，不作为插件的普通依赖安装。版本范围允许旧 Host 和 RC1，**不表示可以将这些版本混装**。DSH profile 应保留宿主生成的 `pnpm-workspace.yaml` 设置 `nodeLinker: hoisted`、`autoInstallPeers: false`，由启动器维护的 `profiles/node_modules` 提供对应宿主包。`@deepseek-ai/schemastery` 与 `qrcode` 仍为普通依赖。不要在 profile 中启用自动安装 peer 包。
+>
+> 从此前适配版本升级时，先备份 profile；若曾为排障显式添加上述三个内核包，移除这些临时依赖声明后，在 profile 目录运行 `pnpm install` 更新锁文件及安装内容，再重启 DSH。检查 profile 的 `node_modules` 是否仍有旧版内核包覆盖宿主；其他插件若仍依赖旧包，需先查明依赖来源。仅升级全局 `dsh` 或放宽版本范围不会替换锁文件中的旧包。2026-09-06 曾实测旧 `dsh-sandbox-policy@0.1.0-rc.6` 覆盖 RC1，导致发送返回 200 后首轮报 `Cannot read properties of undefined (reading 'length')`。
+>
+> 安装后检查诊断协议和桥状态，并运行 `DSH_MOBILE_TOKEN` 环境变量鉴权的 `node tools/verify-rc1-first-reply.mjs`（在宿主本机执行，会创建并归档临时测试会话，产生一次真实模型请求）。该脚本要求收到非空 `assistant/message` 且 `turn/end` 正常完成。`protocol: "typert-rc1"`、`services.typertGateway: true`、`checks.respondBridge: true` 只用于诊断，不能替代首轮回复或问询/审批闭环验收。
 
 ## 3. 启用 / 重启步骤
 
@@ -325,7 +331,7 @@ flutter build apk --release
 - [x] `--dump-config` 含 mobile-remote 行；启动日志含 lanBridge 监听行（桌面版）
 - [x] **web 版局域网直连实测**（2026-08-23，隔离 DSH_HOME）：`0.0.0.0:3081` + 局域网 IP bootstrap 200
 - [x] 未认证 401 / 错误口令 401 / 正确口令通行
-- [x] `POST /m/api/send` 注入成功（200 + messageId；图片路径 200 + accepted:true）
+- [x] `POST /m/api/send` 注入成功（旧版/活跃 RC1 为 200 + messageId；RC1 冷会话为 200 + accepted:true + `note:"session-resumed"`；图片路径 200 + accepted:true）
 - [x] SSE 连接 + hello + 事件转发（重连退避、断线补拉、pendingFrames 回放、心跳 25s）
 - [x] `/m/qr.png` 返回 PNG
 - [x] 桌面设置页「连接移动端设备」二维码 + App 扫码自动连接

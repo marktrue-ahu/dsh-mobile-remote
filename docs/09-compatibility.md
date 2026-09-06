@@ -1,6 +1,6 @@
 # 09 兼容性说明（Compatibility）
 
-> 版本：v3.1.1（2026-08-26 发布；含 WSL/类 Unix 路径修复与 reasoning/title 字段的降级说明） · 面向：开源使用者 / 二次开发 / 多设备部署
+> 版本：v3.1.1 基线（RC1 适配在 `feature/dsh-0.1.2-rc1-compat` 分支实施，尚未发布新版本） · 面向：开源使用者 / 二次开发 / 多设备部署
 
 本文回答两个问题：**App 在哪些手机上能跑**，以及**插件在什么样的 Harness 上能跑**。
 
@@ -10,9 +10,9 @@
 
 | 组件 | 要求 |
 |---|---|
-| 桌面端 DSH（Harness） | 与开发基线同系列（本文档基于 **v0.1.1-rc.2 服务包 = DSH Desktop v2.0.2** 编写；v2.8.2 起为 0.1.1-rc.2 适配，更低版本可能缺少 `apiProxy`/`workspaceRegistry`/`commands` 等服务，功能会按 §2 降级） |
-| dsh-mobile-remote 插件 | **v3.0.0（与 App/git tag 版本号统一）**；`/m/api/diagnostics` 可自检 |
-| 手机 App（Android） | v3.0.0（与插件同版本 = 完美配对；不同版本可用但"谁旧谁吃亏"，详见 README「版本与兼容」）；Android 7.0+、64 位机型 |
+| 桌面端 DSH（Harness） | 支持 **v0.1.1-rc.2** 与 **v0.1.2-rc.1**；前者使用旧 `apiProxy`/`/api` Remote，后者使用 Typert Gateway/Remote Event。更低版本可能缺少 `apiProxy`、`workspaceRegistry`、`commands` 或 Gateway 服务，功能会按 §2 降级 |
+| dsh-mobile-remote 插件 | **v3.1.1 基线（与 App/git tag 版本号统一）**；RC1 适配完成前不改正式版本号；`/m/api/diagnostics` 可自检 |
+| 手机 App（Android） | v3.1.1 基线（与插件同版本 = 完美配对；不同版本可用但"谁旧谁吃亏"，详见 README「版本与兼容」）；Android 7.0+、64 位机型 |
 | 字段级兼容（v3.1.0 候选） | `reasoning`/`title` 为纯增量字段：新插件+旧 App 无影响（忽略新字段）；新 App+旧插件自动回退（不渲染折叠块 / 悬浮球标题兜底短码）——任意组合均可使用 |
 | 字段级兼容（v3.1.1） | `/m/api/directories` 根视图新增 `sep`（服务端路径分隔符）；新插件+旧 App 忽略该字段即可（旧 App 在 WSL 上仍按 `\` 拼接，由服务端`normalizeServerPath` 归一化兜底，浏览/建夹/建会话均可用）；新 App+旧插件缺少 `sep` 时按根视图推断分隔符——任意组合均可使用 |
 | Flutter 构建环境 | Flutter 3.35+（Dart SDK ^3.13） |
@@ -36,10 +36,14 @@
 | `messageFeedback` | 消息 👍/👎（与 PC 端同一份） | 软依赖 | 反馈菜单隐藏/报错 |
 | `approval` | 权限策略读取（`setPolicy` 仅当存在时调用） | 可选 | 跳过策略写入 |
 | `credentials` | DeepSeek 余额查询 | 可选 | 回退环境变量 `DEEPSEEK_API_KEY`；都没有则余额不可用 |
-| `apiProxy` | 问询/审批弹窗桥 + 应答回写 | 可选（v2.3+ 新功能） | `checks.respondBridge=false`，手机不弹问询/审批卡（PC 端不受影响）；`/m/api/respond` 返回 503 |
+| `typertGateway` | RC1 Remote 调用、Remote Event 问询/审批桥 | RC1 必需（由 `ctx.inject` 获取） | `protocol` 回退为 `api-proxy-legacy`；受影响的 RC1 功能明确报错，不伪装为成功 |
+| `sessionController` | RC1 冷会话 `session.prompt` 的恢复与投递 | RC1 冷会话发送使用（由 `ctx.inject` 获取）；活跃会话仍沿用原有队列语义 | 优先调用进程内 `prompt`；服务缺失时回退 Typert Gateway，若两者都不可用则返回明确发送错误 |
+| `apiProxy` | 0.1.1-rc.2 的问询/审批弹窗桥 + 应答回写 | 旧版可选 | `checks.respondBridge=false`，手机不弹问询/审批卡（PC 端不受影响）；`/m/api/respond` 返回 503 |
 | `userQuestions` | （间接）问询链路 | 可选 | 无弹窗（同上） |
 
-> ⚠ **apiProxy 属私有协议**：`events.mux` 与 `respond` 的消息格式是 PC 端 GUI 的内部通道，**无版本稳定承诺**。插件以 `ctx.inject(["apiProxy"])` 获取并做函数存在性探测；若未来 Harness 重构该接口，桥会干净降级（不影响其他功能），随插件版本更新恢复。这是本插件对内核唯一的"越界"耦合，集中在 `lib/index.js` 的「问询/审批帧桥」一段。
+> ⚠ **两代 Host Remote 不能只做名称替换**：0.1.1-rc.2 的 `apiProxy` 使用旧 `/api` envelope；0.1.2-rc.1 的 Typert Gateway 要求命名 `args`、严格方法签名，并通过 `$events`/`$events/result` 传递问询与审批。适配集中在 [lib/rc1-adapter.js](../lib/rc1-adapter.js) 和 `lib/index.js` 的 Remote Event 桥；业务错误不会在两条协议之间重试，避免一次移动操作重复执行。
+
+> RC1 事件桥在 Gateway stream 重连时复用已有 `eventId`，移动端 pending 帧只补发一次；回答前会校验会话、交互类型和审批结果。Gateway 不可用时，诊断会显示实际协议和桥状态，受影响功能返回明确错误。
 
 ### 2.2 事件与 RPC
 
@@ -47,16 +51,31 @@
 |---|---|---|
 | `ctx.on("session/event")` | 消息流/通知聚合/上下文窗口 | 事件形态随版本演进；未知类型一律透传不解析，解析异常被 try/catch 兜底 |
 | `ctx.on("agent/status")` | 状态点（绿/橙） | 同上 |
-| `session.models` RPC | 模型目录（App 模型选择器） | 失败 → 目录为空，App 隐藏模型胶囊 |
-| `settings.update`（`agent-presets` / `permission` 命名空间） | 默认预设修改 | 与 PC 端同一写入通道；命名空间变更会导致设置失败（App 报错提示） |
-| `session.fork` | 消息分支 | 内核接口变化 → fork 失败提示 |
-| `agent.followup` / `session.cancel` | 发消息/停止 | 同上 |
+| `session.models` / `session.modelCatalog` | 模型目录（App 模型选择器） | 旧版走 `session.models`；RC1 走无参数 `session/modelCatalog`，并把 RC1 `default` 归一为移动 API 的 `current`；失败 → 目录为空，App 隐藏模型胶囊 |
+| `settings.update`（`agent-presets` / `permission` 命名空间） | 默认预设修改 | RC1 通过 `settings/update(ns, patch, expectedRevision)`；命名空间变更会导致设置失败（App 报错提示） |
+| `session.prompt` / `session.fork` / `session.cancel` | 发消息、消息分支、停止 | RC1 统一把业务请求放入命名 `request`；错误透传并显示明确提示 |
 
 > ⚠ **子代理通知判定需要 `session.header.origin`（DSH ≥ 0.1.1-rc.2）**：通知聚合对子代理会话（`origin === "subagent"`）抑制完成/失败通知（与内核自身通知一致）。旧内核 header 无 `origin` 字段时，子代理完成/失败通知会被放行（不影响功能正确性，仅通知噪音）；fork 出的独立会话（无 origin）照常通知。
 >
 > ⚠ **v3.1.0 候选新增字段（纯增量，无协议破坏）**：`assistant/message` 摘要的 `reasoning`（思维链正文，仅非空时下发，≤20000 字符）与 `/m/api/bootstrap` 的 `agents[*].title` / `sessions[*].title`（会话标题，空则兜底短码）。旧版 App 按 key 取值、忽略未知字段；旧版插件缺少这些字段时新版 App 自动回退（不渲染折叠块 / 悬浮球显示 id 短码）。两端任意组合均可正常使用。
 
-### 2.3 高度自定义化的 Harness
+### 2.3 RC1 适配边界
+
+RC1 适配不复用 `dsh-std`，只在插件内集中转换 Host 差异。移动端 HTTP/SSE 接口保持原有字段和语义，`lib/rc1-adapter.js` 负责以下命名与参数边界：
+
+- `session.prompt`、`selectModel`、`attachment`、`updateQueue`、`fork`、`cancel`、`page`、`workspace.archiveSession` 使用 RC1 的命名 `request` 参数；`session.list` 使用保留的 `_request` 空对象。
+- `session.models` 调用 `session/modelCatalog`，将 RC1 的 `default` 映射为移动端继续读取的 `current`。
+- RC1 的会话当前模型优先从 `model/selection` 与 `request/header` 事件折叠；冷会话读取 `session.list` 的 `modelSelection.next`，没有选择时才使用部署默认模型。
+- `settings.update` 保持三个独立参数；`subagent.list`、`subagent.interrupt` 使用 RC1 的 `subagents` 命名空间；目标服务使用 `agentId` 查找会话。
+- `user-questions/request` 和 `approval/request` 经 `$events` 转成现有 `question/requested`、`approval/requested` 帧；回答经 `$events/result` 结算（RC1 下走 Typert Gateway 的**进程内 `dispatchRpc`**，不走旧版 HTTP `/api` envelope——后者被浏览器会话认证栅挡住会 401）；事件流重连不重复弹出同一个 `eventId`。
+
+> 2026-09-06 增量修复：RC1 `Session` 的事件日志通过 `snapshotEvents()` 读取，旧版 Host 继续读取 `events`；配置、历史、用量路径统一经过兼容读取层。RC1 的持久化冷会话不在 live agent 注册表时，移动端发送优先调用已注入的 `sessionController.prompt`，由 Host 恢复后投递；注入服务缺失时才回退 Typert Gateway。旧版 Host 的 live-agent 排队与插队语义保持不变。RC1 的 prompt 回执只有 `accepted`，App 在缺少旧版 `messageId` 时保留乐观消息的未绑定状态，等待 SSE/历史回显合并，避免重复气泡。该修复已在真实 0.1.2-rc.1 Web CLI/Linux 运行时做定向回归，但完整兼容仍以验收清单为准。
+
+当 `typertGateway` 未注入时，插件继续使用 0.1.1-rc.2 的旧 `apiProxy`/`/api` 通道；当 RC1 的 `sessionController` 未注入时，冷会话发送回退 Gateway，并在 Gateway 也不可用时明确失败。`/m/api/diagnostics` 返回 `protocol`（`typert-rc1` 或 `api-proxy-legacy`）、`services.typertGateway`、`services.sessionController`、`remoteEventClientId`，用于确认实际选中的协议和冷会话投递能力。已在真实 **0.1.2-rc.1** 宿主（Web CLI / Linux）验证：`protocol=typert-rc1` 生效、`$events` stream 收到 `ready`、真实 `ask_user_question` 瀑布正确转成 `question/requested` 帧；期间发现并修复了 respond 结算经旧 HTTP envelope 导致 `401` 的缺陷（详见 [docs/rc1-respond-settle-review.md](rc1-respond-settle-review.md)）。**完整兼容声明仍需**按 [RC1 兼容验收清单](rc1-acceptance-checklist.md) 在两种 Host 版本、Desktop/Web、Windows 与 WSL/Linux 环境逐项实测（当前逐项进展见 [docs/rc1-t01-t19-verification.md](rc1-t01-t19-verification.md)）。
+
+### 2.4 高度自定义化的 Harness
+
+**内核依赖必须与宿主一致。** 本插件将 `dsh-credentials`、`dsh-llm`、`dsh-sandbox-policy` 声明为 peer 包，由 DSH profile 的宿主模块回退目录提供。旧锁文件中的普通依赖副本可能优先于新宿主加载；实测旧沙箱策略包会在 RC1 组装系统提示时读取已移除的 `session.events`，使每轮失败。升级步骤见 [安装说明](06-install-run.md#21-依赖声明的两种方式)。修复此安装问题后已验证默认模型首轮回复；这不代表所有第三方插件均已兼容 RC1。
 
 - **自定义权限预设/模型/Agent 预设**：App 全部从内核动态读取（catalog、session-config），不内置白名单；未知预设名显示为「…」（后续版本可拉取预设清单美化）。
 - **第三方插件动作**：`ctx.mobileActions.register(...)` 注册后自动出现在 App 动作区（v0.1 契约：仅 text 字段）。
@@ -95,7 +114,7 @@ App 为 Flutter 原生 APK（`com.dsh.remote`），渲染后端为 **Impeller（
 
 | # | 问题 | 影响 | 状态/缓解 |
 |---|---|---|---|
-| 1 | 问询/审批桥依赖 apiProxy 私有协议 | 未来内核大版本可能断桥 | 干净降级 + 插件版本跟进；诊断可查 |
+| 1 | 两代 Host Remote 契约不同 | Host 升级后可能出现映射或事件桥错误 | RC1 使用本地 Typert 适配层；旧版保留 apiProxy 路径；诊断显示实际协议，插件版本跟进 |
 | 2 | 自定义权限预设名在 App 显示「…」 | 纯展示 | 后续拉取预设清单 |
 | 3 | 国产 ROM 杀后台导致通知延迟（App 内角标） | 通知不及时 | 推送桥不受影响；App 重连后补拉 |
 | 4 | Impeller 在极老 GPU 的潜在渲染问题（未实测） | 少数旧机可能花屏 | manifest 一行回退 Skia |
@@ -114,7 +133,7 @@ App 为 Flutter 原生 APK（`com.dsh.remote`），渲染后端为 **Impeller（
 | 类别 | 内容 | 说明 |
 |---|---|---|
 | 设计令牌（有意） | 品牌色 `#426EFE` / 深色 `#0E1116` 等（App `theme.dart`）、`com.dsh.remote`、QR 协议 `DSHREMOTE\|地址\|口令`、`EnableImpeller=true` | 产品设计/通信契约，勿随意改 |
-| 内核耦合词（有意） | 系统消息过滤词 `Current runtime context` / `This snapshot supersedes` / `background job `（App `chat_screen.dart`）、apiProxy 协议字段名 | 与内核/PC 端保持一致的隐藏规则 |
+| 内核耦合词（有意） | 系统消息过滤词 `Current runtime context` / `This snapshot supersedes` / `background job `（App `chat_screen.dart`）、旧 apiProxy 与 RC1 Gateway 字段名 | 与内核/PC 端保持一致的隐藏规则 |
 | 插件可配置项 | `path` / `authToken` / `cookieName` / `sessionTtlMs` / `rechargeUrl` / `maxConnections` / `pushUrls` / `pushCooldownMs` / `pushContent` / `rateLimit` / `trustedHosts` / `doneGraceMs`（v2.8.0）/ `lanBridge`（v3.0.0：`{enabled, port, host}`，默认关） | schema 默认值，改配置即可 |
 | 插件内置常量 | 通知上限 100、catalog 缓存 15s、SSE 心跳 25s、SSE 超时 15s、登录限流默认 10 次/60s（`rateLimit` 可配）、状态文件 `~/.dsh/mobile-remote/` | 合理默认，无需配置 |
 | App 内置常量 | HTTP 超时 15/20s（余额 25s）、连接/探测超时 8s、地址表上限 8、重试退避 1s→15s、看门狗 15s 检查 / 心跳 75s（3 周期）、日志保留 15 天/256KB、聊天初始窗口 50 条、历史分段 30 条、上下文圆环阈值 70%/90%、思维链折叠手动状态键 `dsh_mr_reasoning_overrides`（按会话持久化，每会话软上限 100 条） | 合理默认；修改点集中在各文件顶部常量 |
