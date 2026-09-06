@@ -1,10 +1,5 @@
 # Agent instructions
 
-## Git remotes
-
-- `origin` is the only configured remote: `git@github.com:marktrue-ahu/dsh-mobile-remote.git`.
-- Before any pull, rebase, merge, push, or tag operation, verify the current branch and `origin` target.
-
 ## Agent skills
 
 ### Issue tracker
