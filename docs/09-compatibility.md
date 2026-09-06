@@ -66,9 +66,9 @@ RC1 适配不复用 `dsh-std`，只在插件内集中转换 Host 差异。移动
 - `session.models` 调用 `session/modelCatalog`，将 RC1 的 `default` 映射为移动端继续读取的 `current`。
 - RC1 的会话当前模型优先从 `model/selection` 与 `request/header` 事件折叠；冷会话读取 `session.list` 的 `modelSelection.next`，没有选择时才使用部署默认模型。
 - `settings.update` 保持三个独立参数；`subagent.list`、`subagent.interrupt` 使用 RC1 的 `subagents` 命名空间；目标服务使用 `agentId` 查找会话。
-- `user-questions/request` 和 `approval/request` 经 `$events` 转成现有 `question/requested`、`approval/requested` 帧，回答经 `$events/result` 结算；事件流重连不重复弹出同一个 `eventId`。
+- `user-questions/request` 和 `approval/request` 经 `$events` 转成现有 `question/requested`、`approval/requested` 帧；回答经 `$events/result` 结算（RC1 下走 Typert Gateway 的**进程内 `dispatchRpc`**，不走旧版 HTTP `/api` envelope——后者被浏览器会话认证栅挡住会 401）；事件流重连不重复弹出同一个 `eventId`。
 
-当 `typertGateway` 未注入时，插件继续使用 0.1.1-rc.2 的旧 `apiProxy`/`/api` 通道。`/m/api/diagnostics` 返回 `protocol`（`typert-rc1` 或 `api-proxy-legacy`）、`services.typertGateway`、`remoteEventClientId`，用于确认实际选中的协议。此次适配代码已完成静态和适配映射校验；完整兼容声明仍需按 [RC1 兼容验收清单](rc1-acceptance-checklist.md) 在两种 Host 版本、Desktop/Web、Windows 与 WSL/Linux 环境逐项实测。
+当 `typertGateway` 未注入时，插件继续使用 0.1.1-rc.2 的旧 `apiProxy`/`/api` 通道。`/m/api/diagnostics` 返回 `protocol`（`typert-rc1` 或 `api-proxy-legacy`）、`services.typertGateway`、`remoteEventClientId`，用于确认实际选中的协议。已在真实 **0.1.2-rc.1** 宿主（Web CLI / Linux）验证：`protocol=typert-rc1` 生效、`$events` stream 收到 `ready`、真实 `ask_user_question` 瀑布正确转成 `question/requested` 帧；期间发现并修复了 respond 结算经旧 HTTP envelope 导致 `401` 的缺陷（详见 [docs/rc1-respond-settle-review.md](rc1-respond-settle-review.md)）。**完整兼容声明仍需**按 [RC1 兼容验收清单](rc1-acceptance-checklist.md) 在两种 Host 版本、Desktop/Web、Windows 与 WSL/Linux 环境逐项实测（当前逐项进展见 [docs/rc1-t01-t19-verification.md](rc1-t01-t19-verification.md)）。
 
 ### 2.4 高度自定义化的 Harness
 
