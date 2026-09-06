@@ -187,7 +187,7 @@ pushUrls:
 - 移动端显示活动条（思考中/正在调用工具），不显示工具结果细节（v2.6 起移除工具卡片，详见 CHANGELOG）。
 - 长任务期间建议等待上一轮完成再发新消息，避免排队混乱。
 - 归档（archive）会话与 PC 端同源显示，行为一致。
-- 问询/审批弹窗依赖内核 `apiProxy` 私有协议（与 PC 端 GUI 同一通道）：Harness 未来大版本重构时桥会干净降级，随插件更新恢复（诊断页可查）。
+- 问询/审批弹窗按 Host 版本选择协议：DSH `0.1.1-rc.2` 使用 `apiProxy`，DSH `0.1.2-rc.1` 使用 Typert Gateway 的 `$events`/`$events/result`；插件在本地适配层集中转换，诊断页可查看实际协议和桥状态。
 - 通知删除只清记录不"静音"：同会话同类新事件仍会产生新通知。
 - App 构建签名：正式分发须自建 keystore（换签名 = 换应用，用户需重装重扫）；详见 docs/06 §8.2 与 docs/09 §6。
 - **与 dsh-web 的移动端远程（`@linxin666/dsh-remote-web-ui`）同装会冲突**：对方把手机页面/API 整体写死在 `/m` 前缀（不可配置），本插件默认也挂在 `/m`——两者抢同一路由前缀可能导致异常/崩溃。共存方法：给本插件配 `path: /mr`（任意非 `/m` 单段）并重启 DSH，手机 App 自动适配无需重装（详见 FAQ「设备/兼容类」）。
@@ -198,7 +198,7 @@ pushUrls:
 
 ## 兼容性
 
-- **dsh 版本**：适配 **`0.1.1-rc.2`** 服务包 = **DSH Desktop v2.0.2**（v3.0.0 起；v2.8.2 起已完成 0.1.1-rc.2 适配：`commands.execute` 四参签名、错误对象元组化、桌面版强制回环 → LAN 桥）；服务依赖、降级行为、已知问题详见 **[docs/09-compatibility.md](docs/09-compatibility.md)**
+- **dsh 版本**：兼容 **`0.1.1-rc.2`** 与 **`0.1.2-rc.1`** 服务包。旧版走 `apiProxy`，RC1 走 Typert Gateway；当前适配在 `feature/dsh-0.1.2-rc1-compat` 分支，完整兼容仍按 T01–T19 验收清单实测，尚未发布新版本。服务依赖、降级行为、已知问题详见 **[docs/09-compatibility.md](docs/09-compatibility.md)**
 - **平台（App）**：Android 7.0+ 全品牌（渲染 Impeller 自动回退；实测小米 17 Pro Max）；**iOS 未开发**（开发者无苹果设备，Dart 代码已平台无关，欢迎社区贡献，见 docs/09 §4）
 - **平台（桌面）**：Windows/macOS；命令行 dsh web 与桌面端均支持（纯 headless 形态插件静默无操作）
 - **个性化**：模型/权限/Agent 预设动态读取 PC 端真实目录，用户自定义自动出现；自定义动作经 `mobileActions` 注册自动上架

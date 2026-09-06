@@ -1,7 +1,7 @@
 # 05 测试用例设计文档 — dsh-mobile-remote
 
 > 版本：v3.1.1（2026-08-26 发布，v3.0.0 之前内容已按实际验证结果填写；v3.1.0 用例见 F-20~F-22，v3.1.1 用例见 F-23） · 配套：03-api.md、04-security.md
-> 环境：Windows + DSH Desktop（desktop profile，内核 0.1.1-rc.2；web profile 亦适用） + Android（DSH Remote App）
+> 环境：按 RC1 兼容清单分别使用 DSH 0.1.1-rc.2 / 0.1.2-rc.1 的 Desktop、Web profile，并保留 Windows + WSL/Linux 回归；客户端为 Android（DSH Remote App）。缺少某环境时记录为未验证。
 > 前置：插件已安装并启用（LAN 桥监听 0.0.0.0:3080）；访问口令为安装时生成的随机串（下文 `<TOKEN>`）。
 ## 1. 测试范围与环境
 - 功能：认证、发消息、事件回流、历史、会话、通知、新建会话、目录、默认配置、二维码。
@@ -140,7 +140,7 @@
 | 步骤 | 发指令触发 `ask_user_question`（带选项）→ 观察两端弹窗 → 手机选选项提交 |
 | 预期 | ① 两端同时弹卡片；② 提交后 agent 收到答案（PC 端可见答案生效）、两端卡片同步消失 |
 | 变体 A | 手机输入自定义答案提交（单选语义：选项与自定义二选一） |
-| 变体 B | 手机点 ✕ → 卡片即时消失，agent 收到取消（`ASK_CANCELLED`） |
+| 变体 B | 手机点 ✕ → 卡片即时消失；旧 Host 沿用原取消语义，RC1 收到 `ASK_ABORTED` |
 | 变体 C | PC 端先答 → 手机卡片同步消失；手机后答提示"可能电脑端已先回答" |
 | 变体 D | 断网期间产生问询 → App 重连后补发弹窗（pendingFrames 回放） |
 

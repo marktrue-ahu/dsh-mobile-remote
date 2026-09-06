@@ -1,34 +1,20 @@
 # Issue tracker: GitHub
 
-This repository's issues and specs are stored in GitHub Issues at `marktrue-ahu/dsh-mobile-remote`. Always pass this repository explicitly so that issue operations target the user's `origin` fork and never the read-only `source` repository.
-
-## CLI environment
-
-GitHub CLI is installed on the Windows host and is available from WSL at:
-
-```sh
-DSH_GH='/mnt/c/Program Files/GitHub CLI/gh.exe'
-```
-
-GitHub CLI requests must use the local HTTP proxy:
-
-```sh
-env HTTP_PROXY=http://127.0.0.1:1080/ HTTPS_PROXY=http://127.0.0.1:1080/ "$DSH_GH" ...
-```
+这个 repo 的 issues 和 PRDs 存放在 GitHub issues 中。所有操作都使用 `gh` CLI，并以 `origin` remote 推断仓库。
 
 ## Conventions
 
-- **Create an issue:** `"$DSH_GH" issue create --repo marktrue-ahu/dsh-mobile-remote --title "..." --body-file <path>`.
-- **Read an issue:** `"$DSH_GH" issue view <number> --repo marktrue-ahu/dsh-mobile-remote --comments`; request JSON when labels or comments need filtering.
-- **List issues:** `"$DSH_GH" issue list --repo marktrue-ahu/dsh-mobile-remote --state open --json number,title,body,labels,comments`; add label and state filters as needed.
-- **Comment on an issue:** `"$DSH_GH" issue comment <number> --repo marktrue-ahu/dsh-mobile-remote --body-file <path>`.
-- **Apply or remove labels:** `"$DSH_GH" issue edit <number> --repo marktrue-ahu/dsh-mobile-remote --add-label "..."` or `--remove-label "..."`.
-- **Close an issue:** `"$DSH_GH" issue close <number> --repo marktrue-ahu/dsh-mobile-remote --comment "..."`.
+- **Create an issue**: `gh issue create --title "..." --body "..."`。多行 body 使用 heredoc。
+- **Read an issue**: `gh issue view <number> --comments`，用 `jq` 过滤 comments，并同时获取 labels。
+- **List issues**: `gh issue list --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'`，按需加上 `--label` 和 `--state` filters。
+- **Comment on an issue**: `gh issue comment <number> --body "..."`
+- **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
+- **Close**: `gh issue close <number> --comment "..."`
 
-Apply the proxy environment shown above to every GitHub CLI invocation. Prefer `--body-file` for multiline content.
+## When a skill says “publish to the issue tracker”
 
-## Skill instructions
+创建一个 GitHub issue。
 
-When a skill says “publish to the issue tracker,” create an issue in `marktrue-ahu/dsh-mobile-remote`.
+## When a skill says “fetch the relevant ticket”
 
-When a skill says “fetch the relevant ticket,” read the corresponding issue, its labels, and its comments from that repository.
+运行 `gh issue view <number> --comments`。

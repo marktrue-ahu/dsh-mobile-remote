@@ -78,7 +78,7 @@
 - 插件**持久化仅限最小移动端状态**（`~/.dsh/mobile-remote/`：通知已读 id、会话最近活跃时间），不含会话内容；口令只存在于 profile 配置。
 - 会话内容沿用 dsh 现有策略存储；插件仅在请求处理期间持有内存副本。
 - **二维码数据端点 `/m/api/qr-config` 仅允许 loopback**（TCP socket 来源校验，无法伪造）—— 桌面设置页读取后展示二维码；二维码含地址+口令，请勿截屏转发。
-- **问询/审批应答（`/m/api/respond`）不绕过内核安全**：插件只是把客户端 payload 转交 `apiProxy.respond`，答案内容（选项合法性、custom/selected 互斥、审批 outcome 枚举）全部由内核 schema 校验；rpcId 必须命中内核 pending 表（先到先得，不可伪造待答）。取消操作同样走内核 `ASK_CANCELLED` 语义。
+- **问询/审批应答（`/m/api/respond`）不绕过内核安全**：旧 Host 由插件转交 `apiProxy.respond`，RC1 由插件通过 Typert Gateway `$events/result` 结算；两条路径都要求事件身份命中 Host pending 表。问询答案仍由 `user-questions` 链路处理，审批 outcome 只接受 `allowed-once`、`rejected`、`cancelled`、`unavailable`，取消问询映射为 `ASK_ABORTED`。协议错误不会切换另一条通道重发。
 - **第三方推送通道脱敏（v2.6）**：Server酱/ntfy/Bark/generic 等推送默认只收到「事件类型 + 会话短码」（`pushContent: minimal`），会话标题/错误详情等核心内容默认不出本机；仅显式配置 `pushContent: standard` 后外发——第三方服务不可信。
 ## 7. 安全测试要点（并入 05-test-cases.md）
 1. 口令启用后：未认证访问 bootstrap/send/events/history 返回 401；错误口令 401。

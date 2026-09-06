@@ -186,7 +186,7 @@ graph LR
 | `session-create` | 按 preset 新建会话并覆写配置 | `agents.create`、presets |
 | `notifications` | 事件流聚合（completed/needs-answer/failed） 已读状态（文件持久化 `~/.dsh/mobile-remote/read-notifs.json`） | `ctx.on session/event` |
 | `mobile-actions` | 动作注册表服务 `ctx.mobileActions` + 清单/执行端点 | 注册表（Cordis 语义） |
-| `respond` | 问询/审批应答（v2.3）：经 `apiProxy.respond` 回写，与 PC 端 GUI 同一 pending 通道 | `apiProxy`（`ctx.inject`） |
+| `respond` | 问询/审批应答：旧 Host 经 `apiProxy.respond`，RC1 经 Typert Gateway `$events/result`，两者都复用移动端 `/m/api/respond` 契约 | `apiProxy` 或 `typertGateway`（`ctx.inject`） |
 
 ## 12. 关键实现要点
 
@@ -195,29 +195,29 @@ graph LR
 - **模型切换**：经 `ctx.agents` 的 per-session LLM target 设置（`installAgentLlmTarget` 语义），与 GUI 模型选择器一致
 - **动作执行**：handler 在电脑端运行，长任务结果经会话事件回流（不阻塞 HTTP 响应）
 
-## 12b. 问询/审批弹窗桥（v2.3，与 PC 端同一 pending）
+## 12b. 问询/审批弹窗桥（双 Host Remote 契约）
 
 ```mermaid
 sequenceDiagram
-    participant K as dsh 内核（apiProxy）
-    participant P as 插件（ctx.inject apiProxy）
+    participant K as dsh 内核（apiProxy 或 Typert Gateway）
+    participant P as 插件（本地 Host 适配层）
     participant M as 手机 App
     participant U as 用户
 
-    K-->>P: mux 帧 question/requested / approval/requested（含 rpcId）
+    K-->>P: 旧 mux 帧，或 RC1 `$events` waterfall（含 eventId）
     P->>P: pendingFrames 缓存（App 重连时补发）
     P-->>M: SSE `mobile/frame`
     M->>M: 聊天页弹出卡片（问询/审批）
     U->>M: 选选项/输入/允许一次/拒绝/✕
     M->>P: POST /m/api/respond {kind, rpcId, ...}
-    P->>K: apiProxy.respond（内核校验 matchesQuestions 等）
-    K-->>P: question/resolved / approval/resolved
+    P->>K: 旧 apiProxy.respond，或 RC1 `$events/result`
+    K-->>P: question/resolved / approval/resolved（同一移动帧）
     P-->>M: SSE `mobile/frame`（收起卡片，两端同步消失）
 ```
 
-- **获取服务必须用 `ctx.inject(["apiProxy"])`**：各插件上下文隔离，`ctx.get` 看不到兄弟插件注册的服务（dsh-client-connection 同款用法）。
+- **获取服务必须用 `ctx.inject`**：各插件上下文隔离，旧版注入 `apiProxy`，RC1 注入 `typertGateway`；`ctx.get` 看不到兄弟插件注册的服务。
 - 只转发 question/approval/session-queue 瞬态帧；`session/event` 仍走 `ctx.on` 桥避免重复。
-- **私有协议风险**：`events.mux` / `respond` 消息格式无稳定版本承诺；缺失时干净降级（`/m/api/respond` 返回 503、诊断 `respondBridge=false`），详见 docs/09-compatibility.md。
+- **协议风险**：旧 `events.mux`/`respond` 无稳定版本承诺，RC1 Gateway 要求严格命名参数和事件结果身份；适配层不跨协议重试，缺失时干净降级（`/m/api/respond` 返回 503、诊断 `respondBridge=false`），详见 docs/09-compatibility.md。
 - 断线补发：App 重连 SSE 时插件回放 `pendingFrames`；从「需要你回答」通知进入会话即见挂起弹窗。
 - 另一端先答：内核 pending 表先到先得，后答方收到 `not-pending`，App 收起卡片并提示"可能电脑端已先回答"。
 ## 13. 推送桥（Phase 2 架构）

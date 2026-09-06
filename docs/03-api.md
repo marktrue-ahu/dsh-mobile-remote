@@ -115,11 +115,12 @@
 **响应**
 
 - `200 { "ok": true, "agentId": "session-abc", "messageId": "m_<uuid>", "mode": "followup" | "steer" | "queued" }`（`mode: "queued"` 时附 `note`；图片路径 `note: "image-prompt"`）
+- RC1 冷会话（持久化但尚未注册 live agent）返回 `200 { "ok": true, "accepted": true, "agentId": "session-abc", "mode": "followup" | "steer", "note": "session-resumed" }`；RC1 `session.prompt` 回执不提供旧版 `messageId`，客户端保留乐观消息的未绑定状态，等待 SSE/历史中的 `user/message` 回显。
 - `400 { "error": "empty-text" }`：text 为空或非字符串
-- `404 { "error": "session-not-found" }`：指定会话不存在
+- `404 { "error": "session-not-found" }`：指定会话不存在，或旧版 Host 没有可用的冷会话恢复能力
 - `503 { "error": "no-live-agent" }`：无匹配的运行中 agent
 - `503 { "error": "agents-unavailable" }`：agents 服务不可用（非 web 组合或启动中）
-**语义**：服务端构造 `createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })` 后调用 `agent.followup(message)`（排队/空闲释放）或 `agent.steer(message)`（插队）；运行中 `followup` 走持存（见上）；含 `images` 时经内核 `session.prompt` 图片通道。`followup` 会持久化消息并唤醒空闲驱动器；不等待执行结果（结果经 SSE 回流）。
+**语义**：旧版 Host 服务端构造 `createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })` 后调用 `agent.followup(message)`（排队/空闲释放）或 `agent.steer(message)`（插队）；RC1 冷会话改由 `session.prompt` 恢复会话并接收内容；运行中 `followup` 走持存（见上）；含 `images` 时经内核 `session.prompt` 图片通道。消息投递不等待执行结果（结果经 SSE 回流）。
 
 ### 3.2c GET /m/api/send-receipt（v3.0.0 热修 05，发送回执查询）
 
@@ -401,7 +402,7 @@
 或 `{ "all": true }`。删除移动端通知镜像中的记录（不影响 PC 端自己的通知中心）；不设墓碑——后续新事件仍会正常生成新通知。删除后经 SSE 广播 `notifications/changed` 帧，客户端刷新列表与未读角标。响应 `200 { "ok": true }`。
 ### 6.7c POST /m/api/respond（v2.3，问询/审批弹窗）
 
-回答内核人类问询（`ask_user_question` 工具）或权限审批。插件经 `apiProxy.respond` 回写，**与 PC 端 GUI 完全同一 pending 通道与校验**（`matchesQuestions`、审批决策等由内核把关）：
+回答内核人类问询（`ask_user_question` 工具）或权限审批。插件按 Host 版本选择回写通道：0.1.1-rc.2 经 `apiProxy.respond`，0.1.2-rc.1 经 Typert Gateway `$events/result`（进程内 `dispatchRpc`，不经过带浏览器会话认证的 HTTP `/api` 面）；两者都回到 Host 的 pending waterfall，移动端请求和 SSE 帧格式保持不变：
 
 **问询**（`kind: "question"`，answers 顺序与提问一致、每问必答）：
 
@@ -420,9 +421,9 @@
 { "kind": "approval", "rpcId": "...", "sessionId": "session-abc", "approvalId": "a-1", "outcome": "allowed-once" }
 ```
 
-- `outcome`：`allowed-once` | `rejected`。
+- `outcome`：`allowed-once` | `rejected` | `cancelled` | `unavailable`。
 
-**取消**（`kind: "cancel"`）：内核收到 cancelled，agent 按 `ASK_CANCELLED` 继续。
+**取消**（`kind: "cancel"`）：旧 Host 沿用 `apiProxy` 的取消语义；RC1 通过 `$events/result` 发送 `UserQuestionError`（`ASK_ABORTED`），两者都会结束当前待答卡片。
 
 响应：`200 { "ok": true, "accepted": true }`；`accepted: false` + `reason`（如 `not-pending`，PC 端已先回答）。
 

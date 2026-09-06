@@ -1,13 +1,13 @@
-# Triage labels
+# Triage Labels
 
-Engineering skills use five canonical triage roles. This table maps those roles to the labels used by this repository's GitHub issue tracker.
+Skills 使用五个 canonical triage roles。这个文件把这些 roles 映射到此 repo issue tracker 中实际使用的 label 字符串。
 
-| Label in engineering skills | Label in our tracker | Meaning |
-| --- | --- | --- |
+| Label in mattpocock/skills | Label in our tracker | Meaning |
+| -------------------------- | -------------------- | ------- |
 | `needs-triage` | `needs-triage` | Maintainer needs to evaluate this issue |
-| `needs-info` | `needs-info` | Waiting on the reporter for more information |
-| `ready-for-agent` | `ready-for-agent` | Fully specified and ready for an autonomous agent |
+| `needs-info` | `needs-info` | Waiting on reporter for more information |
+| `ready-for-agent` | `ready-for-agent` | Fully specified, ready for an AFK agent |
 | `ready-for-human` | `ready-for-human` | Requires human implementation |
 | `wontfix` | `wontfix` | Will not be actioned |
 
-When a skill mentions a triage role, use the label in the second column. This file records vocabulary only; a missing GitHub label may be created when an authorized workflow first needs it.
+当某个 skill 提到 role 时，使用此表中对应的 label 字符串。

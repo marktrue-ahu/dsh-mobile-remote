@@ -1,31 +1,31 @@
-# Domain docs
+# Domain Docs
 
-This is a single-context repository. Engineering skills must consume the repository's domain documentation before exploring or changing the relevant code.
+Engineering skills 探索 codebase 时，应如何消费这个 repo 的 domain documentation。
 
-## Before exploring
+## Before exploring, read these
 
-- Read the root `CONTEXT.md` for the project's canonical domain language.
-- Read the relevant accepted or proposed decisions in `docs/adr/` for the area being changed.
-- If either location does not exist, continue silently. Do not create domain documentation until terminology or a decision is actually resolved.
+- repo 根目录的 **`CONTEXT.md`**；
+- **`docs/adr/`** 中与你即将处理区域相关的 ADR。
 
-## Layout
+如果这些文件不存在，静默继续。producer skill（`/grill-with-docs`）会在 terms 或 decisions 实际被解决时懒创建它们。
 
-```text
+## File structure
+
+这是 single-context repo：
+
+```
 /
 ├── CONTEXT.md
-├── docs/
-│   └── adr/
-└── ...
+├── docs/adr/
+└── src/
 ```
 
-There is no `CONTEXT-MAP.md` and no separate Flutter/mobile-remote domain context. Both sides use the root glossary and the shared ADR set.
+## Use the glossary's vocabulary
 
-## Use the glossary vocabulary
+当输出命名 domain concept 时，使用 `CONTEXT.md` 中定义的 term。不要漂移到 glossary 明确避免的 synonyms。
 
-Use terms defined in `CONTEXT.md` when naming domain concepts in issues, specs, implementation plans, code, tests, and documentation. Do not drift to synonyms that the glossary explicitly marks as avoided.
+如果需要的概念还不在 glossary 中，这是一个信号：要么重新考虑是否正在发明项目没有使用的语言，要么通过 `/grill-with-docs` 记录缺口。
 
-If a required concept is absent, reconsider whether the task is inventing unnecessary language. When a genuine domain gap exists, resolve it through the project's domain-design workflow before treating the new term as canonical.
+## Flag ADR conflicts
 
-## Respect ADRs
-
-Do not silently override an ADR. If a proposed implementation conflicts with an existing decision, identify the ADR and explain why it may need to be revisited before implementation proceeds.
+如果输出与现有 ADR 矛盾，明确指出，而不是静默覆盖。
