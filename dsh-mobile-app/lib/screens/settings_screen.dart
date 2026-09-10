@@ -371,6 +371,31 @@ class _SettingsScreenState extends State<SettingsScreen> {
         buf.writeln('  • $n（$k）= $v');
       });
     }
+    // 宿主代际与兼容状态（v3.1.3 / docs/adr/0001）：版本号用于身份识别，
+    // 能力结果用于行为判断——两者不可互相替代，故分行展示。
+    final host = d['host'] as Map<String, dynamic>?;
+    if (host != null && host.isNotEmpty) {
+      buf.writeln();
+      buf.writeln(L10n.t('电脑端 DSH:', 'Host DSH:'));
+      final v = host['version'];
+      final supported = host['supported'];
+      final verText = v == null ? L10n.t('版本未知', 'version unknown') : '$v';
+      final range = host['supportedRange'] ?? '';
+      // supported 为 null 表示版本号无法解析（未知）——不谎报为不支持。
+      final stateText = supported == true
+          ? L10n.t('✅ 受支持', '✅ supported')
+          : supported == false
+              ? L10n.t('⚠ 不在受支持范围', '⚠ outside supported range')
+              : L10n.t('ℹ 版本未知', 'ℹ unknown');
+      buf.writeln('  $stateText：$verText${range == '' ? '' : L10n.t('（受支持 $range）', ' (supported $range)')}');
+      final caps = host['capabilities'] as Map<String, dynamic>? ?? {};
+      caps.forEach((k, val) {
+        final n = _hostCapabilityName(k);
+        // 旧代交互通道存在是「宿主未升级」的信号，不是能力就绪——用 ℹ 而非 ✅。
+        final mark = val == true ? (k == 'hasLegacyInteractionBridge' ? 'ℹ' : '✅') : '❌';
+        buf.writeln('  $mark $n（$k）${k == 'hasLegacyInteractionBridge' && val == true ? L10n.t(' · 旧代宿主，建议升级', ' · legacy host, upgrade advised') : ''}');
+      });
+    }
     buf.writeln();
     final services = d['services'] as Map<String, dynamic>? ?? {};
     buf.writeln(L10n.t('服务:', 'Services:'));
@@ -418,6 +443,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
     buf.writeln();
     buf.writeln('${L10n.t('插件: ', 'Plugin: ')}${plugin['name']} v${plugin['version']}');
     return buf.toString();
+  }
+
+  /// 宿主能力项中文名（v3.1.3 诊断 host.capabilities，docs/adr/0001）。未知 key 原样返回。
+  String _hostCapabilityName(String key) {
+    switch (key) {
+      case 'hasRemoteInvoke':
+        return L10n.t('Remote 调用入口', 'Remote invoke');
+      case 'hasRemoteEventBridge':
+        return L10n.t('Remote 事件桥', 'Remote event bridge');
+      case 'hasColdSessionResume':
+        return L10n.t('冷会话恢复', 'Cold session resume');
+      case 'hasLegacyInteractionBridge':
+        return L10n.t('旧代交互通道', 'Legacy interaction bridge');
+      default:
+        return key;
+    }
   }
 
   /// 实时指标中文名（v3.1.3 runtime.metrics）。未知 key 原样返回。
