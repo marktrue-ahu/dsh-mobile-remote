@@ -17,3 +17,5 @@ dsh-mobile-app/dist/
 
 # AGENT 规则（写给 AI 助手的项目约定，仅本机保留，不推送 GitHub）
 AGENT-RULES.md
+# 本地构建产物：从 dsh-mobile-app/build/.../app-debug.apk 复制的验证包
+dsh-mobile-app-debug.apk
