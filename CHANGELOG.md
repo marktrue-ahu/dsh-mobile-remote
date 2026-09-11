@@ -10,6 +10,88 @@
 - **下载与安装**：确认弹窗（版本/说明/大小/来源）→ App 内流式下载（进度可取消，取消即中止流并清理半成品文件）→ 主机源 sha256 校验 → **签名预检**（本机与下载 APK 证书 SHA-256 比对，不一致或读取异常一律取消并明确提示）→ FileProvider 拉起系统安装器。Android 8+ 首次安装由系统引导授权「安装未知应用」。
 - **签名预检实现（AGP 9 适配）**：AGP 9 产物为纯 v2 签名（`getPackageArchiveInfo(GET_SIGNATURES)` 读不到签名）——签名读取改用 **API 28+ `GET_SIGNING_CERTIFICATES`（signingInfo，兼容 v2/v3）**，API<28 回退 GET_SIGNATURES；构建签名配置改用 AGP 9 DSL（`enableV1Signing/enableV2Signing`）。
 - **发布链路**：新增 Linux/WSL 发布脚本 `package-release.sh`（与 Windows `package-release.ps1` 等价）；manifest.json 由共享生成器 `tools/gen-manifest.js` 统一生成（version 含 build / sha256 / size / notes=CHANGELOG 最新条目全文，JSON 合法且无 BOM），产物可用 `tools/verify-update-manifest.mjs` 校验。部署者把 APK + manifest 放进插件 `updateDir` 即完成主机源发布。
+- **现象**：v3.1.2 起（内核 0.1.2-rc.1 审批决策改为单条 Cordis 瀑布），answerer 以 `ctx.on("approval/request", …, { prepend: true, global: true })` 注册——手机在线（SSE `connections.size > 0`）即接管并挂起 promise（120s）且不调用 `next()` → 排在其后的内核"转发桌面 GUI"监听（`dsh-api-remotes` → `$events` 远程事件）不执行 → PC 端不弹卡。手机独占与桌面呈现互斥，桌面用户无法在 PC 审批，只能等手机答或 120s 后 fail-close `unavailable`（issue 报告含源码级技术分析）。
+- **修复思路（插件侧，无内核改动）**：0.1.2 的桌面弹卡并不在瀑布监听内联完成——`dsh-api-remotes` 把两个 Agent 作用域瀑布（`approval/request`、`user-questions/request`）继续转成 typertGateway 的 **$events 远程事件广播**：每个 $events 客户端（桌面 GUI 是其一）收到同一事件副本，**任一客户端先回 `$events/result` 即结算**（`settleRemoteEvent`），其余客户端收 **cancel 帧自动收卡**（`finishRemoteEvent`）。因此瀑布监听者只要**不抢先消费（next() 放行）**，审批/问询就会广播到桌面 GUI 与本插件各自的 $events 客户端——插件在 `both` 模式下再挂一个**进程内 $events 客户端**（`ctx.typertGateway.openWireStream("$events")`），即可恢复 v3.1.1 帧桥"两端同显、任一端先答即生效"。
+- **新增配置 `approvalMode`（`lib/index.js` schema，cordis.patch.yml 配置，重启生效）**：
+  - `both`（**默认**）——桌面 GUI 与手机同时收到审批/问询待办，先答生效、另一端自动收卡。需 DSH 0.1.2-rc.1+ / 桌面 v2.0.5+（$events 通道）；旧宿主自动降级 `mobile`（启动日志 + 诊断 notes 说明）；
+  - `mobile`——v3.1.2 行为：手机在线即由手机独占应答，离线 `next()` 交桌面 GUI（外出远程用）；
+  - `desktop`——一律 `next()` 交桌面 GUI，手机不弹审批/问询卡（常驻电脑前用）。
+- **双端结算语义**：手机在场时待办 120s 无应答 fail-close（审批 → `unavailable`、问询 → `UserQuestionError`/`ASK_CANCELLED` rejection）；任一端口答/超时/取消都会广播 resolved 帧——**其它手机端卡片同步收起**（v3.1.2 只结算不广播，超时/多手机时卡片残留）。
+- **`/m/api/respond` 增强（顺手修复 v3.1.2 遗留缺陷）**：① question/approval 条目支持按 `rpcId` 兜底匹配——修复 **v3.1.2 的 question 应答必失败**（App 端只回传 rpcId 不回传 questionId，原查找 miss → 走 apiProxy 降级 → 现代内核 503，问询只能在桌面答）；② `kind=cancel` 在现代宿主下结算本地条目（审批 → `cancelled`、问询 → `ASK_CANCELLED` rejection；v3.1.2 取消悬空、只能等 120s 超时）；③ 结算统一广播 resolved 帧（见上）。
+- **诊断**：`checks.approvalMode`（生效策略）+ `checks.remoteEvents`（$events 双端通道就绪与否）+ `notes` 首行策略说明；both 降级 / desktop 配置均有明确提示。
+- **兼容性**：App 协议零破坏（帧只增字段：requested 帧新增 `rpcId`，resolved 帧新增 `rpcId`/`questionId` 冗余字段，旧 App 按 key 取用、忽略未知字段）；旧内核（0.1.1-rc.2 及更早）走 apiProxy 帧桥路径不受影响（era 互斥：0.1.2+ 无 apiProxy、旧内核无瀑布/$events，运行时分别探测）。App 侧小改（3.1.3+18）：设置 → 环境诊断支持字符串字段与 notes 渲染（v3.1.3 前字符串行会按布尔误显示 ❌）。
+
+### RC1 交互与文件通道健壮性（issue #6 验收）
+
+- **问询取消/超时改为 rejection**：手机取消、120s 超时、`req.signal` 中止此前以 `null` 结算瀑布，内核 `ask_user_question` 随即读取 `.answers` → `TypeError: Cannot read properties of null`。现统一以 `UserQuestionError` rejection 结算（取消/超时 `ASK_CANCELLED`、Host 中止 `ASK_ABORTED`），与桌面 GUI answerer 语义一致；`$events/result` 走 `outcome.kind = "rejected"`（`error.{name,message,code}`）。
+- **严格答案校验**：`selected` 必须是自身属性且为 `string[]`，`custom` 若存在必须是字符串，不再用 `?? []`/`?? ""` 静默兜底；`questionId`/`approvalId`/`sessionId` 的类型与归属全部校验，审批 `outcome` 非枚举值直接 `400`（此前被静默降级成 `unavailable`）。
+- **挂起待办可回放**：RC1 手机接管与双端呈现的 `question/requested`、`approval/requested` 帧写入 `pendingFrames`，App 断线重连即补发（此前只有旧帧桥写入，重连后卡片消失、只能等超时）；结算/取消/超时/对端先答/会话销毁都会清理回放帧。
+- **`$events` 不再挂死 Host**：手机离线或事件无法归属会话时，本插件这个进程内唯一 `$events` client 会对事件回 `next()`（此前静默忽略 → Host 瀑布永久挂起）；已结算事件的重复投递同样用 `next()` 确认；`$events/result` 一律使用创建该投递时的 `clientId`，断流后不再拿新 client 的 id 冒领结算。
+- **双端竞态与断流**：桌面先答的 cancel 帧与手机 `/respond` 并发时按已结算幂等返回（不再误报 `503`）；`$events` 流断开时清理本客户端专属的待办条目与手机卡片（Gateway 不会给已断开的 client 补发 cancel，否则卡片会残留到 120s）；结算回执丢失（断流，本插件自己的投递已失效）时收卡并交由仍在线的其它 `$events` client（桌面 GUI）应答——收的只是本端投递，Host 瀑布不因此挂死；定时器重臂修复（结算失败不再留下已触发的一次性 timer）；`/respond` 取消必须携带 `sessionId`。
+- **文件传输 TOCTOU 修复（Linux/macOS）**：下载/上传不再 `statSync → createReadStream` / `writeFileSync` 按路径名操作——改为先 `O_NONBLOCK|O_NOFOLLOW` 打开、`fstat` 复核，再用 `/proc/self/fd`（macOS `/dev/fd`）解析**已打开句柄**的真实路径做工作区包含校验，读写固定在该句柄上；上传用 descriptor-relative 路径 + `O_CREAT|O_EXCL|O_NOFOLLOW` 创建。下载 `ReadStream` 的异步 `error` 已消费（此前可崩 DSH 进程），`res` 提前关闭时释放句柄。**Windows 明确 fail-closed**（`503 files-unavailable`，见 docs/04 §6：Node 无 `openat`/RootDirectory 等价能力，不做不安全的降级）。
+- **测试**：新增 `test/rc1-runtime.test.mjs`（问询取消/超时 rejection、断线回放、无手机 `$events` next、signal 中止、断流收卡、下载流异步错误、符号链接越界与上传边界），与既有 `test/rc1-adapter.test.mjs` 共 10 项全部通过。
+- **App 侧（3.1.3+21）**：`cancelRespond(rpcId, {sessionId})` 接收卡片自带归属会话——多会话并发时 store 的单例 pending 可能已被新请求覆盖，按 rpcId 反查会拿不到 sessionId 而静默跳过服务端取消。
+- **范围说明（维护者确认）**：Windows 文件传输保持 fail-closed，不做纯 Node 的不安全降级；`/m/api/directories` 的任意路径浏览属既有会话创建能力（口令鉴权下的信任模型），不计入工作区包含语义。
+
+### 其余
+
+- **修复（真机验证发现，v3.1.2 遗留）**：问询 `questions` 取值路径错误——内核瀑布值为**顶层 `questions`**（`userQuestions.ask` 传 `{questions, agent, signal}`，桌面 GUI `$on` 亦读 `request.questions`），插件接管与双端广播误取 `req.request.questions` → 手机端 `question/requested` 携带空问题列表，**手机问询在 v3.1.2 不可用**（与 `/respond` 缺 questionId 并列的第二根因）。修复：`holdQuestion` 与 `onEventsWaterfall` 两处改读 `questions`（`lib/index.js`）。
+- **修复（桌面端插件树加载崩溃）**：`approvalMode` schema 改用 schemastery `union`/`const` 表达——`z.enum` 不是 `@deepseek-ai/schemastery` 的 API（宿主桌面 v2.0.5 提供的 3.18.2 无此方法），此前桌面端加载插件树即抛 `TypeError: z.enum is not a function` 导致整树失败；改为 `z.union([z.const("both"), z.const("mobile"), z.const("desktop")]).default("both")`，语义（三值集合 + `both` 默认 + 非法值拒绝）与原意图一致。
+- **修复（真机验证发现，诊断显示）**：`runtime.form` 判定——桌面启动器未给插件进程置 `DSH_DESKTOP=1`，桌面版恒显示 `cli` 误导诊断；改以 `desktopBrowserAccess` 服务探测兜底（仅桌面版 v2.0.5+ 提供，与 LAN 桥同源判定），桌面版正确显示 `desktop`（新增顶层助手 `runtimeForm(ctx)`）。
+- **诊断精简（用户反馈）**：`services.apiProxy` / `checks.respondBridge` / `checks.frameBridge` / `checks.pendingFrames` 是 0.1.1-rc.2 及更早内核（apiProxy 帧桥 era）的探测项——0.1.2-rc.1+ 内核无 apiProxy，此前恒 ❌ 徒增噪音；v3.1.3 起**仅在帧桥实际激活时输出**，现代宿主不再显示（审批/问询状态看 `checks.approvalMode` / `checks.remoteEvents`），FAQ/docs/09 措辞同步。
+- **诊断可读化（用户反馈，App 3.1.3+19）**：设置 → 环境诊断的服务/端点实测项改为「中文名（英文 key）」显示——`approvalMode` 带取值说明（both · 双端同卡，先答生效 / mobile · 手机在线独占 / desktop · 仅桌面 GUI）、`remoteEvents` 等新字段有中文名、挂起待办非 0 时附语义提示；英文 key 保留便于复制粘贴排障。旧版 App（≤3.1.2）无此展示（字符串行按布尔误显示 ❌ 属显示限制，以插件日志/诊断 JSON 为准）。
+- **实时计数指标（用户反馈，服务端 + App 3.1.3+20）**：`/m/api/diagnostics` 新增 `runtime.metrics`——手机在线连接数（SSE）/ 运行中 Agent / 会话数 / 工作区数 / 推送通道数，替代早期恒真的占位探测（`sessionsList ≥0` 等永远 ✅ 的检查已不再输出）；App 诊断页新增「实时指标」区展示；旧版 App 忽略新字段（协议只加不减）。
+- 审批/问询 answerer 常量收敛（`PENDING_TIMEOUT_MS` = 120s）；超时定时器 `unref`（卸载不再残留句柄）。
+- 文档同步：README（功能/配置说明/dsh 版本基线）、FAQ（问询/审批弹窗类新增 issue #9 问答与 approvalMode 配置示例）、docs/09（§1 基线、§2.1 服务/机制表 + approvalMode 语义说明、§5 已知问题 12/13、§6 配置项）。
+
+### 真机验证（2026-09-08 深夜，DSH Desktop 2.0.5 / 手机 Xiaomi 2509FPN0BC，App 3.1.2+17，LAN 桥）
+
+| 场景 | 操作 | 结果 |
+|---|---|---|
+| 审批双端·手机先答 | 合成审批 → 两端同弹 → 手机「允许一次」 | `allowed-once`；桌面卡自动消失 ✅ |
+| 审批双端·桌面先答 | 同上 → 桌面「允许一次」 | `allowed-once`；手机卡自动消失 ✅ |
+| 问询双端·手机先答 | ask_user_question → 两端同弹 → 手机回答 | 答案经 `$events/result` 返回；桌面面板自动收起 ✅ |
+| 问询双端·桌面先答 | 同上 → 桌面回答 | 手机问询框自动收起 ✅ |
+| `mobile` 模式 | 审批/问询仅手机弹（桌面不弹）+ 手机应答 | ✅（approvalMode 切换 + 重启生效） |
+| `mobile` 超时 | 手机在线不答 → 恰好 120s | `unavailable` fail-close ✅（手机卡自动收起） |
+| `desktop` 模式 | 审批/问询仅桌面弹（手机不弹）+ 桌面应答 | ✅ |
+| 取消路径 | 双端同弹 → 手机点 ✕ | `cancelled`；桌面卡自动收起 ✅ |
+
+测试中发现并记录的边界：桌面 GUI 单「composer 待办槽」——审批卡悬置时若另一 pending 交互（问询）到达，会顶掉审批卡（客户端 UI 行为，非插件缺陷；真实使用中 agent 串行问询不并发）。
+
+## v3.1.2（2026-09-05）— 新建会话权限死锁修复（issue #6）+ 宿主包 peer 化（issue #7）
+
+### issue #6：默认权限预设为「完全访问」时，手机端新建会话必失败（risk-confirmation-required）
+
+- **现象**：设置页把默认权限预设设为 danger-full-access（该路径已带风险确认并成功保存）后，首页「新建会话」必失败——服务端 `lib/index.js:1753` 在建会话前校验 `confirmDanger !== true` 即返回 400，而 App 端 `doCreate` 只传 `permissionPreset`（跟随默认预设）、不传 `confirmDanger`，新建会话弹层也没有权限预设选择/风险确认入口 → 死锁：默认预设设成完全访问后，手机端永远无法新建会话。
+- **App（Flutter，3.1.2+17）**（`dsh-mobile-app/lib/screens/sheets.dart`）：
+  - 新建会话弹层新增「权限预设」行：默认跟随设置页默认预设；可逐项选择（danger 先过风险确认弹层，与设置页一致）；
+  - `doCreate` 兜底：目标预设为 danger-full-access 且未经本弹层确认时，先弹风险确认；确认后请求体显式带 `confirmDanger: true`；取消则终止创建（不再出现 400 死锁）；
+  - 风险确认弹层重构为可复用 `_askDangerConfirm`（返回 `Future<bool?>`），设置页路径（`showPermSheet → _showDangerConfirm`）行为不变（取消回权限列表、确认后 `applySessionConfig` 不变）。
+- 服务端无改动：契约本就要求显式 `confirmDanger`（docs/03-api §创建会话），App 侧对齐即可。
+
+### issue #7：精确钉版 @deepseek-ai/* 共享宿主包 → 双实例（dual-package hazard）
+
+- `package.json`：`@deepseek-ai/dsh-llm` / `dsh-credentials` / `dsh-sandbox-policy` 从 `dependencies`（精确 `0.1.0-rc.6`）移至 `peerDependencies`（`>=0.1.0-rc.6 <0.2.0`）；
+- `@deepseek-ai/schemastery` 一并 peer 化（`>=3.18.1`）：宿主 0.1.2-rc.1 已是 3.18.2，原精确 `3.18.1` 已过期（与宿主版本分叉）；
+- 效果：安装后不再在 profile 内产生并存第二份副本，Node 模块解析上溯宿主 bundle（插件 `~/.dsh/profiles/<profile>/node_modules/` → 宿主 `~/.dsh/profiles/node_modules/`），版本与宿主一致，双实例从根上消除；插件市场「可能遮蔽宿主版本」警告随声明方式修正而消失。
+- 验证：`pnpm install` 后插件 node_modules 无 `@deepseek-ai` 副本、无 `0.1.0-rc.6` 残留；`require.resolve` 命中宿主 0.1.2-rc.1；`dsh plugin list` 正常。
+
+### 兼容性
+
+- 适配/验证组合：DSH 0.1.2-rc.1（DSH Desktop v2.0.5）——插件加载、LAN 桥（`0.0.0.0:3080 → 127.0.0.1:43120/m/api`）与口令认证均正常（`flutter analyze` 零问题，App 单测 24/24，`node --check` 通过）。
+- **DSH Desktop 2.0.5 浏览器门禁适配（真机调试发现）**：2.0.5 给桌面 WebServer 每个路由包了一层 desktop-browser-access 门禁——默认只放行带 `x-dsh-desktop-renderer` 能力头的 Electron 渲染器请求，手机经 LAN 桥的请求（即使 `x-mobile-token` 正确）一律 `403 forbidden`（`dsh-plugin-desktop/lib/webserver.js` → `decideDesktopBrowserAccess`）。修复：桥转发上游时，若同上下文存在 `ctx.desktopBrowserAccess`（桌面启动器提供），补传其 `rendererHeader`；桥的 LAN 面仍由插件 authToken（≥16 位）把关，不依赖「允许浏览器打开」设置，web profile/旧版桌面自动跳过。
+- **0.1.2-rc.1 RPC 网关适配（`lib/index.js` apiRpc 重构）**：0.1.2-rc.1 起内核 RPC 契约变化——①端点命名 `namespace.method` → `namespace/method`（`session.models`→`session/modelCatalog`、`session.history`→`session/control`、`goal.create`→`goals/create`、`subagent.*`→`subagents/*`）；②载荷按新参数形态适配（多数端点收单参数 `request`，`subagents/interruptByParent` 三参数平铺，`session/modelCatalog`/`session/control` 零参数，`goals/create` 为 `agent`+`request`，`session/prompt` 需补 `requestId`）；③桌面 2.0.5 后 `/api` HTTP 通道被浏览器门禁+会话 Cookie 鉴权关闭，插件内 fetch 必 403——统一改走进程内 `ctx.typertGateway.invokeRpc`（@Remote 网关，与宿主同域），旧宿主无网关时保留原 HTTP 路径降级。`readSessionConfig`/图像限额改读 `session/control` 投影（`modelSelection.lastUsed` / `imageLimits`），模型目录改读 `session/modelCatalog`（`groups` 结构不变）。
+- 注：DSH Desktop 采用 pnpm `nodeLinker: hoisted`，file: 插件是**物理拷贝**——改源码后必须 `pnpm install --force` 同步到 `~/.dsh/profiles/<profile>/node_modules/` 并重启生效。
+- **0.1.2 Session API 变更适配（真机定位）**：0.1.2 的 `Session` 类不再暴露 `.events` 数组，改用 `snapshotEvents()`/`eventAt()`/`seq`；`PermissionPresetService.current()` 也改为接收 session 对象（不再接受事件数组）。插件所有 `session.events` 访问点（`/history`、`sessionTitleOf`、`foldAgentPreset`、`readSessionConfig`、`/usage`）统一收敛到新增 `eventsOf(session)` 助手（兼容休眠快照 `{events}` 形态与旧版宿主），修复 App 打开会话「该会话暂不可用」与 `Cannot read properties of undefined (reading 'length'/'filter')` 崩溃。
+- **审批/问询移动端 answerer（0.1.2 机制再适配）**：0.1.2 移除了 apiProxy（旧帧桥失效，手机收不到审批卡）；内核改为 Agent 作用域 Cordis 瀑布 `approval/request` / `user-questions/request`，answerer 须以 `global: true` 注册（dispatch 从宿主服务的 fiber 分发并做 agent 作用域过滤，非 global 的根监听不入选）。插件注册 `{ prepend: true, global: true }` 监听：手机在线（SSE）即接管（转发 `mobile/frame` + `/respond` 结算），离线/超时 fail-close（`unavailable`，与内核一致），拒接 `next()` 落回桌面 GUI answerer。与官方 `packages/api/remotes` + `packages/client/ui-approval` 同形态（已对照 deepseek-ai/deepseek-harness dsh-v0.1.2-rc.1 源码逐行验证）。
+- **休眠会话自动恢复**：`/send` 遇到休眠会话（桌面重启后）调用 `agents.resume({ resumeSessionId, agentOptions, setup })` 自动重挂 agent（先前必 404 session-not-found）；`readSessionConfig` 对休眠会话从日志折叠配置（`model/selection`、`agent-preset/selected`、`permission/preset`），修复重启后聊天页「模型/权限」标签为空。
+- **合成审批测试端点**：`POST /m/api/dev/approval-test`（需口令）——复用内核同款 Agent 作用域瀑布（`scopeTarget(agent, agent)`），绕过 turn-enclosed 校验，用于不依赖模型行为的审批链路验证（手机接卡 → 批准/拒绝 → `/respond` 结算 → 瀑布返回 outcome）。新增 peer：`@deepseek-ai/dsh-scope`。
+- **B站反馈落地**：
+  - **文件传输（csborbbnc 反馈）**：服务端新增 `GET /m/api/files?path=`（下载，流式 + `Content-Disposition`，MIME 按扩展名）与 `POST /m/api/files/upload`（`{sessionId, name, data base64}` → 写入会话工作目录，64MB 上限；与目录选择器同信任模型：口令鉴权 + 现有限流）；App 端 composer「⊕ 更多」新增「上传文件」（Android 系统文件选择器，原生通道 `dsh/files`）与「下载文件」（输入电脑路径 → 保存到手机「下载」目录，Android 10+ MediaStore、更早版本应用下载目录，零新依赖）。**v3.1.3（issue #6）起该对端点的读写改为句柄语义并做工作区包含校验，见下文「RC1 交互与文件通道健壮性」**。
+  - **自由复制（csborbbnc 反馈）**：消息文本本已支持选中复制/操作栏复制——本次补齐**代码块复制按钮**（复制全文 + 行数提示）。
+  - **干活完提醒可靠性（小小的甜菜 反馈）**：推送超时 10s→15s，并对网络层失败（DNS 抖动/连接重置等）重试一次（HTTP 4xx/5xx 不重试，避免配额错误空转）。
+  - **微信/IM 提醒通道（v3.1.2 第二波）**：新增**企业微信群机器人 Webhook**推送格式（`format: wecom`，国内稳定、免登录态、约 20 条/分钟限额）；新增「**发送测试通知**」（App 设置 → 通知 + `POST /m/api/push-test`——逐通道验证、绕过节流，配置后一键确认通不通）；docs/06 §6 通道推荐重构（企业微信机器人 / Server酱 / Bark；ntfy.sh 境内不可直连警示）；docs/07 FAQ Q4 补充验证步骤；README 新增「微信入口（可选）：dsh-im」推荐章节（IM 对话入口与本插件互补：dsh-im 管对话、本插件管控制台+提醒）。
 
 ## v3.1.1（2026-08-26）— WSL/类 Unix 平台路径选择修复（issue #5）
 

@@ -34,6 +34,7 @@ function request(method, url, body) {
 function config() {
 	return {
 		path: "/m", authToken: "", cookieName: "token", sessionTtlMs: 1000,
+		trustedHosts: [],
 		rechargeUrl: "https://example.test", maxConnections: 4, pushUrls: [],
 		pushCooldownMs: 1000, doneGraceMs: 1000, pushContent: "minimal",
 		rateLimit: { maxFailures: 10, windowMs: 60000, blockMs: 60000 },
@@ -100,6 +101,14 @@ test("B0 operation list is exposed through the mobile API and capabilities", asy
 		get(name) { return provided.get(name); },
 		provide(name, value) { provided.set(name, value); },
 		on() { return () => {}; },
+		// The plugin registers Cordis effects (event bridge, mobile interaction
+		// state); the mock needs the same seam so this test actually runs in a
+		// checkout where plugin dependencies are installed instead of being skipped.
+		effect(callback) {
+			const disposer = callback?.();
+			return typeof disposer === "function" ? disposer : () => {};
+		},
+		inject() {},
 	};
 	let dispose;
 	try {
