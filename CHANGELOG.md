@@ -1,15 +1,7 @@
 # Changelog
 
-## v3.1.1+16（2026-08-31）— App 自动更新（双更新源，恢复 fa 分支功能）
+## v3.1.3（2026-09-08，issue #9）— 审批/问询双端呈现（`approvalMode: both` 默认）+ 可配置策略
 
-> 正确整合 `feature/app-auto-update` 的实现（此前 `4b4e23e` 的空合并丢失了全部文件）。
-
-- **双更新源**（设置 → 关于，单选持久化，默认 GitHub）：**GitHub Releases**（`releases/latest` 取首个 `DSH-Remote-*.apk` 资产直连下载）与 **dsh 运行主机**（插件新增 `updateDir` 配置 + `/api/update/manifest`、`/api/update/apk` 两个带 authToken 鉴权的端点，manifest 为唯一权威）。切换立即生效；GitHub 不可达时明确提示可切主机源。
-- **检查触发**：设置页「检查更新」手动按钮（结果三分支：已是最新 / 确认弹窗 / 失败原因）+ 启动连接成功后静默自动检查一次（命中才提示：首页横幅 + 设置页版本行「● 有新版本」常驻，直到安装拉起或版本变更）。
-- **版本判定（纯 Dart 模块 `update_core.dart`，14 例单测兜底）**：先比 major.minor.patch 再比 build；远端未显式带 `+build`（如 tag `v3.0.0`）时主段相等即不提示——本地热修 build 不被误判为降级；远端显式 build 更小按防降级异常处理（不更新并提示）。
-- **下载与安装**：确认弹窗（版本/说明/大小/来源）→ App 内流式下载（进度可取消，取消即中止流并清理半成品文件）→ 主机源 sha256 校验 → **签名预检**（本机与下载 APK 证书 SHA-256 比对，不一致或读取异常一律取消并明确提示）→ FileProvider 拉起系统安装器。Android 8+ 首次安装由系统引导授权「安装未知应用」。
-- **签名预检实现（AGP 9 适配）**：AGP 9 产物为纯 v2 签名（`getPackageArchiveInfo(GET_SIGNATURES)` 读不到签名）——签名读取改用 **API 28+ `GET_SIGNING_CERTIFICATES`（signingInfo，兼容 v2/v3）**，API<28 回退 GET_SIGNATURES；构建签名配置改用 AGP 9 DSL（`enableV1Signing/enableV2Signing`）。
-- **发布链路**：新增 Linux/WSL 发布脚本 `package-release.sh`（与 Windows `package-release.ps1` 等价）；manifest.json 由共享生成器 `tools/gen-manifest.js` 统一生成（version 含 build / sha256 / size / notes=CHANGELOG 最新条目全文，JSON 合法且无 BOM），产物可用 `tools/verify-update-manifest.mjs` 校验。部署者把 APK + manifest 放进插件 `updateDir` 即完成主机源发布。
 - **现象**：v3.1.2 起（内核 0.1.2-rc.1 审批决策改为单条 Cordis 瀑布），answerer 以 `ctx.on("approval/request", …, { prepend: true, global: true })` 注册——手机在线（SSE `connections.size > 0`）即接管并挂起 promise（120s）且不调用 `next()` → 排在其后的内核"转发桌面 GUI"监听（`dsh-api-remotes` → `$events` 远程事件）不执行 → PC 端不弹卡。手机独占与桌面呈现互斥，桌面用户无法在 PC 审批，只能等手机答或 120s 后 fail-close `unavailable`（issue 报告含源码级技术分析）。
 - **修复思路（插件侧，无内核改动）**：0.1.2 的桌面弹卡并不在瀑布监听内联完成——`dsh-api-remotes` 把两个 Agent 作用域瀑布（`approval/request`、`user-questions/request`）继续转成 typertGateway 的 **$events 远程事件广播**：每个 $events 客户端（桌面 GUI 是其一）收到同一事件副本，**任一客户端先回 `$events/result` 即结算**（`settleRemoteEvent`），其余客户端收 **cancel 帧自动收卡**（`finishRemoteEvent`）。因此瀑布监听者只要**不抢先消费（next() 放行）**，审批/问询就会广播到桌面 GUI 与本插件各自的 $events 客户端——插件在 `both` 模式下再挂一个**进程内 $events 客户端**（`ctx.typertGateway.openWireStream("$events")`），即可恢复 v3.1.1 帧桥"两端同显、任一端先答即生效"。
 - **新增配置 `approvalMode`（`lib/index.js` schema，cordis.patch.yml 配置，重启生效）**：
@@ -93,6 +85,16 @@
   - **干活完提醒可靠性（小小的甜菜 反馈）**：推送超时 10s→15s，并对网络层失败（DNS 抖动/连接重置等）重试一次（HTTP 4xx/5xx 不重试，避免配额错误空转）。
   - **微信/IM 提醒通道（v3.1.2 第二波）**：新增**企业微信群机器人 Webhook**推送格式（`format: wecom`，国内稳定、免登录态、约 20 条/分钟限额）；新增「**发送测试通知**」（App 设置 → 通知 + `POST /m/api/push-test`——逐通道验证、绕过节流，配置后一键确认通不通）；docs/06 §6 通道推荐重构（企业微信机器人 / Server酱 / Bark；ntfy.sh 境内不可直连警示）；docs/07 FAQ Q4 补充验证步骤；README 新增「微信入口（可选）：dsh-im」推荐章节（IM 对话入口与本插件互补：dsh-im 管对话、本插件管控制台+提醒）。
 
+## v3.1.1+16（2026-08-31）— App 自动更新（双更新源，恢复 fa 分支功能）
+
+> 正确整合 `feature/app-auto-update` 的实现（此前 `4b4e23e` 的空合并丢失了全部文件）。
+
+- **双更新源**（设置 → 关于，单选持久化，默认 GitHub）：**GitHub Releases**（`releases/latest` 取首个 `DSH-Remote-*.apk` 资产直连下载）与 **dsh 运行主机**（插件新增 `updateDir` 配置 + `/api/update/manifest`、`/api/update/apk` 两个带 authToken 鉴权的端点，manifest 为唯一权威）。切换立即生效；GitHub 不可达时明确提示可切主机源。
+- **检查触发**：设置页「检查更新」手动按钮（结果三分支：已是最新 / 确认弹窗 / 失败原因）+ 启动连接成功后静默自动检查一次（命中才提示：首页横幅 + 设置页版本行「● 有新版本」常驻，直到安装拉起或版本变更）。
+- **版本判定（纯 Dart 模块 `update_core.dart`，14 例单测兜底）**：先比 major.minor.patch 再比 build；远端未显式带 `+build`（如 tag `v3.0.0`）时主段相等即不提示——本地热修 build 不被误判为降级；远端显式 build 更小按防降级异常处理（不更新并提示）。
+- **下载与安装**：确认弹窗（版本/说明/大小/来源）→ App 内流式下载（进度可取消，取消即中止流并清理半成品文件）→ 主机源 sha256 校验 → **签名预检**（本机与下载 APK 证书 SHA-256 比对，不一致或读取异常一律取消并明确提示）→ FileProvider 拉起系统安装器。Android 8+ 首次安装由系统引导授权「安装未知应用」。
+- **签名预检实现（AGP 9 适配）**：AGP 9 产物为纯 v2 签名（`getPackageArchiveInfo(GET_SIGNATURES)` 读不到签名）——签名读取改用 **API 28+ `GET_SIGNING_CERTIFICATES`（signingInfo，兼容 v2/v3）**，API<28 回退 GET_SIGNATURES；构建签名配置改用 AGP 9 DSL（`enableV1Signing/enableV2Signing`）。
+- **发布链路**：新增 Linux/WSL 发布脚本 `package-release.sh`（与 Windows `package-release.ps1` 等价）；manifest.json 由共享生成器 `tools/gen-manifest.js` 统一生成（version 含 build / sha256 / size / notes=CHANGELOG 最新条目全文，JSON 合法且无 BOM），产物可用 `tools/verify-update-manifest.mjs` 校验。部署者把 APK + manifest 放进插件 `updateDir` 即完成主机源发布。
 ## v3.1.1（2026-08-26）— WSL/类 Unix 平台路径选择修复（issue #5）
 
 ### 现象
