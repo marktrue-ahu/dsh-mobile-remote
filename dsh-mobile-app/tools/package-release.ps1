@@ -11,7 +11,9 @@ if (-not (Test-Path $apk)) {
     exit 1
 }
 $pubspec = Get-Content (Join-Path $appDir 'pubspec.yaml') -Raw
-$ver = ([regex]::Match($pubspec, '(?m)^version:\s*(\d+\.\d+\.\d+)')).Groups[1].Value
+# version 形如 3.1.3+21：主段必须锚定非数字边界，否则会把整串当主段、
+# 再拼一次 build 得到 "3.1.3+21+21"（与 package-release.sh 保持等价）。
+$ver = ([regex]::Match($pubspec, '(?m)^version:\s*(\d+\.\d+\.\d+)(?![\d.])')).Groups[1].Value
 if (-not $ver) { Write-Error 'Cannot parse version from pubspec.yaml'; exit 1 }
 $buildNum = ([regex]::Match($pubspec, '(?m)^version:\s*\d+\.\d+\.\d+\+(\d+)')).Groups[1].Value
 $fullVer = if ($buildNum) { "$ver+$buildNum" } else { $ver }   # manifest 版本精确到 build（热修可识别）
