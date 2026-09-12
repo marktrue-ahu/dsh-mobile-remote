@@ -1,13 +1,13 @@
-# Triage labels
+# 分类标签
 
-Engineering skills use five canonical triage roles. This table maps those roles to the labels used by this repository's GitHub issue tracker.
+工程技能使用五个标准分类角色。下表将这些角色映射到本仓库 GitHub issue 跟踪器使用的标签。
 
-| Label in engineering skills | Label in our tracker | Meaning |
+| 工程技能中的标签 | 跟踪器中的标签 | 含义 |
 | --- | --- | --- |
-| `needs-triage` | `needs-triage` | Maintainer needs to evaluate this issue |
-| `needs-info` | `needs-info` | Waiting on the reporter for more information |
-| `ready-for-agent` | `ready-for-agent` | Fully specified and ready for an autonomous agent |
-| `ready-for-human` | `ready-for-human` | Requires human implementation |
-| `wontfix` | `wontfix` | Will not be actioned |
+| `needs-triage` | `needs-triage` | 维护者需要评估该 issue |
+| `needs-info` | `needs-info` | 等待报告者补充信息 |
+| `ready-for-agent` | `ready-for-agent` | 已完整定义，可供自主代理执行 |
+| `ready-for-human` | `ready-for-human` | 需要人工实现 |
+| `wontfix` | `wontfix` | 不处理 |
 
-When a skill mentions a triage role, use the label in the second column. This file records vocabulary only; a missing GitHub label may be created when an authorized workflow first needs it.
+当技能提到分类角色时，使用第二列的标签。本文件只记录词汇；缺失的 GitHub 标签可在授权工作流首次需要时创建。

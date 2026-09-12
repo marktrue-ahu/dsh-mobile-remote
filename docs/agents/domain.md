@@ -1,14 +1,14 @@
-# Domain docs
+# 领域文档
 
-This is a single-context repository. Engineering skills must consume the repository's domain documentation before exploring or changing the relevant code.
+本仓库为单上下文仓库。工程技能在探索或修改相关代码前必须阅读仓库的领域文档。
 
-## Before exploring
+## 探索之前
 
-- Read the root `CONTEXT.md` for the project's canonical domain language.
-- Read the relevant accepted or proposed decisions in `docs/adr/` for the area being changed.
-- If either location does not exist, continue silently. Do not create domain documentation until terminology or a decision is actually resolved.
+- 阅读根目录 `CONTEXT.md`，了解项目的规范领域语言。
+- 阅读 `docs/adr/` 中与被改区域相关的已接受或候选决策。
+- 若以上位置不存在，静默继续；在术语或决策真正落定之前不要创建领域文档。
 
-## Layout
+## 布局
 
 ```text
 /
@@ -18,14 +18,14 @@ This is a single-context repository. Engineering skills must consume the reposit
 └── ...
 ```
 
-There is no `CONTEXT-MAP.md` and no separate Flutter/mobile-remote domain context. Both sides use the root glossary and the shared ADR set.
+没有 `CONTEXT-MAP.md`，也没有独立的 Flutter/mobile-remote 领域上下文。两侧共用根词汇表与共享的 ADR 集合。
 
-## Use the glossary vocabulary
+## 使用词汇表词汇
 
-Use terms defined in `CONTEXT.md` when naming domain concepts in issues, specs, implementation plans, code, tests, and documentation. Do not drift to synonyms that the glossary explicitly marks as avoided.
+在 issue、规格、实现计划、代码、测试和文档中命名领域概念时，使用 `CONTEXT.md` 中定义的术语。不要漂移到词汇表明确标记为应避免的同义词。
 
-If a required concept is absent, reconsider whether the task is inventing unnecessary language. When a genuine domain gap exists, resolve it through the project's domain-design workflow before treating the new term as canonical.
+若缺少某个必需概念，请重新考虑任务是否在发明不必要的语言。当存在真正的领域缺口时，先通过项目的领域设计流程解决，再将该新术语视为规范。
 
-## Respect ADRs
+## 尊重 ADR
 
-Do not silently override an ADR. If a proposed implementation conflicts with an existing decision, identify the ADR and explain why it may need to be revisited before implementation proceeds.
+不要静默推翻 ADR。若提议的实现与既有决策冲突，指出对应 ADR，并在继续实现前说明为何可能需要重新审视。

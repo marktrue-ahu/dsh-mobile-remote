@@ -1,17 +1,17 @@
-# Agent instructions
+# Agent 指令
 
-Follow the repository-specific instructions in `AGENT-SINGLE.md`.
+遵循仓库规则文件 `AGENT-RULES.md`（本机保留，不随仓库推送）。
 
-## Agent skills
+## Agent 技能
 
-### Issue tracker
+### Issue 跟踪
 
-Issues are tracked in the GitHub repository `marktrue-ahu/dsh-mobile-remote`. See `docs/agents/issue-tracker.md`.
+Issues 跟踪在 GitHub 仓库 `marktrue-ahu/dsh-mobile-remote`。见 `docs/agents/issue-tracker.md`。
 
-### Triage labels
+### 分类标签
 
-Use the repository's canonical five-label triage vocabulary. See `docs/agents/triage-labels.md`.
+使用仓库的标准五标签分类词汇。见 `docs/agents/triage-labels.md`。
 
-### Domain docs
+### 领域文档
 
-This is a single-context repository. See `docs/agents/domain.md`.
+本仓库为单上下文仓库。见 `docs/agents/domain.md`。
