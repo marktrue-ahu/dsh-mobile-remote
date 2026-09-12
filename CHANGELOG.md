@@ -3,7 +3,7 @@
 ## fork 本地记录 — DSH 0.1.5-rc.2 适配（2026-09，[Issue #7](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/7)）
 
 > **本节明确标注为 fork 本地**，不对应上游版本号条目。版本号管理属于上游仓库作者，本 fork **不自行发版、不 bump 版本号**——插件与 App 版本号保持 `3.1.3`。需要判断手上这份是否含适配时，看本节与对应 commit。
-> 决策记录：[ADR 0001](docs/adr/0001-current-dsh-generation-only.md)；spec：[docs/specs/dsh-0.1.5-rc2-compatibility.md](docs/specs/dsh-0.1.5-rc2-compatibility.md)；验收清单：[docs/10-dsh-0.1.5-rc2-acceptance.md](docs/10-dsh-0.1.5-rc2-acceptance.md)。
+> 决策记录：[ADR 0001 = Issue #9](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/9)；spec：[Issue #7](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/7)；验收清单：[Issue #11](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/11)；需求讨论：[Issue #10](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/10)。
 
 ### 受支持宿主收敛为当前代际
 
@@ -44,7 +44,7 @@
 
 - **`docs/02-architecture.md` §12b 与本文 v2.4.0 条目更正**：此前把「获取 `apiProxy` 必须用 `ctx.inject`」的原因记为「各插件上下文隔离，`ctx.get` 看不到兄弟插件注册的服务」。该结论**是误判**——同 realm 下 `ctx.get` 能读到兄弟插件的服务，上游官方插件指引也明确「可选服务用 `ctx.get(name)`，`ctx.<name>` 只留给已声明的注入」。真实原因是**激活时间点**：旧代 `ApiProxyService` 的依赖链比本插件的 `webServer` 更深，插件装配时它通常尚未 ACTIVE，严格 `ctx.get` 读到 `undefined`。改用 `ctx.inject` 之所以有效，是因为它把一次性读取换成了响应式依赖。
 - `docs/09-compatibility.md` §1 / §2.1 / §2.2 改写为单代口径，新增 §2.4「旧代际与弃用通道」与 §2.5「验收范围」；已知问题清单第 1 条由「apiProxy 私有协议」改为「结算依赖未文档化私有方法 `dispatchRpc`」。
-- 新增 `docs/10-dsh-0.1.5-rc2-acceptance.md`（T01–T23 逐项验收清单，含新增的 T20 升级提示与能力上报、T21 结算通路缺失降级、T22 队列帧同步、T23 宿主范围判定）。
+- 验收清单迁至 [Issue #11](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/11)（T01–T23 逐项验收，含新增的 T20 升级提示与能力上报、T21 结算通路缺失降级、T22 队列帧同步、T23 宿主范围判定）；过程文档（spec / 需求讨论 / ADR）一并迁至 Issue #7 / #10 / #9，仓库内不再保留。
 
 ### 验收状态（如实标注）
 

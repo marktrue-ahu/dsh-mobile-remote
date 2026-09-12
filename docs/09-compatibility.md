@@ -1,6 +1,6 @@
 # 09 兼容性说明（Compatibility）
 
-> 版本：v3.1.3（DSH 0.1.5-rc.2 适配，见 [ADR 0001](adr/0001-current-dsh-generation-only.md) 与 [Issue #7](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/7)） · 面向：开源使用者 / 二次开发 / 多设备部署
+> 版本：v3.1.3（DSH 0.1.5-rc.2 适配，见 [ADR 0001（Issue #9）](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/9) 与 [Spec Issue #7](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/7)） · 面向：开源使用者 / 二次开发 / 多设备部署
 
 > ⚠ **平台范围（issue #6）**：`/m/api/files*`（文件下载/上传）的 TOCTOU 防护基于 descriptor-relative 语义，**仅 Linux/macOS 可用**；**Windows 返回 `503 files-unavailable`**（安全 fail-closed，理由见 docs/04 §6）。其余功能（会话、消息、审批/问询、目录浏览、通知、推送）不受平台限制。
 
@@ -42,7 +42,7 @@
 
 ## 2. 内核耦合点与降级行为
 
-插件与 Harness 的耦合分三档：**硬依赖**（缺失 = 对应功能不可用）、**软依赖**（缺失 = 功能降级）、**可选**（缺失 = 自动禁用该功能）。插件对每个依赖都做了存在性探测，**任何一项缺失都不会让插件崩溃或影响其他功能**；能力缺失一律**明确报错**，不静默伪装成功（ADR 0001）。
+插件与 Harness 的耦合分三档：**硬依赖**（缺失 = 对应功能不可用）、**软依赖**（缺失 = 功能降级）、**可选**（缺失 = 自动禁用该功能）。插件对每个依赖都做了存在性探测，**任何一项缺失都不会让插件崩溃或影响其他功能**；能力缺失一律**明确报错**，不静默伪装成功（[ADR 0001 = Issue #9](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/9)）。
 
 ### 2.1 服务（`ctx.get` / `ctx.inject`）
 
@@ -89,7 +89,7 @@
 
 ### 2.4 旧代际与弃用通道
 
-插件只支持当前 DSH 代际（[ADR 0001](adr/0001-current-dsh-generation-only.md)）。旧代际宿主上的表现：
+插件只支持当前 DSH 代际（[ADR 0001 = Issue #9](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/9)）。旧代际宿主上的表现：
 
 - **不拒绝加载**：插件不做启动期版本拦截；宿主版本低于受支持范围时仍加载。
 - **能力缺失明确报错**：`host.capabilities` 中缺失的项，对应功能返回 503 `host-capability-unavailable`，错误文案带升级指引。
@@ -98,7 +98,7 @@
 
 ### 2.5 验收范围（如实标注）
 
-逐项验收清单见 [DSH 0.1.5-rc.2 验收清单](10-dsh-0.1.5-rc2-acceptance.md)。**未完成逐项验收前不得对外宣称「完整兼容」**；缺环境的项记录为**未验证**，不留空白、也不得由其他环境或内核版本的既有证据平移推定。
+逐项验收清单见 [Issue #11：DSH 0.1.5-rc.2 适配验收清单](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/11)。**未完成逐项验收前不得对外宣称「完整兼容」**；缺环境的项记录为**未验证**，不留空白、也不得由其他环境或内核版本的既有证据平移推定。
 
 ---
 

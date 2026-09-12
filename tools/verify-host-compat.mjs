@@ -1,4 +1,4 @@
-// DSH 0.1.5-rc.2 适配（Issue #7，docs/adr/0001）单元检查：
+// DSH 0.1.5-rc.2 适配（Spec Issue #7，ADR Issue #9）单元检查：
 // ① 宿主版本范围判定（受支持代际的下界与后续补丁）；
 // ② 能力探测的独立性与语义（三项能力必须可分别表达「能调用但不能收事件」这类半可用状态）。
 // 从已安装 profile 副本导入（仓库根 node_modules 无 @deepseek-ai 依赖）；可用 DSH_MOBILE_PLUGIN 指定模块路径。

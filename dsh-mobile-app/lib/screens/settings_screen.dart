@@ -371,7 +371,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         buf.writeln('  • $n（$k）= $v');
       });
     }
-    // 宿主代际与兼容状态（v3.1.3 / docs/adr/0001）：版本号用于身份识别，
+    // 宿主代际与兼容状态（v3.1.3 / ADR 0001 = Issue #9）：版本号用于身份识别，
     // 能力结果用于行为判断——两者不可互相替代，故分行展示。
     final host = d['host'] as Map<String, dynamic>?;
     if (host != null && host.isNotEmpty) {
@@ -445,7 +445,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     return buf.toString();
   }
 
-  /// 宿主能力项中文名（v3.1.3 诊断 host.capabilities，docs/adr/0001）。未知 key 原样返回。
+  /// 宿主能力项中文名（v3.1.3 诊断 host.capabilities，ADR 0001 = Issue #9）。未知 key 原样返回。
   String _hostCapabilityName(String key) {
     switch (key) {
       case 'hasRemoteInvoke':

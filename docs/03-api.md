@@ -579,7 +579,7 @@
 - 服务端先打开并校验目录句柄，再通过 descriptor-relative + `O_EXCL|O_NOFOLLOW` 创建目标，目录替换/符号链接竞态不会越界；当前平台不具备 descriptor fs 时 fail-closed → `503 files-unavailable`
 - `name` 不合法（含 `\ / : * ? " < > |`、`.`/`..`/超 255）→ `400 invalid-name`；body 上限 64MB → `413 payload-too-large`
 
-### 6.17 宿主代际诊断（`host` 节，ADR 0001）
+### 6.17 宿主代际诊断（`host` 节，[ADR 0001 = Issue #9](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/9)）
 
 **GET `/m/api/diagnostics`** 的 `host` 节回答「电脑端 DSH 是什么版本、是否受支持、四项能力是否就绪」——版本号用于身份识别，能力结果用于行为判断，两者不可互相替代：
 
