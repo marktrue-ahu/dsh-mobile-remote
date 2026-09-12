@@ -58,7 +58,7 @@ class FakeRequest extends EventEmitter {
 	}
 }
 
-function createHarness(overrides = {}) {
+function createHarness(overrides = {}, config = CONFIG) {
 	const routes = [];
 	const listeners = new Map();
 	const cleanups = [];
@@ -76,9 +76,9 @@ function createHarness(overrides = {}) {
 		inject() {},
 		on(event, fn) { listeners.set(event, fn); return () => listeners.delete(event); },
 	};
-	apply(ctx, CONFIG);
+	apply(ctx, config);
 	return {
-		route: routes.find((r) => r.path === `${CONFIG.path}/api`).handler,
+		route: routes.find((r) => r.path === `${config.path}/api`).handler,
 		fire(event, ...args) { return listeners.get(event)?.(...args); },
 		clean() { for (const c of cleanups.reverse()) c?.(); },
 	};
@@ -202,4 +202,33 @@ test("host version range constants and predicate stay pinned to 0.1.5-rc.2 gener
 	assert.equal(isHostVersionSupported("0.1.1-rc.2"), false);
 	assert.equal(isHostVersionSupported("0.2.0"), false);
 	assert.equal(isHostVersionSupported(undefined), null);
+});
+
+test("T21: settlement path missing (dispatchRpc) degrades remoteEvents=false without lying about the bridge", async () => {
+	// 事件桥（openWireStream）在、结算通路（dispatchRpc）缺——「能收事件但不能结算」半可用态：
+	// checks.remoteEvents 必须如实 false（不谎报「双端就绪」），hasRemoteEventBridge 仍为 true。
+	const gateway = {
+		invokeRpc() { return Promise.resolve({ ok: true, value: {} }); },
+		openWireStream(_e, _p, signal) {
+			return (async function* () {
+				yield { type: "ready", clientId: "client-1" };
+				await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+			})();
+		},
+		// 无 dispatchRpc —— 问询/审批出站结算通路缺失
+	};
+	const harness = createHarness(
+		{ get: (name) => name === "typertGateway" ? gateway : undefined },
+		{ ...CONFIG, approvalMode: "both" },
+	);
+	try {
+		// 等事件循环让 ready 帧生效（$events 客户端为异步打开）
+		for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+		const res = await getRoute(harness.route, "/m/api/diagnostics");
+		const body = JSON.parse(res.chunks.at(-1));
+		assert.equal(body.host.capabilities.hasRemoteEventBridge, true, "事件桥能力如实上报");
+		assert.equal(body.checks.remoteEvents, false, "结算通路缺失 → remoteEvents=false（半可用不谎报）");
+	} finally {
+		harness.clean();
+	}
 });
