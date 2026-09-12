@@ -93,6 +93,19 @@ async function getRoute(route, url) {
 	return res;
 }
 
+async function postJson(route, body) {
+	const req = new FakeRequest("/m/api/respond", "POST");
+	const res = new FakeResponse();
+	const done = new Promise((resolve) => res.once("finish", resolve));
+	route(req, res);
+	queueMicrotask(() => {
+		req.emit("data", Buffer.from(JSON.stringify(body)));
+		req.emit("end");
+	});
+	await done;
+	return { status: res.statusCode, body: JSON.parse(res.chunks.at(-1)) };
+}
+
 function sseConnect(route) {
 	const req = new FakeRequest("/m/api/events");
 	const res = new FakeResponse();
@@ -228,6 +241,50 @@ test("T21: settlement path missing (dispatchRpc) degrades remoteEvents=false wit
 		const body = JSON.parse(res.chunks.at(-1));
 		assert.equal(body.host.capabilities.hasRemoteEventBridge, true, "事件桥能力如实上报");
 		assert.equal(body.checks.remoteEvents, false, "结算通路缺失 → remoteEvents=false（半可用不谎报）");
+	} finally {
+		harness.clean();
+	}
+});
+test("T14: approval frame chain settles via respond allowed-once (同 T13 双端框架)", async () => {
+	// 审批与问询同属 $events 双端呈现框架：waterfall(approval/request) → pending → 帧 →
+	// /respond approval → $events/result 结算 → resolved 帧。宿主真实弹卡在本部署会话
+	// 未启用 approval 门控（bash/write/subagent 均直接放行或沙箱拦截），故以 HTTP seam 闭环。
+	const calls = [];
+	const gateway = {
+		invokeRpc() { return Promise.resolve({ ok: true, value: {} }); },
+		openWireStream(_e, _p, signal) {
+			return (async function* () {
+				yield { type: "ready", clientId: "client-1" };
+				yield { type: "waterfall", event: "approval/request", eventId: "ev-approve-1", agentId: "session:s", request: { toolName: "bash", reason: "T14 probe", callId: "c1" } };
+				await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+			})();
+		},
+		dispatchRpc(endpoint, payload) { calls.push({ endpoint, payload }); return Promise.resolve({ ok: true, value: undefined }); },
+	};
+	const harness = createHarness(
+		{ get: (name) => name === "typertGateway" ? gateway : undefined },
+		{ ...CONFIG, approvalMode: "both" },
+	);
+	try {
+		const sse = sseConnect(harness.route);
+		for (let i = 0; i < 30; i++) await new Promise((resolve) => setImmediate(resolve));
+		const frame = sse.chunks.map((c) => c.startsWith("data: ") ? c.slice(6) : "").map((s) => { try { return JSON.parse(s); } catch { return null; } }).find((f) => f?.frame?.type === "approval/requested");
+		assert.ok(frame, "approval/requested 帧到达手机通道");
+		assert.equal(frame.frame.rpcId, "ev-approve-1");
+		assert.equal(frame.frame.toolName, "bash");
+
+		// 手机端应答"允许一次"
+		const res = await postJson(harness.route, {
+			kind: "approval",
+			rpcId: "ev-approve-1",
+			sessionId: "s",
+			outcome: "allowed-once",
+		});
+		assert.equal(res.status, 200);
+		assert.equal(res.body.ok, true);
+		// 结算走后端 $events/result（与浏览器 GUI 同一通路）
+		assert.ok(calls.some((c) => c.endpoint === "$events/result" && c.payload.args.outcome.kind === "result"), "$events/result 已结算");
+		assert.ok(sse.chunks.some((c) => c.includes("approval/resolved")), "approval/resolved 帧广播");
 	} finally {
 		harness.clean();
 	}
