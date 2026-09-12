@@ -196,6 +196,8 @@ test("host version range constants and predicate stay pinned to 0.1.5-rc.2 gener
 	assert.deepEqual(SUPPORTED_HOST_MIN, [0, 1, 5]);
 	assert.equal(isHostVersionSupported("0.1.5-rc.2"), true);
 	assert.equal(isHostVersionSupported("0.1.6"), true);
+	assert.equal(isHostVersionSupported("0.1.5-rc.1"), false, "低于下界的同 tuple prerelease 不受支持");
+	assert.equal(isHostVersionSupported("0.1.5-rc.0"), false);
 	assert.equal(isHostVersionSupported("0.1.2-rc.1"), false);
 	assert.equal(isHostVersionSupported("0.1.1-rc.2"), false);
 	assert.equal(isHostVersionSupported("0.2.0"), false);

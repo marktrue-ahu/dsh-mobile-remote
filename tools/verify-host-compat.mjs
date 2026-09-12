@@ -38,6 +38,10 @@ check("下界放宽到 0.1.5-rc.3（同 tuple 的后续 RC）", isHostVersionSup
 check("0.1.5 正式版受支持", isHostVersionSupported("0.1.5") === true);
 check("0.1.6 受支持（同代后续补丁）", isHostVersionSupported("0.1.6") === true);
 check("0.1.9-alpha.1 受支持", isHostVersionSupported("0.1.9-alpha.1") === true);
+check("0.1.5-rc.1 不受支持（低于下界的同 tuple prerelease）", isHostVersionSupported("0.1.5-rc.1") === false);
+check("0.1.5-rc.0 不受支持", isHostVersionSupported("0.1.5-rc.0") === false);
+check("0.1.5-alpha.1 不受支持", isHostVersionSupported("0.1.5-alpha.1") === false);
+check("0.1.4-rc.9 不受支持（patch 低于下界）", isHostVersionSupported("0.1.4-rc.9") === false);
 
 // 2. 旧代与越界版本不受支持（"只支持当前代际"）
 check("0.1.2-rc.1 不受支持", isHostVersionSupported("0.1.2-rc.1") === false);
