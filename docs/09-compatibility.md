@@ -2,6 +2,8 @@
 
 > 版本：v3.1.3（DSH 0.1.5-rc.2 适配，见 [ADR 0001](adr/0001-current-dsh-generation-only.md) 与 [Issue #7](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/7)） · 面向：开源使用者 / 二次开发 / 多设备部署
 
+> ⚠ **平台范围（issue #6）**：`/m/api/files*`（文件下载/上传）的 TOCTOU 防护基于 descriptor-relative 语义，**仅 Linux/macOS 可用**；**Windows 返回 `503 files-unavailable`**（安全 fail-closed，理由见 docs/04 §6）。其余功能（会话、消息、审批/问询、目录浏览、通知、推送）不受平台限制。
+
 本文回答两个问题：**App 在哪些手机上能跑**，以及**插件在什么样的 Harness 上能跑**。
 
 ---
