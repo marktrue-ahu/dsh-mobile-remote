@@ -98,7 +98,7 @@
 
 ### 2.5 验收范围（如实标注）
 
-逐项验收清单见 [Issue #11：DSH 0.1.5-rc.2 适配验收清单](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/11)。**未完成逐项验收前不得对外宣称「完整兼容」**；缺环境的项记录为**未验证**，不留空白、也不得由其他环境或内核版本的既有证据平移推定。
+逐项验收清单见 [Issue #11：DSH 0.1.5-rc.2 适配验收清单](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/11)。真实 Web/Linux 宿主的可重复检查入口为 `tools/acceptance-web-check.mjs`（默认不产生成功业务写入；设置 `DSH_ACCEPTANCE_MUTATE=1` 可启用会话、goal、反馈与临时目录的受控写验收）；最新证据与环境阻塞记录在 `CHANGELOG.md` 的 fork 本地适配条目。**未完成逐项验收前不得对外宣称「完整兼容」**；缺环境的项记录为**未验证**，不留空白、也不得由其他环境或内核版本的既有证据平移推定。
 
 ---
 

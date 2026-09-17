@@ -48,8 +48,9 @@
 
 ### 验收状态（如实标注）
 
-- **尚未在 `0.1.5-rc.2` 真实宿主上执行逐项验收**。当前仅有模块级回归通过：`tools/verify-host-compat.mjs`（20/20）、`tools/wsl-path-check.mjs`（8/8）、`tools/hotfix07-unit-check.mjs`（14/14）、`verify-image-sniff` / `verify-64k-fix` / `verify-413-precheck`。
-- 因此**不得对外宣称「完整兼容」**；受支持范围只表示「代码层面对该代际做了适配」。上一代际（0.1.2-rc.1）的既有验证记录不属于本轮证据。
+- **2026-09-17 已在真实 `0.1.5-rc.2 × Web CLI/Linux` 宿主执行验收**：`tools/acceptance-web-check.mjs` 无成功业务写入模式 36/36、受控写模式 82/82（无显式 model 建会话、归档/恢复/分叉/停止、发送幂等与回执、goal 状态迁移、反馈写入/清除、临时目录创建/可见/删除）；本轮运行 `tools/e2e-check.mjs` 实收发送→完整事件回流与限流 429；诊断实收 `host.version=0.1.5-rc.2`、`supported=true`、Remote invoke/event/cold-resume 三项能力就绪。Node 回归 42/42（含 T11 provider 配置保存/清除的隔离凭据契约）、宿主范围 24/24、路径 8/8、hotfix 14/14、图片魔数 6/6 均通过；Flutter 3.47.1 下 `flutter test` 24/24、`flutter analyze` 零问题。
+- **仍未完成的环境矩阵**：当前机器无 Android SDK、无 Android 设备，APK 构建与 T02/T19 真机交互无法执行；没有 DSH Desktop 宿主实例，`0.1.5-rc.2 × Desktop` 组合未执行；无低于下界的独立宿主，T20 低版本安装实测仅由自动化替身覆盖。真实宿主正在承载本会话，未做会中插件卸载/热重载；T11 真实用户凭据未被改动（保存/清除由隔离契约测试覆盖）；T15 当前部署 `pushChannels=0`，真实 ntfy wire 由隔离测试覆盖；T16 无活跃后台任务/子代理可供取消或中断。
+- 因此目前仍**不得对外宣称「完整兼容」**；已完成 Web/Linux 可执行项，剩余项保留明确环境阻塞，不以其他宿主或模块测试冒充真机/Desktop 证据。
 
 ## v3.1.3（2026-09-08，issue #9）— 审批/问询双端呈现（`approvalMode: both` 默认）+ 可配置策略
 

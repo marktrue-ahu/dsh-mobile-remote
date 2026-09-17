@@ -34,6 +34,7 @@ const CONFIG = {
 	approvalMode: "desktop",
 };
 
+const PROVIDERS_PATH = "/m/api/llm-providers";
 const PROBE_PATH = "/m/api/llm-providers/probe";
 const NS = "llm-providers.test-provider";
 
@@ -222,6 +223,80 @@ test("E(#13): 命名空间白名单护栏不因字段改名而失效（未声明
 		assert.equal(res.status, 400);
 		assert.equal(res.body.error, "unknown-namespace");
 		assert.equal(llm.calls.length, 0, "未声明的命名空间不得触发 discoverModels");
+	} finally {
+		harness.clean();
+	}
+});
+
+test("F(T11): 保存 provider 配置经 settings + credentials 同源写入且不回显密钥", async () => {
+	const llm = fakeLlm();
+	const mutations = [];
+	const credentialCalls = [];
+	const settings = {
+		get() { return {}; },
+		async mutate(ns, ops) { mutations.push({ ns, ops }); },
+	};
+	const credentials = {
+		async set(ref, value) { credentialCalls.push({ kind: "set", ref, value }); },
+		async unset(ref) { credentialCalls.push({ kind: "unset", ref }); },
+	};
+	const harness = createHarness({
+		get: (name) => name === "llm" ? llm.service : name === "settings" ? settings : name === "credentials" ? credentials : undefined,
+	});
+	try {
+		const res = await postJson(harness.route, {
+			provider: "test-provider",
+			settingsNs: NS,
+			baseURL: "https://api.example.test/v1",
+			apiKey: "sk-acceptance-secret",
+		}, PROVIDERS_PATH);
+		assert.equal(res.status, 200, JSON.stringify(res.body));
+		assert.equal(res.body.keyConfigured, true);
+		assert.equal(Object.hasOwn(res.body, "apiKey"), false, "响应不得回显密钥");
+		assert.equal(credentialCalls.length, 1);
+		assert.equal(credentialCalls[0].kind, "set");
+		assert.equal(credentialCalls[0].value, "sk-acceptance-secret");
+		assert.equal(mutations.length, 1);
+		assert.equal(mutations[0].ns, NS);
+		assert.deepEqual(mutations[0].ops, [
+			{ op: "set", path: ["baseURL"], value: "https://api.example.test/v1" },
+			{ op: "set", path: ["apiKeyEnv"], value: "TEST_PROVIDER_API_KEY" },
+		]);
+	} finally {
+		harness.clean();
+	}
+});
+
+test("G(T11): removeKey 清除 credential 并保留非敏感 provider 配置", async () => {
+	const llm = fakeLlm();
+	const mutations = [];
+	const credentialCalls = [];
+	const settings = {
+		get() { return { apiKeyEnv: "TEST_PROVIDER_API_KEY", baseURL: "https://old.example.test/v1" }; },
+		async mutate(ns, ops) { mutations.push({ ns, ops }); },
+	};
+	const credentials = {
+		async set(ref, value) { credentialCalls.push({ kind: "set", ref, value }); },
+		async unset(ref) { credentialCalls.push({ kind: "unset", ref }); },
+	};
+	const harness = createHarness({
+		get: (name) => name === "llm" ? llm.service : name === "settings" ? settings : name === "credentials" ? credentials : undefined,
+	});
+	try {
+		const res = await postJson(harness.route, {
+			provider: "test-provider",
+			settingsNs: NS,
+			baseURL: "https://api.example.test/v2",
+			removeKey: true,
+		}, PROVIDERS_PATH);
+		assert.equal(res.status, 200, JSON.stringify(res.body));
+		assert.equal(res.body.keyConfigured, false);
+		assert.equal(credentialCalls.length, 1);
+		assert.equal(credentialCalls[0].kind, "unset");
+		assert.deepEqual(mutations[0].ops, [
+			{ op: "set", path: ["baseURL"], value: "https://api.example.test/v2" },
+			{ op: "set", path: ["apiKeyEnv"], value: "TEST_PROVIDER_API_KEY" },
+		]);
 	} finally {
 		harness.clean();
 	}
