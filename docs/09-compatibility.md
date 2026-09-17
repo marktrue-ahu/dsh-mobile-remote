@@ -1,6 +1,6 @@
 # 09 兼容性说明（Compatibility）
 
-> 版本：v3.1.3（2026-09-08 开发中：issue #9 审批双端呈现 / 可配置策略 approvalMode，机制基线 0.1.2-rc.1） · 面向：开源使用者 / 二次开发 / 多设备部署
+> 版本：v3.1.3（DSH 0.1.5-rc.2 适配，见 [ADR 0001（Issue #9）](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/9) 与 [Spec Issue #7](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/7)） · 面向：开源使用者 / 二次开发 / 多设备部署
 
 > ⚠ **平台范围（issue #6）**：`/m/api/files*`（文件下载/上传）的 TOCTOU 防护基于 descriptor-relative 语义，**仅 Linux/macOS 可用**；**Windows 返回 `503 files-unavailable`**（安全 fail-closed，理由见 docs/04 §6）。其余功能（会话、消息、审批/问询、目录浏览、通知、推送）不受平台限制。
 
@@ -12,20 +12,37 @@
 
 | 组件 | 要求 |
 |---|---|
-| 桌面端 DSH（Harness） | **v3.1.2/v3.1.3 机制基线：`0.1.2-rc.1` 服务包 = DSH Desktop v2.0.5**（approval/request 瀑布 answerer + `$events` 远程事件双端审批 + RPC 网关，见 §2）；旧基线 `0.1.1-rc.2` = v2.0.2 起适配（本文件 §2 同时保留两代机制说明，`apiProxy` 帧桥为旧内核路径） |
-| dsh-mobile-remote 插件 | **v3.0.0（与 App/git tag 版本号统一）**；`/m/api/diagnostics` 可自检 |
-| 手机 App（Android） | v3.0.0（与插件同版本 = 完美配对；不同版本可用但"谁旧谁吃亏"，详见 README「版本与兼容」）；Android 7.0+、64 位机型 |
-| 字段级兼容（v3.1.0 候选） | `reasoning`/`title` 为纯增量字段：新插件+旧 App 无影响（忽略新字段）；新 App+旧插件自动回退（不渲染折叠块 / 悬浮球标题兜底短码）——任意组合均可使用 |
+| 桌面端 DSH（Harness） | **受支持范围 `>=0.1.5-rc.2 <0.2.0`**（当前 Typert 代际及其后续补丁/RC）。更早代际（0.1.1-rc.2 / 0.1.2-rc.1）**不再受支持**：插件仍可加载（不做启动期拦截），但相关功能会以明确错误失败，诊断会给出缺失的能力与升级指引。见 §2.4 |
+| dsh-mobile-remote 插件 | **v3.1.3**；`/m/api/diagnostics` 可自检（`services` / `checks` / **`host`**） |
+| 手机 App（Android） | v3.1.3（与插件同版本 = 完美配对；不同版本可用但"谁旧谁吃亏"，详见 README「版本与兼容」）；Android 7.0+、64 位机型 |
+| 字段级兼容（v3.1.0） | `reasoning`/`title` 为纯增量字段：新插件+旧 App 无影响（忽略新字段）；新 App+旧插件自动回退（不渲染折叠块 / 悬浮球标题兜底短码）——任意组合均可使用 |
 | 字段级兼容（v3.1.1） | `/m/api/directories` 根视图新增 `sep`（服务端路径分隔符）；新插件+旧 App 忽略该字段即可（旧 App 在 WSL 上仍按 `\` 拼接，由服务端`normalizeServerPath` 归一化兜底，浏览/建夹/建会话均可用）；新 App+旧插件缺少 `sep` 时按根视图推断分隔符——任意组合均可使用 |
+| 字段级兼容（v3.1.3） | `/m/api/diagnostics` 新增 `host` 节（宿主版本号 + 四项能力 + 是否受支持）与 `notes` 末行宿主结论。旧版 App 按 key 取值、忽略未知字段，无影响 |
 | Flutter 构建环境 | Flutter 3.35+（Dart SDK ^3.13） |
 
-**快速自检**：手机 App → 设置 → 环境诊断。`services` 一节列出每个内核服务是否存在；**v3.1.3+ 看 `checks.approvalMode`**（生效策略）与 **`checks.remoteEvents`**（`true` = `$events` 双端呈现通道就绪，`false` = both 降级 mobile 或配置即 mobile/desktop）；`notes` 首行说明当前审批策略实际语义。旧内核（0.1.1-rc.2 及更早）宿主才会出现 `services.apiProxy` / `checks.respondBridge` / `checks.frameBridge` / `checks.pendingFrames`（帧桥 era 探测项，v3.1.3 起仅帧桥激活时输出）——**0.1.2-rc.1+ 宿主看不到这些键属正常**。
+**快速自检**：手机 App → 设置 → 环境诊断。**先看 `host` 一节**——它直接回答「电脑端 DSH 是什么版本、是否受支持、四项能力是否就绪」：
+
+```jsonc
+"host": {
+  "version": "0.1.5-rc.2",          // 宿主 DSH 版本号（读不到为 null）
+  "supported": true,                 // 是否落在受支持范围；null = 版本号无法解析（未知）
+  "supportedRange": ">=0.1.5-rc.2 <0.2.0",
+  "capabilities": {
+    "hasRemoteInvoke": true,         // Remote 调用入口：模型目录/会话配置/发送等全部依赖
+    "hasRemoteEventBridge": true,    // Remote 事件桥：问询/审批双端同卡（$events）的前提
+    "hasColdSessionResume": true,    // 冷会话恢复：不在 live agent 注册表里的持久会话发送
+    "hasLegacyInteractionBridge": false  // 旧代交互通道（true 即说明宿主未升级）
+  }
+}
+```
+
+`checks.approvalMode`（生效策略）与 `checks.remoteEvents`（`true` = `$events` 双端呈现通道就绪，含结算通路可用性）继续保留；`notes` 首行说明审批策略实际语义，末行是宿主结论。旧内核（0.1.1-rc.2 及更早）宿主才会出现 `services.apiProxy` / `checks.respondBridge` / `checks.frameBridge` / `checks.pendingFrames`——**当前代际宿主看不到这些键属正常**。
 
 ---
 
 ## 2. 内核耦合点与降级行为
 
-插件与 Harness 的耦合分三档：**硬依赖**（缺失 = 对应功能不可用）、**软依赖**（缺失 = 功能降级）、**可选**（缺失 = 自动禁用该功能）。插件对每个依赖都做了存在性探测，**任何一项缺失都不会让插件崩溃或影响其他功能**。
+插件与 Harness 的耦合分三档：**硬依赖**（缺失 = 对应功能不可用）、**软依赖**（缺失 = 功能降级）、**可选**（缺失 = 自动禁用该功能）。插件对每个依赖都做了存在性探测，**任何一项缺失都不会让插件崩溃或影响其他功能**；能力缺失一律**明确报错**，不静默伪装成功（[ADR 0001 = Issue #9](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/9)）。
 
 ### 2.1 服务（`ctx.get` / `ctx.inject`）
 
@@ -38,29 +55,29 @@
 | `messageFeedback` | 消息 👍/👎（与 PC 端同一份） | 软依赖 | 反馈菜单隐藏/报错 |
 | `approval` | 权限策略读取（`setPolicy` 仅当存在时调用） | 可选 | 跳过策略写入 |
 | `credentials` | DeepSeek 余额查询 | 可选 | 回退环境变量 `DEEPSEEK_API_KEY`；都没有则余额不可用 |
-| `apiProxy`（0.1.1-rc.2 及更早） | 问询/审批帧桥 + 应答回写（旧内核通道） | 可选（v2.3+ 新功能） | 旧内核下手机不弹问询/审批卡（PC 端不受影响）；`/m/api/respond` 返回 503。v3.1.3 起该键与 `respondBridge`/`frameBridge`/`pendingFrames` 仅在帧桥激活时输出——0.1.2-rc.1+ 宿主缺失属正常 |
-| `userQuestions` | （间接）问询链路 | 可选 | 无弹窗（同上） |
-| `approval/request`·`user-questions/request` 瀑布（0.1.2-rc.1+） | Agent 作用域 Cordis 瀑布，插件 answerer 应答（0.1.2 移除了 apiProxy 后的新机制） | 软依赖 | 无瀑布宿主（旧内核）由 apiProxy 帧桥接管；手机弹窗功能不受影响 |
-| `typertGateway` `$events` 远程事件（0.1.2-rc.1+，`both` 模式） | 插件进程内 $events 客户端：瀑布经内核转发到网关后与桌面 GUI 同收事件副本、先答生效（issue #9 双端呈现） | 可选（v3.1.3） | `approvalMode: both` 自动降级为 mobile（手机在线独占），日志与诊断 notes 说明 |
+| `approval/request`·`user-questions/request` 瀑布 | Agent 作用域 Cordis 瀑布，插件 answerer 应答（当前代际的交互入口） | 软依赖 | 无瀑布宿主由旧代 `apiProxy` 帧桥接管（弃用通道，见 §2.4） |
+| `typertGateway` — Remote 调用入口（`invokeRpc`） | 模型目录、会话配置、发送、队列操作、归档、分支、目标等全部 RPC | **硬依赖（当前代际）** | `host.capabilities.hasRemoteInvoke=false`；各 RPC 路由返回 503 `host-capability-unavailable` 并附升级指引。**不再回退到 `/api` HTTP 通道**（该通道自桌面 2.0.5 起被浏览器访问门禁关闭，试它只会得到 403 死路） |
+| `typertGateway` — `$events` 远程事件桥（`openWireStream`） | 插件进程内 $events 客户端：瀑布经内核转发后与桌面 GUI 同收事件副本、先答生效（issue #9 双端呈现） | 可选（v3.1.3） | `host.capabilities.hasRemoteEventBridge=false`；`approvalMode: both` 自动降级为 mobile（手机在线独占应答），日志与诊断 notes 说明 |
+| `sessionController`（`prompt`） | 冷会话恢复：不在 live agent 注册表里的持久会话发送 | **硬依赖（冷会话路径）** | `host.capabilities.hasColdSessionResume=false`；冷会话发送走远程调用入口（若该入口亦不可用则明确报错） |
+| `apiProxy`（旧代，0.1.1-rc.2 及更早） | 问询/审批帧桥 + 应答回写 | **弃用通道**（ADR 0001） | 当前代际宿主不提供该服务，帧桥静默不生效（属正常）。命中时打一次 warn 提示升级。保留原因见 §2.4 |
 
-> ⚠ **approvalMode（v3.1.3，issue #9）语义**：`both`（默认）= 桌面 GUI 与手机同时弹卡、任一端先答即生效、另一端自动收卡（对齐 v3.1.1 帧桥体验；仅 0.1.2-rc.1+ 网关可用，旧宿主自动降级 mobile）；`mobile` = 手机在线独占应答（v3.1.2 行为），离线交桌面 GUI；`desktop` = 一律交桌面 GUI（手机不弹卡）。手机在场时待办 120s 无应答 fail-close（`unavailable` / 问询跳过），与 v3.1.2 一致。配置于 `cordis.patch.yml` → mobile-remote 行 `config.approvalMode`，重启生效。
->
-> ⚠ **apiProxy 属私有协议**（旧内核通道）：`events.mux` 与 `respond` 的消息格式是 PC 端 GUI 的内部通道，**无版本稳定承诺**。插件以 `ctx.inject(["apiProxy"])` 获取并做函数存在性探测；若未来 Harness 重构该接口，桥会干净降级（不影响其他功能），随插件版本更新恢复。这是本插件对内核唯一的"越界"耦合，集中在 `lib/index.js` 的「问询/审批帧桥」一段（0.1.2-rc.1+ 内核无 apiProxy，该段静默不生效，改走瀑布 answerer + $events 双端呈现）。
+> ⚠ **approvalMode（v3.1.3，issue #9）语义**：`both`（默认）= 桌面 GUI 与手机同时弹卡、任一端先答即生效、另一端自动收卡；`mobile` = 手机在线独占应答（v3.1.2 行为），离线交桌面 GUI；`desktop` = 一律交桌面 GUI（手机不弹卡）。手机在场时待办 120s 无应答 fail-close（`unavailable` / 问询跳过）。配置于 `cordis.patch.yml` → mobile-remote 行 `config.approvalMode`，重启生效。
 
 ### 2.2 事件与 RPC
 
 | 内核接口 | 用途 | 风险与降级 |
 |---|---|---|
-| `ctx.on("session/event")` | 消息流/通知聚合/上下文窗口 | 事件形态随版本演进；未知类型一律透传不解析，解析异常被 try/catch 兜底 |
+| `ctx.on("session/event")` | 消息流/通知聚合/上下文窗口/**队列即时同步** | 事件形态随版本演进；未知类型一律透传不解析，解析异常被 try/catch 兜底 |
+| `ctx.on("agent/inbox/spliced")`（经 `session/event` 送达） | 队列即时同步：内核任何生效的 inbox 变更都会 append 该会话事件，据此重推 `mobile/queue` 快照 | 事件名与载荷在当前代际与上一代一致；缺失时手机队列退回 REST 轮询兜底（不报错，仅不实时） |
 | `ctx.on("agent/status")` | 状态点（绿/橙） | 同上 |
-| `session.models` RPC | 模型目录（App 模型选择器） | 失败 → 目录为空，App 隐藏模型胶囊 |
+| `session/modelCatalog` RPC | 模型目录（App 模型选择器） | 失败 → 目录为空，App 隐藏模型胶囊 |
 | `settings.update`（`agent-presets` / `permission` 命名空间） | 默认预设修改 | 与 PC 端同一写入通道；命名空间变更会导致设置失败（App 报错提示） |
-| `session.fork` | 消息分支 | 内核接口变化 → fork 失败提示 |
-| `agent.followup` / `session.cancel` | 发消息/停止 | 同上 |
+| `session/prompt` | 发消息（`mode: queue \| steer`，`requestId` **必填**） | `requestId` 由插件无条件铸造；缺失会被网关以 `gateway/input-invalid` 拒绝投递 |
+| `session/fork` / `session/cancel` | 消息分支 / 停止 | 内核接口变化 → 失败提示 |
 
-> ⚠ **子代理通知判定需要 `session.header.origin`（DSH ≥ 0.1.1-rc.2）**：通知聚合对子代理会话（`origin === "subagent"`）抑制完成/失败通知（与内核自身通知一致）。旧内核 header 无 `origin` 字段时，子代理完成/失败通知会被放行（不影响功能正确性，仅通知噪音）；fork 出的独立会话（无 origin）照常通知。
+> ⚠ **子代理通知判定需要 `session.header.origin`**：通知聚合对子代理会话（`origin === "subagent"`）抑制完成/失败通知（与内核自身通知一致）；fork 出的独立会话（无 origin）照常通知。
 >
-> ⚠ **v3.1.0 候选新增字段（纯增量，无协议破坏）**：`assistant/message` 摘要的 `reasoning`（思维链正文，仅非空时下发，≤20000 字符）与 `/m/api/bootstrap` 的 `agents[*].title` / `sessions[*].title`（会话标题，空则兜底短码）。旧版 App 按 key 取值、忽略未知字段；旧版插件缺少这些字段时新版 App 自动回退（不渲染折叠块 / 悬浮球显示 id 短码）。两端任意组合均可正常使用。
+> ⚠ **两层请求幂等并存（v3.1.3）**：当前代际内核新增了按 `requestId` 的幂等短路（会扫整条持久会话日志找同 `rpcId` 的 `user/message`），与插件自建的发件回执层（`/m/api/send` + `/m/api/send-receipt`）**职责不同、两层都保留**：内核负责「同一请求不重复执行」，插件负责「传输层中断后回答是否已送达」（`Connection reset by peer` 后重试不重复即由此保证）。
 
 ### 2.3 高度自定义化的 Harness
 
@@ -68,6 +85,20 @@
 - **第三方插件动作**：`ctx.mobileActions.register(...)` 注册后自动出现在 App 动作区（v0.1 契约：仅 text 字段）。
 - **自定义问答 provider / 自动审批策略**：若用户的 Harness 已经接管人类问询（如自动答题插件、审批策略改为自动放行），内核**不会产生** `question/requested` / `approval/requested` 帧——手机不弹窗是**正确行为**，不是 bug。
 - **多 profile**：插件按 profile 安装（`<profile>/node_modules/dsh-mobile-remote`），每个 profile 独立配置口令/连接。
+- **内核依赖必须与宿主一致**：`dsh-credentials` / `dsh-llm` / `dsh-sandbox-policy` / `dsh-scope` 在 `package.json` 中声明为 peer 依赖，范围与受支持宿主同源（`>=0.1.5-rc.2 <0.2.0`）。profile 的依赖副本可能比宿主更旧，旧副本会优先于宿主加载并导致每轮失败——升级后务必重装依赖（见 [安装说明](06-install-run.md)）。
+
+### 2.4 旧代际与弃用通道
+
+插件只支持当前 DSH 代际（[ADR 0001 = Issue #9](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/9)）。旧代际宿主上的表现：
+
+- **不拒绝加载**：插件不做启动期版本拦截；宿主版本低于受支持范围时仍加载。
+- **能力缺失明确报错**：`host.capabilities` 中缺失的项，对应功能返回 503 `host-capability-unavailable`，错误文案带升级指引。
+- **旧代交互通道保留但弃用**：旧代 `apiProxy` 帧桥仍在代码中（`lib/index.js` 的「问询/审批帧桥（旧代宿主专用）」一段），命中时打一次 warn。保留它的唯一理由是：它不依赖网关**未文档化的私有方法** `dispatchRpc`，是结算通路失效时的降级出口。
+- **`dispatchRpc` 是已知的单点依赖**：`$events/result` 的结算只能经该方法（网关的公开面只有 `wireStream` / `registerRemoteEvents` / `invoke` / `stream`；`/api` HTTP 面被浏览器会话认证栅挡住）。插件在启动时探测其可调用性，缺失则 `checks.remoteEvents=false` 且瀑布按 `mobile` 语义工作——问询/审批在手机在线时由手机独占应答，不会弹出无法应答的卡片。上游若变更该通路，问询/审批将失效而非降级。
+
+### 2.5 验收范围（如实标注）
+
+逐项验收清单见 [Issue #11：DSH 0.1.5-rc.2 适配验收清单](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/11)。真实 Web/Linux 宿主的可重复检查入口为 `tools/acceptance-web-check.mjs`（默认不产生成功业务写入；设置 `DSH_ACCEPTANCE_MUTATE=1` 可启用会话、goal、反馈与临时目录的受控写验收）；最新证据与环境阻塞记录在 `CHANGELOG.md` 的 fork 本地适配条目。**未完成逐项验收前不得对外宣称「完整兼容」**；缺环境的项记录为**未验证**，不留空白、也不得由其他环境或内核版本的既有证据平移推定。
 
 ---
 
@@ -101,7 +132,7 @@ App 为 Flutter 原生 APK（`com.dsh.remote`），渲染后端为 **Impeller（
 
 | # | 问题 | 影响 | 状态/缓解 |
 |---|---|---|---|
-| 1 | 问询/审批桥依赖 apiProxy 私有协议 | 未来内核大版本可能断桥 | 干净降级 + 插件版本跟进；诊断可查 |
+| 1 | 问询/审批的**出站结算**依赖网关未文档化的私有方法 `dispatchRpc` | 上游若变更该通路，问询/审批在手机在线时会失效而非降级 | 启动时探测可调用性 → 缺失则 `checks.remoteEvents=false` 且瀑布按 `mobile` 语义工作（不弹出无法应答的卡片）；保留旧代 `apiProxy` 帧桥作为降级出口（§2.4）。见 ADR 0001 |
 | 2 | 自定义权限预设名在 App 显示「…」 | 纯展示 | 后续拉取预设清单 |
 | 3 | 国产 ROM 杀后台导致通知延迟（App 内角标） | 通知不及时 | 推送桥不受影响；App 重连后补拉 |
 | 4 | Impeller 在极老 GPU 的潜在渲染问题（未实测） | 少数旧机可能花屏 | manifest 一行回退 Skia |

@@ -1,5 +1,57 @@
 # Changelog
 
+## fork 本地记录 — DSH 0.1.5-rc.2 适配（2026-09，[Issue #7](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/7)）
+
+> **本节明确标注为 fork 本地**，不对应上游版本号条目。版本号管理属于上游仓库作者，本 fork **不自行发版、不 bump 版本号**——插件与 App 版本号保持 `3.1.3`。需要判断手上这份是否含适配时，看本节与对应 commit。
+> 决策记录：[ADR 0001 = Issue #9](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/9)；spec：[Issue #7](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/7)；验收清单：[Issue #11](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/11)；需求讨论：[Issue #10](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/10)。
+
+### 受支持宿主收敛为当前代际
+
+- **受支持范围改为 `>=0.1.5-rc.2 <0.2.0`**（当前 Typert 代际及其后续补丁/RC）。`package.json` 的四个内核 peer 依赖（`dsh-credentials` / `dsh-llm` / `dsh-sandbox-policy` / `dsh-scope`）范围由 `>=0.1.0-rc.6 <0.2.0` 收敛到同一下界，安装期即可发现明显不匹配。
+- **不做启动期版本拦截**：范围外宿主插件仍加载，能力缺失由功能级明确错误承担（`503 host-capability-unavailable` + 升级指引），避免内核小版本微调误杀整个插件。
+- 注意范围形态：`^0.1.5-rc.2` 这种 caret 写法在 npm 语义下**不**匹配 `0.1.5-rc.3`（prerelease 只有与下界完全同 tuple 才被允许），与「支持当前代际含后续 RC」的意图不符，故显式写成区间。
+
+### 兼容性判定改为能力探测（替代「存在某个方法即算新代」）
+
+- `/m/api/diagnostics` 新增 **`host` 节**：`version`（宿主 DSH 版本号）+ `supported` + `supportedRange` + `capabilities` 四项（`hasRemoteInvoke` / `hasRemoteEventBridge` / `hasColdSessionResume` / `hasLegacyInteractionBridge`）；`notes` 末行给出一句话结论。
+- **修正既有误判**：此前以「`typertGateway` 存在且带 `invokeRpc`」作为新代判据。实际上旧代（0.1.1-rc.2）**也提供**该服务与调用方法，只是**没有事件流面**——于是判定为「新代」而事件桥在 `if (!gateway?.openWireStream) return;` 处静默不启动，诊断宣称正常、功能静默失效。现拆成三个独立能力项，因为「能调用」与「能收事件」是独立成立的两件事。
+- **版本号只用于展示与升级提示，不参与功能门控**：读不到版本号时 `supported: null`（未知），不谎报为不支持。版本号用官方同款 idiom 沿 node 解析链读清单文件（**不能探目录存在性**——profile 的依赖镜像只增不删，升级后留下指向已不存在包的断链，探目录会误判为存在）。
+- 新增纯函数 `isHostVersionSupported()` 与 `tools/verify-host-compat.mjs`（20 项断言：下界、同 tuple 后续 RC、同代补丁、旧代、越界、不可解析、空白与构建元数据容忍）。
+
+### 队列即时同步（对应验收清单 T08/T22）
+
+- **修复**：当前代际下电脑端改动队列、内核认领排队消息**不会**即时反映到手机 dock，只能靠 REST 轮询兜底（表现为已执行的消息仍挂在待发送列表）。根因是队列帧来源单一——只在旧代 `apiProxy` 帧桥收到 `session/queue` 时转发，而当前代际宿主不提供 `apiProxy`。
+- **修复方式**：`onSessionEvent` 增加 `agent/inbox/spliced` 分支 → `broadcastQueue(session.id)`。该事件是持久会话事件（经 `ctx.on("session/event")` 送达），内核任何生效的 inbox 变更都会 append；事件名与载荷在当前代际与上一代一致，故同一实现覆盖两代。会话身份取自监听器第一个参数（该事件载荷本身无 `sessionId` 字段）。
+- 旧代 `apiProxy` 的 `session/queue` 分支保留（覆盖仍在旧代的部署）。
+
+### 明确报错与弃用通道
+
+- **`apiRpc` 不再把死端点伪装成内核故障**：既无 Remote 调用入口、又无旧代 `apiProxy` 服务时，直接返回明确错误而不是去请求自桌面 2.0.5 起已被浏览器访问门禁关闭的 `/api` HTTP 通道（那只会得到 403 死路，把「宿主能力缺失」误导成「内核故障」）。
+- **旧代 `apiProxy` 帧桥保留但标记弃用**：命中时打一次 warn 提示升级。保留理由：它不依赖网关**未文档化的私有方法** `dispatchRpc`，是结算通路失效时的降级出口。
+- **`dispatchRpc` 单点依赖显式化**：`$events/result` 结算只能经该私有方法（网关公开面只有 `wireStream` / `registerRemoteEvents` / `invoke` / `stream`）。`eventsCapable()` 增加其可调用性判定 → 缺失时 `checks.remoteEvents=false` 且瀑布按 `mobile` 语义工作（**不弹出无法应答的卡片**），启动日志给出告警。
+- `/m/api/respond` 兜底失败的文案改为带升级指引的明确说明。
+
+### 发送幂等与字段修正
+
+- **`session.prompt` 的 `requestId` 改为无条件铸造**：该字段是内核 strict schema 的**必填**项，缺失会被网关以 `gateway/input-invalid` **直接拒绝投递**，而不是「仅失去幂等保护」。适配器改用 `p.requestId ?? randomUUID()`，`promptImage` 显式传入。
+- **两层幂等并存并注释分层**：当前代际内核新增了按 `requestId` 的幂等短路（扫整条持久会话日志找同 `rpcId` 的 `user/message`），与插件自建发件回执层（`/m/api/send` + `/m/api/send-receipt`）职责不同、两层都保留——内核负责「同一请求不重复执行」，插件负责「传输层中断后回答是否已送达」（`Connection reset by peer` 后重试不重复即由此保证）。
+
+### 死代码清理
+
+- 删除 `session.history → session/control` 端点重命名与对应载荷适配器：`session.history` **从未被调用**（图像限额取 `session/control` 基线投影），且该映射语义可疑——`session.history` 在任何代际的 Remote 端点表里都不存在。**无行为变化**。
+
+### 文档更正（既有错误结论）
+
+- **`docs/02-architecture.md` §12b 与本文 v2.4.0 条目更正**：此前把「获取 `apiProxy` 必须用 `ctx.inject`」的原因记为「各插件上下文隔离，`ctx.get` 看不到兄弟插件注册的服务」。该结论**是误判**——同 realm 下 `ctx.get` 能读到兄弟插件的服务，上游官方插件指引也明确「可选服务用 `ctx.get(name)`，`ctx.<name>` 只留给已声明的注入」。真实原因是**激活时间点**：旧代 `ApiProxyService` 的依赖链比本插件的 `webServer` 更深，插件装配时它通常尚未 ACTIVE，严格 `ctx.get` 读到 `undefined`。改用 `ctx.inject` 之所以有效，是因为它把一次性读取换成了响应式依赖。
+- `docs/09-compatibility.md` §1 / §2.1 / §2.2 改写为单代口径，新增 §2.4「旧代际与弃用通道」与 §2.5「验收范围」；已知问题清单第 1 条由「apiProxy 私有协议」改为「结算依赖未文档化私有方法 `dispatchRpc`」。
+- 验收清单迁至 [Issue #11](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/11)（T01–T23 逐项验收，含新增的 T20 升级提示与能力上报、T21 结算通路缺失降级、T22 队列帧同步、T23 宿主范围判定）；过程文档（spec / 需求讨论 / ADR）一并迁至 Issue #7 / #10 / #9，仓库内不再保留。
+
+### 验收状态（如实标注）
+
+- **2026-09-17 已在真实 `0.1.5-rc.2 × Web CLI/Linux` 宿主执行验收**：`tools/acceptance-web-check.mjs` 无成功业务写入模式 36/36、受控写模式 82/82（无显式 model 建会话、归档/恢复/分叉/停止、发送幂等与回执、goal 状态迁移、反馈写入/清除、临时目录创建/可见/删除）；本轮运行 `tools/e2e-check.mjs` 实收发送→完整事件回流与限流 429；诊断实收 `host.version=0.1.5-rc.2`、`supported=true`、Remote invoke/event/cold-resume 三项能力就绪。Node 回归 42/42（含 T11 provider 配置保存/清除的隔离凭据契约）、宿主范围 24/24、路径 8/8、hotfix 14/14、图片魔数 6/6 均通过；Flutter 3.47.1 下 `flutter test` 24/24、`flutter analyze` 零问题。
+- **仍未完成的环境矩阵**：当前机器无 Android SDK、无 Android 设备，APK 构建与 T02/T19 真机交互无法执行；没有 DSH Desktop 宿主实例，`0.1.5-rc.2 × Desktop` 组合未执行；无低于下界的独立宿主，T20 低版本安装实测仅由自动化替身覆盖。真实宿主正在承载本会话，未做会中插件卸载/热重载；T11 真实用户凭据未被改动（保存/清除由隔离契约测试覆盖）；T15 当前部署 `pushChannels=0`，真实 ntfy wire 由隔离测试覆盖；T16 无活跃后台任务/子代理可供取消或中断。
+- 因此目前仍**不得对外宣称「完整兼容」**；已完成 Web/Linux 可执行项，剩余项保留明确环境阻塞，不以其他宿主或模块测试冒充真机/Desktop 证据。
+
 ## v3.1.3（2026-09-08，issue #9）— 审批/问询双端呈现（`approvalMode: both` 默认）+ 可配置策略
 
 - **现象**：v3.1.2 起（内核 0.1.2-rc.1 审批决策改为单条 Cordis 瀑布），answerer 以 `ctx.on("approval/request", …, { prepend: true, global: true })` 注册——手机在线（SSE `connections.size > 0`）即接管并挂起 promise（120s）且不调用 `next()` → 排在其后的内核"转发桌面 GUI"监听（`dsh-api-remotes` → `$events` 远程事件）不执行 → PC 端不弹卡。手机独占与桌面呈现互斥，桌面用户无法在 PC 审批，只能等手机答或 120s 后 fail-close `unavailable`（issue 报告含源码级技术分析）。
@@ -563,7 +615,8 @@ lanBridge:
 - 诊断探针：`services` 全量服务探测 + `respondBridge`/`frameBridge`/`pendingFrames`
 
 ### 修复
-- **问询/审批桥拿不到 apiProxy**：各插件上下文隔离，`ctx.get` 看不到兄弟插件服务 → 改用 `ctx.inject`（dsh-client-connection 同款）
+- **问询/审批桥拿不到 apiProxy**：~~各插件上下文隔离，`ctx.get` 看不到兄弟插件服务~~ → 改用 `ctx.inject`（dsh-client-connection 同款）
+  > **更正（2026-09，见 docs/02-architecture.md §12b）**：上述「上下文隔离」是当时的误判，**不是**本条修复的真实原因。同 realm 下 `ctx.get` 能读到兄弟插件的服务；真实原因是旧代 `ApiProxyService` 的依赖链比本插件的 `webServer` 更深，插件装配时它尚未 ACTIVE。改用 `ctx.inject` 之所以有效，是因为它把一次性读取换成了响应式依赖，而非它「能看见」而 `ctx.get` 看不见。本条记录保留原文以便对照，结论以 §12b 为准。
 - 手机点 ✕ 取消后卡片不消失（本地状态提前清空导致 resolved 帧被跳过）→ 即时收起 + 无条件转发
 - 聊天初始化竞态：SSE 事件与历史加载并发时不再丢失/回退 lastSeq
 - 历史页加载不再污染正在流式生成的草稿

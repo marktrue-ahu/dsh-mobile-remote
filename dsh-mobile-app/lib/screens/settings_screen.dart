@@ -412,34 +412,211 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (d == null) return L10n.t('检测失败', 'Check failed');
     final buf = StringBuffer();
     final runtime = d['runtime'] as Map<String, dynamic>? ?? {};
+    final form = runtime['form'];
+    final formText = form == 'desktop'
+        ? 'desktop · ${L10n.t('桌面版', 'DSH Desktop')}'
+        : form == 'cli'
+        ? 'cli · ${L10n.t('命令行/网页', 'CLI / Web')}'
+        : '${form ?? '?'}';
     buf.writeln(
-      '${L10n.t('运行形态: ', 'Mode: ')}${runtime['form']}${runtime['authEnabled'] == true ? L10n.t(' · 口令已启用', ' · auth on') : L10n.t(' · 口令未启用', ' · auth off')}',
+      '${L10n.t('运行形态: ', 'Mode: ')}$formText${runtime['authEnabled'] == true ? L10n.t(' · 口令已启用', ' · auth on') : L10n.t(' · 口令未启用', ' · auth off')}',
     );
     buf.writeln(
       '${L10n.t('监听: ', 'Listen: ')}${runtime['host']}:${runtime['port']}',
     );
     buf.writeln('${L10n.t('进程目录: ', 'CWD: ')}${runtime['cwd']}');
+    final metrics = runtime['metrics'] as Map<String, dynamic>?;
+    if (metrics != null && metrics.isNotEmpty) {
+      buf.writeln();
+      buf.writeln(L10n.t('实时指标:', 'Live metrics:'));
+      metrics.forEach((k, v) {
+        final n = _metricsName(k);
+        buf.writeln('  • $n（$k）= $v');
+      });
+    }
+    // 宿主代际与兼容状态（v3.1.3 / ADR 0001 = Issue #9）：版本号用于身份识别，
+    // 能力结果用于行为判断——两者不可互相替代，故分行展示。
+    final host = d['host'] as Map<String, dynamic>?;
+    if (host != null && host.isNotEmpty) {
+      buf.writeln();
+      buf.writeln(L10n.t('电脑端 DSH:', 'Host DSH:'));
+      final v = host['version'];
+      final supported = host['supported'];
+      final verText = v == null ? L10n.t('版本未知', 'version unknown') : '$v';
+      final range = host['supportedRange'] ?? '';
+      // supported 为 null 表示版本号无法解析（未知）——不谎报为不支持。
+      final stateText = supported == true
+          ? L10n.t('✅ 受支持', '✅ supported')
+          : supported == false
+          ? L10n.t('⚠ 不在受支持范围', '⚠ outside supported range')
+          : L10n.t('ℹ 版本未知', 'ℹ unknown');
+      buf.writeln(
+        '  $stateText：$verText${range == '' ? '' : L10n.t('（受支持 $range）', ' (supported $range)')}',
+      );
+      final caps = host['capabilities'] as Map<String, dynamic>? ?? {};
+      caps.forEach((k, val) {
+        final n = _hostCapabilityName(k);
+        // 旧代交互通道存在是「宿主未升级」的信号，不是能力就绪——用 ℹ 而非 ✅。
+        final mark = val == true
+            ? (k == 'hasLegacyInteractionBridge' ? 'ℹ' : '✅')
+            : '❌';
+        buf.writeln(
+          '  $mark $n（$k）${k == 'hasLegacyInteractionBridge' && val == true ? L10n.t(' · 旧代宿主，建议升级', ' · legacy host, upgrade advised') : ''}',
+        );
+      });
+    }
     buf.writeln();
     final services = d['services'] as Map<String, dynamic>? ?? {};
     buf.writeln(L10n.t('服务:', 'Services:'));
-    services.forEach((k, v) => buf.writeln('  ${v == true ? '✅' : '❌'} $k'));
+    services.forEach((k, v) {
+      final n = _diagName('services', k);
+      buf.writeln('  ${v == true ? '✅' : '❌'} ${k == n ? n : '$n ($k)'}');
+    });
     buf.writeln();
     final checks = d['checks'] as Map<String, dynamic>? ?? {};
     buf.writeln(L10n.t('端点实测:', 'Endpoint checks:'));
     checks.forEach((k, v) {
-      if (v is num) {
+      final n = _diagName('checks', k);
+      final shown = k == n ? n : '$n ($k)';
+      if (k == 'approvalMode') {
+        final m = v == 'both'
+            ? L10n.t('both · 双端同卡，先答生效', 'both · both ends, first answer wins')
+            : v == 'mobile'
+            ? L10n.t('mobile · 手机在线独占', 'mobile · phone-exclusive while online')
+            : v == 'desktop'
+            ? L10n.t('desktop · 仅桌面 GUI', 'desktop · desktop GUI only')
+            : '${v ?? '?'}';
+        buf.writeln('  ℹ $shown：$m');
+      } else if (v == true) {
+        buf.writeln('  ✅ $shown');
+      } else if (v == false) {
+        buf.writeln('  ❌ $shown');
+      } else if (v is num) {
         // 计数字段（如 pendingFrames 挂起待答数）：0 正常，>0 表示有问询/审批待处理
-        buf.writeln('  ${v == 0 ? '✅' : '⚠'} $k = $v');
+        buf.writeln(
+          '  ${v == 0 ? '✅' : '⚠'} $shown = $v${v == 0 ? '' : L10n.t('（有审批/问询待处理）', ' (approval/question pending)')}',
+        );
       } else {
-        buf.writeln('  ${v == true ? '✅' : '❌'} $k');
+        buf.writeln('  ℹ $shown = $v');
       }
     });
+    final notes = d['notes'] as List? ?? [];
+    if (notes.isNotEmpty) {
+      buf.writeln();
+      buf.writeln(L10n.t('备注:', 'Notes:'));
+      for (final n in notes) {
+        buf.writeln('  • $n');
+      }
+    }
     final plugin = d['plugin'] as Map<String, dynamic>? ?? {};
     buf.writeln();
     buf.writeln(
       '${L10n.t('插件: ', 'Plugin: ')}${plugin['name']} v${plugin['version']}',
     );
     return buf.toString();
+  }
+
+  /// 宿主能力项中文名（v3.1.3 诊断 host.capabilities，ADR 0001 = Issue #9）。未知 key 原样返回。
+  String _hostCapabilityName(String key) {
+    switch (key) {
+      case 'hasRemoteInvoke':
+        return L10n.t('Remote 调用入口', 'Remote invoke');
+      case 'hasRemoteEventBridge':
+        return L10n.t('Remote 事件桥', 'Remote event bridge');
+      case 'hasColdSessionResume':
+        return L10n.t('冷会话恢复', 'Cold session resume');
+      case 'hasLegacyInteractionBridge':
+        return L10n.t('旧代交互通道', 'Legacy interaction bridge');
+      default:
+        return key;
+    }
+  }
+
+  /// 实时指标中文名（v3.1.3 runtime.metrics）。未知 key 原样返回。
+  String _metricsName(String key) {
+    switch (key) {
+      case 'mobileOnline':
+        return L10n.t('手机在线连接', 'Phone connections');
+      case 'agents':
+        return L10n.t('运行中 Agent', 'Live agents');
+      case 'sessions':
+        return L10n.t('会话数', 'Sessions');
+      case 'workspaces':
+        return L10n.t('工作区数', 'Workspaces');
+      case 'pushChannels':
+        return L10n.t('推送通道', 'Push channels');
+      default:
+        return key;
+    }
+  }
+
+  /// 服务/实测项中文名（环境诊断可读化，v3.1.3+）。未知 key 原样返回。
+  /// 渲染时保留英文 key 便于复制粘贴排障（issue/日志对照）。
+  String _diagName(String section, String key) {
+    switch (section) {
+      case 'services':
+        switch (key) {
+          case 'webServer':
+            return L10n.t('网页服务', 'Web server');
+          case 'agents':
+            return L10n.t('Agent 服务', 'Agents');
+          case 'sessions':
+            return L10n.t('会话服务', 'Sessions');
+          case 'llm':
+            return L10n.t('模型服务', 'LLM');
+          case 'permissionPresets':
+            return L10n.t('权限预设', 'Permission presets');
+          case 'agentPresets':
+            return L10n.t('Agent 预设', 'Agent presets');
+          case 'workspaceRegistry':
+            return L10n.t('工作区服务', 'Workspaces');
+          case 'approval':
+            return L10n.t('审批服务', 'Approval');
+          case 'credentials':
+            return L10n.t('凭据服务', 'Credentials');
+          case 'messageFeedback':
+            return L10n.t('消息反馈', 'Message feedback');
+          case 'userQuestions':
+            return L10n.t('问询服务', 'Questions');
+          case 'apiProxy':
+            return L10n.t(
+              '旧帧桥 apiProxy（0.1.1 内核）',
+              'Legacy apiProxy (0.1.1 kernel)',
+            );
+          default:
+            return key;
+        }
+      default:
+        switch (key) {
+          case 'modelsRpc':
+            return L10n.t('模型目录 RPC', 'Model catalog RPC');
+          case 'sessionsList':
+            return L10n.t('会话列表', 'Session list');
+          case 'directories':
+            return L10n.t('目录浏览', 'Directory browse');
+          case 'workspaces':
+            return L10n.t('工作区列表', 'Workspace list');
+          case 'notifications':
+            return L10n.t('通知中心', 'Notifications');
+          case 'actions':
+            return L10n.t('动作区', 'Actions');
+          case 'approvalMode':
+            return L10n.t('审批策略', 'Approval mode');
+          case 'remoteEvents':
+            return L10n.t('双端审批通道', 'Dual-end channel');
+          case 'respondBridge':
+            return L10n.t('旧帧桥应答（0.1.1 内核）', 'Legacy respond (0.1.1 kernel)');
+          case 'frameBridge':
+            return L10n.t(
+              '旧帧桥循环（0.1.1 内核）',
+              'Legacy frame loop (0.1.1 kernel)',
+            );
+          case 'pendingFrames':
+            return L10n.t('挂起待答', 'Pending frames');
+          default:
+            return key;
+        }
+    }
   }
 
   Widget _card(String title, List<Widget> children) {

@@ -43,7 +43,7 @@
 | GET | `/m/api/usage` | 会话 token 用量 | 是 |
 | GET | `/m/api/workspaces` | 已注册工作区 | 是 |
 | GET/POST | `/m/api/directories` | 目录浏览/新建文件夹 | 是 |
-| GET | `/m/api/diagnostics` | 环境诊断 | 是 |
+| GET | `/m/api/diagnostics` | 环境诊断（服务端端点实测 + `host` 宿主代际节） | 是 |
 | GET | `/m/api/git/capabilities` | Git provider 能力声明 | 是 |
 | GET | `/m/api/git/context` | 解析会话/工作区对应仓库 | 是 |
 | GET | `/m/api/git/status` | 工作区状态（只读） | 是 |
@@ -727,3 +727,29 @@ fetch/push 序列化 common domain，pull/sync/abort 同时序列化 common 与 
 - 目标目录：`sessionId` 对应 agent 的工作目录 → 缺省回退第一个注册工作区根；无法确定 → `404 workspace-not-found`（不再静默写入其它 workspace）
 - 服务端先打开并校验目录句柄，再通过 descriptor-relative + `O_CREAT|O_EXCL|O_NOFOLLOW` 创建目标，目录替换/符号链接竞态不会越界；当前平台不具备 descriptor fs 时 fail-closed → `503 files-unavailable`
 - `name` 不合法（含 `\ / : * ? " < > |`、`.`/`..`/超 255）→ `400 invalid-name`；同名已存在 → `409 file-exists`；body 上限 64MB → `413 payload-too-large`
+
+### 6.18 宿主代际诊断（`host` 节，[ADR 0001 = Issue #9](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/9)）
+
+**GET `/m/api/diagnostics`** 的 `host` 节回答「电脑端 DSH 是什么版本、是否受支持、四项能力是否就绪」——版本号用于身份识别，能力结果用于行为判断，两者不可互相替代：
+
+```jsonc
+{
+  "host": {
+    "version": "0.1.5-rc.2",              // 宿主 DSH 版本号；读不到为 null（不参与门控）
+    "supported": true,                     // 是否落在受支持范围；null = 版本号无法解析（未知）
+    "supportedRange": ">=0.1.5-rc.2 <0.2.0",
+    "capabilities": {
+      "hasRemoteInvoke": true,             // Remote 调用入口（invokeRpc/invoke）
+      "hasRemoteEventBridge": true,        // Remote 事件桥（openWireStream）
+      "hasColdSessionResume": true,        // 冷会话恢复（sessionController.prompt）
+      "hasLegacyInteractionBridge": false  // 旧代交互通道（apiProxy）；true 即宿主未升级
+    }
+  },
+  "notes": ["…", "host: DSH 0.1.5-rc.2（受支持范围 >=0.1.5-rc.2 <0.2.0），三项能力均就绪"]
+}
+```
+
+- **版本号只用于展示与升级提示，不参与功能门控**；范围外宿主插件仍加载，能力缺失由功能级错误承担（见下）。版本号由插件沿 node 解析链读宿主包清单获得，读不到时 `supported` 为 `null`（未知），不谎报为不支持。
+- **能力缺失的报错契约**：任一能力缺失时，受影响路由返回 `503` + `error: "host-capability-unavailable"`，`detail` 含缺失能力名与升级指引。**不再回退到 `/api` HTTP 通道**——该通道自桌面 2.0.5 起被浏览器访问门禁关闭，试它只会得到 403 死路。
+- **`hasLegacyInteractionBridge` 为 `true` 不是「能力就绪」**：它表示宿主仍是旧代（问询/审批走旧 `apiProxy` 帧桥），功能可用但已不受支持；插件启动时打一次 warn 提示升级。
+- `checks.remoteEvents` 在此基础上额外要求结算通路（网关未文档化的私有方法 `dispatchRpc`）可调用；`false` 时问询/审批按 `mobile` 语义工作（手机在线独占应答），不弹出无法应答的卡片。

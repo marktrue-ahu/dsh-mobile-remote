@@ -215,7 +215,7 @@ sequenceDiagram
     P-->>M: SSE `mobile/frame`（收起卡片，两端同步消失）
 ```
 
-- **获取服务必须用 `ctx.inject(["apiProxy"])`**：各插件上下文隔离，`ctx.get` 看不到兄弟插件注册的服务（dsh-client-connection 同款用法）。
+- **获取服务必须用 `ctx.inject(["apiProxy"])`**：原因**不是**上下文隔离——同 realm 下 `ctx.get` 能读到兄弟插件注册的服务，官方指引也明确「可选服务用 `ctx.get(name)`，`ctx.<name>` 只留给已声明的注入」。真实原因是**激活时间点**：旧代 `ApiProxyService` 的依赖链比本插件的 `webServer` 更深，插件装配时它往往尚未 ACTIVE，严格 `ctx.get` 读到 `undefined`。因此同步探测用 `ctx.get`（包 try/catch），而要真正调用或订阅的能力一律走 `ctx.inject`——它是响应式依赖，服务迟到或卸载后重载都会自动重跑。（历史记录见 CHANGELOG v2.4.0 条目。）
 - 只转发 question/approval/session-queue 瞬态帧；`session/event` 仍走 `ctx.on` 桥避免重复。
 - **私有协议风险**：`events.mux` / `respond` 消息格式无稳定版本承诺；缺失时干净降级（`/m/api/respond` 返回 503、诊断 `respondBridge=false`），详见 docs/09-compatibility.md。
 - 断线补发：App 重连 SSE 时插件回放 `pendingFrames`；从「需要你回答」通知进入会话即见挂起弹窗。
