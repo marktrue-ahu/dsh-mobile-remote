@@ -307,7 +307,41 @@ flutter build apk --release
 - 插件/网页端改动 → 按 §3 同步并重启 DSH。
 - App 改动 → 重新 `flutter build apk --release` 并重装（同签名覆盖安装，保留连接信息）。
 
-### 8.5 App 自动更新（双更新源，v3.0.0+）
+### 8.5 测试构建与重复自动更新验证
+
+测试构建的目标是：APK 内置版本保持不变，主机源 `manifest.json` 使用更大的测试 build 号（通常为 `+99`），这样每次打开「检查更新」都能再次触发更新流程。
+
+1. 不修改 `dsh-mobile-app/pubspec.yaml`，也不要给 Flutter 构建命令传入新的 `--build-number`：
+
+   ```bash
+   cd dsh-mobile-app
+   flutter analyze
+   flutter test
+   flutter build apk --release
+   ```
+
+2. 使用 manifest 覆盖变量打包并部署。`MANIFEST_VERSION` 只写入 manifest，不会改变 APK 内置的 `versionName/versionCode`：
+
+   ```bash
+   UPDATE_DIR="$HOME/.dsh/mobile-remote/update" \
+   MANIFEST_VERSION="3.1.4+99" \
+   bash tools/package-release.sh
+   ```
+
+   Windows PowerShell：
+
+   ```powershell
+   $env:MANIFEST_VERSION = '3.1.4+99'
+   $env:UPDATE_DIR = "$HOME/.dsh/mobile-remote/update"
+   .\tools\package-release.ps1
+   Remove-Item Env:MANIFEST_VERSION, Env:UPDATE_DIR
+   ```
+
+3. 验证 `manifest.json` 的 `version` 为 `3.1.4+99`，并确认 `sha256`、`size` 与 manifest 指向的 APK 一致；随后在 App 中检查更新并完成覆盖安装。
+
+> `+99` 仅用于测试，不得用于正式发布。测试完成后清空 `updateDir` 或重新部署正式 manifest，避免用户持续收到测试更新。APK 与已安装版本必须使用同一签名。
+
+### 8.6 App 自动更新（双更新源，v3.0.0+）
 
 > 入口：设置 → 关于 → 「更新源」（GitHub Releases / dsh 运行主机，单选持久化，默认 GitHub）+「检查更新」；自动检查在启动连接成功后静默执行一次，命中后首页横幅 + 版本行「● 有新版本」提示。更新流程：确认弹窗（版本/说明/大小/来源）→ 下载（进度可取消）→ 主机源 sha256 校验 → **签名预检**（与已装版本签名不一致即取消并提示）→ 系统安装器。
 

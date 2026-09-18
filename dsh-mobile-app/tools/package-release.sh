@@ -47,9 +47,11 @@ echo "Archived: $tgz_out ($(du -h "$tgz_out" | cut -f1))"
 
 # 3) manifest.json（共享生成器：合法 JSON / 无 BOM / notes=CHANGELOG 最新条目全文 / sha256+size）
 manifest="$dist/manifest.json"
+# 测试构建可用 MANIFEST_VERSION=3.1.4+99 覆盖 manifest 版本；不修改 APK 内置版本。
+manifest_ver="${MANIFEST_VERSION:-$full_ver}"
 node "$app_dir/tools/gen-manifest.js" \
     --apk "$apk_out" \
-    --version "$full_ver" \
+    --version "$manifest_ver" \
     --changelog "$repo_dir/CHANGELOG.md" \
     --out "$manifest"
 

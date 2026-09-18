@@ -48,7 +48,9 @@ if (Test-Path $packed) {
 # 3) manifest.json（共享生成器 gen-manifest.js：合法 JSON / 无 BOM / notes=CHANGELOG 最新条目全文 / sha256+size）
 # 与 package-release.sh 完全同一生成器，保证双端产出等价。
 $manifest = Join-Path $dist 'manifest.json'
-node (Join-Path $PSScriptRoot 'gen-manifest.js') --apk $apkOut --version $fullVer --changelog (Join-Path $repoDir 'CHANGELOG.md') --out $manifest
+# 测试构建可用 $env:MANIFEST_VERSION='3.1.4+99' 覆盖 manifest 版本；不修改 APK 内置版本。
+$manifestVer = if ($env:MANIFEST_VERSION) { $env:MANIFEST_VERSION } else { $fullVer }
+node (Join-Path $PSScriptRoot 'gen-manifest.js') --apk $apkOut --version $manifestVer --changelog (Join-Path $repoDir 'CHANGELOG.md') --out $manifest
 if ($LASTEXITCODE -ne 0) { Write-Error "gen-manifest.js failed with exit code $LASTEXITCODE"; exit 1 }
 
 # 4) 可选：拷入插件 updateDir（应用「主机源」更新通道）

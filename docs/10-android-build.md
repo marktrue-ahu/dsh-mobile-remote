@@ -76,6 +76,33 @@ dsh-mobile-app/build/app/outputs/apk/release/app-release.apk
 
 直接 Gradle 构建适合排查具体 Android 任务；日常发布仍建议使用 Flutter CLI。
 
+## 3.1 测试构建：APK 版本不变，manifest 使用 `+99`
+
+需要反复验证主机源自动更新时，保持 `pubspec.yaml` 和 APK 内置版本不变，只覆盖 manifest 的版本号。例如当前 APK 为 `3.1.4+21`，测试 manifest 使用 `3.1.4+99`。
+
+```bash
+cd dsh-mobile-app
+flutter analyze
+flutter test
+flutter build apk --release
+
+# MANIFEST_VERSION 只影响 manifest.json，不会修改 APK 的 versionName/versionCode
+MANIFEST_VERSION="3.1.4+99" \\
+UPDATE_DIR="$HOME/.dsh/mobile-remote/update" \\
+bash tools/package-release.sh
+```
+
+Windows PowerShell：
+
+```powershell
+$env:MANIFEST_VERSION = '3.1.4+99'
+$env:UPDATE_DIR = "$HOME/.dsh/mobile-remote/update"
+.\tools\package-release.ps1
+Remove-Item Env:MANIFEST_VERSION, Env:UPDATE_DIR
+```
+
+验收：检查 `updateDir/manifest.json` 的 `version` 为 `3.1.4+99`，并校验其中的 `sha256`、`size` 与 APK 一致；更新完成后可再次执行同一流程重复测试。`+99` 只用于测试，正式发布前应清理测试 manifest 并恢复正式版本。
+
 ## 4. Google 下载必须走本地代理
 
 首次构建会从 Google Storage 下载 Flutter Android 引擎和其他依赖。当前环境使用 HTTP 代理：
