@@ -52,6 +52,13 @@ String draftAfterFailure(String current, String fallback) =>
 String composerSignature(String sessionId, String mode, String text, List<String> imagePaths) =>
     '$sessionId|$mode|$text|${imagePaths.join(',')}';
 
+/// v3.1.4（issue #13 排查建议 3）：轮次结束时是否需要**兜底补拉**——
+/// 本轮出现过真人提问（lastUserSeq 非空），但没有渲染出更晚的回复条目
+/// （lastAssistantSeq 为空或早于提问）→ 判定内容被静默吞掉，补拉一次历史。
+/// 纯函数便于单测：见 test/issue13_logic_test.dart。
+bool needsTurnEndResync({int? lastUserSeq, int? lastAssistantSeq}) =>
+    lastUserSeq != null && (lastAssistantSeq == null || lastAssistantSeq <= lastUserSeq);
+
 /// Phase 2(A4)：统一「打开会话页」流程——切换会话 + 刷新会话配置 + 推入 ChatScreen。
 /// 返回后执行 [onReturn]（各调用点差异：刷新列表 / 恢复原会话）。
 Future<void> openChat(BuildContext context, AppStore store, String sessionId,
@@ -90,11 +97,20 @@ class _ChatScreenState extends State<ChatScreen> {
   String _draft = '';
   bool _streaming = false;
   int _lastSeq = 0;
+  // v3.1.4（issue #13）：轮次兜底同步——最近一条已渲染的真人提问 / 回复的 seq，
+  // 用于判断"本轮有提问却没有回复条目"（内容被静默吞掉）时补拉一次历史。
+  int? _lastUserSeq;
+  int? _lastAssistantSeq;
+  DateTime? _lastResyncAt; // 兜底补拉节流（10s）
   // v2.7.2 review(M1)：本页绑定的会话（initState 时捕获）——事件按它过滤，叠层页面互不污染
   String? _mySessionId;
   // v2.7.2：排队消息停靠区（对齐 PC 端 Queue Dock）——可见、自解释，无需操作手册
   List<Map<String, dynamic>> _queue = [];
   bool _queueCollapsed = true; // 多条时折叠成计数头
+  // v3.1.4（issue #12 姊妹需求）：会话任务清单（内核 dsh-tool-todo 投影同源）——
+  // todo/write 整份覆盖、turn/start 清空；面板默认折叠成一行计数（对齐 PC 端任务面板）
+  List<Map<String, dynamic>> _todos = [];
+  bool _todosCollapsed = true;
   String? _editingQueueId;
   final _queueEditCtrl = TextEditingController();
   Timer? _queueRefreshTimer;
@@ -287,13 +303,16 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
-  Future<void> _load() async {
+  /// [reset] = true：按**当前会话表面**重建（`/compact` 改写了表面、或轮次兜底补拉）——
+  /// 丢弃现有条目并从历史重建，`_lastSeq` 以历史末条为准。默认 false：打开会话时带并发保护
+  /// （保留历史请求期间 SSE 已入列的新条目）。
+  Future<void> _load({bool reset = false}) async {
     final id = widget.store.sessionId;
     if (id == null) return;
-    AppLog.instance.log('Chat: 打开会话 $id');
+    AppLog.instance.log(reset ? 'Chat: 重同步会话（按新表面重载）$id' : 'Chat: 打开会话 $id');
     try {
       final events = await api.history(id, limit: _liveMax);
-      AppLog.instance.log('Chat: 历史加载成功 ${events.length} 条');
+      AppLog.instance.log('Chat: 历史加载成功 ${events.length} 条${reset ? '（重同步）' : ''}');
       if (!mounted) return;
       setState(() {
         // 并发保护：历史请求期间 SSE 可能已把更新的事件入列（位于 _items 头部）。
@@ -302,6 +321,7 @@ class _ChatScreenState extends State<ChatScreen> {
         final keep = <_MsgItem>[];
         if (fetchedLast > 0) {
           for (final m in _items) {
+            if (reset) break; // 重同步：不保留任何旧条目（表面已被重写）
             if (m.seq != null && m.seq! > fetchedLast) {
               keep.add(m);
             } else if (m.seq == null && m.kind == _MsgKind.user) {
@@ -324,14 +344,43 @@ class _ChatScreenState extends State<ChatScreen> {
         _reasoningExpanded = false;
         _draft = '';
         _streaming = false;
+        // v3.1.4（issue #12 姊妹需求）：任务清单按**时间正序**折叠一次（最新覆盖、turn/start 清空），
+        // 与内核投影一致——历史事件在下面按倒序入列渲染，顺序敏感的状态必须单独折叠。
+        var foldedTodos = <Map<String, dynamic>>[];
+        for (final ev in events) {
+          if (ev.type == 'turn/start') {
+            foldedTodos = [];
+          } else if (ev.type == 'todo/write') {
+            foldedTodos = ((ev.data?['todos'] as List?) ?? const []).whereType<Map<String, dynamic>>().toList();
+          }
+        }
+        _todos = foldedTodos;
         // 最新在前（渲染时倒序，最新位于列表底部）
         for (final ev in events.reversed) {
           if (ev.seq != null && ev.seq! > fetchedLast) continue; // 已在 keep 中
           _appendEvent(ev, history: true, tail: true);
         }
+        // v3.1.4（issue #13）：跟踪字段按**时间正序**重算——历史是倒序入列的，
+        // 沿用循环里的赋值会得到"最旧一条"，导致轮次兜底误判。
+        // 条件与渲染保持一致：真人 user 消息（含旧内核无 sourceKind 的）+ 非空文本的回复。
+        for (final ev in events) {
+          if (ev.seq == null) continue;
+          if (ev.type == 'user/message') {
+            final kind = ev.data?['sourceKind'] as String?;
+            if (kind == null || kind == 'user') _lastUserSeq = ev.seq;
+          } else if (ev.type == 'assistant/message' && ((ev.data?['text'] as String?) ?? '').trim().isNotEmpty) {
+            _lastAssistantSeq = ev.seq;
+          }
+        }
         _items.insertAll(0, keep); // SSE 期间的新事件放回头部
         if (events.isNotEmpty) {
           _earliestSeq = events.first.seq ?? 0;
+          // v3.1.4：重同步后按新表面重建条目；_lastSeq 仍取"已处理过的最大 seq"
+          // （只增不减——下调会让后续 catchup 重复补拉已渲染的事件）
+          if (reset) {
+            _lastUserSeq = null;
+            _lastAssistantSeq = null;
+          }
           if (fetchedLast > _lastSeq) _lastSeq = fetchedLast;
         }
         if (keep.isNotEmpty) {
@@ -341,6 +390,9 @@ class _ChatScreenState extends State<ChatScreen> {
       });
       // v2.7.2 review：队列同步移到 setState 之外（避免误导为嵌套 setState）
       _refreshQueue();
+      // v3.1.4：任务清单权威读法（内核投影同源）——历史折叠只在最近窗口内有效，
+      // 这里再对一次，保证打开会话即看到当前清单（休眠/旧内核返回 null 则保持历史折叠结果）
+      _refreshTodos();
       AppLog.instance.log('Chat: 已入列 ${_items.length} 条（历史 ${events.length} 条）lastSeq=$_lastSeq firstSeq=$_earliestSeq');
       _scrollToBottom(force: true); // 初始定位到最新消息
       _refreshUsage();
@@ -390,6 +442,12 @@ class _ChatScreenState extends State<ChatScreen> {
   /// v2.8.0：live 视图统一普通（非 reverse）列表，视觉顶部是 pixels≈0。
   bool _onLiveScroll(ScrollNotification n) {
     if (!_infiniteMode || !n.metrics.hasContentDimensions) return false;
+    // v3.1.4（issue #14）：忽略**嵌套滚动**与横向滚动——代码块/表格内部的横向
+    // SingleChildScrollView 会向上冒泡出 pixels=0 的通知，此前被误判成"滚到视觉顶部"
+    // → 每次横滑都触发加载更早、列表跳回该轮上方。
+    // ScrollNotification.depth：外层列表自身为 0，嵌套滚动冒泡上来时 > 0。
+    if (n.depth != 0) return false;
+    if (n.metrics.axis != Axis.vertical) return false;
     if (n.metrics.pixels < 80) {
       _loadMoreInfinite();
     }
@@ -627,6 +685,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (ev.sessionId != null && ev.sessionId != _mySessionId) return;
     if (ev.type == '_catchup') {
       _catchup();
+      _refreshTodos(); // v3.1.4：重连/唤醒后任务清单也对齐一次
       return;
     }
     if (ev.type == 'agent/status') {
@@ -672,6 +731,18 @@ class _ChatScreenState extends State<ChatScreen> {
       if (mounted) setState(() {});
       return;
     }
+    // v3.1.4（issue #12 姊妹需求）：任务清单实时折叠——与内核 dsh-tool-todo 的会话投影
+    // 完全同语义（最新 todo/write 覆盖整份、turn/start 清空）。
+    // 这里是实时 SSE 路径；历史/回放由 _loadInitial 按**时间正序**折叠后再存状态
+    // （历史事件是倒序入列的，顺序折叠会得到旧状态）。
+    if (ev.type == 'todo/write') {
+      _todos = ((ev.data?['todos'] as List?) ?? const []).whereType<Map<String, dynamic>>().toList();
+      if (mounted) setState(() {});
+      return; // 不产生消息气泡
+    }
+    if (ev.type == 'turn/start') {
+      _todos = []; // 新一轮开始清空清单（继续走下方渲染，保留"轮次 N 开始"分隔条）
+    }
     // v3.0.0：队列快照帧（认领/删除/编辑即时反映）→ 本页 dock 即时同步
     if (ev.type == 'mobile/queue') {
       final sid = ev.data?['sessionId'] as String?;
@@ -690,6 +761,12 @@ class _ChatScreenState extends State<ChatScreen> {
     if (ev.seq != null) {
       if (ev.seq! <= _lastSeq) return;
       _lastSeq = ev.seq!;
+    }
+    // v3.1.4（issue #13）：/compact 走 surfaceOp=replace 重写会话表面——
+    // 收到 compression 结束事件即按新表面重载一次，避免手机继续显示已被 shadow 的旧消息。
+    if (ev.type == 'compaction/end') {
+      _resyncAfterCompaction();
+      return;
     }
     if (ev.type == 'assistant/chunk') {
       final text = ev.data?['text'] as String? ?? '';
@@ -741,7 +818,42 @@ class _ChatScreenState extends State<ChatScreen> {
     if (_inHistory) _pendingNew = true;
     // v2.7.2：事件驱动队列刷新（认领类事件前置立即刷新，其余节流）
     _onQueueAffectingEvent(ev.type);
+    // v3.1.4（issue #13 排查建议 3）：轮次结束但本轮渲染不出任何回复条目 → 兜底补拉一次。
+    // 触发场景：事件被任何一层（过滤/竞态/脏 seq）静默吞掉时，避免"只剩一条轮次结束分隔条"。
+    if (ev.type == 'turn/end') _maybeResyncAfterTurn();
     _scrollToBottom();
+  }
+
+  /// v3.1.4（issue #13）：会话表面被内核重写（`/compact` 的 surfaceOp=replace）后，
+  /// 按**新表面**重载一次——否则手机继续显示已被 shadow 的旧消息，与桌面端视图分叉。
+  void _resyncAfterCompaction() {
+    AppLog.instance.log('Chat: 压缩完成 → 按新表面重载会话（对齐桌面端视图）');
+    _load(reset: true);
+  }
+
+  /// v3.1.4（issue #13 排查建议 3）：本轮出现过真人提问、但没有渲染出更晚的回复条目
+  /// → 说明有内容被静默吞掉，补拉一次历史（10s 节流，避免抖动时反复拉取）。
+  void _maybeResyncAfterTurn() {
+    if (!needsTurnEndResync(lastUserSeq: _lastUserSeq, lastAssistantSeq: _lastAssistantSeq)) return;
+    final now = DateTime.now();
+    if (_lastResyncAt != null && now.difference(_lastResyncAt!) < const Duration(seconds: 10)) return;
+    _lastResyncAt = now;
+    AppLog.instance.log('Chat: 轮次结束但无回复条目（lastUser=$_lastUserSeq lastAssistant=$_lastAssistantSeq）→ 兜底补拉');
+    _load(reset: true);
+  }
+
+  /// v3.1.4（issue #12 姊妹需求）：任务清单权威补拉（内核 todo 投影）——
+  /// SSE 的 `todo/write` 帧负责实时，本方法负责"打开会话/断线重连后对齐一次"。
+  Future<void> _refreshTodos() async {
+    final id = _mySessionId ?? widget.store.sessionId;
+    if (id == null) return;
+    try {
+      final list = await api.todos(id);
+      if (!mounted || list == null) return; // null = 未激活/旧内核：保持历史折叠结果
+      setState(() => _todos = list);
+    } catch (e) {
+      AppLog.instance.log('Chat: 任务清单拉取失败 $id → $e');
+    }
   }
 
   Future<void> _catchup() async {
@@ -755,6 +867,13 @@ class _ChatScreenState extends State<ChatScreen> {
         for (final ev in events) {
           if (ev.seq != null && ev.seq! <= _lastSeq) continue;
           if (ev.seq != null) _lastSeq = ev.seq!;
+          // v3.1.4：任务清单随补拉前进（正序：todo/write 覆盖、turn/start 清空）——
+          // 补拉走 _appendEvent 而非 _handleEvent，这里必须同步折叠，否则重连后清单是旧的。
+          if (ev.type == 'turn/start') {
+            _todos = [];
+          } else if (ev.type == 'todo/write') {
+            _todos = ((ev.data?['todos'] as List?) ?? const []).whereType<Map<String, dynamic>>().toList();
+          }
           _appendEvent(ev);
         }
       });
@@ -915,6 +1034,34 @@ class _ChatScreenState extends State<ChatScreen> {
   /// v2.7.2 review：只显示可操作的 queued 行（对齐 PC 端 QueueDock 的
   /// `placement === "queued"` 过滤）——steering 行是"插话中"消息、即将执行，
   /// 显示并允许操作会误导（删除大概率来不及，插话按钮也被隐藏）。
+  /// v3.1.4（issue #12 姊妹需求）：任务清单面板（对齐 PC 端「任务」面板）——
+  /// 折叠态只占一行计数（如「1 进行中 · 6 待处理」），点按展开完整清单。
+  /// 数据与内核 `dsh-tool-todo` 的会话投影同源（`todo/write` 整份覆盖、`turn/start` 清空）。
+  Widget _buildTodoPanel() {
+    if (_todos.isEmpty) return const SizedBox.shrink();
+    var inProgress = 0;
+    var pending = 0;
+    var completed = 0;
+    for (final todo in _todos) {
+      switch (todo['status']) {
+        case 'in_progress':
+          inProgress++;
+        case 'completed':
+          completed++;
+        default:
+          pending++;
+      }
+    }
+    return _TodoPanel(
+      todos: _todos,
+      collapsed: _todosCollapsed,
+      inProgress: inProgress,
+      pending: pending,
+      completed: completed,
+      onToggle: () => setState(() => _todosCollapsed = !_todosCollapsed),
+    );
+  }
+
   Widget _buildQueueDock() {
     // v2.7.2：只显示可操作的 queued 行（对齐 PC 端 QueueDock）；
     // steering/context（插话中/上下文注入）不可操作,不显示
@@ -1097,6 +1244,14 @@ class _ChatScreenState extends State<ChatScreen> {
           return;
         }
         final mid = d?['messageId'] as String?;
+        // v3.1.4（issue #12）：内核来源标记——非 "user" 即系统注入（plugin/agent-instructions/tool…），
+        // 渲染成可折叠块；缺字段（旧内核）时为 null，退回关键词启发式。
+        final sourceKind = d?['sourceKind'] as String?;
+        // v3.1.4（issue #13）：只有**真人提问**参与"本轮是否缺回复"的兜底判定
+        // （注入消息不是提问，不该因它触发补拉）
+        if (sourceKind == null || sourceKind == 'user') {
+          if (ev.seq != null) _lastUserSeq = ev.seq;
+        }
         // 去重（SSE 回显 vs 本地乐观添加）：
         // 1) 已有同 messageId 的消息 → 直接跳过（回显已完成渲染，同文本连发也不误并）
         if (mid != null && out.any((m) => m.kind == _MsgKind.user && m.messageId == mid)) return;
@@ -1116,9 +1271,9 @@ class _ChatScreenState extends State<ChatScreen> {
           }
         }
         if (history) {
-          out.add(_MsgItem.user(text, seq: ev.seq, messageId: mid, images: _imagesOf(d)));
+          out.add(_MsgItem.user(text, seq: ev.seq, messageId: mid, images: _imagesOf(d), sourceKind: sourceKind));
         } else {
-          out.insert(0, _MsgItem.user(text, seq: ev.seq, messageId: mid, images: _imagesOf(d)));
+          out.insert(0, _MsgItem.user(text, seq: ev.seq, messageId: mid, images: _imagesOf(d), sourceKind: sourceKind));
         }
       case 'assistant/message':
         var body = d?['text'] as String? ?? '';
@@ -1151,6 +1306,8 @@ class _ChatScreenState extends State<ChatScreen> {
             messageId: d?['messageId'] as String?,
             images: _imagesOf(d),
             reasoning: reasoningText.isEmpty ? null : reasoningText);
+        // v3.1.4（issue #13）：记录最近一条渲染出来的回复，供轮次兜底判定
+        if (ev.seq != null) _lastAssistantSeq = ev.seq;
         if (history) {
           out.add(item);
         } else {
@@ -1789,6 +1946,8 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           // v3.0.0 图像链路：待发送图片缩略图 rail（composer 上方，PC 端 AttachmentRail 同理念）
           _buildImageRail(),
+          // v3.1.4：任务清单面板（内核 todo 投影同源，对齐 PC 端「任务」面板）
+          if (!_inHistory) _buildTodoPanel(),
           // v2.7.2：队列停靠区（独立于输入框的轻量条，空队列不渲染）
           _buildQueueDock(),
           // composer（v2.8.0 重构为两层，对齐 PC 端 InputBar）：
@@ -2262,6 +2421,21 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget _buildItem(_MsgItem item) {
     switch (item.kind) {
       case _MsgKind.user:
+        // v3.1.4（issue #12）：系统注入消息（内核 source.kind ≠ "user"）不当普通气泡铺屏，
+        // 改为可折叠块——默认收起、点按展开，展开状态按 messageId 持久化（同思维链机制）。
+        if (item.injected && item.images.isEmpty) {
+          final ikey = item.messageId ?? 's${item.seq}';
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: _InjectedBubble(
+              text: item.text,
+              sourceKind: item.sourceKind,
+              expanded: widget.store.reasoningOverrideOf(_mySessionId ?? '', 'inj:$ikey') ?? false,
+              onToggle: (v) => setState(() =>
+                  widget.store.setReasoningOverride(_mySessionId ?? '', 'inj:$ikey', v)),
+            ),
+          );
+        }
         // v3.0.0(热修 06)：对齐 PC 端——图卡与文本为**两个独立气泡**（图在上、文在下）；
         // 服务端 blocksToText 为 image 块生成的「[图片]」占位行由图卡渲染替代（带图时不再展示）。
         final images = item.images;
@@ -2341,13 +2515,18 @@ class _MsgItem {
   final List<Map<String, dynamic>> images;
   // 思维链正文（可折叠；assistant 消息专用，null/空 = 无思维链）
   final String? reasoning;
-  _MsgItem.user(this.text, {this.seq, this.messageId, this.images = const []})
+  /// v3.1.4（issue #12）：内核对 user 消息的来源标记（createUserMessage({source}).kind）——
+  /// "user" = 真人发言；"plugin" / "agent-instructions" / "tool" 等 = 系统注入；
+  /// null = 旧内核未下发（客户端退回启发式判断）。
+  final String? sourceKind;
+  _MsgItem.user(this.text, {this.seq, this.messageId, this.images = const [], this.sourceKind})
       : kind = _MsgKind.user,
         usage = null,
         rating = null,
         reasoning = null;
   _MsgItem.assistant(this.text, {this.usage, this.seq, this.messageId, this.rating, this.images = const [], this.reasoning})
-      : kind = _MsgKind.assistant;
+      : kind = _MsgKind.assistant,
+        sourceKind = null;
   _MsgItem.divider(this.text)
       : kind = _MsgKind.divider,
         usage = null,
@@ -2355,17 +2534,214 @@ class _MsgItem {
         messageId = null,
         rating = null,
         images = const [],
-        reasoning = null;
+        reasoning = null,
+        sourceKind = null;
+
+  /// 注入消息（非真人发言）→ 渲染成可折叠块，而不是普通气泡（v3.1.4）
+  bool get injected => sourceKind != null && sourceKind != 'user';
 
   _MsgItem copyWith({int? seq, String? messageId}) {
     // v3.0.0：本方法仅用于 user 乐观消息补 messageId/seq——若未来复用到
     // assistant/divider 会静默变成用户消息，这里显式断言防住
     assert(kind == _MsgKind.user, 'copyWith only supports user items');
-    return _MsgItem.user(text, seq: seq ?? this.seq, messageId: messageId ?? this.messageId);
+    return _MsgItem.user(text, seq: seq ?? this.seq, messageId: messageId ?? this.messageId, sourceKind: sourceKind);
   }
 }
 
 // ── 气泡组件 ──
+/// v3.1.4（issue #12）：系统注入消息折叠块——默认收起成一行摘要，点按展开正文。
+/// 展开状态复用「思维链」同一套每消息覆盖存储（键前缀 `inj:`），列表回收重建不丢。
+/// 判定依据是内核 `createUserMessage({source}).kind`（非 "user" 即注入），比关键词黑名单可靠。
+class _InjectedBubble extends StatelessWidget {
+  final String text;
+  final String? sourceKind;
+  final bool expanded;
+  final ValueChanged<bool> onToggle;
+  const _InjectedBubble({
+    required this.text,
+    required this.sourceKind,
+    required this.expanded,
+    required this.onToggle,
+  });
+
+  String get _label {
+    switch (sourceKind) {
+      case 'agent-instructions':
+        return L10n.t('系统指令注入', 'Injected instructions');
+      case 'plugin':
+        return L10n.t('插件注入', 'Plugin injection');
+      case 'tool':
+        return L10n.t('工具注入', 'Tool injection');
+      default:
+        return L10n.t('系统注入', 'System injection');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ink3 = DshColors.ink3(context);
+    return Container(
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color: DshColors.surface(context),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: DshColors.line(context)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            onTap: () => onToggle(!expanded),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+              child: Row(
+                children: [
+                  Icon(Icons.settings_suggest_outlined, size: 14, color: ink3),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      '$_label · ${text.length} ${L10n.t('字', 'chars')}',
+                      style: TextStyle(fontSize: 11.5, color: ink3, fontWeight: FontWeight.w600),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  Icon(expanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down, size: 16, color: ink3),
+                ],
+              ),
+            ),
+          ),
+          if (expanded)
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 260),
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
+                child: Text(text, style: TextStyle(fontSize: 12.5, height: 1.45, color: ink3)),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// v3.1.4（issue #12 姊妹需求）：任务清单面板（对齐 PC 端「任务」面板）——
+/// 折叠态一行计数、展开态完整清单；数据来自内核 `dsh-tool-todo` 的 `todo/write` 快照。
+class _TodoPanel extends StatelessWidget {
+  final List<Map<String, dynamic>> todos;
+  final bool collapsed;
+  final int inProgress;
+  final int pending;
+  final int completed;
+  final VoidCallback onToggle;
+  const _TodoPanel({
+    required this.todos,
+    required this.collapsed,
+    required this.inProgress,
+    required this.pending,
+    required this.completed,
+    required this.onToggle,
+  });
+
+  IconData _statusIcon(Object? status) {
+    switch (status) {
+      case 'in_progress':
+        return Icons.pending_outlined;
+      case 'completed':
+        return Icons.check_circle_outline;
+      default:
+        return Icons.radio_button_unchecked;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ink2 = DshColors.ink2(context);
+    final ink3 = DshColors.ink3(context);
+    final brand = DshColors.brand(context);
+    final summary = [
+      if (inProgress > 0) L10n.t('$inProgress 进行中', '$inProgress in progress'),
+      if (pending > 0) L10n.t('$pending 待处理', '$pending pending'),
+      if (completed > 0) L10n.t('$completed 已完成', '$completed done'),
+    ].join(' · ');
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 2, 14, 0),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            onTap: onToggle,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 2),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.checklist_rtl, size: 13, color: ink3),
+                  const SizedBox(width: 5),
+                  Text(
+                    L10n.t('任务', 'Tasks'),
+                    style: TextStyle(fontSize: 11.5, color: ink3, fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(width: 6),
+                  Flexible(
+                    child: Text(
+                      summary,
+                      style: TextStyle(fontSize: 11.5, color: ink2),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  const SizedBox(width: 3),
+                  Icon(collapsed ? Icons.keyboard_arrow_down : Icons.keyboard_arrow_up, size: 15, color: ink3),
+                ],
+              ),
+            ),
+          ),
+          if (!collapsed)
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 150),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    for (final todo in todos)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 2),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Padding(
+                              padding: const EdgeInsets.only(top: 2),
+                              child: Icon(
+                                _statusIcon(todo['status']),
+                                size: 13,
+                                color: todo['status'] == 'completed' ? ink3 : brand,
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            Expanded(
+                              child: Text(
+                                '${todo['content'] ?? ''}',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  height: 1.35,
+                                  color: todo['status'] == 'completed' ? ink3 : ink2,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
 /// Agent 气泡：Markdown 解析结果按文本缓存（流式时每次重建不重新解析，只解析增量）。
 /// 携带思维链正文时，在正文上方渲染可折叠「思维链」块（默认展开状态由设置决定，单条可点按切换）。
 class _AssistantBubble extends StatefulWidget {

@@ -284,7 +284,7 @@ test("A(#12): /push-test 四格式 wire 形状（generic / ntfy / bark / serverc
 		assert.equal(echo.records.length, 4, "四个通道各发一次（pushToChannel 已 await，响应返回即记录完毕）");
 
 		const byPath = new Map(echo.records.map((r) => [r.path, r]));
-		assert.deepEqual([...byPath.keys()].sort(), ["/bark", "/generic", "/ntfy", "/serverchan"]);
+		assert.deepEqual([...byPath.keys()].sort(), ["/", "/bark", "/generic", "/serverchan"]);
 		for (const rec of echo.records) {
 			assert.equal(rec.method, "POST");
 			assert.equal(rec.headers["user-agent"], "dsh-mobile-remote", "统一 UA 标识");
@@ -301,21 +301,14 @@ test("A(#12): /push-test 四格式 wire 形状（generic / ntfy / bark / serverc
 		assert.equal(g.sessionId, "");
 		assert.equal(typeof g.time, "number");
 
-		// ntfy（#12 修复形状）—— POST topic URL，纯文本正文 + X-Title 头；
-		// 正文**不是** JSON（旧实现把 {title,message} JSON POST 到 topic URL，标题丢失）
-		const ntfy = byPath.get("/ntfy");
-		assert.equal(ntfy.headers["content-type"], "text/plain; charset=utf-8", "ntfy 正文必须是纯文本");
-		// 标题走 X-Title 头，且线上值必须 ASCII 安全：undici 的 ByteString 转换拒绝码点 > 0xFF，
-		// 中文/emoji 原样下发会在建连前抛错（整条推送失败）。非 ASCII 标题按 RFC 2047 编码字下发，
-		// ntfy 服务端解码回原文（B 的真实回读即证）。
-		const ntfyTitle = ntfy.headers["x-title"];
-		assert.equal(typeof ntfyTitle, "string", "必须走 X-Title 头承载标题");
-		assert.match(ntfyTitle, /^[\x20-\x7E]+$/, "线上头值必须 ASCII 安全（否则 undici 建连前抛 TypeError）");
-		assert.match(ntfyTitle, /^=\?UTF-8\?B\?[^?]+\?=$/, "多字节标题必须 RFC 2047 编码字");
-		assert.equal(decodeRfc2047(ntfyTitle), TEST_FULL_TITLE, "ntfy 解码后必须还原原标题");
-		assert.equal(ntfy.raw, TEST_DESP, "正文是纯详情文本，不含 JSON 包装");
-		assert.ok(!ntfy.raw.includes('"message"'), "正文不得是 {title,message} JSON");
-		assert.throws(() => JSON.parse(ntfy.raw), "正文不得是合法 JSON");
+		// ntfy（v3.1.4 / issue #14 Bug3）——JSON 发布必须 POST 服务根地址，body 内带 topic。
+		// 发到 topic URL 会被 ntfy 当成纯文本，导致标题丢失。
+		const ntfy = byPath.get("/");
+		assert.equal(ntfy.headers["content-type"], "application/json");
+		const ntfyPayload = JSON.parse(ntfy.raw);
+		assert.equal(ntfyPayload.topic, "ntfy");
+		assert.equal(ntfyPayload.title, TEST_FULL_TITLE);
+		assert.equal(ntfyPayload.message, TEST_DESP);
 
 		// bark —— JSON: { title, body }
 		const bark = byPath.get("/bark");
@@ -447,29 +440,20 @@ test("C(#12): minimal 模式脱敏 —— 真实 turn/end→doneGrace 链路不�
 	}
 });
 
-test("D(#12 正向钉桩): 插件实际下发的 X-Title 是 ASCII 安全、undici 可接受、可往返还原的编码字", async (t) => {
-	// 运行期约束（本钉桩的由来）：fetch 的头值经 WebIDL ByteString 转换，码点 > 0xFF 直接抛
-	// 「Cannot convert argument to a ByteString…」——且发生在建连之前，所以带中文/emoji 的标题
-	// **必须**编码后才能上 X-Title 头。本用例不看内部函数，只钉插件真实发出的那串头值。
+test("D(#14): 插件实际下发 ntfy JSON 的 root/topic 形状", async (t) => {
 	const echo = await startEchoServer();
 	const harness = createHarness({}, configWith([{ name: "n", url: `${echo.base}/ntfy`, format: "ntfy" }]));
 	try {
 		const res = await postJson(harness.route, {}, "/m/api/push-test");
 		assert.equal(res.status, 200);
-		const ntfy = echo.records.find((r) => r.path === "/ntfy");
-		assert.ok(ntfy, "ntfy 通道必须真的发出请求（编码失败会连请求都发不出）");
-		const wire = ntfy.headers["x-title"];
-		assert.equal(typeof wire, "string");
-
-		// ① ASCII 安全：每个字符都在可打印 ASCII 范围内（undici 只接受 ≤ 0xFF，非 ASCII 需编码）
-		assert.match(wire, /^[\x20-\x7E]+$/, "头值必须 ASCII 安全");
-		// ② undici 可接受：把真实头值交给 Headers 构造不抛错（等价于 fetch 建连前的校验）
-		assert.doesNotThrow(() => new Headers({ "x-title": wire }), "头值必须能通过 undici 校验");
-		// ③ 可往返还原：按 RFC 2047 解码后逐字等于原标题（ntfy 服务端同款解码；B 为端到端实证）
-		assert.equal(decodeRfc2047(wire), TEST_FULL_TITLE, "解码后必须逐字还原原标题");
-		// ④ RFC 2047 编码字每片 ≤ 75 字符（实现按 45 字节分片 → base64 60 字符 + 包装）
-		for (const word of wire.split(" ")) assert.ok(word.length <= 75, `编码字超长：${word.length} > 75`);
-		t.diagnostic(`D 插件实发 x-title：${wire}（${Buffer.byteLength(TEST_FULL_TITLE, "utf8")} 字节 UTF-8 → ${wire.length} 字符 ASCII）`);
+		const ntfy = echo.records.find((r) => r.path === "/");
+		assert.ok(ntfy, "ntfy 通道必须 POST 到服务根地址");
+		assert.equal(ntfy.headers["content-type"], "application/json");
+		const payload = JSON.parse(ntfy.raw);
+		assert.equal(payload.topic, "ntfy");
+		assert.equal(payload.title, TEST_FULL_TITLE);
+		assert.equal(payload.message, TEST_DESP);
+		t.diagnostic(`D 插件实发 ntfy JSON：${ntfy.raw}`);
 	} finally {
 		harness.clean();
 		await echo.close();

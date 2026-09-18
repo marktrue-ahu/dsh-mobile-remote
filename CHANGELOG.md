@@ -1,5 +1,72 @@
 # Changelog
 
+## v3.1.4（2026-09-16，issue #14 / #12 / #13）— 离线待答不再丢 + 任务面板 + 注入折叠 + 压缩后重同步
+
+> 范围：插件侧三项（离线待答、ntfy 标题、诊断补齐）+ App 侧四项（横滑误触发、注入消息折叠、任务面板、`/compact` 后重同步与轮次兜底）。
+> 版本：插件 `3.1.4` / App `3.1.4+21`。回归脚本：`tools/verify-issue14-p0.mjs`（mock 宿主，37 项断言）、`tools/verify-issue14-live.mjs`（真机一键验收）、`dsh-mobile-app/test/issue13_logic_test.dart`（兜底判定单测）。
+
+### issue #14 Bug2（同时是 Bug1 的真因）：手机离线时审批/问询帧被整个丢弃
+
+- **现象**：必须在审批发生前就停在那个会话里，手机上才会出现审批卡；事后打开 App 什么都没有（只能在电脑上处理）；App 关闭/被杀时收不到任何"需要你回答"提醒。
+- **根因**：`onEventsWaterfall` 第一行 `if (connections.size === 0) return;`（v3.1.3 第 3686 行）——手机没连就整段早退，于是 ① 待答**条目**不建、② 回放存储 `pendingFrames` 不写、③ 挂在同一函数里的 `needs-answer` **推送**也一起没了。而回放存储唯一的历史写入点在 `ctx.inject(["apiProxy"], …)` 的 mux 循环里，0.1.2-rc.1+ 内核已移除 apiProxy（实测 0.1.5-rc.2 全量搜 `apiProxy` 0 命中）→ 该通道是死代码，`pendingFrames` 永远是空 Map，`/api/events` 建连时的回放逻辑形同虚设。
+- **修复**：无论手机是否在线都建条目 + 写回放存储（`putAskReplay`，键 `a:<phoneId>` / `q:<phoneId>`，与 `/respond` 结算同源）；**只在手机在线时才 arm fail-close 超时**（离线时是桌面端在处理审批，不能被手机侧 120s 超时误杀），离线条目改走 `armOfflineReap`（30 分钟后**只清理、不结算**）；`holdApproval`/`holdQuestion`（mobile 接管路径）同样写入回放存储，接管期间断线重连也能拿回卡片。
+- **成对清理（报告人提醒的坑）**：`finishApproval`/`finishQuestion` 内统一 `dropAskReplay`，覆盖"手机先答 / 120s 超时 / ✕ 取消 / 桌面端先答（cancel 帧）/ 离线到期"五条路径——只修写入会出现"幽灵审批卡"（早已处理的请求被反复回放给 App）。
+- **关于推送归因**：报告人推测"`notifyNeedsAnswer` 的唯一调用点挂在 apiProxy 帧桥上"，实测不成立——`$events` 瀑布内（审批/问询两个分支）本就有推送调用，真正的拦路者就是上面那行早退；按他的建议"把推送搬到 $events 路径"会搬进同一个函数而依然收不到。
+
+### issue #14 Bug3：ntfy 标题丢失、正文变成一坨 JSON
+
+- **根因**：JSON payload 被 POST 到**主题地址**。ntfy 的 JSON 发布契约是 `POST /`（或自托管 base path 根）且 body 内带 `topic`；发到主题地址时服务端按**纯文本**处理整段 JSON。
+- **实测证据**：`POST https://ntfy.sh/<topic>` + `{"title":…,"message":…}` → 响应体无 `title` 字段、`message` 为 JSON 原文；改 `POST https://ntfy.sh/` + body 带 `topic` → `title` 正常返回。本机真实通道（微信 + ntfy）修复前的历史消息同样可见该症状。
+- **修复**：新增导出helper `ntfyPublish(url, payload)`（`lib/index.js` 模块级，单测友好）——解析配置里的主题地址，改为 POST 服务器根地址并在 body 内补 `topic`，兼容自托管带 base path 的部署（`https://host/ntfy/topic` → `POST https://host/ntfy/`）；schema 注释与实现口径统一（此前文档写 text/plain + X-Title）。配置写法不变。
+
+### issue #14 建议 6：诊断补齐可观测性
+
+- `checks.pendingFrames` 从"仅旧 apiProxy era 输出"改为**无条件输出**，并新增 `checks.pendingApprovals` / `checks.pendingQuestions`——现代内核下也能自查"离线时审批帧有没有被记下来"（正是本次排查现场）；App 诊断页对计数字段已有「✅ 0 / ⚠ >0」渲染，无需 App 改动。
+- 新增每通道最近一次投递结果 `checks.push:<通道名>`（`ok 21:04:33` / `fail 21:03:10 · HTTP 401: …` / `idle（尚未投递）`）——排障时不必再翻服务端日志确认"到底发没发出去"；事件推送与 `/api/push-test` 手动自检**两条入口都记录**（真机验收时正是它暴露了 Server酱通道当天额度已满：`fail · 超过当天的发送次数限制[5]`）。
+
+### issue #14（App 侧）：代码块 / 表格横滑误触发"加载更早"，列表跳回该轮上方
+
+- **根因**：`_onLiveScroll` 不区分滚动来源——代码块/表格内部的横向 `SingleChildScrollView` 会把 `pixels=0` 的通知**冒泡**给外层 `NotificationListener`，被误判成"滚到视觉顶部"→ 每次横滑都触发 `_loadMoreInfinite()`，列表前插旧内容、视觉跳回。
+- **修复**：加 `n.depth != 0`（忽略嵌套滚动）与 `n.metrics.axis != Axis.vertical`（只认纵向）两道过滤——与报告人给出的两行建议一致。
+
+### issue #12：系统注入消息改为**可折叠块**（不再当普通气泡铺屏）
+
+- **结构化判定（报告人建议的 `source` 路线）**：内核 `createUserMessage({ source })` 本就区分来源——真人 `kind: "user"`，注入为 `plugin` / `agent-instructions` / `tool` 等。插件 `summarizeEvent` 的 `user/message` 分支新增透出 `sourceKind`（旧内核无 source 则不下发该字段）。
+- **App 渲染**：`sourceKind` 非 `"user"` 的消息渲染成折叠块——一行摘要（类型标签 + 字数）、默认收起、点按展开；展开状态复用「思维链」同一套每消息覆盖存储（键前缀 `inj:`），列表回收重建不丢。原有 3 个关键词黑名单仍直接过滤（PC 端 GUI 也不显示的那三类）。
+- **效果**：技能目录、`[SCHEDULE REMINDER]`、压缩摘要、其它插件注入等不再以普通气泡占满屏幕。
+
+### 新功能：会话任务清单面板（对齐 PC 端「任务」面板）
+
+- **数据源与 PC 端同一处**：内核 `dsh-tool-todo` 把整份清单以 `todo/write` 快照写入会话事件，并注册会话投影 `todos`（投影语义：最新快照生效、`turn/start` 清空）。
+- **插件**：① `summarizeEvent` 新增 `todo/write` 分支（条数 ≤50、单条 ≤200 字符、status 白名单校验）；② 加入 `SURFACE_TYPES` → 历史补拉/重连回放也能拿到快照；③ 新增 `GET /m/api/todos?sessionId=`——直接读内核投影（`sessionProjections.stateOf(session, "todos")`），休眠/旧内核返回 `todos: null`。
+- **App**：输入框上方新增折叠面板——收起态一行计数（`1 进行中 · 3 待处理 · 4 已完成`），展开态完整清单（状态图标 + 完成项置灰）；实时靠 SSE `todo/write`/`turn/start` 折叠，打开会话/断线重连后用 `/api/todos` 对齐一次（历史只有 50 条窗口，投影读法保证长时间工具链之后仍然准确）。
+
+### issue #13：`/compact` 之后首条回复"消失"——真机未能复现 + 按报告人建议加两道兜底
+
+- **复现尝试（真机实时 + 历史两条路径，各两个会话）**：均未复现。逐条对账证明两端都正常——
+  - 插件侧：`/compact` 后的 `assistant/message` 确实广播了（`seq=44/64/83`，textLen 63/37/501…），`/api/history` 里也在；
+  - App 侧：事件被正常处理并渲染（`Chat: build itemCount` 16→19→21 递增），截图上压缩后的长回复（含表格、代码块、链接）完整显示。
+  - 另核实：`assistant/chunk` 在 0.1.5 内核里**不是会话事件**（不在 `known-event-types`），所以"流式草稿被 `turn/end` 清空"这条路径在当前内核下不可能发生。
+- **但借这次排查确认了两处真实隐患，并按报告人的排查建议 2/3 落地兜底**：
+  1. **压缩后按新表面重载**：`/compact` 以 `surfaceOp.replace` 重写会话表面，手机此前**不重载** → 继续显示已被 shadow 的旧消息（与桌面端视图分叉）。现在收到 `compaction/end` 立即 `_load(reset: true)` 按当前表面重建。
+  2. **轮次兜底补拉**（报告人建议 3）：`turn/end` 时若"本轮出现过真人提问、却没有渲染出更晚的回复条目"，判定内容被静默吞掉 → 补拉一次历史（10s 节流防抖；判定抽成纯函数 `needsTurnEndResync` 并带单测，见 `test/issue13_logic_test.dart`）。
+- 对方环境里的真因仍未定位（已请其提供 App 日志 `Chat: SSE 事件 <type> seq=` 片段）；本版两道兜底可让同类"静默丢内容"**自愈**。
+
+### 验证
+
+- `node tools/verify-issue14-p0.mjs`：mock 宿主内跑真实插件代码，**37 项断言全绿**——push-test 自检记账 / 离线记账 / 离线推送 / ntfy 请求形状（本地假 ntfy 断言 URL 与 body）/ 重连回放 / 手机应答清理 / 对端先答清理 / 离线期间不结算 / 问询同契约 / `todo/write` 摘要与 status 白名单 / `sourceKind` 注入标记 / `/api/todos` 端点（缺参 400、未激活 null、投影映射与截断）。
+- 真机端到端（LAN 桥 + Android 17 + App 3.1.3+20，2026-09-16）：杀掉 App（`mobileOnline=0`）→ 在新建会话里触发一次真实沙箱升级审批 → 诊断 `pendingApprovals=1 / pendingFrames=1`（旧版此处恒 0）→ ntfy 收到**带标题**的「⚠ 需要你回答 · a1bf1abb…a95b」→ 重开 App 出现回放审批卡 → 手机点「允许一次」→ 诊断归零、工具真的执行（探针文件写入成功）；审批在手机离线状态下挂起 **>120s 未被 fail-close**（桌面端流程不受手机侧超时干扰）。见证脚本：`tools/verify-issue14-live.mjs`。
+- App 3.1.4+21 真机：任务面板 / 注入折叠 / 横滑不跳 三项截图与 logcat 逐项核对（详见 issue #14 / #12 回复）。
+- issue #13 兜底（App 3.1.4+21 真机）：实时 `/compact` 后 App 日志出现「压缩完成 → 按新表面重载会话」+「重同步会话（按新表面重载）」并按新表面重建条目；正常轮次**不触发**兜底（无「轮次结束但无回复条目」日志），回复照常渲染；`flutter test` **28/28**（含 `needsTurnEndResync` 4 项）。
+
+### 升级与验证（真机）
+
+1. 电脑端：更新插件包（`dsh-mobile-remote-v3.1.4.tgz`）后**重启 DSH**（LAN 桥持有监听，不建议热重载）。
+2. 手机端：安装 `DSH-Remote-v3.1.4.apk`（覆盖安装，登录态与数据保留）。
+3. 验收：`POST /m/api/push-test`（设置 → 通知 → 发送测试通知）→ ntfy 收到的通知**应有标题**；随后关闭 App → 在电脑端触发一次需要审批的操作 → ntfy 应收到「⚠ 需要你回答」标题的推送，重新打开 App 应看到审批卡并可作答；诊断页 `pendingFrames` / `pendingApprovals` 应随状态归零（不留幽灵卡）；会话里跑一次长任务（agent 会调 `todo_write`）→ 输入框上方出现「任务」计数条，点开可看清单。
+
+## v3.1.3（2026-09-08，issue #9）— 审批/问询双端呈现（`approvalMode: both` 默认）+ 可配置策略
+
 ## fork 本地记录 — DSH 0.1.5-rc.2 适配（2026-09，[Issue #7](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/7)）
 
 > **本节明确标注为 fork 本地**，不对应上游版本号条目。版本号管理属于上游仓库作者，本 fork **不自行发版、不 bump 版本号**——插件与 App 版本号保持 `3.1.3`。需要判断手上这份是否含适配时，看本节与对应 commit。
