@@ -18,6 +18,7 @@
 | 字段级兼容（v3.1.0） | `reasoning`/`title` 为纯增量字段：新插件+旧 App 无影响（忽略新字段）；新 App+旧插件自动回退（不渲染折叠块 / 悬浮球标题兜底短码）——任意组合均可使用 |
 | 字段级兼容（v3.1.1） | `/m/api/directories` 根视图新增 `sep`（服务端路径分隔符）；新插件+旧 App 忽略该字段即可（旧 App 在 WSL 上仍按 `\` 拼接，由服务端`normalizeServerPath` 归一化兜底，浏览/建夹/建会话均可用）；新 App+旧插件缺少 `sep` 时按根视图推断分隔符——任意组合均可使用 |
 | 字段级兼容（v3.1.3） | `/m/api/diagnostics` 新增 `host` 节（宿主版本号 + 四项能力 + 是否受支持）与 `notes` 末行宿主结论。旧版 App 按 key 取值、忽略未知字段，无影响 |
+| 用量与额度（v3.2） | 新插件+新 App 通过 `/m/api/account-usage` 显示 DeepSeek/Codex/OpenCode Go；旧 App 忽略新端点。新 App+旧插件显示“电脑端插件版本过旧”，不影响其它功能。 |
 | Flutter 构建环境 | Flutter 3.35+（Dart SDK ^3.13） |
 
 **快速自检**：手机 App → 设置 → 环境诊断。**先看 `host` 一节**——它直接回答「电脑端 DSH 是什么版本、是否受支持、四项能力是否就绪」：
