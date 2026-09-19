@@ -1,6 +1,6 @@
 # 03 API 接口设计文档 — dsh-mobile-remote
 
-> 版本：v3.1.0 + Git Slice A · 状态：已实现 · 配套：00-开发总纲.md、02-architecture.md、04-security.md、09-compatibility.md
+> 版本：v3.2.0 + Git Slice A · 状态：已实现 · 配套：00-开发总纲.md、02-architecture.md、04-security.md、09-compatibility.md
 > 前缀：`/m`（可配置项 `path`，默认 `/m`）。以下所有路径均以前缀开头。
 > 服务端 API 同时服务 Flutter App（dsh-mobile-app）与桌面设置页客户端模块；不含网页版页面（v2.1 起移除）。
 ## 1. 通用约定
@@ -58,6 +58,7 @@
 | GET | `/m/api/git/commit` | 提交详情 | 是 |
 | GET | `/m/api/git/diff` | 工作区/暂存/提交差异 | 是 |
 | GET | `/m/api/balance` | DeepSeek 官方余额 | 是 |
+| GET | `/m/api/account-usage` | 用量与额度（DeepSeek / Codex / OpenCode Go） | 是 |
 | GET | `/m/api/qr-config` | 桌面二维码数据（loopback only） | 否（loopback） |
 | POST | `/m/api/defaults` | 修改默认 Agent/权限预设 | 是 |
 | GET/POST | `/m/api/llm-providers` | 模型提供商列表 / 保存配置（v2.6） | 是 |
@@ -308,6 +309,7 @@
 | POST | `/m/api/directories` | 新建文件夹（v2.1） |
 | GET | `/m/api/diagnostics` | 环境诊断（服务端端点实测，v2.1） |
 | GET | `/m/api/balance` | DeepSeek 官方余额（服务端代查，v2.1） |
+| GET | `/m/api/account-usage` | 用量与额度（服务端代查，v3.2） |
 | GET | `/m/api/qr-config` | 桌面二维码数据（loopback only，v2.1） |
 | POST | `/m/api/defaults` | 修改默认 Agent/权限预设（v2.1） |
 
@@ -711,6 +713,45 @@ B3 的写请求必须携带 `X-DSH-Git-Contract: 2.x`（或等价的
 fetch/push 序列化 common domain，pull/sync/abort 同时序列化 common 与 worktree domain。
 远端认证、网络、远端拒绝、非 fast-forward 分别映射为稳定错误；连接中断或结果无法
 从读事实证明时进入 `unknown-result`，而不是自动重试。
+
+### 6.16 GET /m/api/account-usage（用量与额度，v3.2）
+
+服务端并发查询三个固定来源，凭据只在电脑端解析和使用；手机端只接收成功来源的脱敏投影。默认使用电脑进程内 60 秒快照；详情页顶部刷新使用 `?refresh=1` 绕过快照并发起一轮新的查询（2 秒内重复刷新受保护）。来源固定按 DeepSeek → Codex → OpenCode Go 排列，未配置/未登录来源不返回，已配置但本次查询失败的来源也不返回。
+
+```json
+{
+  "ok": true,
+  "fetchedAt": "2026-08-30T12:00:00.000Z",
+  "availableCount": 3,
+  "failedCount": 0,
+  "sources": [
+    { "id": "deepseek", "title": "DeepSeek", "kind": "balance",
+      "amount": "12.50", "currency": "CNY", "available": true },
+    { "id": "codex", "title": "Codex", "kind": "quota",
+      "account": { "displayName": "Personal", "maskedEmail": "p***@example.com" },
+      "windows": [
+        { "window": "5h", "remainingPercent": 72, "resetAt": "2026-08-30T13:00:00.000Z" },
+        { "window": "weekly", "remainingPercent": 64 }
+      ],
+      "credits": { "unlimited": false, "balance": "8.00" },
+      "individualLimit": { "limit": "100", "used": "28", "remaining": "72", "remainingPercent": 72 }
+    },
+    { "id": "opencode-go", "title": "OpenCode Go", "kind": "quota",
+      "windows": [
+        { "window": "5h", "remainingPercent": 91 },
+        { "window": "weekly", "remainingPercent": 83 },
+        { "window": "monthly", "remainingPercent": 76 }
+      ]
+    }
+  ]
+}
+```
+
+- Codex 通过 `dsh-codex-connect` 的 `OpenAICodexCredentialStore`、`openAICodexAuthStatus` 与 `readOpenAICodexRateLimits` 查询同一份当前活动账户快照；若 Codex 配置启用代理，额度请求复用其 `OpenAICodexProxyManager`，代理不可用时不直连；不读取/复制 OAuth 文件，不返回 token。
+- OpenCode Go 优先读取 `llm-pi-ai` 的 `opencode-go.apiKeyEnv`，其次读取 `llm-pi-ai/opencode-go` API-key record，再回退 `OPENCODE_GO_API_KEY` / `OPENCODE_API_KEY`；请求固定发送到官方 `GET https://opencode.ai/zen/go/v1/usage`，不接受任意 baseURL。`percent` 转换为 `remainingPercent = 100 - percent`，`rate-limited` 窗口仍保留并标记 `limited: true`。
+- `failedCount` 只统计“已配置但本次查询失败”的来源；未配置来源不算失败。`failedCount > 0` 时 App 显示汇总提示，不显示失败来源细节。
+- 查询快照在电脑进程内缓存 60 秒并共享并发请求；手动 `refresh=1` 的连点在 2 秒内复用快照；不写手机或电脑持久化文件。配额窗口不相加，有限 Credits 和个人消费上限分别展示。
+- HTTP 错误只返回通用 `502 account-usage-failed`（单来源失败不会使整体请求失败）。
 
 ### 6.17 文件传输（v3.1.2，B站 csborbbnc 反馈）
 

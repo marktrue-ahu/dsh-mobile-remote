@@ -1,8 +1,8 @@
 # 09 兼容性说明（Compatibility）
 
-> 版本：v3.1.3（DSH 0.1.5-rc.2 适配，见 [ADR 0001（Issue #9）](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/9) 与 [Spec Issue #7](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/7)） · 面向：开源使用者 / 二次开发 / 多设备部署
+> 版本：v3.2.0（用量与额度；DSH 0.1.5-rc.2 适配，见 [ADR 0001（Issue #9）](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/9) 与 [Spec Issue #7](https://github.com/marktrue-ahu/dsh-mobile-remote/issues/7)） · 面向：开源使用者 / 二次开发 / 多设备部署
 
-> ⚠ **平台范围（issue #6）**：`/m/api/files*`（文件下载/上传）的 TOCTOU 防护基于 descriptor-relative 语义，**仅 Linux/macOS 可用**；**Windows 返回 `503 files-unavailable`**（安全 fail-closed，理由见 docs/04 §6）。其余功能（会话、消息、审批/问询、目录浏览、通知、推送）不受平台限制。
+> ⚠ **平台范围（issue #6）**：`/m/api/files*`（文件下载/上传）的 TOCTOU 防护基于 descriptor-relative 语义，**仅 Linux/macOS 可用**；**Windows 返回 `503 files-unavailable`**（安全 fail-closed，理由见 docs/04 §6）。其余功能（会话、消息、审批/问询、目录浏览、通知、推送、用量查询）不受平台限制。
 
 本文回答两个问题：**App 在哪些手机上能跑**，以及**插件在什么样的 Harness 上能跑**。
 
@@ -13,11 +13,12 @@
 | 组件 | 要求 |
 |---|---|
 | 桌面端 DSH（Harness） | **受支持范围 `>=0.1.5-rc.2 <0.2.0`**（当前 Typert 代际及其后续补丁/RC）。更早代际（0.1.1-rc.2 / 0.1.2-rc.1）**不再受支持**：插件仍可加载（不做启动期拦截），但相关功能会以明确错误失败，诊断会给出缺失的能力与升级指引。见 §2.4 |
-| dsh-mobile-remote 插件 | **v3.1.3**；`/m/api/diagnostics` 可自检（`services` / `checks` / **`host`**） |
-| 手机 App（Android） | v3.1.3（与插件同版本 = 完美配对；不同版本可用但"谁旧谁吃亏"，详见 README「版本与兼容」）；Android 7.0+、64 位机型 |
+| dsh-mobile-remote 插件 | **v3.2.0**；`/m/api/diagnostics` 可自检（`services` / `checks` / **`host`**）并提供 `/m/api/account-usage` |
+| 手机 App（Android） | v3.2.0（与插件同版本 = 完美配对；不同版本可用但"谁旧谁吃亏"，详见 README「版本与兼容」）；Android 7.0+、64 位机型 |
 | 字段级兼容（v3.1.0） | `reasoning`/`title` 为纯增量字段：新插件+旧 App 无影响（忽略新字段）；新 App+旧插件自动回退（不渲染折叠块 / 悬浮球标题兜底短码）——任意组合均可使用 |
 | 字段级兼容（v3.1.1） | `/m/api/directories` 根视图新增 `sep`（服务端路径分隔符）；新插件+旧 App 忽略该字段即可（旧 App 在 WSL 上仍按 `\` 拼接，由服务端`normalizeServerPath` 归一化兜底，浏览/建夹/建会话均可用）；新 App+旧插件缺少 `sep` 时按根视图推断分隔符——任意组合均可使用 |
 | 字段级兼容（v3.1.3） | `/m/api/diagnostics` 新增 `host` 节（宿主版本号 + 四项能力 + 是否受支持）与 `notes` 末行宿主结论。旧版 App 按 key 取值、忽略未知字段，无影响 |
+| 用量与额度（v3.2） | 新插件+新 App 通过 `/m/api/account-usage` 显示 DeepSeek/Codex/OpenCode Go；旧 App 忽略新端点。新 App+旧插件进入该入口会显示“电脑端插件版本过旧”，不影响其它功能；升级插件后无需重新配置凭据 |
 | Flutter 构建环境 | Flutter 3.35+（Dart SDK ^3.13） |
 
 **快速自检**：手机 App → 设置 → 环境诊断。**先看 `host` 一节**——它直接回答「电脑端 DSH 是什么版本、是否受支持、四项能力是否就绪」：

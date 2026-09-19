@@ -10,6 +10,7 @@ import '../api.dart';
 import '../floating.dart';
 import '../l10n.dart';
 import '../logger.dart';
+import '../models.dart';
 import '../store.dart';
 import '../git_models.dart';
 import '../theme.dart';
@@ -20,6 +21,7 @@ import '../update_flow.dart';
 import '../updater.dart';
 import 'sheets.dart';
 import 'providers_screen.dart';
+import 'usage_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
   final AppStore store;
@@ -35,9 +37,9 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
-  Map<String, dynamic>? _balance;
-  String? _balanceError; // 余额查询失败的错误（build 时动态显示）
-  bool _busy = false; // 余额刷新中（刷新按钮转圈）
+  UsageSnapshot? _usage;
+  String? _usageError; // partial | outdated | failed；build 时再翻译
+  bool _usageBusy = false; // 用量与额度刷新中
   bool _alertShown = false; // 本次会话内余额预警已提示过
   Map<String, dynamic>? _diag;
   bool _diagLoaded = false;
@@ -49,7 +51,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   @override
   void initState() {
     super.initState();
-    _refreshBalance();
+    _refreshUsage();
     _loadAppVersion();
     _initBubbleState();
     // 连接状态等 store 变化实时刷新（修复：旧版离开页面重进才能看到状态更新）
@@ -220,48 +222,70 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
-  Future<void> _refreshBalance() async {
-    if (_busy) return; // v3.0.0 review：在途锁，防连点并发查询/重复触发悬浮球
-    setState(() => _busy = true);
+  Future<void> _refreshUsage() async {
+    if (_usageBusy) return;
+    setState(() {
+      _usageBusy = true;
+      _usageError = null;
+    });
     try {
-      final b = await api.balanceInfo();
+      final snapshot = await api.accountUsage();
       if (!mounted) return;
-      // v2.9.0 review(M2)：成功后清除既往查询失败的错误态（否则副标题永远显示"查询失败"）
+      final deepSeek = snapshot.sourceOf('deepseek');
+      final total = deepSeek?.amountNumber;
       setState(() {
-        _balance = b;
-        _balanceError = null;
+        _usage = snapshot;
+        _usageError = snapshot.failedCount > 0 ? 'partial' : null;
       });
-      // 余额联动悬浮球（低余额时悬浮球亮起 + 气泡）
-      if (b != null) {
-        final total = (b['total'] as num?)?.toDouble() ?? 0;
-        unawaited(Floating.notifyBalance(total));
-      }
-      // 余额预警：低于阈值时提示一次（本次会话内不重复打扰）
-      if (widget.store.balanceAlert && b != null) {
-        final total = (b['total'] as num?)?.toDouble() ?? double.infinity;
-        if (total < widget.store.balanceThreshold && !_alertShown) {
-          _alertShown = true;
-          showToast(
-            context,
-            L10n.t('余额不足 ¥', 'Low balance ¥') +
-                total.toStringAsFixed(1) +
-                L10n.t('，建议及时充值', ' — consider topping up'),
-          );
-        }
+      // 余额联动悬浮球与预警仍只使用 DeepSeek 金额余额。
+      if (total != null) unawaited(Floating.notifyBalance(total));
+      if (widget.store.balanceAlert &&
+          total != null &&
+          total < widget.store.balanceThreshold &&
+          !_alertShown) {
+        _alertShown = true;
+        showToast(
+          context,
+          L10n.t('余额不足 ¥', 'Low balance ¥') +
+              total.toStringAsFixed(1) +
+              L10n.t('，建议及时充值', ' — consider topping up'),
+        );
       }
     } catch (e) {
       if (!mounted) return;
-      // 查询失败：记住错误，build 里动态显示（语言切换后也能正确翻译）
-      _balanceError = '$e';
-      if (mounted) setState(() {});
+      final oldPlugin = e is ApiException && e.code == 'not-found';
+      setState(() {
+        // 保留最后一次成功快照，避免短暂网络失败把账户摘要清空。
+        _usageError = oldPlugin ? 'outdated' : 'failed';
+      });
     } finally {
-      if (mounted) setState(() => _busy = false);
+      if (mounted) setState(() => _usageBusy = false);
     }
   }
 
   /// 阈值显示格式：整数不带小数（¥10），非整数两位（¥12.50）。
   String _fmtThreshold(double v) =>
       v == v.roundToDouble() ? v.round().toString() : v.toStringAsFixed(2);
+
+  /// v3.1.2：发送测试通知——逐个通道验证（服务端绕过节流）。
+  Future<void> _sendTestPush() async {
+    try {
+      final r = await api.pushTest();
+      final results = (r['results'] as List? ?? []).whereType<Map>().toList();
+      final okCount = results.where((e) => e['ok'] == true).length;
+      if (mounted) {
+        showToast(
+          context,
+          L10n.t(
+            '测试通知已发送（$okCount/${results.length} 个通道成功）',
+            'Test sent ($okCount/${results.length} channels OK)',
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) showToast(context, '${L10n.t('发送失败：', 'Send failed: ')}$e');
+    }
+  }
 
   /// 余额预警阈值选择：¥5 / ¥10 / ¥20 / ¥50 / 自定义输入。
   Future<void> _pickThreshold() async {
@@ -375,14 +399,37 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
-  /// 余额状态行（build 时求值：语言切换后即时换语言）。
-  String get _balanceLabel {
-    if (_busy) return L10n.t('查询中…', 'Loading…');
-    if (_balanceError != null)
-      return '${L10n.t('查询失败：', 'Failed: ')}$_balanceError';
-    final b = _balance;
-    if (b == null) return L10n.t('无数据', 'No data');
-    return '${L10n.t('实时 · 币种 ', 'Live · ')}${b['currency']}${b['available'] == false ? L10n.t(' · 不可用', ' · unavailable') : ''}';
+  bool get _deepSeekLow => widget.store.balanceAlert &&
+      ((_usage?.sourceOf('deepseek')?.amountNumber ?? double.infinity) < widget.store.balanceThreshold);
+
+  String? get _usageErrorText => switch (_usageError) {
+        'partial' => L10n.t('部分额度来源刷新失败', 'Some usage sources failed to refresh'),
+        'outdated' => L10n.t('电脑端插件版本过旧', 'Desktop plugin is outdated'),
+        'failed' => L10n.t('额度查询失败', 'Usage query failed'),
+        _ => null,
+      };
+
+  /// 用量与额度摘要（build 时求值：语言切换后即时换语言）。
+  String get _usageLabel {
+    if (_usageBusy && _usage == null) return L10n.t('查询中…', 'Loading…');
+    if (_usageErrorText != null) return _usageErrorText!;
+    final sources = _usage?.sources;
+    if (sources == null) return L10n.t('尚未查询', 'Not queried yet');
+    final count = sources.where((source) => source.available).length;
+    if (count == 0) return L10n.t('暂无可用额度来源', 'No usage sources');
+    return L10n.t(
+      '$count 个来源可用',
+      '$count source${count == 1 ? '' : 's'} available',
+    );
+  }
+
+  Future<void> _openUsage() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => UsageScreen(store: widget.store, initial: _usage),
+      ),
+    );
+    if (mounted) unawaited(_refreshUsage());
   }
 
   Future<void> _loadDiag() async {
@@ -706,9 +753,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final store = widget.store;
     final ink3 = DshColors.ink3(context);
     final brand = DshColors.brand(context);
+    final danger = DshColors.danger(context);
     final ok = DshColors.ok(context);
     final warn = DshColors.warn(context);
-    final danger = DshColors.danger(context);
 
     String permName(String? id) => permNameOf(id) ?? '…';
     String presetName(String? id) => switch (id) {
@@ -779,6 +826,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
             onTap: () => widget.onReconfigure(),
           ),
         ]),
+        // v3.1.2：推送通道自检（配置在电脑端 cordis.patch.yml 的 pushUrls）
+        _card(L10n.t('通知', 'Notifications'), [
+          _row(
+            leading: const Icon(Icons.notifications_active_outlined),
+            title: L10n.t('发送测试通知', 'Send test notification'),
+            sub: L10n.t(
+              '验证推送通道（电脑端 cordis.patch.yml 配置）',
+              'Verify push channels (configured on the PC)',
+            ),
+            trailing: Text(
+              L10n.t('发送 ▸', 'Send ▸'),
+              style: TextStyle(fontSize: 12, color: brand),
+            ),
+            onTap: _sendTestPush,
+          ),
+        ]),
         _card(L10n.t('默认配置', 'Defaults'), [
           _row(
             leading: const Icon(Icons.security_outlined),
@@ -820,49 +883,33 @@ class _SettingsScreenState extends State<SettingsScreen> {
         _card(L10n.t('账户', 'Account'), [
           _row(
             leading: const Icon(Icons.account_balance_wallet_outlined),
-            title: L10n.t('余额', 'Balance'),
-            sub: _balanceLabel,
+            title: L10n.t('用量与额度', 'Usage & allowance'),
+            sub: _usageLabel,
             trailing: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text(
-                  _balance != null
-                      ? '¥${(_balance!['total'] as num).toStringAsFixed(2)}'
-                      : '—',
+                  _usage == null
+                      ? '—'
+                      : '${_usage!.sources.where((source) => source.available).length}',
                   style: TextStyle(
                     fontSize: 16,
                     fontWeight: FontWeight.w600,
-                    // 预警开启且低于阈值 → 红色警示
-                    color:
-                        (store.balanceAlert &&
-                            (_balance?['total'] as num?)?.toDouble() != null &&
-                            ((_balance!['total'] as num).toDouble() <
-                                store.balanceThreshold))
-                        ? danger
-                        : brand,
+                    color: _deepSeekLow ? danger : brand,
                   ),
                 ),
-                const SizedBox(width: 2),
-                // 余额旁独立刷新按钮（点击数字刷新的旧交互已移除）
-                if (_busy)
+                if (_usageBusy)
                   const Padding(
-                    padding: EdgeInsets.all(7),
+                    padding: EdgeInsets.only(left: 8),
                     child: SizedBox(
                       width: 14,
                       height: 14,
                       child: CircularProgressIndicator(strokeWidth: 2),
                     ),
-                  )
-                else
-                  GestureDetector(
-                    onTap: _refreshBalance,
-                    child: Padding(
-                      padding: const EdgeInsets.all(6),
-                      child: Icon(Icons.refresh, size: 17, color: brand),
-                    ),
                   ),
               ],
             ),
+            onTap: _openUsage,
           ),
           _row(
             leading: const Icon(Icons.add_card_outlined),
@@ -1421,7 +1468,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final msgr = ScaffoldMessenger.of(context);
     showSheet(context, L10n.t('应用日志', 'App log'), [
       Text(
-        '${L10n.t('最近 ', 'Last ')}$AppLog.instance.lines.length${L10n.t(' 条 · 文件 dsh_mobile.log', ' entries · file dsh_mobile.log')}',
+        '${L10n.t('最近 ', 'Last ')}${AppLog.instance.lines.length}${L10n.t(' 条 · 文件 dsh_mobile.log', ' entries · file dsh_mobile.log')}',
         textAlign: TextAlign.center,
         style: TextStyle(fontSize: 11, color: DshColors.ink3(context)),
       ),

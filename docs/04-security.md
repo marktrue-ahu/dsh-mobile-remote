@@ -1,6 +1,6 @@
 # 04 安全设计文档 — dsh-mobile-remote
 
-> 版本：v3.0.0 · 状态：已实现 · 配套：02-architecture.md、03-api.md、09-compatibility.md
+> 版本：v3.2.0 · 状态：已实现 · 配套：02-architecture.md、03-api.md、09-compatibility.md
 
 ## 1. 威胁模型
 
@@ -84,6 +84,7 @@
   - **边界外的目录选择器**（`/m/api/directories`）是**有意保留的任意路径浏览**（新建会话需跨盘选工作目录），不适用工作区包含语义：其信任模型与 §2 口令鉴权一致（已认证用户本就持有 agent 控制权）。
   - **残留风险**：包含校验基于句柄的规范化路径，无法识别 bind mount / overlay / 特权本地攻击者构造的挂载视图；需要该等级隔离时应依赖 OS 层隔离（容器/ACL）而非插件内检查。
 - **第三方推送通道脱敏（v2.6）**：Server酱/ntfy/Bark/generic 等推送默认只收到「事件类型 + 会话短码」（`pushContent: minimal`），会话标题/错误详情等核心内容默认不出本机；仅显式配置 `pushContent: standard` 后外发——第三方服务不可信。
+- **用量与额度投影（v3.2）**：`/m/api/account-usage` 只返回成功来源的余额/配额、脱敏 Codex 账户标签和汇总失败数；DeepSeek/OpenCode Go 密钥与 Codex OAuth token 永不进入响应、App 日志或持久化文件。OpenCode Go 只请求固定官方 HTTPS 端点；Codex 启用代理但代理不可用时拒绝直连。服务端只保留 60 秒进程内快照，单来源失败不回退到过期数据。
 ## 7. 安全测试要点（并入 05-test-cases.md）
 1. 口令启用后：未认证访问 bootstrap/send/events/history 返回 401；错误口令 401。
 2. 口令关闭时：以上端点返回 200。

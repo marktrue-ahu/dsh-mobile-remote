@@ -18,7 +18,7 @@ Map<String, dynamic> _jsonMap(Object? value) =>
 class ApiException implements Exception {
   final String message;
 
-  /// 内核/移动契约稳定错误码，供 UI 区分语义。
+  /// 内核/移动契约稳定错误码（如 queue-item-not-found / steer-unavailable），供 UI 区分语义。
   final String? code;
   final int? statusCode;
   final bool retryable;
@@ -395,10 +395,16 @@ class Api implements GitApi, GitWriteApi {
 
   // ── v3.1.2（csborbbnc 反馈）：文件传输 ──
   /// 下载电脑文件（返回原始字节；失败抛 ApiException）。
-  Future<Uint8List> downloadFile(String path, {Duration timeout = const Duration(seconds: 120)}) async {
+  Future<Uint8List> downloadFile(
+    String path, {
+    Duration timeout = const Duration(seconds: 120),
+  }) async {
     try {
       final res = await _client
-          .get(_uri('/api/files?path=${Uri.encodeQueryComponent(path)}'), headers: _headers)
+          .get(
+            _uri('/api/files?path=${Uri.encodeQueryComponent(path)}'),
+            headers: _headers,
+          )
           .timeout(timeout);
       if (res.statusCode != 200) {
         Map<String, dynamic>? body;
@@ -408,8 +414,9 @@ class Api implements GitApi, GitWriteApi {
           body = null;
         }
         throw ApiException(
-            (body?['detail'] as String?) ?? 'HTTP ${res.statusCode}',
-            code: body?['error'] is String ? (body?['error'] as String) : null);
+          (body?['detail'] as String?) ?? 'HTTP ${res.statusCode}',
+          code: body?['error'] is String ? (body?['error'] as String) : null,
+        );
       }
       return res.bodyBytes;
     } catch (e) {
@@ -419,8 +426,12 @@ class Api implements GitApi, GitWriteApi {
   }
 
   /// 上传文件到会话工作目录（base64，服务端写盘；返回 {path, bytes}）。
-  Future<Map<String, dynamic>> uploadFile(String sessionId, String name, Uint8List bytes,
-      {Duration timeout = const Duration(minutes: 3)}) async {
+  Future<Map<String, dynamic>> uploadFile(
+    String sessionId,
+    String name,
+    Uint8List bytes, {
+    Duration timeout = const Duration(minutes: 3),
+  }) async {
     return await postJson('/api/files/upload', {
       'sessionId': sessionId,
       'name': name,
@@ -429,7 +440,8 @@ class Api implements GitApi, GitWriteApi {
   }
 
   /// v3.1.2：发送测试通知（逐个通道验证，绕过节流；返回 {channels, results[]}）。
-  Future<Map<String, dynamic>> pushTest() async => await postJson('/api/push-test', {});
+  Future<Map<String, dynamic>> pushTest() async =>
+      await postJson('/api/push-test', {});
 
   Map<String, dynamic> _decode(http.Response res) {
     // v2.9.0 review(LOW#7)：非 JSON 错误体（反代 HTML 页等）不再抛 FormatException，回退 HTTP <status>
@@ -567,7 +579,9 @@ class Api implements GitApi, GitWriteApi {
   /// 会话任务清单（v3.1.4，issue #12 姊妹需求）：读内核 todo 投影（与 PC 端「任务」面板同源）。
   /// 返回 null = 该会话未激活/旧内核无该工具 —— 调用方退回历史事件折叠，不视为错误。
   Future<List<Map<String, dynamic>>?> todos(String sessionId) async {
-    final data = await getJson('/api/todos?sessionId=${Uri.encodeQueryComponent(sessionId)}');
+    final data = await getJson(
+      '/api/todos?sessionId=${Uri.encodeQueryComponent(sessionId)}',
+    );
     final list = data['todos'];
     if (list is! List) return null;
     return list.cast<Map<String, dynamic>>();
@@ -892,6 +906,18 @@ class Api implements GitApi, GitWriteApi {
     } on ApiException {
       rethrow;
     }
+  }
+
+  /// 设置页用量与额度：服务端只返回最新查询成功的来源，不返回任何凭据。
+  /// [refresh] 为 true 时绕过电脑端 60 秒运行期缓存，用于详情页手动刷新。
+  Future<UsageSnapshot> accountUsage({
+    bool refresh = false,
+    Duration timeout = const Duration(seconds: 30),
+  }) async {
+    final path = refresh
+        ? '/api/account-usage?refresh=1'
+        : '/api/account-usage';
+    return UsageSnapshot.fromJson(await getJson(path, timeout: timeout));
   }
 
   /// 修改默认配置（Agent 预设 / 权限预设，作用于之后新建的会话）。
