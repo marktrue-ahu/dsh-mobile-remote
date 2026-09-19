@@ -20,6 +20,8 @@ import 'screens/sessions_screen.dart';
 import 'screens/settings_screen.dart';
 import 'screens/notifications_screen.dart';
 import 'screens/sheets.dart';
+import 'screens/sheets.dart';
+import 'screens/usage_screen.dart';
 import 'updater.dart';
 
 final AppStore store = AppStore();
@@ -111,6 +113,10 @@ class _DshAppState extends State<DshApp> {
           // 打开通知页（与抽屉入口同款：先切到首页再推通知页）
           await _handleFloatingAction('notifs');
           break;
+        case 'openUsageRequested':
+          // 悬浮球面板「用量与额度」区块 → App 用量页
+          await _handleFloatingAction('usage');
+          break;
       }
       return null;
     });
@@ -149,6 +155,9 @@ class _DshAppState extends State<DshApp> {
       // 打开通知页（与抽屉入口同款：先切到首页再推通知页）
       await store.refreshNotifs();
       openNotificationsScreen();
+    } else if (action == 'usage') {
+      // 悬浮球面板区块 → 用量与额度详情页（每次进入都重新拉取）
+      nav.push(MaterialPageRoute(builder: (_) => UsageScreen(store: store)));
     }
   }
 

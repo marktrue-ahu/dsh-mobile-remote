@@ -16,7 +16,7 @@ class MainActivity : FlutterActivity() {
     private var floatingChannel: MethodChannel? = null
     // v2.7.2 review(FS1)：悬浮球面板动作可能发生在冷启动（进程已被系统杀死时点"打开会话/充值/通知"），
     // 此时走 onCreate 而非 onNewIntent；Flutter 引擎未就绪前先暂存，configureFlutterEngine 后再投递。
-    private var pendingOpenAction: String? = null // "charge" | "notifs" | "session:<id>"
+    private var pendingOpenAction: String? = null // "charge" | "usage" | "notifs" | "session:<id>"
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         super.onCreate(savedInstanceState)
@@ -117,6 +117,7 @@ class MainActivity : FlutterActivity() {
         if (intent == null) return
         when {
             intent.getBooleanExtra("open_charge", false) -> pendingOpenAction = "charge"
+            intent.getBooleanExtra("open_usage", false) -> pendingOpenAction = "usage"
             intent.getBooleanExtra("open_notifs", false) -> pendingOpenAction = "notifs"
             else -> intent.getStringExtra("open_session")?.let { pendingOpenAction = "session:$it" }
         }
@@ -129,6 +130,7 @@ class MainActivity : FlutterActivity() {
         val ch = floatingChannel ?: return
         when {
             action == "charge" -> ch.invokeMethod("openChargeRequested", null)
+            action == "usage" -> ch.invokeMethod("openUsageRequested", null)
             action == "notifs" -> ch.invokeMethod("openNotifsRequested", null)
             action.startsWith("session:") -> {
                 val sid = action.removePrefix("session:")
