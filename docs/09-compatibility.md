@@ -69,8 +69,9 @@
 
 | 内核接口 | 用途 | 风险与降级 |
 |---|---|---|
-| `ctx.on("session/event")` | 消息流/通知聚合/上下文窗口/**队列即时同步** | 事件形态随版本演进；未知类型一律透传不解析，解析异常被 try/catch 兜底 |
+| `ctx.on("session/event")` | 消息流/通知聚合/上下文窗口/队列即时同步/Conversation timeline | 事件形态随版本演进；未知类型进入通用事件卡，能力缺失时 App 回退摘要模式；解析异常被 try/catch 兜底 |
 | `ctx.on("agent/inbox/spliced")`（经 `session/event` 送达） | 队列即时同步：内核任何生效的 inbox 变更都会 append 该会话事件，据此重推 `mobile/queue` 快照 | 事件名与载荷在当前代际与上一代一致；缺失时手机队列退回 REST 轮询兜底（不报错，仅不实时） |
+| `sessionQuery.readEvent`（可选） | Tool activity 与未知 Visible event 的按需无损详情 | 不存在时回退快照；旧历史详情明确显示不可用，不猜测重建 |
 | `ctx.on("agent/status")` | 状态点（绿/橙） | 同上 |
 | `session/modelCatalog` RPC | 模型目录（App 模型选择器） | 失败 → 目录为空，App 隐藏模型胶囊 |
 | `settings.update`（`agent-presets` / `permission` 命名空间） | 默认预设修改 | 与 PC 端同一写入通道；命名空间变更会导致设置失败（App 报错提示） |
@@ -80,6 +81,10 @@
 > ⚠ **子代理通知判定需要 `session.header.origin`**：通知聚合对子代理会话（`origin === "subagent"`）抑制完成/失败通知（与内核自身通知一致）；fork 出的独立会话（无 origin）照常通知。
 >
 > ⚠ **两层请求幂等并存（v3.1.3）**：当前代际内核新增了按 `requestId` 的幂等短路（会扫整条持久会话日志找同 `rpcId` 的 `user/message`），与插件自建的发件回执层（`/m/api/send` + `/m/api/send-receipt`）**职责不同、两层都保留**：内核负责「同一请求不重复执行」，插件负责「传输层中断后回答是否已送达」（`Connection reset by peer` 后重试不重复即由此保证）。
+
+> ⚠ **Issue #1 时间线能力协商（纯增量）：** `/bootstrap` 与 SSE `hello` 的 `capabilities.eventTimeline` 声明 `detail`、`unknownEvents`、`callCorrelation` 等能力。新版 App 只在 `capabilities.eventTimeline.detail` 且事件摘要带 `detail.available` 时请求 `/event-detail`；能力是端点级声明，单事件仍可能因旧日志/离线而不可用。旧插件没有声明时继续使用已有摘要/历史路径，并把详情显示为不可用，不按插件版本号猜测能力。
+>
+> ⚠ **`/bootstrap` 的 `agents[*].sessionId`（纯增量）**：`agentId` 与 `sessionId` 不是同一标识（`session:` 前缀、子代理场景），新版 App 按 session 维护运行状态，需要 bootstrap 一并下发映射，否则冷启动/重连后要等 `agent/status` 变化帧才知道会话在跑（发送键会短暂显示为「发送」而非「停止」）。旧插件不发该字段时 App 回退按 `agentId == sessionId` 取值。`agents[*].title` 的兜底短码也改由 sessionId 派生（旧插件缺字段时不影响）。
 
 ### 2.3 高度自定义化的 Harness
 
