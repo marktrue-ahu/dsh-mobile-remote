@@ -894,6 +894,15 @@ class Api implements GitApi, GitWriteApi {
     }
   }
 
+  /// 设置页用量与额度：服务端只返回最新查询成功的来源，不返回任何凭据。
+  Future<UsageSnapshot> accountUsage({
+    bool refresh = false,
+    Duration timeout = const Duration(seconds: 30),
+  }) async {
+    final path = refresh ? '/api/account-usage?refresh=1' : '/api/account-usage';
+    return UsageSnapshot.fromJson(await getJson(path, timeout: timeout));
+  }
+
   /// 修改默认配置（Agent 预设 / 权限预设，作用于之后新建的会话）。
   Future<void> updateDefaults({
     String? agentPreset,

@@ -58,6 +58,7 @@
 | GET | `/m/api/git/commit` | 提交详情 | 是 |
 | GET | `/m/api/git/diff` | 工作区/暂存/提交差异 | 是 |
 | GET | `/m/api/balance` | DeepSeek 官方余额 | 是 |
+| GET | `/m/api/account-usage` | 用量与额度（DeepSeek / Codex / OpenCode Go） | 是 |
 | GET | `/m/api/qr-config` | 桌面二维码数据（loopback only） | 否（loopback） |
 | POST | `/m/api/defaults` | 修改默认 Agent/权限预设 | 是 |
 | GET/POST | `/m/api/llm-providers` | 模型提供商列表 / 保存配置（v2.6） | 是 |
