@@ -6,7 +6,7 @@
 
 ### Issue 跟踪
 
-Issues 跟踪在 GitHub 仓库 `marktrue-ahu/dsh-mobile-remote`。见 `docs/agents/issue-tracker.md`。
+Issues 跟踪在自建 GitLab 的 `ahedu/dsh-mobile-remote`。见 `docs/agents/issue-tracker.md`。
 
 ### 分类标签
 
