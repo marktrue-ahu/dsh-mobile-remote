@@ -713,37 +713,6 @@ fetch/push 序列化 common domain，pull/sync/abort 同时序列化 common 与 
 远端认证、网络、远端拒绝、非 fast-forward 分别映射为稳定错误；连接中断或结果无法
 从读事实证明时进入 `unknown-result`，而不是自动重试。
 
-### 6.16 GET /m/api/account-usage（用量与额度，v3.2）
-
-服务端并发查询 DeepSeek、当前活动 Codex 账户和 OpenCode Go；凭据只在电脑端解析和使用，手机端只接收脱敏投影。默认使用 60 秒进程内快照，`?refresh=1` 绕过快照并受 2 秒连点保护。未配置来源和本次查询失败来源不会进入 `sources`。
-
-```json
-{
-  "ok": true,
-  "fetchedAt": "2026-08-30T12:00:00.000Z",
-  "availableCount": 3,
-  "failedCount": 0,
-  "sources": [
-    { "id": "deepseek", "title": "DeepSeek", "kind": "balance",
-      "amount": "12.50", "currency": "CNY", "available": true },
-    { "id": "codex", "title": "Codex", "kind": "quota",
-      "account": { "displayName": "Personal", "maskedEmail": "p***@example.com" },
-      "windows": [
-        { "window": "5h", "remainingPercent": 72, "resetAt": "2026-08-30T13:00:00.000Z" }
-      ],
-      "credits": { "unlimited": false, "balance": "8.00" }
-    },
-    { "id": "opencode-go", "title": "OpenCode Go", "kind": "quota",
-      "windows": [{ "window": "weekly", "remainingPercent": 83 }]
-    }
-  ]
-}
-```
-
-- Codex 复用 `dsh-codex-connect` 当前活动账户和代理设置；代理启用但不可用时不直连，不返回 OAuth token。
-- OpenCode Go 固定请求官方 HTTPS 端点，不接受任意 `baseURL`；`percent` 转换为剩余百分比，`rate-limited` 窗口保留并标记 `limited: true`。
-- `failedCount` 只统计已配置但本次查询失败的来源；配额窗口、Credits 和个人消费上限彼此独立，不做相加。
-
 ### 6.17 文件传输（v3.1.2，B站 csborbbnc 反馈）
 
 **GET `/m/api/files?path=…`** — 下载电脑文件
