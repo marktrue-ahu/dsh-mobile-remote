@@ -98,13 +98,49 @@ GraphLayout layoutGraph(List<GitCommit> commits, List<GitBranch> selected) {
   final colors = <int>[];
   final rows = <GraphRow>[];
   var nextColor = selected.length;
-  var laneCount = 1;
+  final commitsByOid = {for (final commit in commits) commit.oid: commit};
+  final commitOids = commitsByOid.keys.toSet();
+  final selectedOids = selected.map((branch) => branch.oid).toSet();
+
+  bool reaches(String start, String target) {
+    final pending = <String>[start];
+    final seen = <String>{};
+    while (pending.isNotEmpty) {
+      final oid = pending.removeLast();
+      if (!seen.add(oid)) continue;
+      if (oid == target) return true;
+      pending.addAll(commitsByOid[oid]?.parents ?? const []);
+    }
+    return false;
+  }
+
+  // Anchor selected tips in the user's selection order when this page contains
+  // them. A selected ancestor shares its descendant's lane until its own row;
+  // reserving a second lane for it would create a false branch split and skip
+  // the normal selected-color transition at that node.
+  final anchoredSelectedOids = selectedOids.where((oid) {
+    if (!commitOids.contains(oid)) return false;
+    return !selectedOids.any((other) => other != oid && reaches(other, oid));
+  }).toSet();
+  for (final branch in selected) {
+    if (!anchoredSelectedOids.contains(branch.oid) ||
+        lanes.contains(branch.oid)) {
+      continue;
+    }
+    lanes.add(branch.oid);
+    colors.add(selectedSlots[branch.oid]?.first ?? nextColor++);
+  }
+
+  var laneCount = lanes.isEmpty ? 1 : lanes.length;
   for (final commit in commits) {
     var lane = lanes.indexOf(commit.oid);
     if (lane < 0) {
-      lane = 0;
-      lanes.insert(0, commit.oid);
-      colors.insert(0, selectedSlots[commit.oid]?.first ?? nextColor++);
+      // A newly encountered component belongs to a new lane. Appending keeps
+      // already active/selected lanes stable instead of visually reconnecting
+      // their parent line to the new component.
+      lane = lanes.length;
+      lanes.add(commit.oid);
+      colors.add(selectedSlots[commit.oid]?.first ?? nextColor++);
     }
     final incoming = colors[lane];
     if (lanes.length > laneCount) {
