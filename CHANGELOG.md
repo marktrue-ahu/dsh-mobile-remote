@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased — Git 分支图 lane 修复（GitLab #4）
+## Unreleased — Git 分支图共同历史 lane 修复（GitLab #5）
+
+- 修复多个选中 tip 按 topo/date 顺序返回时，已有父 lane 被新 tip 挤到当前提交入线造成的视觉错连。
+- selected tip 按选择顺序锚定 lane；未入 active lanes 的新组件追加到右侧；补充真实 `feat/test` 与 `develop` 拓扑回归测试。
+
+## Unreleased — Git 分支图 lane 滚动修复（GitLab #4）
 
 - 修复手机端 Git 分支图各提交行横向滚动偏移不同步导致的 lane 错位。
 - 补充分叉、共享祖先、交叉合并和断开提交组件的拓扑回归测试。
