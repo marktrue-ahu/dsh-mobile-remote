@@ -107,13 +107,6 @@ class AppStore extends ChangeNotifier {
     return pendingApproval?.approvalId == approvalId ? pendingApproval : null;
   }
 
-  ApprovalRequest? _approvalForRpc(Object? rpcId) {
-    for (final a in _pendingApprovalsBySession.values) {
-      if (a.rpcId == rpcId) return a;
-    }
-    return pendingApproval?.rpcId == rpcId ? pendingApproval : null;
-  }
-
   void _clearPendingQuestion(Object? rpcId, [String? sessionId]) {
     _pendingQuestionsBySession.removeWhere((sid, q) => q.rpcId == rpcId && (sessionId == null || sid == sessionId));
     if (pendingQuestion?.rpcId == rpcId && (sessionId == null || pendingQuestion?.sessionId == sessionId)) pendingQuestion = null;

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased — Git 分支图 lane 修复（GitLab #4）
+
+- 修复手机端 Git 分支图各提交行横向滚动偏移不同步导致的 lane 错位。
+- 补充分叉、共享祖先、交叉合并和断开提交组件的拓扑回归测试。
+
 ## Unreleased — Markdown 表格渲染修复（GitLab !3）
 
 - 手机端 Markdown 表格列不再错位：所有行共享同一组列宽（此前每行按自身单元格独立计算，同列跨行偏差 200~400px）。
