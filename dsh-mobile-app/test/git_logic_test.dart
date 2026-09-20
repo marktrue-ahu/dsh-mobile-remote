@@ -88,6 +88,44 @@ void main() {
     },
   );
 
+  test('graph layout keeps selected tips on separate lanes before their shared ancestor', () {
+    // Real repository shape from issue #5:
+    // feat/test 396f581 -> 7695053, while develop 82211f0 -> e152cef.
+    const commits = [
+      GitCommit(
+        oid: '396f5813efa5fce299e6947e4adef176264064a7',
+        parents: ['76950537dc2f85ac2c6f6b3cf4b233f2ae12510c'],
+      ),
+      GitCommit(
+        oid: '82211f0d38350ce6671420b046f953d284b28052',
+        parents: ['e152cef5ebdf9303ba02cc64b4765188c18e6e90'],
+      ),
+      GitCommit(
+        oid: '76950537dc2f85ac2c6f6b3cf4b233f2ae12510c',
+        parents: ['d8fce803a33ce330d1f431f4a9acf6f43e0c120c'],
+      ),
+    ];
+    const selected = [
+      GitBranch(
+        name: 'refs/heads/develop',
+        displayName: 'develop',
+        oid: '82211f0d38350ce6671420b046f953d284b28052',
+      ),
+      GitBranch(
+        name: 'refs/heads/feat/test',
+        displayName: 'feat/test',
+        oid: '396f5813efa5fce299e6947e4adef176264064a7',
+      ),
+    ];
+
+    final layout = graph.layoutGraph(commits, selected);
+
+    expect(layout.rows[0].lane, 1);
+    expect(layout.rows[0].parentLanes, [1]);
+    expect(layout.rows[1].lane, 0);
+    expect(layout.rows[1].parentLanes, [0]);
+  });
+
   test('graph layout preserves an already queued parent lane during a criss-cross merge', () {
     const commits = [
       GitCommit(oid: 'merge', parents: ['left', 'right']),
@@ -104,16 +142,17 @@ void main() {
     expect(layout.rows[5].lane, 0);
   });
 
-  test('graph layout starts a disconnected component without corrupting later lanes', () {
+  test('graph layout appends a disconnected component beside active lanes', () {
     const commits = [
       GitCommit(oid: 'first', parents: ['root']),
-      GitCommit(oid: 'root'),
       GitCommit(oid: 'other', parents: ['other-root']),
+      GitCommit(oid: 'root'),
       GitCommit(oid: 'other-root'),
     ];
     final layout = graph.layoutGraph(commits, const []);
-    expect(layout.rows.map((row) => row.lane), [0, 0, 0, 0]);
-    expect(layout.laneCount, 1);
+    expect(layout.rows.map((row) => row.lane), [0, 1, 0, 0]);
+    expect(layout.rows[2].continuations, isNotEmpty);
+    expect(layout.laneCount, 2);
   });
 
   test('graph labels prioritize current and compact overflow', () {
