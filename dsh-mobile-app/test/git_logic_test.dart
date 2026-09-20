@@ -69,6 +69,53 @@ void main() {
     expect(layout.rows[1].continuations.first.to, 0);
   });
 
+  test(
+    'graph layout keeps shared ancestry aligned when side parent appears first',
+    () {
+      const commits = [
+        GitCommit(oid: 'merge', parents: ['first', 'side']),
+        GitCommit(oid: 'side', parents: ['root']),
+        GitCommit(oid: 'first', parents: ['root']),
+        GitCommit(oid: 'root'),
+      ];
+      final layout = graph.layoutGraph(commits, const []);
+      expect(layout.rows.map((row) => row.lane), [0, 1, 0, 0]);
+      expect(layout.rows[0].parentLanes, [0, 1]);
+      expect(layout.rows[1].parentLanes, [1]);
+      expect(layout.rows[2].parentLanes, [0]);
+      expect(layout.rows[3].parentLanes, isEmpty);
+      expect(layout.laneCount, 2);
+    },
+  );
+
+  test('graph layout preserves an already queued parent lane during a criss-cross merge', () {
+    const commits = [
+      GitCommit(oid: 'merge', parents: ['left', 'right']),
+      GitCommit(oid: 'left', parents: ['base-left']),
+      GitCommit(oid: 'right', parents: ['base-right']),
+      GitCommit(oid: 'base-left', parents: ['root']),
+      GitCommit(oid: 'base-right', parents: ['root']),
+      GitCommit(oid: 'root'),
+    ];
+    final layout = graph.layoutGraph(commits, const []);
+    expect(layout.rows.map((row) => row.lane), [0, 0, 1, 0, 1, 0]);
+    expect(layout.rows[2].continuations, isNotEmpty);
+    expect(layout.rows[4].continuations, isNotEmpty);
+    expect(layout.rows[5].lane, 0);
+  });
+
+  test('graph layout starts a disconnected component without corrupting later lanes', () {
+    const commits = [
+      GitCommit(oid: 'first', parents: ['root']),
+      GitCommit(oid: 'root'),
+      GitCommit(oid: 'other', parents: ['other-root']),
+      GitCommit(oid: 'other-root'),
+    ];
+    final layout = graph.layoutGraph(commits, const []);
+    expect(layout.rows.map((row) => row.lane), [0, 0, 0, 0]);
+    expect(layout.laneCount, 1);
+  });
+
   test('graph labels prioritize current and compact overflow', () {
     const tips = [
       GitBranch(name: 'feature', displayName: 'feature', oid: '1'),
