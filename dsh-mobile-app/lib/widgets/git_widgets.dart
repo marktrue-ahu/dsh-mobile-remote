@@ -272,11 +272,70 @@ class _GraphSheetState extends State<_GraphSheet> {
   bool loadingMore = false;
   int _request = 0;
 
+  // Each row still owns a small horizontal viewport, but all row controllers
+  // share one logical offset. This keeps lane x-coordinates aligned while the
+  // commit column remains vertically scrollable on its own.
+  final Map<String, ScrollController> _graphControllers = {};
+  double _graphScrollOffset = 0;
+  bool _syncingGraphScroll = false;
+
   @override
   void initState() {
     super.initState();
     selected = _defaultSelection();
     _load();
+  }
+
+  ScrollController _graphControllerFor(String oid) {
+    final existing = _graphControllers[oid];
+    if (existing != null) return existing;
+    final controller = ScrollController(initialScrollOffset: _graphScrollOffset);
+    controller.addListener(() {
+      if (_syncingGraphScroll || !controller.hasClients) return;
+      final offset = controller.offset;
+      _graphScrollOffset = offset;
+      _syncingGraphScroll = true;
+      try {
+        for (final other in _graphControllers.values) {
+          if (identical(other, controller) || !other.hasClients) continue;
+          final target = offset.clamp(0.0, other.position.maxScrollExtent);
+          if ((other.offset - target).abs() > 0.01) other.jumpTo(target);
+        }
+      } finally {
+        _syncingGraphScroll = false;
+      }
+    });
+    _graphControllers[oid] = controller;
+    return controller;
+  }
+
+  void _resetGraphScroll() {
+    _graphScrollOffset = 0;
+    final oldControllers = _graphControllers.values.toList();
+    _graphControllers.clear();
+    _syncingGraphScroll = true;
+    try {
+      for (final controller in oldControllers) {
+        if (controller.hasClients && controller.offset != 0) {
+          controller.jumpTo(0);
+        }
+      }
+    } finally {
+      _syncingGraphScroll = false;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      for (final controller in oldControllers) {
+        controller.dispose();
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    for (final controller in _graphControllers.values) {
+      controller.dispose();
+    }
+    super.dispose();
   }
 
   List<GitBranch> _branches() =>
@@ -303,6 +362,7 @@ class _GraphSheetState extends State<_GraphSheet> {
     if (id == null) return;
     final request = ++_request;
     if (reset) {
+      _resetGraphScroll();
       setState(() {
         loading = true;
         loadingMore = false;
@@ -626,23 +686,28 @@ class _GraphSheetState extends State<_GraphSheet> {
             tagNames,
             current: currentBranchName,
           );
+          final graphController = _graphControllerFor(commit.oid);
           return SizedBox(
             height: 58,
             child: Row(
               children: [
                 SizedBox(
                   width: 84,
-                  child: SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: CustomPaint(
-                      size: Size(graphWidth, 58),
-                      painter: _GraphRowPainter(
-                        row: row,
-                        colors: colors,
-                        tipColors: tipColors,
-                        isHead: isHead,
-                        lineColor: DshColors.line(context),
-                        headColor: DshColors.brand(context),
+                  child: ClipRect(
+                    child: SingleChildScrollView(
+                      controller: graphController,
+                      scrollDirection: Axis.horizontal,
+                      physics: const ClampingScrollPhysics(),
+                      child: CustomPaint(
+                        size: Size(graphWidth, 58),
+                        painter: _GraphRowPainter(
+                          row: row,
+                          colors: colors,
+                          tipColors: tipColors,
+                          isHead: isHead,
+                          lineColor: DshColors.line(context),
+                          headColor: DshColors.brand(context),
+                        ),
                       ),
                     ),
                   ),
