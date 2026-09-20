@@ -153,3 +153,37 @@ _Avoid_: Account, model
 **Usage summary**:
 The at-a-glance rendering of the currently available usage sources in the mobile UI, shown as independent per-source entries; it never aggregates balances or quota percentages.
 _Avoid_: Total balance, combined quota
+
+## Conversation timeline
+
+**Conversation timeline**:
+The ordered, replayable rendering of one session's Visible events, covering both live delivery and historical replay.
+_Avoid_: Chat log, message list
+
+**Visible event**:
+A main-conversation event the user may see, carrying a durable sequence number, its type, and — when the computer can still retrieve it — an on-demand detail pointer; an unrecognized type is kept, never silently dropped.
+_Avoid_: Internal record, raw log line
+
+**Tool activity**:
+One tool invocation merged across its whole lifecycle by call id, so arguments, running state, result and error stay in a single timeline entry instead of separate rows.
+_Avoid_: Tool result, activity bar
+
+**On-demand event detail**:
+The lossless per-event payload retrieved by sequence number for long arguments, results and unknown events; when the computer no longer holds it, the phone states it is unavailable instead of reconstructing it.
+_Avoid_: Summary, cached event
+
+**Canonical detail text**:
+The visible text of an event as extracted by the computer under the same rule as the event summary, excluding reasoning and internal blocks; the phone must use it as given and never re-derive text by concatenating raw content blocks.
+_Avoid_: Full response, joined content
+
+**Ordinary mode**:
+The default presentation of the timeline: execution detail is summarized, and selected runtime injections and protocol metadata are hidden.
+_Avoid_: Simple mode, non-technical mode
+
+**Debug mode**:
+The opt-in presentation that additionally exposes raw tool input/output, protocol metadata and unknown events, while system prompts and known context snapshots never appear in either mode.
+_Avoid_: Developer mode, verbose mode
+
+**Timeline capability**:
+The computer's additive declaration that it can serve the timeline, its history and on-demand detail; the phone follows this declaration rather than inferring support from component versions.
+_Avoid_: Version check, feature flag

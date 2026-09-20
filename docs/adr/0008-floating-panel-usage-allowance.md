@@ -2,6 +2,8 @@
 
 Status: accepted
 
+（原编号 0002；与 git 系列撞号后于 2026-09-20 顺延为 0008）
+
 The floating bubble panel shows the full usage and allowance projection in place of its single DeepSeek balance row, and falls back to that row whenever the projection is unavailable. The native service fetches the projection once per panel open under a client-side throttle rather than joining the thirty-minute background and five-second panel cadences that already serve the balance row, because opening a panel is user-initiated: this keeps the "no periodic upstream polling" expectation intact while still showing allowance when the app is not running.
 
 Only monetary balances take part in low-balance alerting; time-window quotas are shown but never light the bubble or borrow the balance wording, because quota cannot be topped up. Account identity stays off the overlay, which is visible over other apps and on the lock screen, though the app detail view still names the active Codex account. Balances and quota windows are never summed, the panel renders remaining capacity as bars and colour without percentages or amounts, and additional Codex buckets stay in the app detail view, where they can be labelled.
