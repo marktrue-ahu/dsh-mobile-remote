@@ -839,13 +839,17 @@ class Api implements GitApi, GitWriteApi {
   }
 
   /// 按 seq 读取一条无损事件详情。详情不可用时由调用方显示明确降级状态。
-  Future<Map<String, dynamic>> eventDetail(String sessionId, int seq, {Duration timeout = const Duration(seconds: 20)}) async {
+  Future<EventDetail> eventDetail(String sessionId, int seq, {Duration timeout = const Duration(seconds: 20)}) async {
     final data = await getJson('/api/event-detail?sessionId=${Uri.encodeQueryComponent(sessionId)}&seq=$seq', timeout: timeout);
     final event = data['event'];
     if (event is! Map || event['type'] is! String) {
       throw ApiException('event detail unavailable', code: 'event-detail-unavailable');
     }
-    return Map<String, dynamic>.from(event);
+    return EventDetail(
+      event: Map<String, dynamic>.from(event),
+      degraded: data['degraded'] == true,
+      detailMode: data['detailMode'] as String?,
+    );
   }
 
   Future<List<AppNotification>> notifications() async {
