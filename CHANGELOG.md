@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — 休眠会话降级读取与配置保持（seeded 会话，fix/dormant-session-read）
+
+- **错误分类**：`/history` 不再把任意休眠读取异常吞成 404 session-not-found——`SESSION_QUERY_SESSION_NOT_FOUND` → 404；损坏 → 500 `session-corrupt`；其它读取/回放失败 → 500 `session-read-failed`（带诊断日志，日志路径脱敏）。
+- **seeded 核心缺陷降级**：DSH 0.1.5-rc.x 的 `readSession()` 用 `Session.create` 校验完整 seeded 日志必抛前缀错误——命中且 `readSurface` 可用时降级读 current surface 打开会话，响应标记 `degraded/current-surface`（不为空页冒充完整历史）；分页只在 surface 范围内有效。
+- **配置保持**：`/send` 恢复休眠会话时，seeded 缺陷下用 `sessionQuery.listEvents+readEvent` 恢复 model/permission/agent-preset 配置（不经新 HTTP 路由）；宿主无恢复能力时回退默认并在响应标记 `configDegraded: true`。
+- **App 侧（3.1.4+31）**：`historyPage()` 解析 `degraded/historyMode`；聊天列表显示"当前仅能恢复部分历史"常驻提示，空页/上翻文案区分「更早历史不可恢复」与「没有更早的消息」。
+- 测试：Node 休眠读取 15 用例 + App HistoryPage 3 用例；合并后全量 Node 153、Flutter 115 通过。
+
 ## Unreleased — 聊天界面重复调试入口移除（GitLab #6）
 
 - 删除聊天界面标题栏中与设置页重复的时间线/调试模式切换按钮。
