@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — 聊天界面重复调试入口移除（GitLab #6）
+
+- 删除聊天界面标题栏中与设置页重复的时间线/调试模式切换按钮。
+- 保留设置页「对话调试模式」作为唯一入口，并保留任务/子代理/目标按钮。
+- 新增 ChatScreen AppBar 回归测试。
+
 ## Unreleased — Git 分支图共同历史 lane 修复（GitLab #5）
 
 - 修复多个选中 tip 按 topo/date 顺序返回时，已有父 lane 被新 tip 挤到当前提交入线造成的视觉错连。
