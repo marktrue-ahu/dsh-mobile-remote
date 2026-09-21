@@ -406,10 +406,20 @@ class ChatEvent {
   }
 }
 
+/// 历史页结果：事件列表 + 分页/降级元数据（v3.1.4 hasMore；v3.1.5 degraded）。
+/// `degraded=true` 表示休眠会话降级读取（current surface）：时间线只含可恢复的表面，
+/// 更早 log-only 历史不可用；客户端应展示"部分历史"提示并区分空页文案。
 class HistoryPage {
   final List<ChatEvent> events;
   final bool hasMore;
-  const HistoryPage({required this.events, this.hasMore = false});
+  final bool degraded;
+  final String? historyMode;
+  const HistoryPage({
+    required this.events,
+    this.hasMore = false,
+    this.degraded = false,
+    this.historyMode,
+  });
 }
 
 class TimelineCapabilities {

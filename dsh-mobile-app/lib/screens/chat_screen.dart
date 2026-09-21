@@ -151,6 +151,7 @@ class _ChatScreenState extends State<ChatScreen> {
   Timer? _queuePollTimer; // v2.7.2 review：dock 可见时的周期兜底刷新
   bool _queueBusy = false; // v2.7.2 review：队列操作忙碌锁（防连点双发）
   int _earliestSeq = 0; // live 窗口最旧条目的 seq（"查看更早"分页起点）
+  bool _historyDegraded = false; // 休眠会话降级读取（current surface）：持续提示"部分历史"
   bool _loadingMore = false;
   bool _noMoreHistory = false; // 已到会话最顶端（无更早消息），停止再查询
   bool _showJumpToLatest = false; // 上翻后显示"回到底部"浮钮
@@ -348,7 +349,9 @@ class _ChatScreenState extends State<ChatScreen> {
     final generation = ++_loadGeneration;
     AppLog.instance.log(reset ? 'Chat: 重同步会话（按新表面重载）$id' : 'Chat: 打开会话 $id');
     try {
-      final events = await api.history(id, limit: _liveMax);
+      final page = await api.historyPage(id, limit: _liveMax);
+      final events = page.events;
+      if (page.degraded) _historyDegraded = true;
       AppLog.instance.log('Chat: 历史加载成功 ${events.length} 条${reset ? '（重同步）' : ''}');
       if (!mounted || generation != _loadGeneration || id != _mySessionId) return;
       setState(() {
@@ -472,11 +475,13 @@ class _ChatScreenState extends State<ChatScreen> {
     final generation = _loadGeneration;
     AppLog.instance.log('Chat: 无限上翻 before=$_earliestSeq');
     try {
-      final events = await api.history(id, before: _earliestSeq, limit: _histPageSize);
+final page = await api.historyPage(id, before: _earliestSeq, limit: _histPageSize);
+      final events = page.events;
+      if (page.degraded) _historyDegraded = true;
       if (!mounted || generation != _loadGeneration || id != _mySessionId) return;
       if (events.isEmpty) {
         _noMoreHistory = true;
-        showToast(context, L10n.t('没有更早的消息了', 'No earlier messages'));
+        showToast(context, L10n.t(_historyDegraded ? '更早历史不可恢复' : '没有更早的消息了', _historyDegraded ? 'Earlier history unavailable' : 'No earlier messages'));
         return; // 已到最顶：不再查询，_earliestSeq 保持不动
       }
       final pageItems = <_MsgItem>[];
@@ -516,10 +521,12 @@ class _ChatScreenState extends State<ChatScreen> {
     final generation = _loadGeneration;
     AppLog.instance.log('Chat: 查看更早 before=$_earliestSeq');
     try {
-      final events = await api.history(id, before: _earliestSeq, limit: _histPageSize);
+final page = await api.historyPage(id, before: _earliestSeq, limit: _histPageSize);
+      final events = page.events;
+      if (page.degraded) _historyDegraded = true;
       if (!mounted || generation != _loadGeneration || id != _mySessionId) return;
       if (events.isEmpty) {
-        showToast(context, L10n.t('没有更早的消息了', 'No earlier messages'));
+        showToast(context, L10n.t(_historyDegraded ? '更早历史不可恢复' : '没有更早的消息了', _historyDegraded ? 'Earlier history unavailable' : 'No earlier messages'));
         return;
       }
       setState(() {
@@ -547,7 +554,9 @@ class _ChatScreenState extends State<ChatScreen> {
     final generation = _loadGeneration;
     AppLog.instance.log('Chat: 历史更早 before=$_histOldestSeq');
     try {
-      final events = await api.history(id, before: _histOldestSeq, limit: _histPageSize);
+final page = await api.historyPage(id, before: _histOldestSeq, limit: _histPageSize);
+      final events = page.events;
+      if (page.degraded) _historyDegraded = true;
       if (!mounted || generation != _loadGeneration || id != _mySessionId) return;
       if (events.isEmpty) {
         setState(() => _histHasOlder = false);
@@ -576,7 +585,9 @@ class _ChatScreenState extends State<ChatScreen> {
     final generation = _loadGeneration;
     AppLog.instance.log('Chat: 历史更新 after=$_histNewestSeq');
     try {
-      final events = await api.history(id, after: _histNewestSeq, limit: _histPageSize);
+final page = await api.historyPage(id, after: _histNewestSeq, limit: _histPageSize);
+      final events = page.events;
+      if (page.degraded) _historyDegraded = true;
       if (!mounted || generation != _loadGeneration || id != _mySessionId) return;
       if (events.isEmpty) {
         setState(() => _histHasNewer = false);
@@ -718,7 +729,7 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
         Expanded(
           child: _histItems.isEmpty
-              ? Center(child: Text(L10n.t('没有更早的消息', 'No earlier messages')))
+              ? Center(child: Text(L10n.t(_historyDegraded ? '更早历史不可恢复' : '没有更早的消息', _historyDegraded ? 'Earlier history unavailable' : 'No earlier messages')))
               : ListView.builder(
                   controller: _scrollCtrl,
                   padding: const EdgeInsets.fromLTRB(16, 10, 16, 6),
@@ -985,6 +996,7 @@ class _ChatScreenState extends State<ChatScreen> {
       while (pageNo < _catchupMaxPages) {
         pageNo++;
         final page = await api.historyPage(id, after: cursor, limit: 100);
+        if (page.degraded) _historyDegraded = true;
         if (!mounted || generation != _loadGeneration || id != _mySessionId) return;
         final fresh = <ChatEvent>[];
         for (final ev in page.events) {
@@ -2119,6 +2131,17 @@ class _ChatScreenState extends State<ChatScreen> {
               jobs: widget.store.jobsOf(_mySessionId ?? ''),
               onOpen: _openTools,
               onKill: _killJob,
+            ),
+          // v3.1.5：休眠会话降级（current surface）常驻提示——部分历史不可恢复
+          if (_historyDegraded)
+            Container(
+              width: double.infinity,
+              color: Theme.of(context).colorScheme.surfaceContainerHighest,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              child: Text(
+                L10n.t('当前仅能恢复部分历史，更早内容可能不可用', 'Only partial history available'),
+                style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant),
+              ),
             ),
           // 消息流：live 视图（普通列表，最新在底部）或历史分段浏览；
           // 上翻时右下角浮出"回到底部"圆钮（位于输入框正上方，不在消息流内）

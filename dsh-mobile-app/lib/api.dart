@@ -818,7 +818,8 @@ class Api implements GitApi, GitWriteApi {
     }
     return bytes;
   }
-/// 拉历史页。服务端返回 hasMore，供断线 catch-up 循环补齐 durable cursor。
+/// 拉历史页。服务端返回 hasMore，供断线 catch-up 循环补齐 durable cursor；
+  /// v3.1.5 起同时解析 degraded/historyMode（休眠会话降级读取标记）。
   Future<HistoryPage> historyPage(String sessionId, {int? after, int? before, int limit = 100, Duration timeout = const Duration(seconds: 15)}) async {
     final params = 'sessionId=${Uri.encodeQueryComponent(sessionId)}'
         '${after != null ? '&after=$after' : ''}${before != null ? '&before=$before' : ''}&limit=$limit';
@@ -826,6 +827,9 @@ class Api implements GitApi, GitWriteApi {
     return HistoryPage(
       events: (data['events'] as List? ?? []).whereType<Map>().map((e) => ChatEvent.fromJson(Map<String, dynamic>.from(e))).toList(),
       hasMore: data['hasMore'] == true,
+      // v3.1.5：休眠会话降级读取标记（current surface）——历史可能不完整
+      degraded: data['degraded'] == true,
+      historyMode: data['historyMode'] as String?,
     );
   }
 
