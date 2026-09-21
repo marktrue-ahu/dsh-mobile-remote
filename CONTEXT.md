@@ -187,3 +187,11 @@ _Avoid_: Developer mode, verbose mode
 **Timeline capability**:
 The computer's additive declaration that it can serve the timeline, its history and on-demand detail; the phone follows this declaration rather than inferring support from component versions.
 _Avoid_: Version check, feature flag
+
+**Code fence**:
+A block boundary made of three or more backticks; a closing fence must use at least as many backticks as its opener, and everything inside the fence is code — never re-parsed as Markdown. Indentation in the opening line is tolerated so that code blocks nested in list items still render.
+_Avoid_: Triple-backtick block, code marker
+
+**Markdown block parsing**:
+The client-side process that cuts a message's given text into block elements (headings, lists, quotes, tables, code) for the Conversation timeline; it renders the text as given and never re-derives it.
+_Avoid_: Markdown conversion, HTML rendering
