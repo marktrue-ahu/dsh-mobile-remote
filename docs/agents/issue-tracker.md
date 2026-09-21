@@ -37,6 +37,34 @@ DSH_GLAB='/mnt/d/Program Files (x86)/glab/glab.exe'
 
 `glab api` 的项目引用支持数字 ID（`projects/53`）与 URL 编码 path（`projects/ahedu%2Fdsh-mobile-remote`）两种写法。
 
+### 已知问题：REST `PUT /projects/:id/issues/:iid` 卡在读响应
+
+该实例上走 REST 的 issue 更新（关闭 / 重启 / 改标签）会**超时无响应**（超时后服务端有时仍会后台生效）：
+
+```text
+read tcp 172.17.255.182:…->117.68.9.95:80: connection attempt failed
+```
+
+WSL 直连 `curl -X PUT` 与 Windows 侧 `glab` 现象一致。注意 `gitlab.local` 解析到 `117.68.9.95` 是 Windows hosts 的显式配置（该地址上就是这套 GitLab），**不是解析错误**。创建 issue 与发表评论（POST）不受影响。
+
+替代路径（已验证）：
+
+- **关闭 / 重启 issue → GraphQL `updateIssue`**：
+
+  ```sh
+  "$DSH_GLAB" api graphql -f query='mutation { updateIssue(input: { projectPath: "ahedu/dsh-mobile-remote", iid: "9", stateEvent: CLOSE }) { issue { iid state } errors } }'
+  ```
+
+  `stateEvent` 取 `CLOSE` / `REOPEN`；GraphQL 的 mutation 名是 `updateIssue`（该实例没有 `issueSetState`）。
+
+- **改标签**：GraphQL `updateIssue` 的 `addLabelIds` / `removeLabelIds`（需 label 的数字 ID），或重试 REST PUT 后用 GET 复核 `labels` 字段（曾观察到 `?add_labels=` 超时但实际已生效）。
+
+任何写操作后都复核一次状态：
+
+```sh
+"$DSH_GLAB" api "projects/53/issues/<iid>" | grep -o '"state":"[a-z]*"'
+```
+
 ## 技能指令
 
 技能说「发布到 issue 跟踪器」时，在 `ahedu/dsh-mobile-remote` 创建 issue，并按 `triage-labels.md` 打标签（`/to-spec` 用 `ready-for-agent`）。
