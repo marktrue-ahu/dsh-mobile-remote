@@ -1,6 +1,6 @@
 # 移动端 Git 首版聚焦日常闭环
 
-Status: accepted
+Status: superseded by ADR 0009
 
 移动 App 的 Git 管理以日常闭环为首版边界，不尝试复制完整桌面 Git 工作台。首版目标包括状态与差异查看、暂存与提交、分支与分支图、fetch、pull、push，以及随后交付的 stash 和 tag；冲突编辑、交互式历史重写、cherry-pick、远端分支重命名和删除等复杂或高风险能力后置。pull 策略可以在设置中选择 merge 或 rebase，但冲突发生后必须暂停并交接，不能自动继续。
 

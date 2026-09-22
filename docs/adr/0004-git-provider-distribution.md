@@ -1,11 +1,19 @@
-# Git provider 随移动 Git 能力提供受支持版本
+# Git 只读 provider 采用外部优先、包内兜底
 
-Status: proposed
+Status: accepted
 
-移动 Git 是用户可见的核心功能，但 provider 在 DSH 中应保持可替换，因此推荐把默认 provider 作为独立包随对应版本的 mobile-remote 一起安装和发布，并维护 Service Definition、provider、mobile-remote 与 App 的兼容矩阵；运行时仍把 provider 视为可选能力，缺失或不兼容时明确报告不可用原因。待默认 provider 的代码归属、发布权限和升级路径验证后再将本决策改为 accepted。
+移动端 Git 只读导航是用户可见的核心功能，同时 Git Service Definition 和 provider 可替换边界仍需保留。运行时优先使用已注册且兼容的外部 provider；没有外部 provider 时，由 mobile-remote 包内的只读 provider 实现同一服务定义，提供仓库识别、分支、tip 绑定提交图、提交详情和变化通知。包内 provider 是默认实现，不是移动 HTTP 路由中的 Git 命令特例，也不提供任何写操作。
+
+## Consequences
+
+- 默认安装无需额外插件即可浏览授权工作区中的 Git 仓库。
+- 外部 provider 可在不改变 Flutter 或移动 API 的情况下替换包内实现；mobile-remote 继续拥有 DTO、错误码和兼容映射。
+- 包内 provider 只能通过受控 argv、非交互环境、输出与时间上限读取已注册工作区中的仓库，不注册 stage、commit、branch mutation、fetch、pull、push 或其他写能力。
+- provider 缺失、不兼容或仓库不可读时，Git 导航入口保持可见并报告稳定原因，不影响其他移动能力。
+- 兼容矩阵只需覆盖 Git Service Definition、provider、mobile-remote 和 App 的只读契约，不再发布移动 Git 写操作协议。
 
 ## Considered Options
 
-- 仅要求用户自行安装社区插件：发布简单，但默认安装没有 Git 功能，支持矩阵不可控。
-- 把 Git 命令直接放进 mobile-remote：交付简单，但破坏 provider/consumer 边界并扩大插件职责。
-- 独立 provider 与项目版本线共同发布：边界清晰且默认可用，但增加一个发布物和兼容性测试成本；当前推荐。
+- 必须单独安装 provider：边界最清晰，但默认安装会出现可见却不可用的核心入口。
+- 只使用包内实现：交付简单，但失去 provider 可替换性。
+- 外部优先、包内只读兜底：默认可用且保留服务接缝；当前采用。
