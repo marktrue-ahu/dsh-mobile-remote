@@ -13,12 +13,30 @@ if [ ! -f "$apk" ]; then
     exit 1
 fi
 
-ver="$(sed -n 's/^version:[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)[[:space:]]*/\1/p' "$app_dir/pubspec.yaml" | head -1)"
-[ -n "$ver" ] || { echo "Cannot parse version from pubspec.yaml" >&2; exit 1; }
-build_num="$(sed -n 's/^version:[[:space:]]*[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*+\([0-9][0-9]*\)[[:space:]]*/\1/p' "$app_dir/pubspec.yaml" | head -1)"
-full_ver="$ver"
-if [ -n "$build_num" ]; then
-    full_ver="$ver+$build_num"
+full_ver="$(sed -nE 's/^version:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+\+[0-9]+)([[:space:]]+#.*)?[[:space:]]*$/\1/p' "$app_dir/pubspec.yaml" | head -1)"
+[ -n "$full_ver" ] || { echo "Cannot parse version (expected X.Y.Z+N) from pubspec.yaml" >&2; exit 1; }
+ver="${full_ver%+*}"
+build_num="${full_ver##*+}"
+
+if [ -n "${MANIFEST_VERSION:-}" ]; then
+    if [ "${ALLOW_TEST_MANIFEST_VERSION:-}" != "1" ]; then
+        echo "MANIFEST_VERSION is test-only; set ALLOW_TEST_MANIFEST_VERSION=1 explicitly" >&2
+        exit 1
+    fi
+    if [[ ! "$MANIFEST_VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\+([0-9]+)$ ]]; then
+        echo "MANIFEST_VERSION must have the form X.Y.Z+N" >&2
+        exit 1
+    fi
+    override_main="${BASH_REMATCH[1]}"
+    override_build="${BASH_REMATCH[2]}"
+    if [ "$override_main" != "$ver" ] || (( 10#$override_build <= 10#$build_num )); then
+        echo "Test manifest version must keep $ver and use a build number greater than $build_num" >&2
+        exit 1
+    fi
+    full_ver="$MANIFEST_VERSION"
+elif [ "${ALLOW_TEST_MANIFEST_VERSION:-}" = "1" ]; then
+    echo "ALLOW_TEST_MANIFEST_VERSION=1 requires MANIFEST_VERSION" >&2
+    exit 1
 fi
 
 dist="$app_dir/dist"
@@ -29,9 +47,13 @@ apk_out="$dist/DSH-Remote-v$ver.apk"
 cp "$apk" "$apk_out"
 echo "Archived: $apk_out ($(du -h "$apk_out" | cut -f1))"
 
-# 2) 插件 tarball（npm pack，本地无网络）
-tgz_out="$dist/dsh-mobile-remote-$ver.tgz"
+# 2) 插件 tarball（npm pack，本地无网络；输出名与 PowerShell 脚本统一）
+npm_tgz="$dist/dsh-mobile-remote-$ver.tgz"
+tgz_out="$dist/dsh-mobile-remote-v$ver.tgz"
 (cd "$repo_dir" && npm pack --pack-destination "$dist" >/dev/null)
+if [ -f "$npm_tgz" ]; then
+    mv -f "$npm_tgz" "$tgz_out"
+fi
 if [ ! -f "$tgz_out" ]; then
     echo "Plugin tarball not found at $tgz_out" >&2
     exit 1

@@ -1,6 +1,6 @@
 # 02 系统架构设计说明书 — dsh-mobile-remote
 
-> 版本：v3.2.0 · 状态：已实现（v2.3 问询/审批弹窗桥、v2.4~v2.5 连接自愈、v2.6 安全加固+模型提供商互通、v2.9/v3.0 LAN 桥 + 图像链路、v3.2 用量与额度） · 配套：01-PRD.md、03-api.md、04-security.md、09-compatibility.md
+> 版本：v3.1.5 · 状态：已实现（v2.3 问询/审批弹窗桥、v2.4~v2.5 连接自愈、v2.6 安全加固+模型提供商互通、v2.9/v3.0 LAN 桥 + 图像链路、v3.1.5 用量与额度） · 配套：01-PRD.md、03-api.md、04-security.md、09-compatibility.md
 
 ## 1. 背景与范围
 DSH 由 Cordis 组合出宿主（desktop 版 `dsh-plugin-desktop` 或 web 版 `dsh --profile web`），webserver 默认只绑定 `127.0.0.1`（**桌面版 0.1.1-rc.2 起强制回环**，DesktopsWebServer 对非回环 host 直接 throw）。本插件在宿主侧挂载 Cordis 插件：在 webServer 上注册 `/m` 前缀路由，并在 **LAN 桥**（`lanBridge`，默认 `0.0.0.0:3080`）自建监听把移动端请求流式转发到回环 webserver——移动端形态为**原生 Flutter App**（`dsh-mobile-app`），经 `/m/api` 与插件通信。插件不修改桌面 GUI 的任何现有 UI。
@@ -217,7 +217,7 @@ sequenceDiagram
     P-->>M: SSE `mobile/frame`（收起卡片，两端同步消失）
 ```
 
-- **获取服务必须用 `ctx.inject(["apiProxy"])`**：各插件上下文隔离，`ctx.get` 看不到兄弟插件注册的服务（dsh-client-connection 同款用法）。
+- **获取服务必须用 `ctx.inject(["apiProxy"])`**：原因**不是**上下文隔离——同 realm 下 `ctx.get` 能读到兄弟插件注册的服务，官方指引也明确「可选服务用 `ctx.get(name)`，`ctx.<name>` 只留给已声明的注入」。真实原因是**激活时间点**：旧代 `ApiProxyService` 的依赖链比本插件的 `webServer` 更深，插件装配时它往往尚未 ACTIVE，严格 `ctx.get` 读到 `undefined`。因此同步探测用 `ctx.get`（包 try/catch），而要真正调用或订阅的能力一律走 `ctx.inject`——它是响应式依赖，服务迟到或卸载后重载都会自动重跑。（历史记录见 CHANGELOG v2.4.0 条目。）
 - 只转发 question/approval/session-queue 瞬态帧；`session/event` 仍走 `ctx.on` 桥避免重复。
 - **私有协议风险**：`events.mux` / `respond` 消息格式无稳定版本承诺；缺失时干净降级（`/m/api/respond` 返回 503、诊断 `respondBridge=false`），详见 docs/09-compatibility.md。
 - 断线补发：App 重连 SSE 时插件回放 `pendingFrames`；从「需要你回答」通知进入会话即见挂起弹窗。

@@ -307,7 +307,43 @@ flutter build apk --release
 - 插件/网页端改动 → 按 §3 同步并重启 DSH。
 - App 改动 → 重新 `flutter build apk --release` 并重装（同签名覆盖安装，保留连接信息）。
 
-### 8.5 App 自动更新（双更新源，v3.0.0+）
+### 8.5 测试构建与重复自动更新验证
+
+测试构建的目标是：APK 内置版本保持不变，主机源 `manifest.json` 使用更大的测试 build 号（通常为 `+99`），这样每次打开「检查更新」都能再次触发更新流程。
+
+1. 不修改 `dsh-mobile-app/pubspec.yaml`，也不要给 Flutter 构建命令传入新的 `--build-number`：
+
+   ```bash
+   cd dsh-mobile-app
+   flutter analyze
+   flutter test
+   flutter build apk --release
+   ```
+
+2. 使用 manifest 覆盖变量打包并部署。`MANIFEST_VERSION` 只写入 manifest，不会改变 APK 内置的 `versionName/versionCode`：
+
+   ```bash
+   ALLOW_TEST_MANIFEST_VERSION=1 \
+   MANIFEST_VERSION="3.1.5+99" \
+   UPDATE_DIR="$HOME/.dsh/mobile-remote/update" \
+   bash tools/package-release.sh
+   ```
+
+   Windows PowerShell：
+
+   ```powershell
+   $env:ALLOW_TEST_MANIFEST_VERSION = '1'
+   $env:MANIFEST_VERSION = '3.1.5+99'
+   $env:UPDATE_DIR = "$HOME/.dsh/mobile-remote/update"
+   .\tools\package-release.ps1
+   Remove-Item Env:ALLOW_TEST_MANIFEST_VERSION, Env:MANIFEST_VERSION, Env:UPDATE_DIR
+   ```
+
+3. 验证 `manifest.json` 的 `version` 为 `3.1.5+99`，并确认 `sha256`、`size` 与 manifest 指向的 APK 一致；随后在 App 中检查更新并完成覆盖安装。
+
+> `+99` 仅用于测试；发布脚本默认拒绝覆盖，必须显式设置 `ALLOW_TEST_MANIFEST_VERSION=1` 才可用。测试完成后清空 `updateDir` 或重新部署正式 manifest，避免用户持续收到测试更新。APK 与已安装版本必须使用同一签名。
+
+### 8.6 App 自动更新（双更新源，v3.0.0+）
 
 > 入口：设置 → 关于 → 「更新源」（GitHub Releases / dsh 运行主机，单选持久化，默认 GitHub）+「检查更新」；自动检查在启动连接成功后静默执行一次，命中后首页横幅 + 版本行「● 有新版本」提示。更新流程：确认弹窗（版本/说明/大小/来源）→ 下载（进度可取消）→ 主机源 sha256 校验 → **签名预检**（与已装版本签名不一致即取消并提示）→ 系统安装器。
 
@@ -330,8 +366,6 @@ flutter build apk --release
 
 重启插件（或触发 patch 热重放）后，手机 App 切「主机」源即可检查/下载。产物可用 `tools/verify-update-manifest.mjs` 校验。
 
-**DSH 0.1.2-rc.1 / 桌面版网络边界**：宿主 WebServer 可能只监听 `127.0.0.1`，这不影响插件注册更新端点，但手机不能直接访问回环端口。按 §4b 启用已配置强 `authToken` 的 LAN 桥（默认 `0.0.0.0:3080`），手机访问桥地址；web 版若 WebServer 已绑定可信局域网地址则可直接访问。LAN 桥只转发移动 API，不转发宿主内部 `/api`、`/m/api/qr-config` 或二维码图片路径。主机源检查失败时停止当前检查，不自动切换 GitHub。
-
 > 安全/兼容提醒：`authToken` 必须开启（更新通道暴露 APK 等于暴露分发面）；签名变更会导致「签名不一致」被预检拦截——正式分发请用同一 keystore，确实换签需先卸载旧版（§8.3）。
 
 ## 9. 验收清单（已执行 ✅）
@@ -349,10 +383,3 @@ flutter build apk --release
 - [x] **App 自动更新（v3.0.0+）**：双源检查（GitHub releases/latest + 主机 updateDir 端点）、版本判定单测（更新/不提示/防降级）、下载进度可取消、主机源 sha256 校验、签名预检（不一致取消）、FileProvider 拉起安装器、`gen-manifest.js` 产物经 `verify-update-manifest.mjs` 校验、`flutter analyze` 零问题
 - [x] 通知删除（单删/批量/清空）+ 诊断页服务探针（respondBridge/frameBridge ✅）
 - [x] 图像链路实机：发送/渲染/全屏/限额/类型纠正（v3.0.0 全套，见 CHANGELOG）
-
-### 9.1 本次 RC1 自动更新兼容收敛
-
-- [x] Node 契约测试（`node --test test/update-routes.test.mjs`）：WebServer 路由注册、无 RC1 Remote 服务时的 manifest/APK、认证/Host/校验错误、LAN 桥允许与拒绝边界。
-- [x] 服务端模块 `node --check` 与现有 RC1 adapter 验证。
-- [ ] DSH 0.1.1-rc.2 与 0.1.2-rc.1 的 live profile/HTTP 双宿主实测：当前环境未执行，不能以静态检查代替。
-- [ ] Android 真机/系统安装器回归：本次未修改 App 更新逻辑；当前环境未提供 Flutter/真机验证条件。

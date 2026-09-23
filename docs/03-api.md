@@ -1,6 +1,6 @@
 # 03 API 接口设计文档 — dsh-mobile-remote
 
-> 版本：v3.2.0 · 状态：已实现 · 配套：00-开发总纲.md、02-architecture.md、04-security.md、09-compatibility.md
+> 版本：v3.1.5 · 状态：已实现；Git API 小节为尚未实现的设计草案 · 配套：00-开发总纲.md、02-architecture.md、04-security.md、09-compatibility.md
 > 前缀：`/m`（可配置项 `path`，默认 `/m`）。以下所有路径均以前缀开头。
 > 服务端 API 同时服务 Flutter App（dsh-mobile-app）与桌面设置页客户端模块；不含网页版页面（v2.1 起移除）。
 ## 1. 通用约定
@@ -44,7 +44,8 @@
 | GET | `/m/api/usage` | 会话 token 用量 | 是 |
 | GET | `/m/api/workspaces` | 已注册工作区 | 是 |
 | GET/POST | `/m/api/directories` | 目录浏览/新建文件夹 | 是 |
-| GET | `/m/api/diagnostics` | 环境诊断 | 是 |
+| GET | `/m/api/diagnostics` | 环境诊断（插件运行时、services、checks） | 是 |
+| — | `/m/api/git/*`（规划中） | 设计草案；v3.1.5 未注册这些路由 | 不适用 |
 | GET | `/m/api/balance` | DeepSeek 官方余额 | 是 |
 | GET | `/m/api/account-usage` | 用量与额度（DeepSeek / Codex / OpenCode Go） | 是 |
 | GET | `/m/api/qr-config` | 桌面二维码数据（loopback only） | 否（loopback） |
@@ -59,9 +60,9 @@
 | GET/POST | `/m/api/goal` | 当前目标 / 创建·暂停·继续·完成（v2.7，goal RPC 同源） | 是 |
 | GET/POST | `/m/api/commands` | 斜杠命令目录/执行（v2.8.0；v2.8.2 适配内核 0.1.1-rc.2 四参签名，服务缺失优雅降级） | 是 |
 
-### 2.1 App 自动更新（主机源，v3.0.0+）
+### 2.1 App 自动更新（主机源，v3.x）
 
-**概念**：插件配置 `updateDir`（默认空串 = 未配置主机源；显式配置时可使用 `~/.dsh/mobile-remote/update/` 等路径，见 docs/06 §8.5）里放发布脚本产出的 APK 与 `manifest.json`。**manifest 是唯一权威**——App 只读 manifest，不枚举目录。
+**概念**：插件配置 `updateDir`（如 `~/.dsh/mobile-remote/update/`，见 docs/06 §8.5）里放发布脚本产出的 APK 与 `manifest.json`。**manifest 是唯一权威**——App 只读 manifest，不枚举目录。
 
 **`manifest.json` 契约**（由 `tools/gen-manifest.js` 统一生成，双端发布脚本共用）：
 
@@ -83,8 +84,6 @@
 - `500 update-apk-read-failed`：读取失败。
 
 > GitHub 源不经过本插件（App 直连 `api.github.com/repos/201222-L/dsh-mobile-remote/releases/latest`，取首个 `DSH-Remote-*.apk` 资产，`browser_download_url` 直连下载）。
-
-**DSH 0.1.2-rc.1 兼容边界**：更新端点直接注册到宿主 `webServer`，不依赖 Typert Gateway、SessionController、Remote Event 或旧 `/api` RPC；这些服务缺失不会阻止主机源端点。若宿主 WebServer 仅监听回环地址，手机必须通过启用并配置 authToken 的 LAN 桥访问。LAN 桥只转发 `/m/api*`，不转发宿主内部 `/api`、`/m/api/qr-config` 或二维码图片路径。
 
 ## 3. 端点详述（v1 既有端点）
 ### 3.1 GET /m/api/bootstrap
@@ -209,17 +208,9 @@
 - `before`（可选）：**上翻分页**——只返回 `seq < before` 的最近 `limit` 条事件（对话内滚动到顶部加载更早）。
 - 三种模式优先级：`after` > `before` > 初始加载（缺省时返回最近 `limit` 条，即尾部）。
 - `limit`（可选，默认 500，上限 1000）：最多返回条数
-**过滤规则**：返回可进入 Conversation timeline 的事件；`assistant/chunk` / `assistant/live-chunk` 只用于实时草稿，`agent/inbox/spliced` 由队列投影承载，`request/header`（含 system prompt/tool schema）、`request/context`、`session/title-llm-request` / `web/deepseek-search-llm-request`（LLM 请求快照：data 含 `system` 系统提示词与 `messages` 对话正文）、`session/end-seed`、`step/start`、`step/end`、`system/message`、`assistant/attempt`（重试/中断的原始 stream 记录）与 `compaction/start` / `compaction/summary` / `compaction/prune` / `compaction/end`（压缩生命周期；summary 正文即替换 shadowed 区间后的上下文快照）属于内部/重建/快照元数据，历史、实时与 3.5b 详情三处都不返回。`compaction/end` 作为不落卡片的实时控制帧通知 App 重新加载 durable snapshot。
+**过滤规则**：返回可进入 Conversation timeline 的事件；`assistant/chunk` / `assistant/live-chunk` 只用于实时草稿，`agent/inbox/spliced` 由队列投影承载，`request/header`（含 system prompt/tool schema）、`request/context`、`session/end-seed`、`step/start`、`step/end`、`system/message`、`assistant/attempt`（重试/中断的原始 stream 记录）与 `compaction/start` / `compaction/summary` / `compaction/prune` / `compaction/end`（压缩生命周期；summary 正文即替换 shadowed 区间后的上下文快照）属于内部/重建/快照元数据，历史、实时与 3.5b 详情三处都不返回。`compaction/end` 作为不落卡片的实时控制帧通知 App 重新加载 durable snapshot。未知 type（即使带 `ignorable: true`）保留 `seq`/`type`，但不提供详情指针；由于详情端点采用 fail-closed allow-list，未知类型请求详情会返回 `404 event-not-found`。只有经审查并列入 allow-list 的可见类型可通过 3.5b 读取详情。
 
-未知 type（即使带 `ignorable: true`）**保留 `seq`/`type` 进入时间线**（事件保真：不能因客户端尚未认识类型而静默丢弃），但**不下发详情指针**——`detail.available` 只对下方 allow-list 内的可见类型为真，其余类型调 3.5b 返回 `404 event-not-found`。这保证「新类型照常可见」与「未命名记录的原始载荷不外泄」同时成立（fail-closed）。
-
-**详情可见类型（allow-list）**：`user/message`、`assistant/message`、`tool/call`、`tool/result`、`todo/write`、`turn/start`、`turn/end`。
-
-判定依据：这几类正是 `summarizeEventCore` **逐个类型显式审过载荷**并下发给 App 的类型；其余类型走 default 分支只给 `{seq, type}`，App 从不消费其 data。`assistant/chunk` / `assistant/live-chunk` 虽被 App 消费，但属于实时草稿（不落 durable 历史），故不在名单内。
-
-**有意的 fail-closed 取舍**：`approval/*`、`question/*`、`session/jobs`、`session/title`、`subagent/*`、`command/*`、`tool/ptc-dispatch*` 这些 App 会渲染卡片、但插件**尚未审过载荷**的类型当前**不在** allow-list —— 调试模式下展开这类卡片会显示「详情不可用」。原因是它们可能携带 prompt / 命令正文（如 `subagent/descriptor`、`command/run`）。要放行某个类型，需先逐类型审计载荷，然后**同时**改服务端 `DETAIL_VISIBLE_TYPES` 与 App 侧详情入口白名单。
-
-> 客户端呈现约定：`session/title`、`model/selection`、`sandbox/mode`、`agent-preset/selected`、`subagent/*`、`team/*`、`feedback/*`、`command/*`、`approval/policy`、`tool/ptc-dispatch*`、`goal/change`、`plan/mode`、`permission/preset`、`schedule/change`、`hook/*`、`llm/retry*`、`deliverables/presented`、`tool-workflow/*`、`session-log-deepseek/delivery-accepted`、`subagent/model-selection-policy` 属协议/运行时元数据——仍下发并保留 `seq`，但普通模式不渲染，调试模式可展开审阅（见 05-test-cases F-34）。`approval/asked` / `approval/decided` 是 durable 审批记录，普通模式以可读标题呈现（历史回放的权威源；问询只有瞬态帧，不保证回放）。
+> 客户端呈现约定：`session/title`、`model/selection`、`sandbox/mode`、`agent-preset/selected`、`subagent/*`、`team/*`、`feedback/*`、`command/*`、`approval/policy`、`tool/ptc-dispatch*`、`goal/change` 属协议/运行时元数据；普通模式不渲染，调试模式按摘要可用字段展示。只有 `user/message`、`assistant/message`、`tool/call`、`tool/result`、`todo/write`、`turn/start`、`turn/end` 在服务端详情 allow-list 中，其他事件没有详情指针（见 3.5b）。`approval/asked` / `approval/decided` 是 durable 审批记录，普通模式以可读标题呈现（历史回放的权威源；问询只有瞬态帧，不保证回放）。
 **响应 200**
 
 ```json
@@ -260,9 +251,7 @@
 
 当服务端只能从 seeded session 的当前 surface 读取时，成功响应额外包含 `"degraded": true, "detailMode": "current-surface"`；客户端必须保留该元数据并提示详情可能不完整。详情不存在或属于内部/敏感类型返回 `404 event-not-found`；单事件详情超过 8 MiB 返回 `413 event-detail-too-large`。
 
-稳定错误矩阵：`session-not-found`（会话不存在）、`event-not-found`（seq 不存在/不可见/无详情权限）、`session-corrupt`（会话数据损坏）、`event-read-failed`（读取失败）和 `event-detail-too-large`（超过 8 MiB）。错误响应不得泄露主机路径或原始异常；旧服务端未保存详情时客户端显示安全错误并提供重试，不猜测重建。
-
-> 命名说明：本端点的读取失败码是 **`event-read-failed`**（单事件级），与 `/m/api/history` 的 **`session-read-failed`**（整会话回放失败）语义不同，**不要**为"统一"而合并——App 侧对两者有各自的文案与重试路径。
+稳定错误矩阵：`session-not-found`（会话不存在）、`event-not-found`（seq 不存在/不可见）、`session-corrupt`（会话数据损坏）、`event-read-failed`（读取失败）和 `event-detail-too-large`（超过 8 MiB）。错误响应不得泄露主机路径或原始异常；旧服务端未保存详情时客户端显示安全错误并提供重试，不猜测重建。
 
 **规范化正文（`text`）**：`assistant/message` 的详情响应额外附 `data.text`，由服务端用**与事件摘要同一个 `blocksToText`** 提取（只拼 `type == "text"` 的块，跳过 `reasoning` 与内部块），因此与摘要下发的 `text` 同源同规则。客户端必须直接采用该字段作为正文，**不得自行递归拼接 `message.content`**——那会把 `reasoning` 块并进正文，使思维链在折叠块之外重复出现（issue #1 需求变更记录）。`tool/result` 等其它类型的详情仍以原始事件载荷为准；原始 `message` 块原样保留。
 
@@ -286,7 +275,7 @@
 | `tool/result` | `{ callId, name, isError, text, images? }`；长结果可通过详情端点获取；**不再下发 `files`**（issue #1 需求变更：工具产出文件不上时间线；图片仍带 `images`） |
 | `turn/start` | `{ turn: number }` |
 | `turn/end` | `{ turn: number, reason: object }` |
-| 其他 | 保留 `type`、`seq` 和详情指针；调试模式展开无损数据 |
+| 其他可见事件 | 保留 `type`、`seq`，未知类型使用通用卡保留顺序；不提供详情指针，也不允许通过 3.5b 读取原始载荷 |
 
 **控制帧**：连接建立后立即 `data: {"type":"hello","serverTime":...,"capabilities":{"eventTimeline":{...}}}`；每 25s `: ping` 注释行。bootstrap 同样返回 `capabilities.eventTimeline`，客户端应按能力协商而不是按版本号猜测。
 **错误语义**：鉴权失败在连接建立阶段以 `401` HTTP 状态返回（EventSource 会触发 error 事件，客户端转登录态）。
@@ -303,8 +292,9 @@
 | `mobile/notify` | `{ notification: { id, kind, sessionId, title, detail, time } }`——插件"真结束"判定后推送的通知（completed / failed / needs-answer），悬浮球/App 与通知中心同源渲染（v2.7.2） |
 | `mobile/frame` | 内核瞬态帧（问询/审批）。`frame` 字段为 `question/requested`（含 `rpcId`、`questions[]`）、`question/resolved`（`questionRpcId`）、`approval/requested`（`rpcId`、`approvalId`、`toolName`、`reason?`）、`approval/resolved`（`approvalId`）。**App 断线重连时服务端补发挂起的待答帧**（`pendingFrames` 回放） |
 | `mobile/queue` | `{ sessionId, rows: [{ id, text, placement }] }`——内核队列快照（`agent/inbox/spliced` 即时镜像，v3.0.2）：认领/删除/编辑实时反映，App 端 dock 以此为权威源（`placement`: `queued` / `steering` / `context`，与 GET /queue 同款形状）；断线重连时 mux 回放当前队列 |
+| `git/changed`（规划中） | 设计目标为 `{ repositoryId }`；当前版本未实现 Git provider，也不会推送此帧 |
 
-客户端应按 `type` 分派；未知 type 使用通用事件卡保留顺序，并在调试模式通过详情指针展开（前向兼容）。
+客户端应按 `type` 分派；未知 type 使用通用事件卡保留顺序（前向兼容）。当前服务端故意不给未知 type 详情指针，按需详情端点对其返回 `404 event-not-found`，避免未经审查地暴露事件载荷。
 ### 3.7 GET /m/qr.png
 
 **查询参数**：`text`（必填，二维码内容，URL 编码）。无 `text` → `400`。 **响应**：`200 image/png`（qrcode 包生成，尺寸 512，纠错级别 M）。
@@ -323,6 +313,10 @@
 | 405 | `method-not-allowed` | 方法不支持（GET 端点收到 POST 等） |
 | 503 | `no-live-agent` | 无运行中 agent |
 | 503 | `agents-unavailable` | agents 服务不可用 |
+| 503 | `git-provider-unavailable` | DSH subprocess/git provider 不可用 |
+| 403 | `workspace-not-allowed` | 仓库不在已注册工作区边界内 |
+| 404 | `not-git-repository` | 工作区不是 Git 仓库 |
+| 400 | `git-command-failed` | Git 只读命令失败 |
 
 ## 5. 版本兼容策略
 
@@ -349,7 +343,7 @@
 | POST | `/m/api/directories` | 新建文件夹（v2.1） |
 | GET | `/m/api/diagnostics` | 环境诊断（服务端端点实测，v2.1） |
 | GET | `/m/api/balance` | DeepSeek 官方余额（服务端代查，v2.1） |
-| GET | `/m/api/account-usage` | 用量与额度（服务端代查，v3.2） |
+| GET | `/m/api/account-usage` | 用量与额度（服务端代查，v3.1.5） |
 | GET | `/m/api/qr-config` | 桌面二维码数据（loopback only，v2.1） |
 | POST | `/m/api/defaults` | 修改默认 Agent/权限预设（v2.1） |
 
@@ -491,7 +485,7 @@
 
 - `outcome`：`allowed-once` | `rejected`。
 
-**取消**（`kind: "cancel"`）：内核收到 cancelled，agent 按 `ASK_CANCELLED` 继续。
+**取消**（`kind: "cancel"`）：必须携带对应 `sessionId`；问询以 `UserQuestionError`/`ASK_CANCELLED` rejection 结算，审批以 `cancelled` 结算。
 
 响应：`200 { "ok": true, "accepted": true }`；`accepted: false` + `reason`（如 `not-pending`，PC 端已先回答）。
 
@@ -650,7 +644,113 @@
 - `line` 必须以 `/` 开头（否则 `400 bad-request`）；未知/畸形命令 `404 command-not-found`；服务未注册 `503 commands-unavailable`（带 detail）；服务在而会话不存在 `404 session-not-found`（与 GET 拆分语义一致）
 - `result` 为内核 settle 对象（`commandId` + `result.{kind,text}`），与 PC 端一致
 
-### 6.16 GET /m/api/account-usage（用量与额度，v3.2）
+### Git API 设计草案（本版本未实现）
+
+> 以下 Git endpoints 是设计目标，不属于 v3.1.5 已实现 API；当前 `lib/index.js` 未注册 `/m/api/git/*` 路由，客户端不得依赖这些端点。设计背景见 `docs/design/mobile-git.md` 与 `docs/adr/` 中相关 ADR。
+
+Git 接口计划由项目自有 provider 提供，执行通过 DSH `subprocess`，仓库必须位于
+`workspaceRegistry` 已注册工作区内。`repositoryId` 为 provider 分配的不透明仓库标识，客户端不得自行拼接
+shell 命令。Slice A 是只读基础；B1/B2 提供受保护的 stage/commit 与本地分支写操作；B3 增加明确目标的 fetch/pull/push/sync 及冲突 abort，仍不提供删除分支、stash、tags、force push 或手机端冲突编辑。
+
+`GET /m/api/git/capabilities` 始终返回 `{ok, git:{available,read,writes,reason,features}}`，不可用时
+由 `available=false` 明确表达；实际仓库操作在 provider 不可用时返回 `503 git-provider-unavailable`。
+`GET /m/api/git/context?sessionId=…` 返回不透明的稳定 `repositoryId`、仓库名称和能力，不返回主机路径。
+其余接口均要求 `repositoryId`：`status` 返回分支与文件状态，`branches` 返回本地/远端分支。
+客户端不得将主机路径当作 B1 写操作的 `repositoryId`；服务端仅接受由 `context` 返回、并在授权工作区内解析的仓库标识。
+`graph` 支持 `limit/cursor` 和可选 JSON `refs`（最多 3 个 `{name,tipOid}` 引用对）；首次请求返回
+`snapshotId`、绑定的 `tips`、提交页和 `nextCursor`，后续请求必须使用同一快照的不透明游标。
+引用移动、删除、tip 不匹配、仓库变化、游标上下文错误或快照过期返回 `409 graph-stale`，客户端不得
+静默回退到全量图。`commit` 要求 `oid`，`diff` 支持 `kind=working|staged|commit`、`oid/path`。
+越过工作区边界返回 `403 workspace-not-allowed`，非 Git 目录返回 `404 not-git-repository`。
+
+#### Slice B0 操作任务
+
+B0 在同一 Git 移动契约下提供持久化任务查询基础设施。`GET /m/api/git/operations` 支持
+`repositoryId`、`status`、`limit`（1–100）和不透明 `cursor`；`GET
+/m/api/git/operations/:operationId` 查询单项任务。查询响应包含 `operationId`、`requestId`、`repositoryId`、`kind`、`status`、`revision`、阶段、可取消性、结果/脱敏错误和恢复阻塞事实。
+
+`POST /m/api/git/operations/:operationId/cancel` 的 JSON 请求体必须包含新的控制
+`requestId` 和查询时的 `expectedRevision`。它只接受 `queued` 或 `running`；排队任务立即进入
+`cancelled`，运行任务先持久化取消请求再尽力终止子进程，不能宣称已回滚。重复的相同控制
+`requestId` 返回原结果，revision 不匹配返回 `409 state-changed`。
+
+任务状态为 `queued`、`running` 或终态 `succeeded`、`failed`、`cancelled`、`conflicted`、
+`unknown-result`。`POST /m/api/git/recovery/acknowledge` 必须携带新的控制
+`requestId`、`operationId`、`repositoryId` 和 `expectedRevision`；它只解除用户已查看事实后的
+恢复阻塞，不重放旧操作。SSE `/m/api/events` 增加 `git/operation` 帧，包含完整操作视图和单调
+`revision`；B1 的 `git/changed` 帧仍至少包含 `repositoryId`，并可带 `changeKinds`（如 `index`、`head`）提示
+客户端刷新对应事实。事件重复或丢失都不改变账本事实，客户端重连后必须重新查询 operationId。
+B0 不定义具体 Git 写操作；B1/B2 写端点复用 B0 任务账本。所有返回 `202` 的执行端点统一返回 accepted DTO：
+`{ok:true,accepted:true,operationId,requestId,status,deduplicated,queryUrl,queryLink,operation}`。
+其中 `queryUrl`/`queryLink` 是可直接 GET 的相对链接 `/git/operations/:operationId`；客户端应按该链接查询，不能把 `operation` 快照当作最终结果。
+`git.capabilities.operations` 用于声明任务账本、幂等、恢复和取消基础设施是否可用。
+
+#### Slice B1 暂存与精确提交
+
+`POST /m/api/git/change-sets` 请求 `{repositoryId,kind}`，其中 `kind` 为 `working|staged`；响应返回
+短期 `changeSetId`、`stateVersion`、`preconditionToken` 和文件/可选 hunk 清单。客户端只提交
+`fileId` 与 `hunkId`，不得提交 patch；未跟踪、二进制和重命名首版仅支持整文件操作。
+
+`POST /m/api/git/stage` 与 `/m/api/git/unstage` 请求 `{repositoryId,requestId,changeSetId,
+preconditionToken,selections}`，`selections` 为 `[{fileId,hunkIds?}]`，立即返回 `202` 的 Git 操作任务。
+服务端在私有临时 index 中执行并通过 Git index lock 原子安装，change-set 事实变化返回
+`409 state-changed` 或 `409 hunk-stale`，不会部分应用。
+
+`POST /m/api/git/commit/preflight` 请求 `{repositoryId,message}`，响应返回 staged tree、当前 HEAD、
+本地分支、提交身份和绑定这些事实的 `preconditionToken`。随后 `POST /m/api/git/commit` 请求
+`{repositoryId,requestId,message,preconditionToken,confirm:true}`，立即返回 `202` 任务；提交任务使用
+`commit-tree` 加 expected HEAD 的 `update-ref` CAS，不运行 hooks，HEAD/tree 变化返回
+`409 state-changed`。任务成功结果包含新 commit OID、tree OID 和分支。
+
+#### Slice B2 本地分支与受保护切换
+
+`POST /m/api/git/branches/preflight` 的 `action` 只能为 `create|rename`（缺失或其他值均为
+`400 invalid-argument`）。预检返回规范化的 `params`；执行请求必须携带**同一个** `params` 对象，另加
+`{repositoryId,requestId,preconditionToken}`。创建参数为 `{name,startOid,remoteRef?}`（默认从当前 HEAD，
+远端起点必须是已验证且仍存在的精确 `refs/remotes/<remote>/<branch>`）；rename 参数为
+`{oldName,name,oldOid}`。创建成功不会自动切换。
+
+`POST /m/api/git/branch-rename` 使用 `{repositoryId,requestId,params:{oldName,name,oldOid},preconditionToken}`，
+只重命名本地分支，不修改远端引用。非法/重复/不存在分支分别返回稳定的 `invalid-argument`、
+`branch-exists` 或 `branch-not-found`。
+
+`POST /m/api/git/branch-switch/preflight` 的 action 固定为 `switch`，使用 `targetBranch` 或已验证的
+`targetRef`。远端引用必须是 provider 精确验证的 `refs/remotes/<remote>/<branch>`；远端切换必须明确
+`localName`，该值同时成为规范 `params.targetBranch`，不会隐式猜测本地名称。返回目标 OID 与影响摘要。
+干净工作区或 Git 可安全携带的改动返回 `safe:true` 和 token；存在覆盖风险时返回 `safe:false` 及
+`allowedActions: ["commit","computer","cancel"]`，不签发强制切换 token。`POST /m/api/git/branch-switch`
+必须提交预检返回的同一 `params`，只执行无 force 的安全切换；所有分支写操作均作为 B0 Git 操作任务返回
+`202` accepted DTO。
+
+#### Slice B3 远端同步
+
+B3 的写请求必须携带 `X-DSH-Git-Contract: 2.x`（或等价的
+`X-DSH-Git-Mobile-Contract`）版本声明；缺失或主版本不兼容返回
+`409 client-incompatible`。所有执行端点只接受预检返回的规范 `params` 和短期
+`preconditionToken`，不接受远端 URL、任意 refspec、OID 或命令选项。
+
+- `GET /m/api/git/remotes?repositoryId=…` 返回已配置 remote、脱敏 URL、remote-tracking 分支和本地 upstream；远端凭据不进入 DTO、账本或错误。
+- `POST /m/api/git/fetch/preflight` 请求 `{repositoryId,remote,branch}`，随后
+  `POST /m/api/git/fetch` 执行只更新对应 `refs/remotes/<remote>/<branch>` 的 fetch。
+- `POST /m/api/git/pull/preflight` 请求 `{repositoryId,remote?,branch?,localBranch?,strategy?}`，随后
+  `POST /m/api/git/pull` 执行 fetch→固定 OID 的 merge/rebase 两阶段；默认策略为 merge。
+- `POST /m/api/git/push/preflight` 请求 `{repositoryId,remote,branch,localBranch?,setUpstream?}`，随后
+  `POST /m/api/git/push` 执行明确的 `refs/heads/<local>:refs/heads/<branch>` 普通 push；目标不存在时允许创建该单一目标 ref。
+  force/force-with-lease 永不支持；只有远端确认成功后才写入 upstream 配置。
+- `POST /m/api/git/sync/preflight` 与 `POST /m/api/git/sync` 执行非原子的
+  fetch→pull→push；新建的远端目标会跳过没有目标可取的 fetch/integrate 阶段，直接以普通 push 创建单一目标 ref。
+  操作查询中的 `stages[]` 保存每阶段状态、跳过原因、前后事实和副作用；任一阶段失败、冲突、取消或不确定都会停止后续阶段并保留部分成功结果。
+- `POST /m/api/git/abort/preflight` 返回当前 merge/rebase 中间态的影响摘要；随后先经
+  `POST /m/api/git/confirmations` 签发一次性挑战，再由 `POST /m/api/git/abort` 创建独立 abort 任务；签发记录可跨服务重启幂等复用，挑战消费和任务创建在同一持久化账本事务中完成。
+  abort 不由普通 cancel 隐式执行。
+- `POST /m/api/git/operations/:operationId/handoff` 的 `target` 为 `computer|model`，只记录冲突交接意图；移动端不自动 continue、commit 或 push。
+
+所有 B3 执行端点返回 `202` accepted DTO。fetch/pull/push/sync/abort 使用不同协调域：
+fetch/push 序列化 common domain，pull/sync/abort 同时序列化 common 与 worktree domain。
+远端认证、网络、远端拒绝、非 fast-forward 分别映射为稳定错误；连接中断或结果无法
+从读事实证明时进入 `unknown-result`，而不是自动重试。
+
+### 6.16 GET /m/api/account-usage（用量与额度，v3.1.5）
 
 服务端并发查询三个固定来源，凭据只在电脑端解析和使用；手机端只接收成功来源的脱敏投影。默认使用电脑进程内 60 秒快照；详情页顶部刷新使用 `?refresh=1` 绕过快照并发起一轮新的查询（2 秒内重复刷新受保护）。来源固定按 DeepSeek → Codex → OpenCode Go 排列，未配置/未登录来源不返回，已配置但本次查询失败的来源也不返回。
 
@@ -689,23 +789,26 @@
 - 查询快照在电脑进程内缓存 60 秒并共享并发请求；手动 `refresh=1` 的连点在 2 秒内复用快照；不写手机或电脑持久化文件。配额窗口不相加，有限 Credits 和个人消费上限分别展示。
 - HTTP 错误只返回通用 `502 account-usage-failed`（单来源失败不会使整体请求失败）。
 
-**悬浮球面板消费语义（v3.2）**：原生悬浮球面板把本端点当作「展开时按需读取」的快照——每次展开面板最多触发一次查询（客户端 2 分钟节流，不并入面板打开期间的 5 秒轮询，也不做后台周期轮询）；成功快照在进程内保留，失败时沿用旧值并标注相对时间；投影不可用（旧插件 404 / 未配置 / 全部失败）时，面板整体降级为原有的单行 DeepSeek 余额。面板按「一个来源一行」渲染：金额来源保留文字（CNY 优先），配额来源只显示主 bucket 窗口的细条与颜色、不出百分比数字，每个进度条上方居中显示窗口短标签（5h / 每周 / 每月，与详情页窗口语义一致）；附加 bucket（服务端命名的 `名称 · 5h`）与账户身份不出现 overlay 面板，详情页仍是完整信息入口（`displayName`/`maskedEmail`、Credits、个人消费上限、重置时间）。
+**悬浮球面板消费语义（v3.1.5，ADR 0008）**：原生悬浮球面板把本端点当作「展开时按需读取」的快照——每次展开面板最多触发一次查询（客户端 2 分钟节流，不并入面板打开期间的 5 秒轮询，也不做后台周期轮询）；成功快照在进程内保留，失败时沿用旧值并标注相对时间；投影不可用（旧插件 404 / 未配置 / 全部失败）时，面板整体降级为原有的单行 DeepSeek 余额。面板按「一个来源一行」渲染：金额来源保留文字（CNY 优先），配额来源只显示主 bucket 窗口的细条与颜色、不出百分比数字，每个进度条上方居中显示窗口短标签（5h / 每周 / 每月，与详情页窗口语义一致）；附加 bucket（服务端命名的 `名称 · 5h`）与账户身份不出现 overlay 面板，详情页仍是完整信息入口（`displayName`/`maskedEmail`、Credits、个人消费上限、重置时间）。
 
 ### 6.17 文件传输（v3.1.2，B站 csborbbnc 反馈）
 
 **GET `/m/api/files?path=…`** — 下载电脑文件
 - 响应：`200` 文件流（`content-type` 按扩展名推断、`content-disposition: attachment` 带 UTF-8 文件名）；路径不存在或非文件 → `404 file-not-found`；缺 `path` → `400 bad-request`
-- 与目录选择器（§6.1）同信任模型：口令鉴权 + 现有限流，路径由手机显式指定
+- 与目录选择器（§6.2）同信任模型：口令鉴权 + 现有限流，路径由手机显式指定；服务端先打开句柄、`fstat` 复核为普通文件，再按 descriptor 真实路径做工作区包含校验，符号链接/越界路径一律 `404`
+- 平台范围：descriptor-relative 保护需 procfs/devfs，**仅 Linux/macOS 提供**；Windows 返回 `503 files-unavailable`（安全 fail-closed，见 docs/04 §6）
 
 **POST `/m/api/files/upload`** — 上传文件到电脑（写会话工作目录）
 ```json
 请求: { "sessionId": "…(可选)", "name": "README.md", "data": "<base64>" }
 响应: { "ok": true, "path": "F:\\DSH-Outpost\\README.md", "bytes": 1234 }
 ```
-- 目标目录：`sessionId` 对应 agent 的工作目录 → 缺省回退第一个注册工作区根；无法确定 → `503 no-workspace`
-- `name` 不合法（含 `\ / : * ? " < > |`、`.`/`..`/超 255）→ `400 invalid-name`；body 上限 64MB → `413 payload-too-large`
+- 目标目录：`sessionId` 对应 agent 的工作目录 → 缺省回退第一个注册工作区根；无法确定 → `404 workspace-not-found`（不再静默写入其它 workspace）
+- 服务端先打开并校验目录句柄，再通过 descriptor-relative + `O_CREAT|O_EXCL|O_NOFOLLOW` 创建目标，目录替换/符号链接竞态不会越界；当前平台不具备 descriptor fs 时 fail-closed → `503 files-unavailable`
+- `name` 不合法（含 `\ / : * ? " < > |`、`.`/`..`/超 255）→ `400 invalid-name`；同名已存在 → `409 file-exists`；body 上限 64MB → `413 payload-too-large`
 
+### 6.18 GET /m/api/diagnostics
 
+返回当前插件的运行诊断：`plugin` 标识插件名与版本；`runtime` 描述插件进程、WebServer 监听地址、鉴权、LAN 桥及运行指标；`services` 列出探测到的宿主服务；`checks` 提供功能检查结果；`notes` 提供可读提示。
 
-
-
+`checks.approvalMode` 表示问询/审批策略，`checks.remoteEvents` 表示 `$events` 双端通道是否就绪。旧宿主的 `apiProxy` / `respondBridge` / `frameBridge` 项仅在相应服务被探测到时出现。当前响应不包含宿主版本、`host.capabilities` 或统一受支持范围；不能根据插件版本推断宿主能力。

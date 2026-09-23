@@ -12,7 +12,8 @@ class AppVersion {
   final int build; // 缺失视为 0
   final bool buildSet; // 原版本串是否显式带 +build（GitHub tag 无 build → false）
 
-  const AppVersion(this.major, this.minor, this.patch, [this.build = 0], {bool? buildSet})
+  const AppVersion(this.major, this.minor, this.patch,
+      {this.build = 0, bool? buildSet})
       : buildSet = buildSet ?? build > 0;
 
   @override
@@ -42,7 +43,7 @@ AppVersion? parseAppVersion(String input) {
     if (n == null || n < 0) return null;
     nums.add(n);
   }
-  return AppVersion(nums[0], nums[1], nums[2], build, buildSet: plus != -1);
+  return AppVersion(nums[0], nums[1], nums[2], build: build, buildSet: plus != -1);
 }
 
 /// 版本比较：a < b → 负；相等 → 0；a > b → 正。先比 major/minor/patch，再比 build。

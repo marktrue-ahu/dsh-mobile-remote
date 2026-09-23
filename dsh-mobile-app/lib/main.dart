@@ -19,7 +19,6 @@ import 'screens/settings_screen.dart';
 import 'screens/notifications_screen.dart';
 import 'screens/sheets.dart';
 import 'screens/usage_screen.dart';
-import 'updater.dart';
 
 final AppStore store = AppStore();
 
