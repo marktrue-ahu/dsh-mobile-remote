@@ -657,7 +657,7 @@ shell 命令。Slice A 是只读基础；B1/B2 提供受保护的 stage/commit �
 `GET /m/api/git/context?sessionId=…` 返回不透明的稳定 `repositoryId`、仓库名称和能力，不返回主机路径。
 其余接口均要求 `repositoryId`：`status` 返回分支与文件状态，`branches` 返回本地/远端分支。
 客户端不得将主机路径当作 B1 写操作的 `repositoryId`；服务端仅接受由 `context` 返回、并在授权工作区内解析的仓库标识。
-`graph` 支持 `limit/cursor` 和可选 JSON `refs`（最多 3 个 `{name,tipOid}` 引用对）；首次请求返回
+`graph` 支持 `limit/cursor` 和可选 JSON `refs`（最多 5 个 `{name,tipOid}` 引用对；本地与远程引用合计）；首次请求返回
 `snapshotId`、绑定的 `tips`、提交页和 `nextCursor`，后续请求必须使用同一快照的不透明游标。
 引用移动、删除、tip 不匹配、仓库变化、游标上下文错误或快照过期返回 `409 graph-stale`，客户端不得
 静默回退到全量图。`commit` 要求 `oid`，`diff` 支持 `kind=working|staged|commit`、`oid/path`。
