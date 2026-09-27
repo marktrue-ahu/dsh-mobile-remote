@@ -398,8 +398,8 @@ class Api implements GitReadApi {
   }
 
   // ── 业务接口 ──
-  Future<Catalog> catalog() async =>
-      Catalog.fromJson(await getJson('/api/catalog'));
+  Future<Catalog> catalog({bool refresh = false}) async =>
+      Catalog.fromJson(await getJson(refresh ? '/api/catalog?refresh=1' : '/api/catalog'));
   Future<SessionConfig> sessionConfig(
     String sessionId,
   ) async => SessionConfig.fromJson(
