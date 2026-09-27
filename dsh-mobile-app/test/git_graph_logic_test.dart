@@ -25,6 +25,78 @@ void main() {
     expect(layout.laneCount, 1);
   });
 
+  test('lane topology origins omit only their incoming stems', () {
+    const selected = [
+      GitBranch(
+        name: 'refs/heads/main',
+        displayName: 'main',
+        oid: 'main-tip',
+        kind: 'local',
+        current: true,
+      ),
+      GitBranch(
+        name: 'refs/heads/feature',
+        displayName: 'feature',
+        oid: 'feature-tip',
+        kind: 'local',
+      ),
+    ];
+    final layout = layoutGraph([
+      commit('main-tip', ['shared']),
+      commit('feature-tip', ['shared']),
+      commit('shared', ['root']),
+      commit('root'),
+    ], selected);
+
+    expect(layout.rows.map((row) => row.hasIncomingEdge), [
+      false,
+      false,
+      true,
+      true,
+    ]);
+  });
+
+  test('selected ancestor tip keeps a real incoming child edge', () {
+    const selected = [
+      GitBranch(
+        name: 'refs/heads/child',
+        displayName: 'child',
+        oid: 'child-tip',
+        kind: 'local',
+      ),
+      GitBranch(
+        name: 'refs/heads/parent',
+        displayName: 'parent',
+        oid: 'parent-tip',
+        kind: 'local',
+      ),
+    ];
+    final layout = layoutGraph([
+      commit('child-tip', ['parent-tip']),
+      commit('parent-tip', ['root']),
+      commit('root'),
+    ], selected);
+
+    expect(layout.rows.map((row) => row.hasIncomingEdge), [false, true, true]);
+    expect(layout.rows.first.parentLanes, [0]);
+  });
+
+  test('incoming edge continues across an appended graph page', () {
+    final first = layoutGraph([
+      commit('tip', ['parent']),
+    ], const []);
+    final second = layoutGraph(
+      [
+        commit('parent', ['root']),
+      ],
+      const [],
+      state: first.continuation,
+    );
+
+    expect(first.rows.single.hasIncomingEdge, isFalse);
+    expect(second.rows.first.hasIncomingEdge, isTrue);
+  });
+
   test('fork and shared ancestor use parent topology without false merge', () {
     final layout = layoutGraph([
       commit('tip', ['left', 'right']),
@@ -67,6 +139,24 @@ void main() {
     expect(layout.rows.first.merge, isTrue);
     expect(layout.laneCount, 3);
   });
+
+  test(
+    'inserting later parents preserves distinct lanes for active parents',
+    () {
+      final layout = layoutGraph([
+        commit('c0', ['c2']),
+        commit('c1', ['c3', 'c4']),
+        commit('c2', ['c4', 'c5']),
+        commit('c3'),
+        commit('c4'),
+        commit('c5'),
+      ], const []);
+
+      expect(layout.rows[2].parentLanes, [2, 1]);
+      expect(layout.rows[2].parentLanes.toSet(), hasLength(2));
+      expect(layout.rows[2].parentColorSlots, hasLength(2));
+    },
+  );
 
   test('criss-crossing active lines retain their continuations', () {
     final layout = layoutGraph([
@@ -277,6 +367,11 @@ void main() {
         );
         for (var i = 0; i < commits.length; i++) {
           expect(paged[i].parentLanes, hasLength(commits[i].parents.length));
+          expect(
+            paged[i].parentLanes.toSet().length,
+            commits[i].parents.toSet().length,
+            reason: 'sample $sample row $i must use distinct parent lanes',
+          );
           expect(
             paged[i].parentColorSlots,
             hasLength(commits[i].parents.length),
