@@ -160,7 +160,7 @@
 **响应**：`200` 原始字节（`Content-Type` 按 `mediaType`，`Cache-Control: private, max-age=3600`，`x-attachment-meta` 带 width/height/bytes/name）；`400` 缺参；`404 attachment-not-found`；其他错误透传。鉴权与其他端点一致（`x-mobile-token`/cookie）。
 ### 3.3 GET /m/api/sessions
 
-**响应 200**
+**规划中的扩展响应示例**（当前 v3.1.5 仅返回原有字段，仍按 `lastActivity ?? createdAt` 排序；以下新增字段与排序规则待实现）
 
 ```json
 {
@@ -182,10 +182,10 @@
 }
 ```
 
-- 排序：`lastMessageAt` 倒序，缺失时回退 `lastActivity`，再回退 `createdAt`；等值时以 `id` 为次级键保证顺序稳定。数据源：优先 `sessionQuery.listSessions()`（含休眠会话），回退 `ctx.sessions.list()`（仅活动会话）。
+- 排序（规划中）：优先按 `lastMessageAt` 倒序，缺失时回退 `lastActivity`，再回退 `createdAt`；等值时以 `id` 为次级键保证顺序稳定。数据源：优先 `sessionQuery.listSessions()`（含休眠会话），回退 `ctx.sessions.list()`（仅活动会话）。
 - `archived`：是否已归档（见 3.4 归档接口）。
-- `lastActivity`：最近活跃时间（ms）。任意会话事件（SSE）与移动端"打开会话"（3.4 touch）都会更新，持久化于 `~/.dsh/mobile-remote/session-activity.json`。**不用于排序**，仅为旧版 App 保留。
-- `lastMessageAt`（规划中，可选）：最近一条用户/助手可见对话消息的时间（ms）；无记录时为 `null`。打开会话不更新，工具活动与生命周期事件也不更新。旧插件不返回该字段时，客户端回退 `lastActivity` 排序，不提示降级。
+- `lastActivity`：最近活跃时间（ms）。任意会话事件（SSE）与移动端"打开会话"（3.4 touch）都会更新，持久化于 `~/.dsh/mobile-remote/session-activity.json`。保留给旧版 App，且在消息时间缺失时仍作为排序回退值；旧 App 调用 `touch` 或内部事件发生时，这类会话仍可能重排。
+- `lastMessageAt`（规划中，可选）：最近一条用户/助手可见对话消息的时间（ms）；无记录时为 `null`。打开会话不更新，工具活动与生命周期事件也不更新。字段缺失或为 `null` 时，客户端回退 `lastActivity`、再回退 `createdAt`，不提示降级；这项兼容回退不保证打开/内部事件后顺序始终不变。
 - `origin`（规划中，可选）：会话来源，子代理会话为 `"subagent"`；其余会话不返回。客户端据此隐藏子代理会话；字段缺失即不过滤。
 - `parentSession`（规划中，可选）：派生来源会话 id，为将来"折叠到父会话"预留。**不得**用它判定子代理会话——用户主动 fork 的会话只有该字段而没有 `origin`。
 
@@ -193,7 +193,7 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/m/api/sessions/touch` | 标记会话被打开（更新 lastActivity；**仅旧版 App 使用**，新版不再调用） |
+| POST | `/m/api/sessions/touch` | 标记会话被打开（更新 lastActivity）；新版 App 将不再调用，端点保留给旧版 App |
 | POST | `/m/api/sessions/archive` | 归档会话（映射内核 `workspace.archiveSession`，与 PC 端同一份状态） |
 | POST | `/m/api/sessions/unarchive` | 恢复（取消归档） |
 | POST | `/m/api/sessions/stop` | 停止（取消）会话当前运行（映射核心 RPC `session.cancel`） |
@@ -604,7 +604,8 @@
 ]}
 ```
 - 映射内核 `subagent.list`（payload `{ parentSessionId }`）；`status` = activity（running/inactive）或 diagnostic reason
-- 缺参数 `400 parentSessionId-required`；会话不存在 `404 session-not-found`
+- 当前实现要求父 agent 活跃，否则返回 `404 session-not-found`；缺参数 `400 parentSessionId-required`。
+- 规划中：子代理会话从父会话的「会话工具」进入，因此父会话已归档或休眠但确实存在时，子代理列表仍须可用；仅会话真正不存在时返回 `404`。
 
 **POST `/m/api/subagents/interrupt`** — 中断子代理
 ```json
