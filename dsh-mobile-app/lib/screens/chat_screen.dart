@@ -97,20 +97,25 @@ bool shouldLoadOlderFromScroll(
 
 /// Phase 2(A4)：统一「打开会话页」流程——切换会话 + 刷新会话配置 + 推入 ChatScreen。
 /// 返回后执行 [onReturn]（各调用点差异：刷新列表 / 恢复原会话）。
+/// [apiClient] 仅供测试注入（与 `ChatScreen.apiClient` 同款）；生产路径传 null 即用全局 `api`。
 Future<void> openChat(
   BuildContext context,
   AppStore store,
   String sessionId, {
   VoidCallback? onTitleChanged,
   Future<void> Function()? onReturn,
+  Api? apiClient,
 }) async {
   await store.setSession(sessionId);
   store.refreshSessionConfig();
   if (!context.mounted) return;
   await Navigator.of(context).push(
     MaterialPageRoute(
-      builder: (_) =>
-          ChatScreen(store: store, onTitleChanged: onTitleChanged ?? () {}),
+      builder: (_) => ChatScreen(
+        store: store,
+        onTitleChanged: onTitleChanged ?? () {},
+        apiClient: apiClient,
+      ),
     ),
   );
   if (onReturn != null) await onReturn();
@@ -1803,10 +1808,12 @@ class _ChatScreenState extends State<ChatScreen> {
     for (final ev in events) {
       final data = ev.data ?? const <String, dynamic>{};
       if (ev.type == 'tool/call') {
-        _activeTools[_toolActivityKey(data, ev.seq, _activeTools.length)] =
-            data['name']?.toString() ??
-            data['toolCall']?.toString() ??
-            L10n.t('工具', 'Tool');
+        final callId = _toolActivityKey(data, ev.seq, _activeTools.length);
+        _activeTools[callId] = timelineToolNameOf(
+          data,
+          callId: callId,
+          fallback: L10n.t('工具', 'Tool'),
+        );
       } else if (ev.type == 'tool/result') {
         _activeTools.remove(
           _toolActivityKey(data, ev.seq, _activeTools.length),
@@ -1856,10 +1863,11 @@ class _ChatScreenState extends State<ChatScreen> {
         _timelineReducer.tools[callId] ??
         ToolLifecycle(
           id: callId,
-          name:
-              d['name']?.toString() ??
-              d['toolCall']?.toString() ??
-              L10n.t('工具', 'Tool'),
+          name: timelineToolNameOf(
+            d,
+            callId: callId,
+            fallback: L10n.t('工具', 'Tool'),
+          ),
           seq: ev.seq,
         );
     final item = _MsgItem.tool(
@@ -2059,14 +2067,10 @@ class _ChatScreenState extends State<ChatScreen> {
           _upsertToolItem(out, ev, history: history);
         }
       case 'tool/call':
-        final name = d?['name']?.toString() ?? L10n.t('工具', 'Tool');
+        final callId = _toolActivityKey(d ?? const <String, dynamic>{}, ev.seq, out.length);
+        final name = timelineToolNameOf(d, callId: callId, fallback: L10n.t('工具', 'Tool'));
         if (!history) {
-          _activeTools[_toolActivityKey(
-                d ?? const <String, dynamic>{},
-                ev.seq,
-                out.length,
-              )] =
-              name;
+          _activeTools[callId] = name;
           _scheduleActivityFlush();
         }
         _upsertToolItem(out, ev, history: history);
@@ -2719,13 +2723,20 @@ class _ChatScreenState extends State<ChatScreen> {
     // v2.9.0 review：与页级动作一致，绑定本页会话（工具页上下文不能跟随全局切换）
     final sid = _mySessionId ?? widget.store.sessionId;
     if (sid == null) return;
-    showSessionToolsSheet(context, widget.store, sid);
+    showSessionToolsSheet(context, widget.store, sid, onTitleChanged: widget.onTitleChanged);
   }
 
   void _openSessionToolsFromActionRail() {
     // Preserve the app-bar action's existing page-session-only behavior.
     final sid = _mySessionId;
-    if (sid != null) showSessionToolsSheet(context, widget.store, sid);
+    if (sid != null) {
+      showSessionToolsSheet(
+        context,
+        widget.store,
+        sid,
+        onTitleChanged: widget.onTitleChanged,
+      );
+    }
   }
 
   Future<void> _openConversationActionRail() async {
