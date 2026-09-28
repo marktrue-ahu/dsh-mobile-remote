@@ -173,21 +173,27 @@
       "live": true,
       "title": "会话标题（活动会话）",
       "archived": false,
-      "lastActivity": 1750000123456
+      "lastActivity": 1750000123456,
+      "lastMessageAt": 1750000111000,
+      "origin": "subagent",
+      "parentSession": "session-parent"
     }
   ]
 }
 ```
 
-- 排序：`lastActivity` 倒序（无活跃记录时回退 `createdAt`）。数据源：优先 `sessionQuery.listSessions()`（含休眠会话），回退 `ctx.sessions.list()`（仅活动会话）。
+- 排序：`lastMessageAt` 倒序，缺失时回退 `lastActivity`，再回退 `createdAt`；等值时以 `id` 为次级键保证顺序稳定。数据源：优先 `sessionQuery.listSessions()`（含休眠会话），回退 `ctx.sessions.list()`（仅活动会话）。
 - `archived`：是否已归档（见 3.4 归档接口）。
-- `lastActivity`：最近活跃时间（ms）。任意会话事件（SSE）与移动端"打开会话"（3.4 touch）都会更新，持久化于 `~/.dsh/mobile-remote/session-activity.json`。
+- `lastActivity`：最近活跃时间（ms）。任意会话事件（SSE）与移动端"打开会话"（3.4 touch）都会更新，持久化于 `~/.dsh/mobile-remote/session-activity.json`。**不用于排序**，仅为旧版 App 保留。
+- `lastMessageAt`（规划中，可选）：最近一条用户/助手可见对话消息的时间（ms）；无记录时为 `null`。打开会话不更新，工具活动与生命周期事件也不更新。旧插件不返回该字段时，客户端回退 `lastActivity` 排序，不提示降级。
+- `origin`（规划中，可选）：会话来源，子代理会话为 `"subagent"`；其余会话不返回。客户端据此隐藏子代理会话；字段缺失即不过滤。
+- `parentSession`（规划中，可选）：派生来源会话 id，为将来"折叠到父会话"预留。**不得**用它判定子代理会话——用户主动 fork 的会话只有该字段而没有 `origin`。
 
 ### 3.4 归档 / 活跃时间接口
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/m/api/sessions/touch` | 标记会话被打开（更新 lastActivity） |
+| POST | `/m/api/sessions/touch` | 标记会话被打开（更新 lastActivity；**仅旧版 App 使用**，新版不再调用） |
 | POST | `/m/api/sessions/archive` | 归档会话（映射内核 `workspace.archiveSession`，与 PC 端同一份状态） |
 | POST | `/m/api/sessions/unarchive` | 恢复（取消归档） |
 | POST | `/m/api/sessions/stop` | 停止（取消）会话当前运行（映射核心 RPC `session.cancel`） |
@@ -287,7 +293,7 @@
 | type | 说明 |
 |---|---|
 | `session/context` | `{ sessionId, contextWindow }`——模型上下文窗口（`request/context` 事件，PC 端圆环同源） |
-| `agent/status` | `{ agentId, sessionId, status, child }`——running / waiting / idle；`sessionId` 为去 `session:` 前缀的会话 id，`child` 标记子代理会话（v2.7.2 起携带后两字段） |
+| `agent/status` | `{ agentId, sessionId, status, child }`——`status` 只有 `running` / `idle` 两值（内核 `AgentStatus` 即为二元联合）；`sessionId` 为去 `session:` 前缀的会话 id，`child` 标记子代理会话（v2.7.2 起携带后两字段）。**不存在 `waiting`**：等待用户审批/作答时 agent 仍为 `running`，该事实由 `mobile/frame` 的挂起问询/审批承载 |
 | `notifications/changed` | 通知记录增删（如移动端删除后），客户端刷新列表与角标 |
 | `mobile/notify` | `{ notification: { id, kind, sessionId, title, detail, time } }`——插件"真结束"判定后推送的通知（completed / failed / needs-answer），悬浮球/App 与通知中心同源渲染（v2.7.2） |
 | `mobile/frame` | 内核瞬态帧（问询/审批）。`frame` 字段为 `question/requested`（含 `rpcId`、`questions[]`）、`question/resolved`（`questionRpcId`）、`approval/requested`（`rpcId`、`approvalId`、`toolName`、`reason?`）、`approval/resolved`（`approvalId`）。**App 断线重连时服务端补发挂起的待答帧**（`pendingFrames` 回放） |
