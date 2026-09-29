@@ -19,6 +19,7 @@ import 'screens/settings_screen.dart';
 import 'screens/notifications_screen.dart';
 import 'screens/sheets.dart';
 import 'screens/usage_screen.dart';
+import 'screens/workspace_browser_screen.dart';
 
 final AppStore store = AppStore();
 
@@ -510,6 +511,13 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
               ],
               _drawerItem(Icons.home_outlined, L10n.t('首页', 'Home'), 0),
               _drawerItem(Icons.history, L10n.t('会话', 'Sessions'), 1),
+              // 「文件」是内容浏览入口，不是第四个页签：点击 push 全屏只读页，
+              // 因此不参与 _index。作用域是当前选中的已注册工作区（见 ADR 0014）。
+              _drawerAction(
+                Icons.folder_outlined,
+                L10n.t('文件', 'Files'),
+                () => openWorkspaceBrowser(context, store),
+              ),
               _drawerItem(Icons.settings_outlined, L10n.t('设置', 'Settings'), 2),
               const Spacer(),
               Padding(
@@ -576,6 +584,34 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
       ),
     );
   }
+  /// 抽屉中「打开一个全屏页」的入口（不参与 _index）。
+  ///
+  /// 与 _drawerItem 的区别：它不切换 shell 页签，而是 push 新路由；因此没有
+  /// 选中态。入口始终可见（能力不可用时由页面内说明原因），见 ADR 0009/0014。
+  Widget _drawerAction(IconData icon, String label, VoidCallback onTap) {
+    final ink2 = DshColors.ink2(context);
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 1),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(10),
+        onTap: () {
+          Navigator.of(context).pop();
+          onTap();
+        },
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
+          child: Row(
+            children: [
+              Icon(icon, size: 20, color: ink2),
+              const SizedBox(width: 12),
+              Text(label, style: TextStyle(fontSize: 14.5, color: ink2)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   /// 工作区切换项（null = 全部工作区）。
   Widget _workspaceItem(Map<String, dynamic>? w) {
     final brand = DshColors.brand(context);
