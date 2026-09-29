@@ -79,10 +79,10 @@
 - 会话内容沿用 dsh 现有策略存储；插件仅在请求处理期间持有内存副本。
 - **二维码数据端点 `/m/api/qr-config` 仅允许 loopback**（TCP socket 来源校验，无法伪造）—— 桌面设置页读取后展示二维码；二维码含地址+口令，请勿截屏转发。
 - **问询/审批应答（`/m/api/respond`）不绕过内核安全**：RC1 路径先在插件侧按原始问题严格校验答案（每项必须有 `selected: string[]`，`custom` 若存在必须为字符串，选项/数量/重复项均校验），再通过 `$events/result` 交给内核；旧 `apiProxy` 路径仍由内核 schema 校验。rpcId 与 sessionId 必须命中对应 pending 表（先到先得，不可伪造待答）。取消操作同样以 `UserQuestionError`/`ASK_CANCELLED` rejection 走内核语义。
-- **文件传输（`/m/api/files*`）**：仅允许已注册工作区内的文件；下载先以 `O_NONBLOCK|O_NOFOLLOW` 打开文件，`fstat` 复核为普通文件后，再用 `/proc/self/fd`（macOS `/dev/fd`）解析**已打开句柄**的真实路径并做工作区包含校验，流式读取固定在该句柄上；上传先打开并复核目录句柄，再用 descriptor-relative 路径 + `O_CREAT|O_EXCL|O_NOFOLLOW` 创建（`O_EXCL` 同时提供 409 语义），写入前再复核一次句柄归属。检查通过后不再按路径名操作对象，因此经典的 `statSync → createReadStream` 符号链接/目录替换竞态不可利用。
-  - **平台范围**：descriptor-relative 保护依赖 procfs/devfs，**Linux/macOS 支持；Windows 明确 fail-closed**（`503 files-unavailable`）——Node 内置 `fs` 在 Windows 没有 `openat`/RootDirectory 等价能力，`O_NOFOLLOW`/`O_DIRECTORY` 也不受支持，纯 Node 的 `realpath → open` 仍存在竞态，故不提供降级实现。将来要支持 Windows 需引入原生 helper（句柄相对打开 + 拒绝 reparse point），不属当前范围。
-  - **边界外的目录选择器**（`/m/api/directories`）是**有意保留的任意路径浏览**（新建会话需跨盘选工作目录），不适用工作区包含语义：其信任模型与 §2 口令鉴权一致（已认证用户本就持有 agent 控制权）。
-  - **残留风险**：包含校验基于句柄的规范化路径，无法识别 bind mount / overlay / 特权本地攻击者构造的挂载视图；需要该等级隔离时应依赖 OS 层隔离（容器/ACL）而非插件内检查。
+- **文件传输（`/m/api/files*`）**：与目录选择器同信任模型（§2 口令鉴权 + 手机端显式指定路径），**不做工作区包含校验**。下载按给定路径 `resolve` 后 `statSync` 确认为普通文件再流式读取；上传把文件名限制在目标会话工作目录内并拒绝路径分隔符与 NUL。已认证用户本就持有 agent 控制权，故该通道不额外收窄路径范围。
+  - **已知边界**：由于不校验工作区包含、也不使用 `O_NOFOLLOW` / 句柄级复核，工作区内指向外部的符号链接，以及 `statSync → createReadStream` 之间的目标替换，都不受保护；能读到进程有权读取的任意文件。
+  - **边界外的目录选择器**（`/m/api/directories`）同样是**有意保留的任意路径浏览**（新建会话需跨盘选工作目录），不适用工作区包含语义。
+  - **后续**：是否将文件传输收紧到工作区包含 + descriptor-relative 句柄保护，见 GitLab `ahedu/dsh-mobile-remote#16`；在决定前，本文件如实描述当前实现，不描述未落地的保护。
 - **第三方推送通道脱敏（v2.6）**：Server酱/ntfy/Bark/generic 等推送默认只收到「事件类型 + 会话短码」（`pushContent: minimal`），会话标题/错误详情等核心内容默认不出本机；仅显式配置 `pushContent: standard` 后外发——第三方服务不可信。
 - **用量与额度投影（v3.1.5）**：`/m/api/account-usage` 只返回成功来源的余额/配额、脱敏 Codex 账户标签和汇总失败数；DeepSeek/OpenCode Go 密钥与 Codex OAuth token 永不进入响应、App 日志或持久化文件。OpenCode Go 只请求固定官方 HTTPS 端点；Codex 启用代理但代理不可用时拒绝直连。服务端只保留 60 秒进程内快照，单来源失败不回退到过期数据。
 - **悬浮球 overlay 面板脱敏（v3.1.5，ADR 0008）**：悬浮球是 **`TYPE_APPLICATION_OVERLAY` 系统级浮层**，可能出现在锁屏、他人可见、或覆盖其它应用之上。因此面板的用量与额度区块只展示来源标题、金额文字与配额细条/颜色；**不显示账户身份（displayName/maskedEmail）**、不显示任何聚合或换算数值；配额窗口永不相加。数据仅按需获取（展开面板时，客户端节流）、失败沿用旧值并标注相对时间，不新增后台轮询或持久化。
