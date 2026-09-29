@@ -6,7 +6,7 @@
 # 所有 agent 以同一系统用户运行，脚本无法阻止绕过——绕过即违规（见 AGENT-RULES）。
 #
 # 用法（在主目录 /home/mark/projects/dsh-mobile-remote 调用；init/verify 在任何树里调用）：
-#   tools/worktree.sh create <issue> <短名> [--kind feature|fix] [--writer <身份>]
+#   tools/worktree.sh create <issue> <短名> [--kind feature|fix] [--writer <身份>] [--base <分支>]
 #   tools/worktree.sh init                     # 当前树：装依赖、补构建环境
 #   tools/worktree.sh verify                   # 当前树：仅干净树验证，报告原子落盘
 #   tools/worktree.sh verify-baseline <issue>  # 临时检出登记基线，同环境复跑门禁留证
@@ -228,13 +228,19 @@ report_evidence_mode() { # 输出当前上下文下该报告应使用的模式
 
 json_dump() { python3 -c 'import json,sys;print(json.dumps(json.load(open(sys.argv[1])),ensure_ascii=False,indent=2))' "$1"; }
 
-json_create_task() { # <file> <issue> <short> <branch> <path> <kind> <baseline> <writer>
+json_create_task() { # <file> <issue> <short> <branch> <path> <kind> <baseline> <writer> [依赖分支] [依赖分支SHA]
   python3 - "$@" <<'PY'
 import datetime,json,os,sys,tempfile
-path,issue,short,branch,wt,kind,baseline,writer=sys.argv[1:9]
+a=sys.argv[1:]
+path,issue,short,branch,wt,kind,baseline,writer=a[0:8]
+depends_on=(a[8] if len(a)>8 else "")
+depends_sha=(a[9] if len(a)>9 else "")
 doc={"issue":issue,"short":short,"branch":branch,"path":wt,"kind":kind,
      "baseline":baseline,"baseline_ref":"main","writer":writer,"role":"implementer",
      "created_at":datetime.datetime.now().strftime("%F %T"),"status":"creating","authorizations":{}}
+if depends_on:
+    # 依赖分支例外：审计记录，说明本分支不是从 main 直接开出来的。
+    doc["depends_on"]=depends_on; doc["depends_on_sha"]=depends_sha
 directory=os.path.dirname(path)
 fd,tmp=tempfile.mkstemp(prefix="."+os.path.basename(path)+".",suffix=".tmp",dir=directory)
 try:
@@ -454,20 +460,26 @@ acquire_locks() { # acquire_locks <超时秒> <规格...>
 
 # ── create ──
 cmd_create() {
-  local issue="${1:-}" short="${2:-}" kind="feature" writer="$WHOAMI_ID"
+  local issue="${1:-}" short="${2:-}" kind="feature" writer="$WHOAMI_ID" base_ref=""
   shift 2 2>/dev/null || true
   while [ $# -gt 0 ]; do
     case "$1" in
       --kind) [ "$#" -ge 2 ] || die "--kind 缺少 feature|fix 值"; kind="$2"; shift 2 ;;
       --writer) [ "$#" -ge 2 ] || die "--writer 缺少身份值"; writer="$2"; shift 2 ;;
+      --base) [ "$#" -ge 2 ] || die "--base 缺少分支名"; base_ref="$2"; shift 2 ;;
       *) die "未知参数：$1" ;;
     esac
   done
-  [ -n "$issue" ] && [ -n "$short" ] || die "用法：tools/worktree.sh create <issue> <短名> [--kind feature|fix] [--writer <身份>]"
+  [ -n "$issue" ] && [ -n "$short" ] || die "用法：tools/worktree.sh create <issue> <短名> [--kind feature|fix] [--writer <身份>] [--base <分支>]"
   [[ "$issue" =~ ^[1-9][0-9]{0,9}$ ]] || die "issue 必须是正整数"
   case "$kind" in feature|fix) ;; *) die "--kind 只能是 feature 或 fix" ;; esac
   [[ "$short" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || die "短名只能是 1-64 个小写字母/数字/连字符"
   [[ "$writer" =~ ^[A-Za-z0-9][A-Za-z0-9._@:-]{0,127}$ ]] || die "writer 身份格式无效"
+  if [ -n "$base_ref" ]; then
+    # 依赖分支例外：必须由用户显式批准后传入，且只接受本地分支名（不接受任意 rev/远程引用）。
+    [[ "$base_ref" =~ ^(feature|fix)/[a-z0-9][a-z0-9-]{0,63}$ ]] || \
+      die "--base 只接受 feature/<名字> 或 fix/<名字> 形式的本地分支"
+  fi
 
   init_state_dirs
   task_lock_acquire "$issue"
@@ -485,7 +497,9 @@ cmd_create() {
   gitq show-ref --verify --quiet "refs/heads/$branch" && die "分支 $branch 已存在"
   [ -e "$path" ] && die "路径已存在：$path"
 
-  # 基线：main 必须与 github/main 同步（不自动快进，避免静默改变基线）
+  # 基线：main 必须与 github/main 同步（不自动快进，避免静默改变基线）。
+  # 注意：baseline 始终指上游 main 的 SHA——verify-baseline 与红灯例外都以它为准，
+  # 这样「这个红灯是不是上游本来就有的」才问得成立。--base 只改变建树起点。
   gitq fetch --quiet github 2>/dev/null || die "无法 fetch github/main，不能证明基线是最新；create 已停止"
   local main_sha gh_sha
   main_sha="$(gitq rev-parse main)"
@@ -495,25 +509,43 @@ cmd_create() {
     die "先按「上游同步」把 main 快进到 github/main，再建树（避免用陈旧基线开工）"
   fi
 
-  # 基线不得携带禁止进入功能分支的文件
-  local hit=""
-  for p in "${FORBIDDEN_PATHS[@]}"; do
-    if gitq ls-tree -r --name-only main -- "$p" | grep -q .; then hit="$hit $p"; fi
+  # 建树起点：默认 main；--base 时用依赖分支的当前 SHA（登记为依赖分支例外）。
+  local start_sha="$main_sha" base_depends_on="" base_depends_sha=""
+  if [ -n "$base_ref" ]; then
+    base_depends_sha="$(gitq rev-parse --verify "refs/heads/$base_ref^{commit}" 2>/dev/null)" || \
+      die "依赖分支不存在：$base_ref"
+    start_sha="$base_depends_sha"
+    base_depends_on="$base_ref"
+    warn "以依赖分支为基线：$base_ref@$(gitq rev-parse --short "$base_depends_sha")"
+    warn "本分支的上游 PR 会夹带该分支相对 main 的全部改动；这是用户显式批准的例外"
+    if gitq merge-base --is-ancestor "$base_depends_sha" "$main_sha"; then
+      die "依赖分支 $base_ref 已在 main 上，无需 --base；请直接从不带 --base 建树"
+    fi
+  fi
+
+  # 基线不得携带禁止进入功能分支的文件。同时检查基线（main）与实际起点（可能含依赖分支）。
+  local hit="" check_ref
+  for check_ref in "$main_sha" "$start_sha"; do
+    for p in "${FORBIDDEN_PATHS[@]}"; do
+      if gitq ls-tree -r --name-only "$check_ref" -- "$p" | grep -q .; then
+        case " $hit " in *" $p "*) ;; *) hit="$hit $p" ;; esac
+      fi
+    done
   done
   if [ -n "$hit" ]; then
-    warn "基线 main 已跟踪这些文件：$hit"
+    warn "基线/起点已跟踪这些文件：$hit"
     die "它们不应随功能分支进入上游 PR。请用户决定如何处理（删除/迁移）后再建树"
   fi
 
-  info "创建 $branch → $path（基线 main@$(gitq rev-parse --short main)）"
+  info "创建 $branch → $path（基线 main@$(gitq rev-parse --short main)，起点 $(gitq rev-parse --short "$start_sha")）"
   # 先原子保留 issue 登记，其他 create 在同 issue 锁下只能看到 creating 并拒绝重入。
-  json_create_task "$task" "$issue" "$short" "$branch" "$path" "$kind" "$main_sha" "$writer" || die "无法原子登记 issue #$issue"
-  if ! gitq worktree add -b "$branch" "$path" "$main_sha" >/dev/null; then
+  json_create_task "$task" "$issue" "$short" "$branch" "$path" "$kind" "$main_sha" "$writer" "$base_depends_on" "$base_depends_sha" || die "无法原子登记 issue #$issue"
+  if ! gitq worktree add -b "$branch" "$path" "$start_sha" >/dev/null; then
     rm -f "$task"
     die "git worktree add 失败；已撤销本次任务登记"
   fi
   json_set "$task" status created || die "工作树已创建，但任务状态写入失败；保留现场并停止"
-  audit create "issue=$issue branch=$branch path=$path baseline=$(gitq rev-parse --short main)"
+  audit create "issue=$issue branch=$branch path=$path baseline=$(gitq rev-parse --short main) start=$(gitq rev-parse --short "$start_sha") depends_on=${base_depends_on:-none}"
   ok "已建树并登记：issue #$issue（写入者 $writer）"
   info "下一步：cd $path && $SCRIPT_PATH init"
   task_lock_release
@@ -944,6 +976,11 @@ cmd_deliver() {
     printf -- '- 分支：`%s`\n- 工作树：`%s`\n- 基线：`%s`（%s）\n- 提交：`%s`（共 %s 个）\n- 落后 main：%s 个提交\n- 验证报告：`%s`\n- 写入者：%s\n- 门禁结果：%s\n\n## 提交列表\n\n' \
       "$branch" "$wt" "$baseline" "$(json_get "$task" baseline_ref)" "$head" "$count" "$behind" "$report_path" "$(json_get "$task" writer)" "$report_kinds"
     printf '%s\n' "$commit_list" | sed 's/^/- /'
+    # 依赖分支例外必须在交付摘要里可见，否则审阅者不知道 PR 里为什么多了别的分支的改动。
+    if [ -n "$(json_get "$task" depends_on)" ]; then
+      printf '\n## ⚠ 依赖分支例外\n\n本分支基于 `%s@%s`（用户显式批准），并非直接从 main 开出。\n上游 PR 会夹带该分支相对 main 的全部改动。\n' \
+        "$(json_get "$task" depends_on)" "$(json_get "$task" depends_on_sha)"
+    fi
     if [ "$using_exception" = "1" ]; then
       printf '\n## ⚠ 以已批准基线例外交付\n\n失败门禁：`%s`（提交 `%s`；理由：%s）\n基线报告：`%s`\n' \
         "$failed_gates" "$head_short" "$(json_get "$task" authorizations.exception.note)" "$(json_get "$task" authorizations.exception.baseline_report)"
@@ -1345,6 +1382,8 @@ cmd_status() {
     printf 'issue #%s  [%s]\n' "$issue" "$(json_get "$f" status)"
     printf '  分支 %s\n  路径 %s\n  写入者 %s\n  基线 %s\n' \
       "$(json_get "$f" branch)" "$(json_get "$f" path)" "$(json_get "$f" writer)" "$(json_get "$f" baseline)"
+    local dep; dep="$(json_get "$f" depends_on)"
+    [ -n "$dep" ] && printf '  ⚠ 依赖分支 %s@%s（用户批准的例外）\n' "$dep" "$(json_get "$f" depends_on_sha | cut -c1-12)"
     local auth; auth="$(json_get "$f" authorizations)"
     [ "$auth" != "" ] && [ "$auth" != "{}" ] && printf '  授权 %s\n' "$(python3 -c "
 import json,sys;d=json.load(open(sys.argv[1])).get('authorizations',{})
@@ -1363,7 +1402,7 @@ usage() {
 
 用法（create/integrate 在主目录调用；init/verify/deliver 在任何工作树里调用）：
 
-  tools/worktree.sh create <issue> <短名> [--kind feature|fix] [--writer <身份>]
+  tools/worktree.sh create <issue> <短名> [--kind feature|fix] [--writer <身份>] [--base <分支>]
   tools/worktree.sh init                     # 当前树：装依赖、补构建环境（不共享生成物）
   tools/worktree.sh verify                   # 当前树：干净树跑门禁，原子写证据
   tools/worktree.sh verify-baseline <issue>  # 登记的基线 SHA 同环境复跑门禁留证

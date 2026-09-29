@@ -110,12 +110,54 @@ WT1="$DSH_WT_ROOT/issue-900-selftest-one"
 [ -d "$WT1" ] && { PASS=$((PASS+1)); say "  PASS  工作树目录已创建"; } || { FAIL=$((FAIL+1)); say "  FAIL  工作树目录缺失"; }
 [ "$(git -C "$WT1" rev-parse --abbrev-ref HEAD)" = "feature/selftest-one" ] \
   && { PASS=$((PASS+1)); say "  PASS  分支名正确"; } || { FAIL=$((FAIL+1)); say "  FAIL  分支名错误"; }
+# 无 --base 时不得出现依赖字段：普通任务不能被误标为"依赖分支例外"。
+run "无 --base 时不登记依赖分支" 0 python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1])); assert "depends_on" not in d, d' "$DSH_WT_STATE/tasks/900.json"
 
 section "规则入口不得落入工作树"
 for f in AGENTS.md AGENT-RULES.md CONTEXT.md docs/adr docs/agents docs/design; do
   [ -e "$WT1/$f" ] && { FAIL=$((FAIL+1)); say "  FAIL  $f 出现在新工作树里"; } \
                    || { PASS=$((PASS+1)); say "  PASS  $f 未落入工作树"; }
 done
+
+section "依赖分支例外（--base）"
+# 造一个「未上游化的依赖分支」：从 main 开分支并加一个提交，模拟 issue #14 的情形。
+DEP_BRANCH="feature/dep-probe"
+git -C "$CLONE" branch -f "$DEP_BRANCH" main >/dev/null 2>&1
+DEP_WT="$TMP/depbuild"
+git -C "$CLONE" worktree add -q "$DEP_WT" "$DEP_BRANCH" >/dev/null 2>&1
+echo "dep-marker" > "$DEP_WT/dep-only.txt"
+git -C "$DEP_WT" add -A >/dev/null 2>&1
+git -C "$DEP_WT" -c user.email=t@t -c user.name=t commit -qm "test: dependency branch content" >/dev/null 2>&1
+git -C "$CLONE" worktree remove --force "$DEP_WT" >/dev/null 2>&1
+DEP_SHA="$(git -C "$CLONE" rev-parse "$DEP_BRANCH")"
+run "--base 指向不存在的分支被拒" fail bash "$WT" create 890 nobase --base feature/does-not-exist
+run "--base 拒绝非分支形式的取值" fail bash "$WT" create 890 badbase --base main
+run "--base 拒绝任意 rev（防绕过）" fail bash "$WT" create 890 revbase --base "$DEP_SHA"
+run "--base 已在 main 上的分支被拒" fail bash "$WT" create 890 ancestor --base feature/selftest-one
+run "--base 建树成功" 0 bash "$WT" create 891 baseprobe --base "$DEP_BRANCH"
+WT_BASE="$DSH_WT_ROOT/issue-891-baseprobe"
+[ "$(git -C "$WT_BASE" rev-parse HEAD)" = "$DEP_SHA" ] \
+  && { PASS=$((PASS+1)); say "  PASS  工作树起点等于依赖分支 SHA"; } \
+  || { FAIL=$((FAIL+1)); say "  FAIL  起点不是依赖分支 SHA"; }
+[ -f "$WT_BASE/dep-only.txt" ] \
+  && { PASS=$((PASS+1)); say "  PASS  依赖分支的文件确实存在于新树（用例非空跑）"; } \
+  || { FAIL=$((FAIL+1)); say "  FAIL  依赖分支内容缺失"; }
+# 关键语义：baseline 仍指上游 main，依赖分支另记。
+TASK_BASE="$DSH_WT_STATE/tasks/891.json"
+python3 - "$TASK_BASE" "$(git -C "$CLONE" rev-parse main)" "$DEP_BRANCH" "$DEP_SHA" <<'PY' \
+  && { PASS=$((PASS+1)); say "  PASS  baseline 仍指上游 main，并登记依赖分支与其 SHA"; } \
+  || { FAIL=$((FAIL+1)); say "  FAIL  baseline/依赖分支登记不正确"; }
+import json,sys
+p,main_sha,dep,dep_sha=sys.argv[1:5]
+d=json.load(open(p))
+assert d.get("baseline")==main_sha, ("baseline 不是 main", d.get("baseline"), main_sha)
+assert d.get("baseline_ref")=="main", d.get("baseline_ref")
+assert d.get("depends_on")==dep, d.get("depends_on")
+assert d.get("depends_on_sha")==dep_sha, d.get("depends_on_sha")
+PY
+run "status 显示依赖分支例外" 0 bash -c 'bash "$1" status 891 | grep -q "依赖分支"' _ "$WT"
 
 section "init 归属、子目录检查与独立产物"
 cd "$WT1" || { say "  FAIL  无法进入工作树 $WT1"; exit 1; }
