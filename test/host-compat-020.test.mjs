@@ -23,6 +23,7 @@ import {
 	readSettingsSection,
 	wireStreamTakesControl,
 	capabilityState,
+	codexProxyUrl,
 } from "../lib/index.js";
 
 const CONFIG = {
@@ -98,7 +99,7 @@ const AGENT = { id: "session-A", session: { id: "session-A", header: { cwd: "/tm
  * 所有发往宿主的调用都被记录，断言只针对"插件传出去的东西"与"端点返回的东西"——
  * 不触碰插件内部实现。
  */
-function createHarness({ generation, frames = [], endAfterFrames = false }) {
+function createHarness({ generation, frames = [], endAfterFrames = false, extraSessions = [], liveChildStatus = {} }) {
 	const modern = generation === "0.2.0";
 	const routes = [];
 	const provided = new Map();
@@ -177,8 +178,25 @@ function createHarness({ generation, frames = [], endAfterFrames = false }) {
 		setState: async () => undefined,
 	};
 
-	provided.set("agents", { get: (id) => (id === "session-A" ? AGENT : undefined), list: () => [AGENT], roots: () => [AGENT] });
-	provided.set("sessions", { get: (id) => (id === "session-A" ? { id: "session-A", header: { cwd: "/tmp/proj" } } : undefined), list: () => [{ id: "session-A", header: { cwd: "/tmp/proj" } }] });
+	// 会话注册表：默认只有父会话；`extraSessions` 用来注入子代理会话（issue #21 的用例）。
+	// 子代理在会话头里带 origin === "subagent" 与 parentSession —— 这是内核提供的字段
+	// （两代都有），也是新版 /subagents 派生列表的唯一依据（不再调用任何 RPC）。
+	const sessionList = [
+		{ id: "session-A", header: { id: "session-A", cwd: "/tmp/proj", createdAt: 1000 } },
+		...extraSessions,
+	];
+	const liveChildAgents = new Map(
+		Object.entries(liveChildStatus).map(([id, status]) => [id, { id, session: { id }, status }]),
+	);
+	provided.set("agents", {
+		get: (id) => (id === "session-A" ? AGENT : liveChildAgents.get(id)),
+		list: () => [AGENT, ...liveChildAgents.values()],
+		roots: () => [AGENT],
+	});
+	provided.set("sessions", {
+		get: (id) => sessionList.find((session) => session.id === id),
+		list: () => sessionList,
+	});
 	provided.set("jobs", jobs);
 	provided.set("settings", settings);
 	provided.set("typertGateway", gateway);
@@ -508,4 +526,83 @@ test("曾就绪的通道在断开后持续重连，且退避等待不泄漏监�
 		h.clean();
 		t.mock.timers.reset();
 	}
+});
+
+// ───────────────────── 7. issue #21 的回归测试 ─────────────────────
+
+const CODEX_MOD = {
+	resolveOpenAICodexSettings: (settings) => settings,
+	resolveOpenAICodexProxyUrl: (settings) => settings?.proxyUrl,
+};
+const CODEX_CFG = { enableProxy: true, proxyUrl: "http://127.0.0.1:1080" };
+
+test("Codex 代理配置：两代设置读取都能读到（issue #21）", () => {
+	// 0.1.x：settings.get(ns)
+	const legacy = { get: (ns) => (ns === "llm-openai-codex" ? CODEX_CFG : undefined) };
+	assert.deepEqual(
+		codexProxyUrl({ get: () => legacy }, CODEX_MOD),
+		{ enabled: true, url: "http://127.0.0.1:1080" },
+	);
+
+	// 0.2.x：**只有 describe()**，get() 已被移除 —— 这正是本次回归的核心。
+	// 旧实现用 settings.get() 读，在 0.2.x 上恒得 undefined → 误判「代理未启用」
+	// → 静默改走直连 chatgpt.com → 连接超时 → 表现为「手机看不到 Codex 余额」。
+	const modern = { describe: () => [{ ns: "llm-openai-codex", value: CODEX_CFG }] };
+	assert.deepEqual(
+		codexProxyUrl({ get: () => modern }, CODEX_MOD),
+		{ enabled: true, url: "http://127.0.0.1:1080" },
+		"0.2.x 必须经 describe() 读到代理配置",
+	);
+});
+
+test("Codex 代理配置：读不到宿主设置必须显式暴露，不得伪装成「未启用」（issue #21）", () => {
+	// 设置服务既无 get 也无 describe ⇒ 插件**读不了**配置。这是接口问题，必须显式失败：
+	// 若伪装成「未启用」，用户只会看到 Codex 余额凭空消失，无从归因。
+	assert.deepEqual(
+		codexProxyUrl({ get: () => ({}) }, CODEX_MOD),
+		{ enabled: true, url: undefined, unreadable: true },
+		"设置服务无读取方法时必须标记 unreadable",
+	);
+	assert.deepEqual(
+		codexProxyUrl({ get: () => undefined }, CODEX_MOD),
+		{ enabled: true, url: undefined, unreadable: true },
+		"设置服务不存在时必须标记 unreadable",
+	);
+	// 对照：设置读得到、只是用户没开代理 ⇒ 走直连是**正确**行为，不应算失败
+	assert.deepEqual(
+		codexProxyUrl({ get: () => ({ describe: () => [] }) }, CODEX_MOD),
+		{ enabled: false, url: undefined },
+		"命名空间不存在属正常配置，不得标记 unreadable",
+	);
+});
+
+test("/subagents：由会话注册表派生子代理，不再调用已删除的端点（issue #21）", async () => {
+	// 宿主 0.2.0 删除了 `subagents/list` Remote 端点（0.1.5 有 4 处声明，0.2.0 为 0），
+	// 原实现因此报 "no active Remote method exports this endpoint"。
+	const h = createHarness({
+		generation: "0.2.0",
+		extraSessions: [
+			{ id: "child-1", header: { id: "child-1", cwd: "/tmp/proj", createdAt: 3000, origin: "subagent", parentSession: "session-A" } },
+			{ id: "child-2", header: { id: "child-2", cwd: "/tmp/proj", createdAt: 2000, origin: "subagent", parentSession: "session-A" } },
+			// fork 出的独立会话：有 parentSession 但**无** origin，是真子代理之外的东西，不得混入
+			{ id: "fork-1", header: { id: "fork-1", cwd: "/tmp/proj", createdAt: 4000, parentSession: "session-A" } },
+			// 别的父会话的子代理，不得混入
+			{ id: "other-1", header: { id: "other-1", cwd: "/tmp/proj", createdAt: 5000, origin: "subagent", parentSession: "session-B" } },
+		],
+		liveChildStatus: { "child-1": "running" },
+	});
+	try {
+		const res = await call(h.route, { url: "/m/api/subagents?parentSessionId=session-A" });
+		assert.equal(res.status, 200);
+		assert.deepEqual(
+			res.body.subagents.map((entry) => entry.id),
+			["child-1", "child-2"],
+			"只列 origin=subagent 且 parentSession 匹配者，按 createdAt 降序（最新派生在最上）",
+		);
+		// 状态必须来自活注册表：直接合并两条路径会把状态写死成 inactive，
+		// 从而丢掉 issue #17 的「运行状态」标识。
+		assert.equal(res.body.subagents[0].status, "running", "活子代理的状态应取自注册表");
+		assert.equal(res.body.subagents[1].status, "inactive", "无活 agent 的子代理回落 inactive");
+		assert.equal(res.body.parentAvailable, true, "父会话活跃时应报告 parentAvailable");
+	} finally { h.clean(); }
 });
