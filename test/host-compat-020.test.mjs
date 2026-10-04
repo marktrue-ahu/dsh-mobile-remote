@@ -15,7 +15,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
+import { EventEmitter, getEventListeners } from "node:events";
 import {
 	apply,
 	jobsNeedsSessionId,
@@ -98,7 +98,7 @@ const AGENT = { id: "session-A", session: { id: "session-A", header: { cwd: "/tm
  * 所有发往宿主的调用都被记录，断言只针对"插件传出去的东西"与"端点返回的东西"——
  * 不触碰插件内部实现。
  */
-function createHarness({ generation }) {
+function createHarness({ generation, frames = [], endAfterFrames = false }) {
 	const modern = generation === "0.2.0";
 	const routes = [];
 	const provided = new Map();
@@ -106,6 +106,7 @@ function createHarness({ generation }) {
 	const seen = {
 		jobsList: [], jobsKill: [], settingsGet: [], settingsDescribe: 0,
 		eventsSubscribe: [], wireStreamArgs: [], legacyJobCallbacks: 0,
+		framesDelivered: 0,
 	};
 
 	// ── 任务服务：0.1.x 收 Agent 对象 + 两个回调；0.2.x 收 SessionId 字符串 + 统一事件流 ──
@@ -128,12 +129,22 @@ function createHarness({ generation }) {
 		: { get(ns) { seen.settingsGet.push(ns); return { baseURL: "https://x.test" }; } };
 
 	// ── 事件流：形参个数即代际（插件按 .length 判别信号位次）──
-	// 流必须**保持打开**直到 signal 中止：真实 $events 流不会自行结束。若让生成器直接结束，
+	// 默认**保持打开**直到 signal 中止：真实 $events 流不会自行结束。若让生成器直接结束，
 	// 插件会（正确地）按"断开"处理并进入退避重连——那是另一条路径，会让测试挂着定时器。
+	// `endAfterFrames: true` 则刻意在发完帧后结束，用来**驱动重连回放**
+	// （宿主在新连接建立时会重投未结算事件），这是评审 WARNING 2 的复现前提。
 	const holdOpenUntilAborted = (signal) => new Promise((resolve) => {
 		if (!signal || signal.aborted) return resolve();
 		signal.addEventListener("abort", () => resolve(), { once: true });
 	});
+	const emitFrames = async function* (signal) {
+		yield { type: "ready", clientId: "c-1" };
+		for (const frame of frames) {
+			seen.framesDelivered += 1;
+			yield frame;
+		}
+		if (!endAfterFrames) await holdOpenUntilAborted(signal);
+	};
 	const gateway = {
 		async invokeRpc() { return { ok: true, value: {} }; },
 		async dispatchRpc() { return { ok: true, value: undefined }; },
@@ -142,13 +153,13 @@ function createHarness({ generation }) {
 		// 0.2.0 真实签名：signal 是第 5 个形参
 		gateway.openWireStream = async function openWireStream(endpoint, payload, uplink, peer, signal, control) {
 			seen.wireStreamArgs.push({ endpoint, payload, uplink, peer, signal, control });
-			return (async function* ready_() { yield { type: "ready", clientId: "c-1" }; await holdOpenUntilAborted(signal); })();
+			return emitFrames(signal);
 		};
 	} else {
 		// 0.1.x 真实签名：signal 是第 3 个形参
 		gateway.openWireStream = async function openWireStream(endpoint, payload, signal) {
 			seen.wireStreamArgs.push({ endpoint, payload, signal });
-			return (async function* ready_() { yield { type: "ready", clientId: "c-1" }; await holdOpenUntilAborted(signal); })();
+			return emitFrames(signal);
 		};
 	}
 
@@ -405,4 +416,96 @@ test("/respond：待办不在本地清单时返回 404 并说明真实原因（�
 		assert.equal(res.body.error, "respond-not-pending");
 		assert.ok(!String(res.body.detail ?? "").includes("apiProxy"), "错误原因不得再提已移除的 apiProxy");
 	} finally { h.clean(); }
+});
+
+// ───────────────────── 6. 评审修复的回归测试 ─────────────────────
+
+const QUESTION_REPLAY_FRAME = {
+	type: "waterfall", event: "user-questions/request", eventId: "ev-q-replay", agentId: "session-A",
+	request: { questions: [{ id: "q1", question: "Replayed?", options: [{ label: "Yes" }] }] },
+};
+
+test("同一问询被重复投递：仍只有一个待办与一份回放帧（评审 WARNING 2）", async () => {
+	// 宿主在新连接建立时会重投尚未结算的事件（dsh-api-gateway 的 remoteEventClients 交付逻辑），
+	// 因此**同一个 eventId 会被插件看到不止一次**。这里把同一帧在一次连接内投递两次来驱动该语义
+	// ——对插件而言与"断开→重连→回放"等价（身份相同、内容相同），但不必让重连循环持续运行。
+	const h = createHarness({ generation: "0.2.0", frames: [QUESTION_REPLAY_FRAME, QUESTION_REPLAY_FRAME] });
+	try {
+		const deadline = Date.now() + 10_000;
+		while (h.seen.framesDelivered < 2 && Date.now() < deadline) await h.wait(20);
+		assert.equal(h.seen.framesDelivered, 2, "同一帧应被投递两次");
+		const res = await call(h.route, { url: "/m/api/diagnostics" });
+		// 身份不稳定时这两项会各变成 2（评审复现：pendingQuestions / pendingFrames 由 1 增至 2）
+		assert.equal(res.body.checks.pendingQuestions, 1, "重复投递不得产生第二个待办");
+		assert.equal(res.body.checks.pendingFrames, 1, "重复投递不得产生第二份待发送帧");
+		// 用帧里的身份回答必须被接受（身份不稳定时旧实现会 400 interaction-mismatch）
+		const answer = await call(h.route, {
+			url: "/m/api/respond", method: "POST",
+			body: { rpcId: "ev-q-replay", kind: "question", sessionId: "session-A", questionId: "session-A:ev-q-replay", answers: [{ id: "q1", selected: ["Yes"] }] },
+		});
+		assert.notEqual(answer.status, 400, "携带帧内身份的回答不得被判 mismatch");
+	} finally { h.clean(); }
+});
+
+test("任务事件：output 不触发全量扫描，无连接时任何事件都不扫描（评审 WARNING 3）", async () => {
+	const h = createHarness({ generation: "0.2.0" });
+	try {
+		await h.wait(30);
+		const sub = h.seen.eventsSubscribe[0];
+		assert.ok(sub, "0.2.x 应已订阅任务事件流");
+		const before = h.seen.jobsList.length;
+		sub.listener({ type: "output", job: { id: "j1", status: "running" } });
+		assert.equal(h.seen.jobsList.length, before, "output 事件不得触发 jobs.list 全量扫描（投影不含输出内容）");
+		// 零移动端连接时，扫描唯一的目的（广播）不存在，生命周期事件也应跳过
+		sub.listener({ type: "progress", job: { id: "j1", status: "running" } });
+		assert.equal(h.seen.jobsList.length, before, "无连接时即使生命周期事件也不应扫描");
+	} finally { h.clean(); }
+});
+
+test("诊断：仅 presets 缺失时目录降级必须显式报出（评审 WARNING 5）", async () => {
+	const h = createHarness({ generation: "0.2.0" });
+	try {
+		// 目录读取依赖的是私有 presets，与 names/apply 是不同成员：只缺 presets 时，
+		// 目录会静默退化成「只有内置 read-only」，诊断必须看得见。
+		h.provided.set("permissionPresets", { names: ["read-only"], apply() { return undefined; } });
+		const res = await call(h.route, { url: "/m/api/diagnostics" });
+		assert.equal(res.status, 200);
+		assert.equal(res.body.checks.hostCapabilities["permissionPresets.catalog"], "drift", "缺 presets 必须报 drift");
+		assert.equal(res.body.checks.hostCapabilities["permissionPresets.apply"], "ok", "names/apply 仍在，不应误报");
+		assert.ok((res.body.notes ?? []).some((n) => String(n).includes("宿主能力非全绿")), "降级必须写入 notes");
+		// 同时确认目录端点确实降级（而不是抛错）——与诊断口径一致
+		const catalog = await call(h.route, { url: "/m/api/catalog" });
+		assert.equal(catalog.status, 200);
+	} finally { h.clean(); }
+});
+
+test("曾就绪的通道在断开后持续重连，且退避等待不泄漏监听器（评审 BLOCKING 1 + WARNING 4）", async (t) => {
+	// 用 mock timers 推进退避：真实等待序列是 3s/6s/12s/…，不模拟则无法在合理时间内
+	// 观察到「越过有界重试上限之后仍在重连」。这条正是 BLOCKING 的判别点：
+	// 旧实现用「每轮开始前的就绪快照」判断，首轮就绪后断流会被误判为「从未就绪」，
+	// 耗尽 READY_RETRY_MAX（6）后退出——总计 7 次打开即永久停止。
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const h = createHarness({ generation: "0.2.0", frames: [], endAfterFrames: true });
+	try {
+		for (let i = 0; i < 12; i += 1) {
+			t.mock.timers.tick(60_000);
+			await new Promise((resolve) => setImmediate(resolve));
+		}
+		const opens = h.seen.wireStreamArgs.length;
+		const signal = h.seen.wireStreamArgs[0]?.signal;
+		// 必须在**恢复真实定时器之前**卸载：否则在途的（被 mock 的）退避定时器永远不会触发，
+		// 插件里那个 async IIFE 会留下一个永不 settle 的 promise，测试文件随即挂住。
+		h.clean();
+		t.mock.timers.reset();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.ok(signal instanceof AbortSignal, "夹具应收到取消信号");
+		assert.ok(opens > 7, `曾就绪后应持续重连（越过有界上限 6），实际打开 ${opens} 次`);
+		// WARNING 4 的判据是「不累积」而非「为零」：卸载时若恰有一个在途等待，它会经 abort
+		// 路径被清理；真有泄漏（每次等待都留下监听器）时这里会是十几次。
+		const listeners = getEventListeners(signal, "abort").length;
+		assert.ok(listeners <= 1, `已完成的退避等待不得累积 abort 监听器，实际残留 ${listeners} 个`);
+	} finally {
+		h.clean();
+		t.mock.timers.reset();
+	}
 });
