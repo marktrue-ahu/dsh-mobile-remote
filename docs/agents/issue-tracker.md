@@ -59,6 +59,20 @@ WSL 直连 `curl -X PUT` 与 Windows 侧 `glab` 现象一致。注意 `gitlab.lo
 
 - **改标签**：GraphQL `updateIssue` 的 `addLabelIds` / `removeLabelIds`（需 label 的数字 ID），或重试 REST PUT 后用 GET 复核 `labels` 字段（曾观察到 `?add_labels=` 超时但实际已生效）。
 
+- **改标题 / 正文 → 同样是 GraphQL `updateIssue`**（已验证）：
+
+  ```sh
+  "$DSH_GLAB" api graphql -f query='mutation { updateIssue(input: { projectPath: "ahedu/dsh-mobile-remote", iid: "19", title: "新标题" }) { issue { iid title } errors } }'
+  ```
+
+  `title` 与 `description` 都是 `UpdateIssueInput` 的字段。**长多行中文正文往返无损**（已验证：换行、`` ` `` 反引号、单双引号、反斜杠、`<>&%$#@!*()[]{}` 均原样保留），因此**规格正文不必一次写死**，事后补验收标准或贴结果都可以。
+
+  长正文的实操：GraphQL 的 query 只能内联传入（`-f query=...`），没有 `@-` 读文件。把正文按 **JSON 规则转义**（`\n` / `\"` / `\\`）后嵌进 GraphQL 字符串字面量即可——JSON 与 GraphQL 的字符串转义在这里兼容。转义在脚本里做（如 Python 的 `json.dumps(body)[1:-1]`），**不要手写**，然后用 argv 数组直接调 glab，避免 shell 引号干扰。
+
+- **删除 issue**：REST `DELETE /projects/53/issues/<iid>` **可用**（被挡的只有 PUT）。删除后用 GET 复核应得 404。
+
+> 被挡的**只有 PUT**。`POST`（创建、评论）与 `DELETE` 实测正常；`GET` 正常；GraphQL 的 mutation 走 POST，因此不受影响。
+
 任何写操作后都复核一次状态：
 
 ```sh
