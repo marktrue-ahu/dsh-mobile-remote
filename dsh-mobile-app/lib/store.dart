@@ -674,19 +674,50 @@ class AppStore extends ChangeNotifier {
     notifyListeners();
   }
 
+  // ── 会话列表刷新的在途守卫（issue #22）──
+  //
+  // 触发源：`_debounceSessions()` 每 800ms 就可能调一次本方法，而一次 `/sessions`
+  // 在服务端是一次**全语料扫描**（实测 70 秒量级）。没有守卫时同一时刻可以有任意多个
+  // 刷新在飞——实测现场 16–18 个连接全部来自手机、宿主 CPU 171%、主线程 91.6%。
+  // 到达速率长期高于完成速率 → 请求无界堆积 → **谁都完不成**，列表永远刷不出来。
+  //
+  // 策略：在途期间不发新请求，只记一次"待补"；在途结束后补发**一次**。
+  // 既不堆积，也不丢语义——事件期间的变化最终仍会反映到列表上。
+  bool _sessionsInFlight = false;
+  bool _sessionsPending = false;
+  bool _sessionsPendingNotify = true;
+
   Future<void> refreshSessions({bool notify = true}) async {
+    if (_sessionsInFlight) {
+      // 已有刷新在飞：只登记"还要再刷一次"，绝不并发再发一个请求。
+      _sessionsPending = true;
+      _sessionsPendingNotify = notify; // 沿用最新一次调用的意图
+      return;
+    }
+    _sessionsInFlight = true;
     try {
-      sessions = await api.sessions();
-      _persistSessions(); // 本地缓存：下次打开 App 秒出列表
-      // 排障日志：打印工作区选择与会话 cwd 样本，便于定位筛选不显示的问题
-      AppLog.instance.log(
-        'Sessions: 拉取 ${sessions.length} 条 · workspacePath=${workspacePath ?? "全部"} · '
-        'workspaces=${workspaces.map((w) => w['path']).join("|")} · '
-        'cwd样例=${sessions.take(3).map((s) => s.cwd ?? "null").join("|")}',
-      );
-      if (notify) notifyListeners();
-    } catch (e) {
-      AppLog.instance.log('Sessions: 拉取失败 $e');
+      try {
+        sessions = await api.sessions();
+        _persistSessions(); // 本地缓存：下次打开 App 秒出列表
+        // 排障日志：打印工作区选择与会话 cwd 样本，便于定位筛选不显示的问题
+        AppLog.instance.log(
+          'Sessions: 拉取 ${sessions.length} 条 · workspacePath=${workspacePath ?? "全部"} · '
+          'workspaces=${workspaces.map((w) => w['path']).join("|")} · '
+          'cwd样例=${sessions.take(3).map((s) => s.cwd ?? "null").join("|")}',
+        );
+        if (notify) notifyListeners();
+      } catch (e) {
+        AppLog.instance.log('Sessions: 拉取失败 $e');
+      }
+    } finally {
+      // **无论成功、失败还是异常都必须复位**：否则一次失败会把守卫永久卡在
+      // in-flight，列表从此再也不刷新——那比不加守卫更糟。
+      _sessionsInFlight = false;
+      if (_sessionsPending) {
+        _sessionsPending = false;
+        // 补发一次。不 await：避免让当前调用方被二次刷新拖住。
+        unawaited(refreshSessions(notify: _sessionsPendingNotify));
+      }
     }
   }
 
