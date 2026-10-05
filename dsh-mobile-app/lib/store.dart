@@ -682,22 +682,61 @@ class AppStore extends ChangeNotifier {
   // 到达速率长期高于完成速率 → 请求无界堆积 → **谁都完不成**，列表永远刷不出来。
   //
   // 策略：在途期间不发新请求，只记一次"待补"；在途结束后补发**一次**。
-  // 既不堆积，也不丢语义——事件期间的变化最终仍会反映到列表上。
+  //
+  // 评审指出的三条语义，逐条对应到实现：
+  //  1. **被合并的调用不得提前完成**：合并时返回"待补这一轮"的共享 Future，直到补发
+  //     真正结束才释放等待者。否则 `_refreshAllInner()` 会先发布旧数据，而随后的补发
+  //     （notify 意图可能是 false）更新了 sessions 却不再通知 UI——列表就停在旧数据上。
+  //  2. **不得越过生命周期补发**：dispose / 关闭 bridge 时清除待补并释放等待者；
+  //     finally 里还必须确认当前请求仍属于当前代，才允许补发。
+  //  3. **守卫按连接代归属**：切换到新地址后，旧地址的在途请求既不能阻塞新地址的刷新，
+  //     也不能在迟到时清掉新代的在途标志或启动新代补发。
+  //
+  // 注意第 3 条**不能**用"在 disposeBridge 里直接把布尔复位"糊过去：那样旧代的
+  // 迟到 finally 会把新代的守卫清掉，重新放出同代并发。故一律以 `_refreshGeneration`
+  // 判定归属。
+  int _refreshGeneration = 0; // 连接代：每次 disposeBridge（含 dispose）自增
   bool _sessionsInFlight = false;
   bool _sessionsPending = false;
   bool _sessionsPendingNotify = true;
+  Completer<void>? _sessionsWaiters; // "待补这一轮"的等待者
 
-  Future<void> refreshSessions({bool notify = true}) async {
+  /// 连接代变更时使旧代的守卫与待补全部失效。
+  ///
+  /// dispose 也走这里（`dispose()` → `disposeBridge()`），因此**不需要**额外的
+  /// `disposed` 标志：代际不符的收尾一律跳过，销毁后既不会补发、也不会应用结果、
+  /// 更不会在 super.dispose() 之后去 notifyListeners()。
+  void _invalidateSessionRefresh() {
+    _refreshGeneration++;
+    // 新代从零开始：旧代的在途不再阻塞新地址的首屏刷新。
+    _sessionsInFlight = false;
+    _sessionsPending = false;
+    // 释放等待者：它们等的那一轮已经不会发生了，不能让其永久挂住。
+    _sessionsWaiters?.complete();
+    _sessionsWaiters = null;
+  }
+
+  Future<void> refreshSessions({bool notify = true}) {
     if (_sessionsInFlight) {
-      // 已有刷新在飞：只登记"还要再刷一次"，绝不并发再发一个请求。
+      // 已有刷新在飞：合并到"待补这一轮"，并返回**该轮**的 Future——
+      // 调用者要的是"刷新完成"，不能在旧请求和补发都没结束时就提前完成。
       _sessionsPending = true;
       _sessionsPendingNotify = notify; // 沿用最新一次调用的意图
-      return;
+      _sessionsWaiters ??= Completer<void>();
+      return _sessionsWaiters!.future;
     }
+    return _runSessionRefresh(notify);
+  }
+
+  Future<void> _runSessionRefresh(bool notify) async {
+    final generation = _refreshGeneration;
     _sessionsInFlight = true;
     try {
       try {
-        sessions = await api.sessions();
+        final fetched = await api.sessions();
+        // 旧代的结果不得应用：地址已切换或已销毁时丢弃，避免旧数据覆盖新地址的列表。
+        if (generation != _refreshGeneration) return;
+        sessions = fetched;
         _persistSessions(); // 本地缓存：下次打开 App 秒出列表
         // 排障日志：打印工作区选择与会话 cwd 样本，便于定位筛选不显示的问题
         AppLog.instance.log(
@@ -710,13 +749,25 @@ class AppStore extends ChangeNotifier {
         AppLog.instance.log('Sessions: 拉取失败 $e');
       }
     } finally {
-      // **无论成功、失败还是异常都必须复位**：否则一次失败会把守卫永久卡在
-      // in-flight，列表从此再也不刷新——那比不加守卫更糟。
-      _sessionsInFlight = false;
-      if (_sessionsPending) {
-        _sessionsPending = false;
-        // 补发一次。不 await：避免让当前调用方被二次刷新拖住。
-        unawaited(refreshSessions(notify: _sessionsPendingNotify));
+      // 旧代的收尾**不得触碰新代的守卫**（评审 WARNING 3）：归属不符就直接退出。
+      // 这一条同时覆盖评审 WARNING 2——销毁会使代际自增，于是不会补发。
+      if (generation == _refreshGeneration) {
+        // **无论成功、失败还是异常都必须复位**：否则一次失败会把守卫永久卡在
+        // in-flight，列表从此再也不刷新——那比不加守卫更糟。
+        _sessionsInFlight = false;
+        final waiters = _sessionsWaiters;
+        _sessionsWaiters = null;
+        if (_sessionsPending) {
+          _sessionsPending = false;
+          // 补发一次（不 await：不让当前调用方被二次刷新拖住）。
+          // 等待者要等到**补发结束**才释放——这正是 BLOCKING 那一条要求的语义。
+          unawaited(
+            _runSessionRefresh(_sessionsPendingNotify)
+                .whenComplete(() => waiters?.complete()),
+          );
+        } else {
+          waiters?.complete();
+        }
       }
     }
   }
@@ -1132,10 +1183,14 @@ class AppStore extends ChangeNotifier {
     api.onSseKeepalive = null;
     _sub = null;
     _connecting = false;
+    // issue #22：连接代变更——旧地址的在途刷新不得再阻塞新地址的首屏，
+    // 也不得在迟到时派生新请求（切换地址 / 重配 / 销毁都会走到这里）。
+    _invalidateSessionRefresh();
   }
 
   @override
   void dispose() {
+    // disposeBridge 会自增连接代，使在途请求的 finally 不再补发（评审 WARNING 2）。
     disposeBridge();
     super.dispose();
   }
