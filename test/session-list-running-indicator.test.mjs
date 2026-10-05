@@ -823,19 +823,34 @@ test("客户端断开即取消：中止枚举、不写响应、不记为失败�
 test("正常完成不触发取消：writableEnded 之后到达的 close 必须被忽略（issue #20）", async () => {
 	// 这是最容易做反的一处：`close` 在**正常完成**时同样会触发，
 	// 少了 writableEnded 判断，每一次成功响应都会被当成取消。
-	const state = { signal: null, settled: "pending" };
+	//
+	// 评审 WARNING 2：本用例原先建了 state 却没接进假 listSessions，也不观察信号，
+	// 于是把 abort 改成无条件调用它**仍然通过**——是假绿。现在捕获真实信号并显式断言。
+	const state = { signal: null };
 	const harness = createHarness({
 		records: [{ header: { id: "session-a", createdAt: 1, cwd: "/tmp" } }],
 		liveSessions: [liveSession("session-a", [])],
+		query: {
+			async listSessions(signal) {
+				state.signal = signal;
+				return [{ header: { id: "session-a", createdAt: 1, cwd: "/tmp" } }];
+			},
+		},
 	});
 	try {
 		const res = drive(harness, "/m/api/sessions");
 		await new Promise((r) => setTimeout(r, 20));
+
+		assert.ok(state.signal instanceof AbortSignal, "插件必须把取消信号传进来（否则本用例没有观测点）");
 		assert.equal(res.statusCode, 200, "正常请求应成功返回");
 		assert.equal(JSON.parse(res.chunks.join("")).sessions.length, 1);
+		// 关键断言：正常完成时**信号不得被取消**
+		assert.equal(state.signal.aborted, false, "正常完成不得取消请求信号");
 
 		res.destroy(); // 响应完成之后才断开（真实客户端收完即关）
 		await new Promise((r) => setTimeout(r, 10));
+		// close 在完成后到达——writableEnded 已为 true，信号仍不得被取消
+		assert.equal(state.signal.aborted, false, "完成之后到达的 close 不得触发取消");
 		assert.deepEqual(harness.logs, [], "完成后的断开不得产生任何告警");
 	} finally { harness.clean(); }
 });
@@ -854,6 +869,71 @@ test("/subagents：断开同样中止持久化枚举（issue #20）", async () =
 
 		assert.equal(state.settled, "aborted", "断开必须中止枚举");
 		assert.equal(res.chunks.length, 0, "取消后不得写响应（尤其不得误报 404 session-not-found）");
+		assert.deepEqual(harness.logs, [], "取消不是失败");
+	} finally { harness.clean(); }
+});
+
+/** 假宿主的可取消单次标题读取：挂住直到 signal 中止。 */
+function cancellableTitleRead(state) {
+	return (sessionId, signal) => {
+		state.signal = signal;
+		state.sessionId = sessionId;
+		return new Promise((resolve, reject) => {
+			const fail = () => {
+				state.settled = "aborted";
+				reject(Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
+			};
+			if (signal?.aborted) return fail();
+			signal?.addEventListener("abort", fail, { once: true });
+		});
+	};
+}
+
+const DORMANT_RECORD = { header: { id: "session-dormant", createdAt: 1, cwd: "/tmp" } };
+
+test("逐个标题兜底（宿主无批量接口）：断开会取消**在途**的那次标题读取（评审 WARNING 1）", async () => {
+	// 只在循环前查 signal.aborted 拦不住**已经开始**的那次读取——它仍会把日志读完。
+	// 必须把信号传进 readTitleSnapshot(sessionId, signal)。
+	const state = { signal: null, settled: "pending" };
+	const harness = createHarness({ records: [], noQuery: true });
+	harness.provide("sessionQuery", {
+		async listSessions() { return [DORMANT_RECORD]; },
+		readTitleSnapshot: cancellableTitleRead(state),
+		// 刻意不提供 readTitleSnapshots → 走 else-if 的逐个循环
+	});
+	try {
+		const res = drive(harness, "/m/api/sessions");
+		await new Promise((r) => setTimeout(r, 20));
+		assert.equal(state.sessionId, "session-dormant", "应进入逐个标题读取路径");
+		assert.ok(state.signal instanceof AbortSignal, "单个标题读取也必须收到取消信号");
+
+		res.destroy();
+		await new Promise((r) => setTimeout(r, 20));
+		assert.equal(state.settled, "aborted", "在途的标题读取必须被中止，而不是读完整个日志");
+		assert.equal(res.chunks.length, 0, "取消后不得写响应");
+		assert.deepEqual(harness.logs, [], "取消不是失败");
+	} finally { harness.clean(); }
+});
+
+test("逐个标题兜底（批量接口抛错后）：断开会取消**在途**的那次标题读取（评审 WARNING 1）", async () => {
+	const state = { signal: null, settled: "pending" };
+	const harness = createHarness({ records: [], noQuery: true });
+	harness.provide("sessionQuery", {
+		async listSessions() { return [DORMANT_RECORD]; },
+		// 批量接口抛错 → 落到 catch 里的逐个兜底
+		async readTitleSnapshots() { throw new Error("batch unavailable"); },
+		readTitleSnapshot: cancellableTitleRead(state),
+	});
+	try {
+		const res = drive(harness, "/m/api/sessions");
+		await new Promise((r) => setTimeout(r, 20));
+		assert.equal(state.sessionId, "session-dormant", "应进入批量失败后的逐个兜底路径");
+		assert.ok(state.signal instanceof AbortSignal, "逐个兜底也必须收到取消信号");
+
+		res.destroy();
+		await new Promise((r) => setTimeout(r, 20));
+		assert.equal(state.settled, "aborted", "在途的标题读取必须被中止");
+		assert.equal(res.chunks.length, 0, "取消后不得写响应");
 		assert.deepEqual(harness.logs, [], "取消不是失败");
 	} finally { harness.clean(); }
 });
