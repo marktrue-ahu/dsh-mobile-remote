@@ -65,6 +65,9 @@ class FakeResponse extends EventEmitter {
 	}
 	end(chunk = "") {
 		if (chunk !== "") this.chunks.push(String(chunk));
+		// 与真实 ServerResponse 一致：end() 之后 writableEnded 为 true，
+		// 于是随后的 close 不会被插件误判成"客户端断开"。
+		this.writableEnded = true;
 		this.emit("finish");
 	}
 	destroy() {
@@ -116,9 +119,10 @@ function createHarness({ records, liveSessions = [], query, noQuery = false, age
 	if (!noQuery) provided.set("sessionQuery", query ?? { listSessions: async () => records ?? [] });
 	if (agents) provided.set("agents", agents);
 	if (gateway) provided.set("typertGateway", gateway);
+	const logs = [];
 	const ctx = {
 		webServer: { host: "127.0.0.1", port: 43120, register(spec) { routes.push(spec); return () => {}; } },
-		logger: { warn() {}, info() {} },
+		logger: { warn(...a) { logs.push(a.join(" ")); }, info() {} },
 		get(name) { return provided.get(name); },
 		provide(name, value) { provided.set(name, value); },
 		on(event, handler) { handlers.push([event, handler]); return () => {}; },
@@ -134,6 +138,10 @@ function createHarness({ records, liveSessions = [], query, noQuery = false, age
 		route: routes.find((route) => route.path === "/m/api").handler,
 		/** 投递一条实时会话事件（走插件真实的 session/event 订阅路径）。 */
 		emit(sessionId, event) { onSessionEvent?.({ id: sessionId }, event); },
+		/** 追加/替换一个内核服务（取消用例要用可取消的 sessionQuery 换掉默认实现）。 */
+		provide(name, value) { provided.set(name, value); },
+		/** 捕获到的 warn 日志（断言"取消不记为失败"用）。 */
+		logs,
 		clean() { dispose?.(); },
 	};
 }
@@ -764,4 +772,88 @@ test("剪枝：观测过旧时不剪枝，并清空陈旧待确认（避免下�
 		0,
 		"必须清空陈旧待确认，否则下轮新鲜观测会把它当成第二次确认而误删",
 	);
+});
+
+// ───────────────── 4. 请求取消（issue #20）─────────────────
+
+/** 假宿主的可取消枚举：挂住直到 signal 中止——与 `dsh-session-query` 的真实语义一致。 */
+function cancellableQuery(state) {
+	return {
+		listSessions(signal) {
+			state.signal = signal;
+			return new Promise((resolve, reject) => {
+				const fail = () => {
+					state.settled = "aborted";
+					reject(Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
+				};
+				if (signal?.aborted) return fail();
+				signal?.addEventListener("abort", fail, { once: true });
+			});
+		},
+	};
+}
+
+/** 直接驱动处理器，以便在扫描进行中手动 destroy 响应（模拟客户端超时/关页）。 */
+function drive(harness, url) {
+	const req = new FakeRequest(url);
+	const res = new FakeResponse();
+	harness.route(req, res);
+	return res;
+}
+
+test("客户端断开即取消：中止枚举、不写响应、不记为失败（issue #20）", async () => {
+	const state = { signal: null, settled: "pending" };
+	const harness = createHarness({ records: [], noQuery: true });
+	harness.provide("sessionQuery", cancellableQuery(state));
+	try {
+		const res = drive(harness, "/m/api/sessions");
+		await new Promise((r) => setTimeout(r, 20));
+		assert.ok(state.signal instanceof AbortSignal, "插件必须把取消信号传给 listSessions（宿主支持，此前没传）");
+		assert.equal(state.signal.aborted, false, "尚未断开时不应已取消");
+
+		res.destroy(); // 客户端超时/关页
+		await new Promise((r) => setTimeout(r, 20));
+
+		assert.equal(state.settled, "aborted", "断开必须立刻中止枚举，而不是把语料读完");
+		assert.equal(res.chunks.length, 0, "取消后不得再写响应（socket 已关闭）");
+		assert.deepEqual(harness.logs, [], "取消不是失败：不得打 warn");
+	} finally { harness.clean(); }
+});
+
+test("正常完成不触发取消：writableEnded 之后到达的 close 必须被忽略（issue #20）", async () => {
+	// 这是最容易做反的一处：`close` 在**正常完成**时同样会触发，
+	// 少了 writableEnded 判断，每一次成功响应都会被当成取消。
+	const state = { signal: null, settled: "pending" };
+	const harness = createHarness({
+		records: [{ header: { id: "session-a", createdAt: 1, cwd: "/tmp" } }],
+		liveSessions: [liveSession("session-a", [])],
+	});
+	try {
+		const res = drive(harness, "/m/api/sessions");
+		await new Promise((r) => setTimeout(r, 20));
+		assert.equal(res.statusCode, 200, "正常请求应成功返回");
+		assert.equal(JSON.parse(res.chunks.join("")).sessions.length, 1);
+
+		res.destroy(); // 响应完成之后才断开（真实客户端收完即关）
+		await new Promise((r) => setTimeout(r, 10));
+		assert.deepEqual(harness.logs, [], "完成后的断开不得产生任何告警");
+	} finally { harness.clean(); }
+});
+
+test("/subagents：断开同样中止持久化枚举（issue #20）", async () => {
+	const state = { signal: null, settled: "pending" };
+	const harness = createHarness({ records: [], noQuery: true, agents: { get: () => undefined, roots: () => [] } });
+	harness.provide("sessionQuery", cancellableQuery(state));
+	try {
+		const res = drive(harness, "/m/api/subagents?parentSessionId=session-parent");
+		await new Promise((r) => setTimeout(r, 20));
+		assert.ok(state.signal instanceof AbortSignal, "子代理路径也要把取消信号传下去");
+
+		res.destroy();
+		await new Promise((r) => setTimeout(r, 20));
+
+		assert.equal(state.settled, "aborted", "断开必须中止枚举");
+		assert.equal(res.chunks.length, 0, "取消后不得写响应（尤其不得误报 404 session-not-found）");
+		assert.deepEqual(harness.logs, [], "取消不是失败");
+	} finally { harness.clean(); }
 });
