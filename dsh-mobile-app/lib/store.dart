@@ -695,47 +695,95 @@ class AppStore extends ChangeNotifier {
   // 注意第 3 条**不能**用"在 disposeBridge 里直接把布尔复位"糊过去：那样旧代的
   // 迟到 finally 会把新代的守卫清掉，重新放出同代并发。故一律以 `_refreshGeneration`
   // 判定归属。
-  int _refreshGeneration = 0; // 连接代：每次 disposeBridge（含 dispose）自增
+  // 评审第二轮（WARNING 1）暴露的边界：generation 只在 disposeBridge 里自增，
+  // 而**自动地址轮换**（`connect.onError`、`_scheduleReconnect`、`refreshAll` 的候选
+  // 切换）与手动切换都只改 `api.baseUrl`，没有任何统一回调。于是旧地址的请求仍是
+  // "当代 owner"：新地址的刷新被合并到它后面，旧地址的迟到结果还能通过 generation
+  // 检查被当作当前地址的数据应用。
+  //
+  // 逐入口补失效既容易漏，又可能在新代请求已经开始之后**重复失效新代**（评审第 4 点）。
+  // 故改为**按连接身份归属**：在刷新入口比对身份，所有路径一次覆盖，且天然幂等
+  // ——身份没变就什么都不做。
+  int _refreshGeneration = 0;
+  String? _refreshIdentity; // 上次刷新归属的连接身份；**只用于比较**
   bool _sessionsInFlight = false;
   bool _sessionsPending = false;
   bool _sessionsPendingNotify = true;
-  Completer<void>? _sessionsWaiters; // "待补这一轮"的等待者
+  Completer<void>? _sessionsWaiters; // 「待补这一轮」的等待者（尚未启动）
+  // 评审 WARNING 2：等待者一旦成为「补发中那一轮」就会被摘成局部变量，失效逻辑只看
+  // 字段就释放不到它。故用集合追踪**所有尚未完成的轮次**，直到该轮结束或生命周期失效。
+  final Set<Completer<void>> _roundWaiters = <Completer<void>>{};
 
-  /// 连接代变更时使旧代的守卫与待补全部失效。
-  ///
-  /// dispose 也走这里（`dispose()` → `disposeBridge()`），因此**不需要**额外的
-  /// `disposed` 标志：代际不符的收尾一律跳过，销毁后既不会补发、也不会应用结果、
-  /// 更不会在 super.dispose() 之后去 notifyListeners()。
-  void _invalidateSessionRefresh() {
+  /// 当前连接身份：活动地址 + 认证身份。地址已含挂载路径。
+  /// **只用于比较**——`api.token` 绝不写入日志、界面或错误信息。
+  String get _connectionIdentity => '${api.baseUrl}\u0000${api.token}';
+
+  /// 轮次等待者的**幂等**收尾：生命周期可能已经先释放过它，此时旧回调还会到达，
+  /// 二次 complete 会抛 StateError / 未捕获异步异常。
+  void _finishRound(Completer<void>? waiter) {
+    if (waiter == null) return;
+    _roundWaiters.remove(waiter);
+    if (!waiter.isCompleted) waiter.complete();
+  }
+
+  void _finishAllRounds() {
+    for (final w in _roundWaiters.toList(growable: false)) {
+      _finishRound(w);
+    }
+  }
+
+  /// 连接身份变化 → 旧代的刷新归属全部失效（幂等：身份没变就什么都不做）。
+  void _syncConnectionGeneration() {
+    final id = _connectionIdentity;
+    if (id == _refreshIdentity) return;
+    _refreshIdentity = id;
     _refreshGeneration++;
-    // 新代从零开始：旧代的在途不再阻塞新地址的首屏刷新。
+    // 新代从零开始：旧地址的在途不再阻塞新地址的首屏刷新。
     _sessionsInFlight = false;
     _sessionsPending = false;
-    // 释放等待者：它们等的那一轮已经不会发生了，不能让其永久挂住。
-    _sessionsWaiters?.complete();
     _sessionsWaiters = null;
+    // 释放旧代**全部**等待者——包括已经变成「补发中」的那一轮（WARNING 2）。
+    _finishAllRounds();
+  }
+
+  /// 连接代变更（关闭 bridge / 销毁）时使旧代的守卫与待补全部失效。
+  ///
+  /// 与 [_syncConnectionGeneration] 的区别：这里**不比对身份**。关闭 bridge 时地址
+  /// 可能没变，但连接已经没了——等待者必须立刻释放，不能拖到旧响应回来或逻辑超时。
+  void _invalidateSessionRefresh() {
+    _refreshGeneration++;
+    _sessionsInFlight = false;
+    _sessionsPending = false;
+    _sessionsWaiters = null;
+    _finishAllRounds();
   }
 
   Future<void> refreshSessions({bool notify = true}) {
+    // 兜底入口：任何方式的连接变更（含自动轮换）都在这里被发现。
+    _syncConnectionGeneration();
     if (_sessionsInFlight) {
-      // 已有刷新在飞：合并到"待补这一轮"，并返回**该轮**的 Future——
+      // 已有刷新在飞：合并到「待补这一轮」，并返回**该轮**的 Future——
       // 调用者要的是"刷新完成"，不能在旧请求和补发都没结束时就提前完成。
       _sessionsPending = true;
       _sessionsPendingNotify = notify; // 沿用最新一次调用的意图
-      _sessionsWaiters ??= Completer<void>();
-      return _sessionsWaiters!.future;
+      final waiter = _sessionsWaiters ??= Completer<void>();
+      _roundWaiters.add(waiter);
+      return waiter.future;
     }
     return _runSessionRefresh(notify);
   }
 
   Future<void> _runSessionRefresh(bool notify) async {
     final generation = _refreshGeneration;
+    final identity = _refreshIdentity;
     _sessionsInFlight = true;
     try {
       try {
         final fetched = await api.sessions();
-        // 旧代的结果不得应用：地址已切换或已销毁时丢弃，避免旧数据覆盖新地址的列表。
-        if (generation != _refreshGeneration) return;
+        // 归属判定必须比对**实时**连接身份，而不是 `_refreshIdentity`（它只在刷新入口
+        // 更新）：地址可能在没有任何刷新的情况下被自动轮换掉，那时两者的存储值仍然相等，
+        // 旧地址的数据就会被应用上去。
+        if (generation != _refreshGeneration || identity != _connectionIdentity) return;
         sessions = fetched;
         _persistSessions(); // 本地缓存：下次打开 App 秒出列表
         // 排障日志：打印工作区选择与会话 cwd 样本，便于定位筛选不显示的问题
@@ -750,8 +798,9 @@ class AppStore extends ChangeNotifier {
       }
     } finally {
       // 旧代的收尾**不得触碰新代的守卫**（评审 WARNING 3）：归属不符就直接退出。
-      // 这一条同时覆盖评审 WARNING 2——销毁会使代际自增，于是不会补发。
-      if (generation == _refreshGeneration) {
+      // 同样比对**实时**身份：地址在无刷新期间被轮换时，旧轮次不得清掉新代的在途，
+      // 也不得启动新代补发。这一条同时覆盖评审 WARNING 2——关闭 bridge 会使代际自增。
+      if (generation == _refreshGeneration && identity == _connectionIdentity) {
         // **无论成功、失败还是异常都必须复位**：否则一次失败会把守卫永久卡在
         // in-flight，列表从此再也不刷新——那比不加守卫更糟。
         _sessionsInFlight = false;
@@ -760,13 +809,14 @@ class AppStore extends ChangeNotifier {
         if (_sessionsPending) {
           _sessionsPending = false;
           // 补发一次（不 await：不让当前调用方被二次刷新拖住）。
-          // 等待者要等到**补发结束**才释放——这正是 BLOCKING 那一条要求的语义。
+          // 等待者已登记在 `_roundWaiters` 里，**不在这里摘除**——它要等到补发结束
+          // 或生命周期失效才释放（评审 WARNING 2）。
           unawaited(
             _runSessionRefresh(_sessionsPendingNotify)
-                .whenComplete(() => waiters?.complete()),
+                .whenComplete(() => _finishRound(waiters)),
           );
         } else {
-          waiters?.complete();
+          _finishRound(waiters);
         }
       }
     }
