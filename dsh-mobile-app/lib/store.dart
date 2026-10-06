@@ -714,9 +714,12 @@ class AppStore extends ChangeNotifier {
   // 字段就释放不到它。故用集合追踪**所有尚未完成的轮次**，直到该轮结束或生命周期失效。
   final Set<Completer<void>> _roundWaiters = <Completer<void>>{};
 
-  /// 当前连接身份：活动地址 + 认证身份。地址已含挂载路径。
+  /// 当前连接身份：活动地址 + **挂载路径** + 认证身份。
   /// **只用于比较**——`api.token` 绝不写入日志、界面或错误信息。
-  String get _connectionIdentity => '${api.baseUrl}\u0000${api.token}';
+  ///
+  /// 评审备注：`Api` 把挂载路径单独存在 `path` 里，并不包含在 `baseUrl` 中，
+  /// 所以这里必须一并带上，否则"同地址换挂载路径"会被误判为身份未变。
+  String get _connectionIdentity => '${api.baseUrl}\u0000${api.path}\u0000${api.token}';
 
   /// 轮次等待者的**幂等**收尾：生命周期可能已经先释放过它，此时旧回调还会到达，
   /// 二次 complete 会抛 StateError / 未捕获异步异常。
@@ -797,26 +800,38 @@ class AppStore extends ChangeNotifier {
         AppLog.instance.log('Sessions: 拉取失败 $e');
       }
     } finally {
-      // 旧代的收尾**不得触碰新代的守卫**（评审 WARNING 3）：归属不符就直接退出。
-      // 同样比对**实时**身份：地址在无刷新期间被轮换时，旧轮次不得清掉新代的在途，
-      // 也不得启动新代补发。这一条同时覆盖评审 WARNING 2——关闭 bridge 会使代际自增。
-      if (generation == _refreshGeneration && identity == _connectionIdentity) {
-        // **无论成功、失败还是异常都必须复位**：否则一次失败会把守卫永久卡在
-        // in-flight，列表从此再也不刷新——那比不加守卫更糟。
-        _sessionsInFlight = false;
-        final waiters = _sessionsWaiters;
-        _sessionsWaiters = null;
-        if (_sessionsPending) {
-          _sessionsPending = false;
-          // 补发一次（不 await：不让当前调用方被二次刷新拖住）。
-          // 等待者已登记在 `_roundWaiters` 里，**不在这里摘除**——它要等到补发结束
-          // 或生命周期失效才释放（评审 WARNING 2）。
-          unawaited(
-            _runSessionRefresh(_sessionsPendingNotify)
-                .whenComplete(() => _finishRound(waiters)),
-          );
+      // 收尾必须区分**三种**情形（第三轮评审核定）：
+      //
+      // ① generation 已过期：说明本代已经被别处取代（disposeBridge，或刷新入口的
+      //    身份同步）。此时**绝不能触碰新代**的守卫与等待者。
+      // ② 仍属当前 owner 代，但**实时连接身份已变**（自动轮换 / 手动切换，且期间
+      //    没有任何刷新或 disposeBridge 来收尾）：既不能走正常收尾——那会把旧代的
+      //    pending **补发到新地址**上；也**不能整个跳过**——那会留下一个永远不会被
+      //    清理的 in-flight 与未释放的等待者，而且若之后又轮换回原地址，刷新入口会
+      //    认为"身份没变"（存储值仍是旧地址），那个遗留守卫就**永久卡住、再也不发
+      //    请求**。正确做法是同步失效本代残留并释放旧轮次等待者，**不补发**。
+      // ③ generation 与实时身份都匹配：走正常复位与补发。
+      if (generation == _refreshGeneration) {
+        if (identity != _connectionIdentity) {
+          _syncConnectionGeneration();
         } else {
-          _finishRound(waiters);
+          // **无论成功、失败还是异常都必须复位**：否则一次失败会把守卫永久卡在
+          // in-flight，列表从此再也不刷新——那比不加守卫更糟。
+          _sessionsInFlight = false;
+          final waiters = _sessionsWaiters;
+          _sessionsWaiters = null;
+          if (_sessionsPending) {
+            _sessionsPending = false;
+            // 补发一次（不 await：不让当前调用方被二次刷新拖住）。
+            // 等待者已登记在 `_roundWaiters` 里，**不在这里摘除**——它要等到补发结束
+            // 或生命周期失效才释放（评审 WARNING 2）。
+            unawaited(
+              _runSessionRefresh(_sessionsPendingNotify)
+                  .whenComplete(() => _finishRound(waiters)),
+            );
+          } else {
+            _finishRound(waiters);
+          }
         }
       }
     }
