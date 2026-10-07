@@ -937,3 +937,34 @@ test("逐个标题兜底（批量接口抛错后）：断开会取消**在途**�
 		assert.deepEqual(harness.logs, [], "取消不是失败");
 	} finally { harness.clean(); }
 });
+
+test("逐个标题兜底（宿主无批量接口）：并发读取仍有界（≤4），不把 N 个点读一次性扇出", async () => {
+	// 真实宿主上逐个 readTitleSnapshot 每次都会自带一轮全语料枚举，Promise.all(ids)
+	// 会让 N 个枚举同时开跑（issue #20 评审 note 904 的同类放大）。
+	const dormant = Array.from({ length: 12 }, (_, i) => ({ header: { id: `session-${i}`, createdAt: i + 1, cwd: "/tmp" } }));
+	let active = 0;
+	let maxActive = 0;
+	const harness = createHarness({ records: [], noQuery: true });
+	harness.provide("sessionQuery", {
+		async listSessions() { return dormant; },
+		readTitleSnapshot: async (sessionId, signal) => {
+			signal?.throwIfAborted();
+			active += 1;
+			maxActive = Math.max(maxActive, active);
+			try {
+				await new Promise((resolve) => setTimeout(resolve, 2));
+				return { session: { id: sessionId }, title: { title: `标题 ${sessionId}` } };
+			} finally {
+				active -= 1;
+			}
+		},
+		// 刻意不提供 readTitleSnapshots → 走逐个兜底
+	});
+	try {
+		const result = await sessions(harness.route);
+		assert.equal(result.status, 200);
+		assert.equal(result.body.sessions.length, dormant.length);
+		for (const row of result.body.sessions) assert.equal(row.title, `标题 ${row.id}`);
+		assert.ok(maxActive <= 4, `observed ${maxActive} concurrent fallback title reads`);
+	} finally { harness.clean(); }
+});

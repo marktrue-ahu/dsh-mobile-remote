@@ -130,7 +130,7 @@ test("响应预算到期后保留共享工作作为后台预热", async () => {
 	refresher.dispose();
 });
 
-test("stat 与标题折叠并发均受四路上限约束", async () => {
+test("revision 扫描受四路上限约束；整轮 miss 只发一次批量折叠", async () => {
 	let active = 0;
 	let maxActive = 0;
 	const enter = async (work) => {
@@ -143,17 +143,71 @@ test("stat 与标题折叠并发均受四路上限约束", async () => {
 			active -= 1;
 		}
 	};
+	const folds = [];
 	const refresher = createSessionTitleRefresher({
 		readRevision: (id) => enter(() => `r-${id}`),
 		readTitles: async (ids) => {
-			const pairs = await Promise.all(ids.map((id) => enter(() => [id, { ok: true, title: id }])));
-			return new Map(pairs);
+			folds.push([...ids]);
+			return new Map(ids.map((id) => [id, { ok: true, title: id }]));
 		},
 		concurrency: 4,
 	});
 	const ids = Array.from({ length: 17 }, (_, i) => `s-${i}`);
 	const result = await refresher.refresh(ids, { budgetMs: 1000 });
 	assert.equal(result.size, ids.length);
-	assert.ok(maxActive <= 4, `observed ${maxActive} concurrent source reads`);
+	assert.ok(maxActive <= 4, `observed ${maxActive} concurrent revision reads`);
+	// 宿主 readTitleSnapshots 每次调用都会全量枚举语料（projectMany → persistence.list），
+	// 所以整轮只能发一次；批次数不得随 N 增长。
+	assert.equal(folds.length, 1, `expected one fold call per pass, saw ${folds.length}`);
+	assert.deepEqual(folds[0], ids, "the single fold call must carry every pending id");
+	refresher.dispose();
+});
+
+test("已 abort 但未结束的 run 不复用：新请求进入后继任务且关闭前不叠加折叠", async () => {
+	const firstFoldStarted = deferred();
+	const finishRetiredFold = deferred();
+	let concurrentFolds = 0;
+	let maxConcurrentFolds = 0;
+	const foldBatches = [];
+	const reads = [];
+	const refresher = createSessionTitleRefresher({
+		readRevision: async (id) => {
+			reads.push(id);
+			return `r-${id}`;
+		},
+		readTitles: async (ids, signal) => {
+			foldBatches.push([...ids]);
+			concurrentFolds += 1;
+			maxConcurrentFolds = Math.max(maxConcurrentFolds, concurrentFolds);
+			try {
+				if (foldBatches.length === 1) {
+					firstFoldStarted.resolve();
+					// 上游已被 abort，但取消清理尚未结束：本次调用仍然挂着。
+					await finishRetiredFold.promise;
+				}
+				return new Map(ids.map((id) => [id, { ok: true, title: `标题 ${id}（signal=${signal?.aborted ? "aborted" : "live"}）` }]));
+			} finally {
+				concurrentFolds -= 1;
+			}
+		},
+	});
+
+	const firstClient = new AbortController();
+	const retired = refresher.refresh(["old"], { signal: firstClient.signal, budgetMs: 1000 });
+	await firstFoldStarted.promise;
+	firstClient.abort(new Error("client disconnected"));
+	assert.deepEqual(await retired, new Map());
+
+	const retry = refresher.refresh(["old", "new"], { budgetMs: 1000 });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(foldBatches.length, 1, "取消清理期间不得叠加第二轮折叠（并发上限必须保持）");
+
+	finishRetiredFold.resolve();
+	const retryTitles = await retry;
+	assert.deepEqual(foldBatches[1], ["old", "new"], "重试必须折叠新 id，而不是把新 id 放进死队列");
+	assert.equal(retryTitles.get("new"), "标题 new（signal=live）", "重试必须拿回结果，不能只返回旧队列的部分结果");
+	assert.equal(maxConcurrentFolds, 1, `observed ${maxConcurrentFolds} concurrent folds`);
+	await refresher.whenIdle();
+	assert.ok(reads.length >= 2, "后继任务必须重新读取 revision");
 	refresher.dispose();
 });

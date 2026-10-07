@@ -149,7 +149,20 @@ function createHarness(fixtures, {
 	const listCalls = { count: 0 };
 	const revisionLists = { count: 0 };
 	const statCalls = { ids: new Set(), revisions: new Map() };
-	const readCalls = { batches: 0, sessions: 0, ids: [], titles: new Map(), aborted: 0, signals: [] };
+	const readCalls = {
+		batches: 0,
+		sessions: 0,
+		ids: [],
+		titles: new Map(),
+		aborted: 0,
+		signals: [],
+		// 真实宿主的 readTitleSnapshots 不是点读：projectMany → listPersisted →
+		// persistence.list() 每次调用都枚举整个语料。这里如实例演并单独计数，
+		// 以便断言"整条调用链的枚举数不随 N 增长"。
+		corpusListings: 0,
+		inFlight: 0,
+		maxInFlight: 0,
+	};
 	const provided = new Map();
 	const sessions = new Map();
 	provided.set("sessions", { get: (id) => sessions.get(id), list: () => [...sessions.values()] });
@@ -167,19 +180,23 @@ function createHarness(fixtures, {
 		statCalls.revisions.set(id, revision);
 		return { header: fixture.header, revision, sizeBytes: Number(metadata.size) };
 	};
+	/** 一次完整语料枚举（与宿主 persistence.list 同语义）。 */
+	const listCorpus = async (signal) => {
+		const listingDelay = revisionListDelayMs();
+		if (listingDelay > 0) await delay(listingDelay, signal);
+		const snapshots = [];
+		for (const fixture of fixtures) {
+			const snapshot = await persistenceSnapshot(fixture.id, signal);
+			if (snapshot) snapshots.push(snapshot);
+		}
+		return snapshots;
+	};
 	provided.set("sessionPersistence", {
 		name: persistenceName,
 		config: { root: persistenceRoot, compression: persistenceCompression },
 		async list({ signal } = {}) {
 			revisionLists.count += 1;
-			const listingDelay = revisionListDelayMs();
-			if (listingDelay > 0) await delay(listingDelay, signal);
-			const snapshots = [];
-			for (const fixture of fixtures) {
-				const snapshot = await persistenceSnapshot(fixture.id, signal);
-				if (snapshot) snapshots.push(snapshot);
-			}
-			return snapshots;
+			return listCorpus(signal);
 		},
 		async stat(id, { signal } = {}) {
 			return persistenceSnapshot(id, signal);
@@ -197,31 +214,51 @@ function createHarness(fixtures, {
 		async readTitleSnapshots(ids, signal) {
 			readCalls.batches += 1;
 			readCalls.signals.push(signal);
+			readCalls.corpusListings += 1;
+			readCalls.inFlight += 1;
+			readCalls.maxInFlight = Math.max(readCalls.maxInFlight, readCalls.inFlight);
 			try {
+				await listCorpus(signal);
 				await beforeTitleRead?.(ids, signal);
-				const results = await Promise.all(ids.map(async (id) => {
-					signal?.throwIfAborted();
-					const fixture = fixtureById.get(id);
-					if (!fixture) return { sessionId: id, status: "rejected" };
-					const raw = await readFile(fixture.file, { signal });
-					signal?.throwIfAborted();
-					readCalls.sessions += 1;
-					readCalls.ids.push(id);
-					const parsed = parseFixtureTitle(raw, fixture);
-					readCalls.titles.set(id, parsed.title);
-					return {
-						sessionId: id,
-						status: "fulfilled",
-						value: {
-							session: parsed.header,
-							...(parsed.title ? { title: { title: parsed.title } } : {}),
-						},
-					};
-				}));
+				const results = new Array(ids.length);
+				let cursor = 0;
+				// 宿主 projectMany 自己的有界 worker（persistedReadConcurrency 默认 4）：
+				// 插件只发一次调用，宽度由宿主决定。
+				const worker = async () => {
+					for (;;) {
+						signal?.throwIfAborted();
+						const index = cursor;
+						cursor += 1;
+						if (index >= ids.length) return;
+						const id = ids[index];
+						const fixture = fixtureById.get(id);
+						if (!fixture) {
+							results[index] = { sessionId: id, status: "rejected" };
+							continue;
+						}
+						const raw = await readFile(fixture.file, { signal });
+						signal?.throwIfAborted();
+						readCalls.sessions += 1;
+						readCalls.ids.push(id);
+						const parsed = parseFixtureTitle(raw, fixture);
+						readCalls.titles.set(id, parsed.title);
+						results[index] = {
+							sessionId: id,
+							status: "fulfilled",
+							value: {
+								session: parsed.header,
+								...(parsed.title ? { title: { title: parsed.title } } : {}),
+							},
+						};
+					}
+				};
+				await Promise.all(Array.from({ length: Math.min(4, ids.length) }, worker));
 				return results;
 			} catch (error) {
 				if (signal?.aborted) readCalls.aborted += 1;
 				throw error;
+			} finally {
+				readCalls.inFlight -= 1;
 			}
 		},
 	});
@@ -246,6 +283,14 @@ function createHarness(fixtures, {
 		statCalls,
 		readCalls,
 		logs,
+		/** 模拟"请求进行中桌面端新建了会话"：语料与枚举结果同时出现新会话。 */
+		addFixture(fixture) {
+			fixtureById.set(fixture.id, fixture);
+			fixtures.push(fixture);
+			records.push({ header: { ...fixture.header }, live: false, persisted: true });
+		},
+		/** 整条调用链的语料枚举次数（枚举结果本身 + 标题批量接口内部的枚举）。 */
+		corpusListings: () => listCalls.count + revisionLists.count + readCalls.corpusListings,
 		clean() { dispose?.(); },
 	};
 }
@@ -503,9 +548,37 @@ test("并发 /sessions 共享同一标题折叠；一个客户端断开不取消
 	const secondResult = await second.finished;
 	assert.equal(secondResult.status, 200);
 	assert.equal(secondResult.body.sessions.length, fixtures.length);
-	assert.equal(harness.readCalls.batches, 2, "five sessions should fold in two bounded batches, not once per HTTP request");
+	assert.equal(harness.readCalls.batches, 1, "一轮折叠只发一次批量调用，且不随 HTTP 请求数增长");
+	assert.equal(harness.readCalls.corpusListings, 1, "标题批量接口每次调用都会全量枚举语料，因此一轮只能调一次");
 	assert.equal(harness.revisionLists.count, 1, "overlapping requests share one corpus revision snapshot");
 	assert.equal(harness.readCalls.sessions, fixtures.length);
+});
+
+test("语料枚举次数不随会话数/标题批次增长（N 放大用例）", async (t) => {
+	const counts = [];
+	for (const count of [8, 40]) {
+		const home = await mkdtemp(join(tmpdir(), "session-title-refresh-home-"));
+		const root = await mkdtemp(join(tmpdir(), `session-title-scale-${count}-`));
+		process.env.HOME = home;
+		let harness;
+		try {
+			const fixtures = writeSessionCorpusFixtures(root, { count: count - 1, largePayloadBytes: 0 });
+			assert.equal(fixtures.length, count);
+			harness = createHarness(fixtures);
+			const result = await request(harness.route);
+			assert.equal(result.status, 200);
+			assert.equal(result.body.sessions.length, count);
+			await waitFor(() => harness.readCalls.sessions === count, `N=${count} background warm-up did not finish`);
+			assert.equal(harness.readCalls.batches, 1, `N=${count}: exactly one fold call serves the pass`);
+			// 整条链：端点枚举 1 + 插件 revision 快照 1 + 标题批量接口内部枚举 1。
+			counts.push(harness.corpusListings());
+		} finally {
+			harness?.clean();
+			await rm(home, { recursive: true, force: true });
+			await rm(root, { recursive: true, force: true });
+		}
+	}
+	assert.deepEqual(counts, [3, 3], `corpus enumerations must not grow with N: ${counts.join(" vs ")}`);
 });
 
 test("最后一个 /sessions 等待者断开后取消上游标题读取", async (t) => {
@@ -539,6 +612,59 @@ test("最后一个 /sessions 等待者断开后取消上游标题读取", async 
 	await waitFor(() => harness.readCalls.aborted === 1, "aborted title read did not settle");
 	assert.equal(harness.readCalls.sessions, 0, "no fixture event rows should be parsed after abort");
 	assert.deepEqual(pending.res.chunks, [], "cancelled request must not write a response");
+});
+
+test("取消清理尚未结束时重试不复用死 run：新会话本次就被折叠", async (t) => {
+	const home = await mkdtemp(join(tmpdir(), "session-title-refresh-home-"));
+	const root = await mkdtemp(join(tmpdir(), "session-title-retire-"));
+	process.env.HOME = home;
+	let harness;
+	t.after(async () => {
+		harness?.clean();
+		await rm(home, { recursive: true, force: true });
+		await rm(root, { recursive: true, force: true });
+	});
+	const fixtures = [writeSessionLogFixture(root, { id: "old-session", version: 4, title: "旧会话标题" })];
+	const firstFoldStarted = deferred();
+	const finishRetiredFold = deferred();
+	harness = createHarness(fixtures, {
+		// 模拟"上游已 abort，但取消清理尚未 settle"：这次折叠会一直挂着，直到测试放行。
+		beforeTitleRead: async () => {
+			firstFoldStarted.resolve();
+			await finishRetiredFold.promise;
+		},
+	});
+	const pending = startRequest(harness.route);
+	await firstFoldStarted.promise;
+	pending.res.destroy();
+	await waitFor(() => harness.readCalls.signals[0]?.aborted === true, "retired pass was not aborted");
+	assert.equal(harness.listCalls.count, 1);
+
+	// 桌面端在取消清理期间新建了会话，App 重试列表。
+	const fresh = writeSessionLogFixture(root, {
+		id: "fresh-session",
+		version: 4,
+		title: "新会话标题",
+		createdAt: 1_700_000_000_500,
+	});
+	harness.addFixture(fresh);
+	const retry = startRequest(harness.route);
+	await waitFor(() => harness.listCalls.count === 2, "retry did not enumerate the corpus");
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(harness.readCalls.batches, 1, "取消清理期间不得叠加第二轮折叠（并发上限须保持）");
+
+	finishRetiredFold.resolve();
+	const retried = await retry.finished;
+	assert.equal(retried.status, 200);
+	const byId = new Map(retried.body.sessions.map((row) => [row.id, row]));
+	assert.equal(
+		byId.get("fresh-session")?.title,
+		"新会话标题",
+		"本次重试必须自己折叠新 id，而不是返回死队列的部分结果",
+	);
+	assert.equal(byId.get(fixtures[0].id)?.title, fixtures[0].title, "旧会话标题同样必须在本次重试里补齐");
+	assert.equal(harness.readCalls.batches, 2, "后继任务在旧清理结束后才发自己的折叠调用");
+	assert.equal(harness.readCalls.maxInFlight, 1, "任何时刻只允许一次在途折叠调用");
 });
 
 test("休眠父会话的子代理列表复用 revision 标题缓存", async (t) => {
