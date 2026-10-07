@@ -159,6 +159,15 @@ class _TurnNavigatorRailState extends State<TurnNavigatorRail>
     widget.onNavigate(widget.anchors[index]);
   }
 
+  /// 手势被抢走：清掉预览，不落点。
+  void _cancelScrub() {
+    if (_previewTurn == null && !_scrubbing) return;
+    setState(() {
+      _previewTurn = null;
+      _scrubbing = false;
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     // 少于 2 轮：没有导航价值，不渲染（与电脑端一致）。
@@ -192,12 +201,26 @@ class _TurnNavigatorRailState extends State<TurnNavigatorRail>
             children: [
               Positioned.fill(
                 child: GestureDetector(
+                  // opaque：整条 28px 都是可点区域（2px 的刻度条对拇指太小）。
+                  // 代价是命中被本组件截住、消息流收不到指针——所以**竖直拖动必须
+                  // 在这里被消费掉**（见下），否则右侧会变成一条滚动死区。
                   behavior: HitTestBehavior.opaque,
                   onTapUp: (d) {
                     // 点按 = 直接跳转（不需要先出预览）。
                     final index = _indexAtLocalY(d.localPosition.dy);
                     widget.onNavigate(widget.anchors[index]);
                   },
+                  // 沿轨拖动直接进入扫掠（不必先长按）：这是"死区"的正解——
+                  // 同样的手势在别处滚动消息流，在轨道上则扫掠轮次。
+                  onVerticalDragStart: (d) {
+                    setState(() => _scrubbing = true);
+                    _setPreviewFromLocalY(d.localPosition.dy);
+                  },
+                  onVerticalDragUpdate: (d) =>
+                      _setPreviewFromLocalY(d.localPosition.dy),
+                  onVerticalDragEnd: (_) => _commitPreview(),
+                  onVerticalDragCancel: _cancelScrub,
+                  // 长按原地不动也能预览（拖动识别器要等位移才生效）。
                   onLongPressStart: (d) {
                     setState(() => _scrubbing = true);
                     _setPreviewFromLocalY(d.localPosition.dy);
@@ -205,15 +228,7 @@ class _TurnNavigatorRailState extends State<TurnNavigatorRail>
                   onLongPressMoveUpdate: (d) =>
                       _setPreviewFromLocalY(d.localPosition.dy),
                   onLongPressEnd: (_) => _commitPreview(),
-                  onLongPressCancel: () {
-                    // 手势被抢走：清掉预览，不落点。
-                    if (_previewTurn != null || _scrubbing) {
-                      setState(() {
-                        _previewTurn = null;
-                        _scrubbing = false;
-                      });
-                    }
-                  },
+                  onLongPressCancel: _cancelScrub,
                   child: _buildTickColumn(frameHeight, overflow),
                 ),
               ),
@@ -233,7 +248,9 @@ class _TurnNavigatorRailState extends State<TurnNavigatorRail>
   Widget _buildTickColumn(double frameHeight, bool overflow) {
     final column = SingleChildScrollView(
       controller: _railCtrl,
-      physics: const ClampingScrollPhysics(),
+      // 轨内滚动**只由自动跟随驱动**（把当前轮带回视野）：不能让轨内滚动去竞争
+      // 竖直拖动，否则长会话下"拖轨道扫掠轮次"会变成"滚动轨道本身"。
+      physics: const NeverScrollableScrollPhysics(),
       child: SizedBox(
         height: _contentHeight,
         child: Column(

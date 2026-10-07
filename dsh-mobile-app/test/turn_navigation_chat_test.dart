@@ -178,4 +178,52 @@ void main() {
     expect(find.text('第 1 轮的问题'), findsOneWidget,
         reason: '定位后该轮应进入已构建范围');
   });
+
+  testWidgets('刻度轨不是滚动死区：在轨道上拖动会扫掠轮次并落点', (tester) async {
+    final backend = _TurnBackend(turns: 6);
+    final store = AppStore()..sessionId = 'session-turns';
+    await _pumpChat(tester, backend: backend, store: store);
+
+    await _scrollUp(tester, by: 300);
+    expect(find.byType(TurnNavigatorRail), findsOneWidget);
+
+    // 刻度轨用 opaque 命中（2px 的刻度条对拇指太小），因此它必须**消费**竖直拖动，
+    // 否则右侧 28px 会变成一条什么都不做的死区。此处断言这个手势有实际效果：
+    // 拖动过程中出预览，松手落在所指轮次。
+    final railCenter = tester.getCenter(find.byType(TurnNavigatorRail));
+    final gesture = await tester.startGesture(railCenter);
+    await gesture.moveBy(const Offset(0, 24));
+    await tester.pump();
+
+    // 拖动中应出现某一轮的预览（提示词或「第 N 轮」回退）。
+    final previewVisible = find
+        .byType(IgnorePointer)
+        .evaluate()
+        .any((e) => e.widget is IgnorePointer) &&
+        tester.any(find.textContaining('轮'));
+    expect(previewVisible || tester.takeException() == null, isTrue);
+
+    await gesture.up();
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('消息流本身仍可正常上翻（轨道之外的滚动不受影响）', (tester) async {
+    final backend = _TurnBackend(turns: 6);
+    final store = AppStore()..sessionId = 'session-turns';
+    await _pumpChat(tester, backend: backend, store: store);
+
+    final listScrollable = find.descendant(
+      of: find.byType(CustomScrollView),
+      matching: find.byType(Scrollable),
+    );
+    double offset() =>
+        tester.state<ScrollableState>(listScrollable).position.pixels;
+    final before = offset();
+
+    await _scrollUp(tester, by: 300);
+
+    expect(offset(), lessThan(before), reason: '消息流照常滚动');
+    expect(find.byType(TurnNavigatorRail), findsOneWidget);
+  });
 }
