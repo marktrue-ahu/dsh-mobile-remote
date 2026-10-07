@@ -18,7 +18,8 @@ DSH_GLAB='/mnt/d/Program Files (x86)/glab/glab.exe'
 
 - **创建 issue**：`"$DSH_GLAB" issue create -R ahedu/dsh-mobile-remote --title "..." -l ready-for-agent`
 - **读取 issue**：`"$DSH_GLAB" issue view <iid> -R ahedu/dsh-mobile-remote --comments`
-- **列出 issue**：`"$DSH_GLAB" issue list -R ahedu/dsh-mobile-remote --state opened`
+- **列出 issue**：`"$DSH_GLAB" api "projects/53/issues?state=opened&per_page=50"`
+  （⚠ 本机的 glab 构建**不支持** `issue list --state`，会报 `Unknown flag: --state`；用上面的 api 形式按状态过滤，别用原生子命令）
 - **评论 issue**：`"$DSH_GLAB" issue note <iid> -R ahedu/dsh-mobile-remote -m "..."`
 - **增删标签**：`"$DSH_GLAB" issue update <iid> -R ahedu/dsh-mobile-remote -l "..."` / `-u "..."`
 - **关闭 issue**：`"$DSH_GLAB" issue close <iid> -R ahedu/dsh-mobile-remote`
@@ -36,6 +37,23 @@ DSH_GLAB='/mnt/d/Program Files (x86)/glab/glab.exe'
 ```
 
 `glab api` 的项目引用支持数字 ID（`projects/53`）与 URL 编码 path（`projects/ahedu%2Fdsh-mobile-remote`）两种写法。
+
+### 上传附件（图片）走 curl，不要用 glab
+
+`glab api "projects/53/uploads" --field "file=@<路径>"` **会失败**（HTTP 400）：glab 是 Windows 二进制，
+既读不了 WSL 侧路径，换成 `\\wsl.localhost\...` 的 UNC 路径也报 400。改用 WSL 原生 `curl` 直接打 multipart：
+
+```sh
+TOKEN=$(/mnt/d/Program\ Files\ \(x86\)/glab/glab.exe auth status --show-token 2>/dev/null \
+        | grep -oP 'keyring:\s*\K\S+')
+curl -sS -X POST -H "PRIVATE-TOKEN: $TOKEN" \
+  -F "file=@overview.png" \
+  http://gitlab.local/api/v4/projects/53/uploads
+```
+
+返回 `{"alt":..., "url":"/uploads/<hash>/<name>", "markdown":"![...](/uploads/...)"}`；
+把 `markdown` 字段原样贴进 issue 正文即可内嵌显示（`url` 是**项目级**的，同一文件可被多个 issue 复用）。
+WSL 能直连 `gitlab.local`（解析到 Windows hosts 里配置的地址，不是解析错误）。
 
 ### 已知问题：REST `PUT /projects/:id/issues/:iid` 卡在读响应
 
