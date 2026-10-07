@@ -73,6 +73,63 @@ test("缓存文件损坏或缺失 → 当作空缓存，不抛异常", () => {
 	});
 });
 
+test("合法 JSON 中缺失或非法 title 应未命中，而非伪命中 null", () => {
+	withDir((dir) => {
+		const invalidRows = [
+			{ revision: "r1", at: 1 },
+			{ revision: "r1", title: 42, at: 1 },
+			{ revision: "r1", title: { text: "invalid" }, at: 1 },
+		];
+		invalidRows.forEach((row, i) => {
+			const file = join(dir, `invalid-${i}.json`);
+			writeFileSync(file, JSON.stringify({ version: 1, entries: { s1: row } }));
+			const cache = createTitleCache({ file });
+			cache.load();
+			assert.deepEqual(cache.get("s1", "r1"), { hit: false }, `row ${i} 必须回源`);
+		});
+	});
+});
+
+test("显式 null 与空字符串仍按无标题事实缓存", () => {
+	withDir((dir) => {
+		const file = join(dir, "null-title.json");
+		writeFileSync(file, JSON.stringify({
+			version: 1,
+			entries: {
+				explicitNull: { revision: "r1", title: null, at: 1 },
+				emptyString: { revision: "r2", title: "", at: 2 },
+			},
+		}));
+		const cache = createTitleCache({ file });
+		cache.load();
+		assert.deepEqual(cache.get("explicitNull", "r1"), { hit: true, title: null });
+		assert.deepEqual(cache.get("emptyString", "r2"), { hit: true, title: null });
+	});
+});
+
+test("load 只接受 version 1，并以文件内容替换内存快照", () => {
+	withDir((dir) => {
+		const file = join(dir, "version.json");
+		const cache = createTitleCache({ file });
+		cache.set("stale", "r0", "旧条目");
+		writeFileSync(file, JSON.stringify({
+			version: 2,
+			entries: { future: { revision: "r1", title: "未来格式" } },
+		}));
+		cache.load();
+		assert.equal(cache.size(), 0, "未知版本必须降级为空缓存，而不是误读未来格式");
+		assert.deepEqual(cache.get("stale", "r0"), { hit: false }, "load 应替换而非合并旧内存条目");
+
+		writeFileSync(file, JSON.stringify({
+			version: 1,
+			entries: { current: { revision: "r2", title: "当前标题", at: 3 } },
+		}));
+		cache.load();
+		assert.deepEqual(cache.get("current", "r2"), { hit: true, title: "当前标题" });
+		assert.deepEqual(cache.get("future", "r1"), { hit: false });
+	});
+});
+
 test("非法输入被忽略：空 id/revision 不写入也不命中", () => {
 	withDir((dir) => {
 		const cache = createTitleCache({ file: join(dir, "t.json") });
