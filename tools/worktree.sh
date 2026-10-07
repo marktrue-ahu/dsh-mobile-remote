@@ -331,19 +331,69 @@ require_role_integrator() {
   [ "$ROLE" = "integrator" ] || die "该操作仅限集成/发布执行者（当前角色：$ROLE）。由用户指派后以 DSH_WT_ROLE=integrator 运行"
 }
 
-# 只有登记写入者能写这棵树；人工接管记录必须绑定当前 HEAD。
+# 写入者身份是否匹配
+writer_identity_matches() { # <issue>
+  local f writer; f="$(task_file "$1")"; writer="$(json_get "$f" writer)"
+  [ "$writer" = "$WHOAMI_ID" ]
+}
+
+# 是否持有一份绑定当前 HEAD 的接管授权
+takeover_records_allow() { # <issue> <worktree>
+  local f head scope
+  [ "${DSH_WT_TAKEOVER:-0}" = "1" ] || return 1
+  f="$(task_file "$1")"; head="$(gitq -C "$2" rev-parse HEAD)"
+  scope="$(json_get "$f" authorizations.takeover.scope_sha)"
+  [ -n "$scope" ] && [ "$scope" = "$head" ]
+}
+
+# 写入型操作：只有登记写入者能写这棵树（或持已记录的接管授权）。
+# `init` 会为本树的写入者准备依赖环境，因此属于写入型。
 require_writer() { # require_writer <issue> <worktree> <branch>
-  local issue="$1" wt="$2" branch="$3" f writer head scope
+  local issue="$1" wt="$2" branch="$3" f writer
   f="$(task_file "$issue")"; writer="$(json_get "$f" writer)"
   require_registered_branch "$issue" "$wt" "$branch"
-  [ "$writer" = "$WHOAMI_ID" ] && return 0
-  if [ "${DSH_WT_TAKEOVER:-0}" = "1" ]; then
-    head="$(gitq -C "$wt" rev-parse HEAD)"; scope="$(json_get "$f" authorizations.takeover.scope_sha)"
-    [ -n "$scope" ] && [ "$scope" = "$head" ] || die "接管授权缺失或已过期；先取得用户批准并绑定当前 HEAD"
+  writer_identity_matches "$issue" && return 0
+  if takeover_records_allow "$issue" "$wt"; then
     warn "以已记录的接管授权操作 issue #$issue（原写入者：$writer）"
     return 0
   fi
   die "issue #$issue 的写入者是 $writer，当前身份 $WHOAMI_ID 无权写入。接管需用户批准"
+}
+
+# 收尾型操作（verify / deliver / verify-baseline）：**允许由非登记写入者执行**。
+# 执行一个任务与给它收尾常常不是同一个会话，而收尾不修改源码——verify 起止都要求
+# 干净树、deliver 只落证据、两者都绑定当前 HEAD。真正需要身份排他的是写入型操作
+# （见上面的 require_writer）。跨会话收尾必须留痕：审计一行 + 任务登记记录是谁收的尾，
+# 这样"谁写了代码"与"谁收了尾"不会被混为一谈。
+require_wrapup_or_writer() { # <issue> <worktree> <branch> <op>
+  local issue="$1" wt="$2" branch="$3" op="$4" f writer
+  f="$(task_file "$issue")"; writer="$(json_get "$f" writer)"
+  require_registered_branch "$issue" "$wt" "$branch"
+  writer_identity_matches "$issue" && return 0
+  if takeover_records_allow "$issue" "$wt"; then
+    warn "以已记录的接管授权操作 issue #$issue（原写入者：$writer）"
+    return 0
+  fi
+  local head; head="$(gitq -C "$wt" rev-parse HEAD)"
+  audit wrapup "issue=$issue op=$op by=$WHOAMI_ID writer=$writer head=${head:0:12}"
+  json_set "$f" last_wrapup_by "$WHOAMI_ID" >/dev/null 2>&1 || true
+  json_set "$f" last_wrapup_op "$op" >/dev/null 2>&1 || true
+  json_set "$f" last_wrapup_at "$(date '+%F %T')" >/dev/null 2>&1 || true
+  warn "跨会话收尾：issue #$issue 的原写入者是 $writer，本次 $op 由 $WHOAMI_ID 执行（已记录）"
+  return 0
+}
+
+# 分支是否**已经完全并入上游 main**：以"相对上游 main 的独有提交数为 0"判定内容归宿，
+# 而不是比对文件名、也不要求 SHA 相等（合流方式不同时 SHA 不会相等）。
+upstream_main_contains_branch() { # <branch> <expected tip>
+  local branch="$1" head="$2" upstream="github/main" tip unique
+  gitq -C "$MAIN_DIR" rev-parse --verify -q "$upstream" >/dev/null 2>&1 || {
+    warn "本地没有 $upstream 引用；无法核验上游包含性"; return 1; }
+  tip="$(gitq -C "$MAIN_DIR" rev-parse "refs/heads/$branch" 2>/dev/null)"
+  [ "$tip" = "$head" ] || { warn "分支 $branch 的 tip 与预期不符（期望 ${head:0:12}）"; return 1; }
+  unique="$(gitq -C "$MAIN_DIR" rev-list --count "$upstream..$branch" 2>/dev/null)"
+  [ "$unique" = "0" ] || { warn "分支 $branch 相对 $upstream 仍有 $unique 个独有提交；拒绝清理"; return 1; }
+  return 0
 }
 
 require_authorization() { # require_authorization <issue> <动作> <scope SHA>
@@ -815,7 +865,7 @@ cmd_verify() {
   task="$(task_file_for_path "$wt")"
   local branch; branch="$(gitq -C "$wt" rev-parse --abbrev-ref HEAD)"
   case "$branch" in feature/*|fix/*) ;; *) die "当前分支 $branch 不是 feature/fix" ;; esac
-  require_writer "$issue" "$wt" "$branch"
+  require_wrapup_or_writer "$issue" "$wt" "$branch" verify
   case "$(json_get "$task" status)" in integrated|cleaned) die "任务已集成/清理，不再接受功能树验证" ;; esac
   require_clean_tree "$wt" "verify（门禁证据必须对应干净提交）"
 
@@ -892,7 +942,7 @@ cmd_deliver() {
   task="$(task_file_for_path "$wt")"
   [ -n "$task" ] || die "任务登记在等待锁期间已变化"
   local branch; branch="$(gitq -C "$wt" rev-parse --abbrev-ref HEAD)"
-  require_writer "$issue" "$wt" "$branch"
+  require_wrapup_or_writer "$issue" "$wt" "$branch" deliver
   case "$(json_get "$task" status)" in integrated|cleaned) die "任务已集成/清理，不再接受二次交付" ;; esac
   require_clean_tree "$wt" "deliver"
 
@@ -1112,43 +1162,60 @@ cmd_cleanup() {
   [ "$(current_branch)" = "develop" ] || die "cleanup 需要主目录固定在 develop"
   require_clean_tree "$MAIN_DIR" "cleanup（主目录）"
   local task; task="$(task_file "$issue")"
-  local branch path status delivered_sha branch_sha remote remote_sha delete_scope
+  local branch path status delivered_sha branch_sha remote remote_sha delete_scope cleanup_sha drift
   branch="$(json_get "$task" branch)"; path="$(json_get "$task" path)"
   status="$(json_get "$task" status)"; delivered_sha="$(json_get "$task" delivered_sha)"
   case "$status" in integrated|cleaned) ;; *) die "任务状态为 $status；cleanup 仅接受已集成任务" ;; esac
   [ -n "$delivered_sha" ] || die "缺少 delivered_sha，拒绝清理"
   branch_sha="$(branch_head "$branch")"
-  [ "$branch_sha" = "$delivered_sha" ] || die "分支 HEAD 已改变；拒绝删除不同于已交付 SHA 的内容"
-  require_authorization "$issue" cleanup "$delivered_sha"
-  github_pr_is_merged "$pr" "$delivered_sha" "$branch" || die "PR 合并证据未通过核验；未删除任何内容"
+  cleanup_sha="$delivered_sha"; drift=0
+  if [ "$branch_sha" != "$delivered_sha" ]; then
+    # 交付之后分支又前进了，而上游合并走的正是**当前 HEAD**（例如复核补正在集成之后才落地）。
+    # 这不是"删掉与已交付不同的内容"：证据换成更强的一条——上游自己的 PR 记录
+    # （要求 PR 已并入 main 且 head.sha == 当前分支 HEAD）**加上**该分支相对上游 main
+    # 的独有提交数为 0。两者都成立，等价于"上游拿走的正好是这棵树里的东西"。
+    info "分支 HEAD（${branch_sha:0:12}）与登记 delivered_sha（${delivered_sha:0:12}）不同：改用上游 PR 记录 + 上游包含性核验"
+    upstream_main_contains_branch "$branch" "$branch_sha" || die "分支未完全并入上游 main；拒绝清理"
+    require_authorization "$issue" cleanup "$branch_sha"
+    github_pr_is_merged "$pr" "$branch_sha" "$branch" || die "PR 合并证据未通过核验（要求已并入 main 且 head.sha == 当前分支 HEAD）；未删除任何内容"
+    cleanup_sha="$branch_sha"; drift=1
+  else
+    require_authorization "$issue" cleanup "$delivered_sha"
+    github_pr_is_merged "$pr" "$delivered_sha" "$branch" || die "PR 合并证据未通过核验；未删除任何内容"
+  fi
   branch_sha="$(branch_head "$branch")"
-  [ "$branch_sha" = "$delivered_sha" ] || die "PR 核验期间分支 SHA 变化；拒绝清理"
+  [ "$branch_sha" = "$cleanup_sha" ] || die "PR 核验期间分支 SHA 变化；拒绝清理"
   if [ -d "$path" ]; then
     [ "$(gitq -C "$path" rev-parse --abbrev-ref HEAD)" = "$branch" ] || die "工作树分支与登记不符"
-    [ "$(gitq -C "$path" rev-parse HEAD)" = "$delivered_sha" ] || die "工作树 HEAD 与已交付 SHA 不符"
+    [ "$(gitq -C "$path" rev-parse HEAD)" = "$cleanup_sha" ] || die "工作树 HEAD 与核验 SHA 不符"
     require_clean_tree "$path" "cleanup"
     gitq worktree remove "$path" || die "git worktree remove 失败；未删除分支"
   fi
 
   # 在 branch-delete 之前先持久化清理事实；若状态盘写失败，仍保留本地分支。
   json_set "$task" cleanup_pr "$pr" || die "无法记录已核验 PR；保留分支"
+  json_set "$task" cleanup_sha "$cleanup_sha" >/dev/null 2>&1 || true
+  if [ "$drift" = "1" ]; then
+    json_set "$task" cleanup_delivered_sha "$delivered_sha" >/dev/null 2>&1 || true
+    audit cleanup-drift "issue=$issue pr=$pr delivered=${delivered_sha:0:12} merged=${cleanup_sha:0:12} by=$WHOAMI_ID"
+  fi
   json_set "$task" status cleaned || die "无法记录清理状态；保留分支"
   json_set "$task" cleaned_at "$(date '+%F %T')" || die "无法记录清理时间；保留分支"
 
   delete_scope="$(json_get "$task" authorizations.branch-delete.scope_sha)"
-  if [ "$delete_scope" = "$delivered_sha" ] && [ "$(branch_head "$branch")" = "$delivered_sha" ]; then
+  if [ "$delete_scope" = "$cleanup_sha" ] && [ "$(branch_head "$branch")" = "$cleanup_sha" ]; then
     # 永不 branch -D 兜底；如果 Git 认为分支未合并，就保留其唯一副本并报告。
     if gitq branch -d "$branch" >/dev/null 2>&1; then
       info "已删除本地分支 $branch"
       for remote in github origin; do
         if gitq remote get-url "$remote" >/dev/null 2>&1; then
           remote_sha="$(gitq ls-remote "$remote" "refs/heads/$branch" 2>/dev/null | awk 'NR==1 {print $1}')"
-          if [ "$remote_sha" != "$delivered_sha" ]; then
+          if [ "$remote_sha" != "$cleanup_sha" ]; then
             warn "远端 $remote/$branch SHA 与已批准 SHA 不同或分支不存在；不删除"
             continue
           fi
           # Lease 检查在服务端更新 ref 的原子操作中再次确认，避免 ls-remote 后的竞态。
-          gitq push --force-with-lease="refs/heads/$branch:$delivered_sha" "$remote" ":refs/heads/$branch" >/dev/null 2>&1 || \
+          gitq push --force-with-lease="refs/heads/$branch:$cleanup_sha" "$remote" ":refs/heads/$branch" >/dev/null 2>&1 || \
             warn "远端 $remote/$branch 删除失败/已变化；保留远端状态"
         fi
       done
@@ -1186,8 +1253,16 @@ cmd_authorize() {
   [ "$scope" = "$(gitq -C "$MAIN_DIR" rev-parse "refs/heads/$branch")" ] || die "分支 SHA 无法核对"
   case "$action" in
     integrate) [ "$status" = "delivered" ] && [ "$delivered" = "$scope" ] || die "integrate 授权仅能绑定已交付的当前 SHA" ;;
-    cleanup) [ "$status" = "integrated" ] && [ "$delivered" = "$scope" ] || die "cleanup 授权仅能绑定已集成且未变化的 delivered SHA" ;;
-    branch-delete) [[ "$status" = integrated || "$status" = cleaned ]] && [ "$delivered" = "$scope" ] || die "branch-delete 授权仅能绑定已集成、未变化的 delivered SHA" ;;
+    cleanup|branch-delete)
+      [[ "$status" = integrated || "$status" = cleaned ]] || die "$action 授权仅能绑定已集成/已清理的任务"
+      if [ "$delivered" != "$scope" ]; then
+        # 交付之后分支又前进（复核补正在集成后落地）：只有当该分支**已经完全并入上游 main**
+        # 时，才允许把授权绑到当前 HEAD。判据与 cleanup 用的那条一致，避免"授权登记"与
+        # "清理核验"两处对同一情形给出不同答案。
+        upstream_main_contains_branch "$branch" "$scope" || \
+          die "分支与已交付 SHA 不同且未完全并入上游 main；拒绝登记 $action 授权"
+      fi
+      ;;
   esac
   python3 - "$task" "$action" "$scope" "$note" "$WHOAMI_ID" <<'PY' | atomic_json_write "$task"
 import datetime,json,sys
@@ -1212,7 +1287,7 @@ cmd_verify_baseline() {
   local task; task="$(task_file "$issue")"
   local path branch baseline baseline_short base_wt synthetic
   path="$(json_get "$task" path)"; branch="$(gitq -C "$(json_get "$task" path)" rev-parse --abbrev-ref HEAD)"; baseline="$(json_get "$task" baseline)"
-  require_writer "$issue" "$path" "$branch"
+  require_wrapup_or_writer "$issue" "$path" "$branch" verify-baseline
   baseline_short="${baseline:0:12}"
   local run_id; run_id="$(date +%s%N)-$$-$RANDOM"
   require_real_gates_context

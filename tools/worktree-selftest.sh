@@ -211,14 +211,19 @@ run "移除外部依赖后 init 恢复可用" 0 bash "$WT" init
 [ -f "$WT1/dsh-mobile-app/android/gradle/wrapper/gradle-wrapper.jar" ] && \
   { PASS=$((PASS+1)); say "  PASS  Gradle wrapper jar 已补齐"; } || { FAIL=$((FAIL+1)); say "  FAIL  wrapper jar 缺失"; }
 
-section "写入者归属与 verify"
+section "写入者归属、收尾跨会话与 verify"
 run "同身份 verify 通过（合成门禁）" 0 bash "$WT" verify
-run "异身份 verify 被拒" fail env DSH_SESSION_ID=other-agent bash "$WT" verify
-run "异身份 + 未批准接管被拒" fail env DSH_SESSION_ID=other-agent DSH_WT_TAKEOVER=1 bash "$WT" verify
+# 收尾与执行常常不是同一个会话：收尾型操作（verify/deliver/verify-baseline）允许跨会话，
+# 但必须留痕（审计 + 任务登记）。写入型操作（init）仍然排他。
+run "异身份 verify 允许（收尾可跨会话）" 0 env DSH_SESSION_ID=other-agent bash "$WT" verify
+run "跨会话收尾写入审计记录" 0 grep -q "wrapup" "$DSH_WT_STATE/audit.log"
+run "跨会话收尾记入任务登记（谁收尾可见）" 0 python3 -c "import json,sys;d=json.load(open('$DSH_WT_STATE/tasks/900.json'));sys.exit(0 if d.get('last_wrapup_by')=='other-agent' and d.get('last_wrapup_op')=='verify' else 1)"
 run "未给授权理由被拒" fail bash "$WT" authorize 900 takeover
 run "非集成角色不能登记接管授权" fail bash "$WT" authorize 900 takeover "selftest 用户批准"
 run "集成角色登记 takeover 意向" 0 env DSH_WT_ROLE=integrator bash "$WT" authorize 900 takeover "selftest 用户批准"
-run "接管身份 verify 通过" 0 env DSH_SESSION_ID=other-agent DSH_WT_TAKEOVER=1 bash "$WT" verify
+# 接管授权必须绑定当时的 HEAD；且只有显式带 DSH_WT_TAKEOVER=1 才生效（下一条用第三方身份证明不泄漏）。
+run "接管授权绑定当前 HEAD" 0 python3 -c "import json,subprocess,sys;d=json.load(open('$DSH_WT_STATE/tasks/900.json'));head=subprocess.check_output(['git','-C','$WT1','rev-parse','HEAD']).decode().strip();sys.exit(0 if d.get('authorizations',{}).get('takeover',{}).get('scope_sha')==head else 1)"
+run "无接管时写入型操作 init 仍被拒" fail env DSH_SESSION_ID=third-agent bash "$WT" init
 
 section "verify 证据与当前树插件隔离"
 export DSH_MOBILE_PLUGIN="$TMP/evil-profile/lib/index.js"
@@ -484,6 +489,14 @@ run "无授权 cleanup 被拒" fail env DSH_WT_ROLE=integrator bash "$WT" cleanu
 run "登记 cleanup 授权" 0 env DSH_WT_ROLE=integrator bash "$WT" authorize 900 cleanup "用户批准清理已合并 PR"
 run "PR head SHA 不匹配时不删工作树" fail env DSH_WT_ROLE=integrator DSH_WT_TEST_MERGED_PR="777:wrong-sha:feature/selftest-one" bash "$WT" cleanup 900 777
 [ -d "$WT1" ] && { PASS=$((PASS+1)); say "  PASS  PR 证据不匹配时工作树保留"; } || { FAIL=$((FAIL+1)); say "  FAIL  PR 不匹配却删除工作树"; }
+# 交付之后分支又前进（复核补正常在集成之后落地）：此时证据换成「上游 PR 记录 + 上游包含性」。
+# 安全方向：上游 main 还没包含该分支时，即使 PR 记录匹配也必须拒绝。
+git -C "$WT1" commit --allow-empty -qm "test: drift after delivery"
+DRIFT_SHA="$(git -C "$WT1" rev-parse HEAD)"
+run "漂移且上游未包含时拒绝登记 cleanup 授权" fail env DSH_WT_ROLE=integrator bash "$WT" authorize 900 cleanup "试图把授权绑到漂移 SHA"
+run "交付后分支前进但上游未包含 → 拒绝清理" fail env DSH_WT_ROLE=integrator DSH_WT_TEST_MERGED_PR="777:$DRIFT_SHA:feature/selftest-one" bash "$WT" cleanup 900 777
+[ -d "$WT1" ] && { PASS=$((PASS+1)); say "  PASS  上游未包含时工作树保留"; } || { FAIL=$((FAIL+1)); say "  FAIL  上游未包含却删除工作树"; }
+git -C "$WT1" reset --hard --quiet "$DELIVERED_SHA"
 run "核验合并 PR 后 cleanup 成功" 0 env DSH_WT_ROLE=integrator DSH_WT_TEST_MERGED_PR="777:$DELIVERED_SHA:feature/selftest-one" bash "$WT" cleanup 900 777
 [ -d "$WT1" ] && { FAIL=$((FAIL+1)); say "  FAIL  工作树仍在"; } || { PASS=$((PASS+1)); say "  PASS  工作树已移除"; }
 if git -C "$CLONE" show-ref --verify --quiet refs/heads/feature/selftest-one; then
