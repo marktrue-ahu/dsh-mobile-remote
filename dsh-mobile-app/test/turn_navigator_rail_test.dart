@@ -1,0 +1,213 @@
+// issue #24：刻度轨的交互测试（Seam 2）。
+//
+// 只断言用户可观察的行为：什么时候出现、点按跳到哪里、长按扫掠看到什么、松手落在哪。
+// 不测私有方法、不锁死 widget 树形状。
+
+import 'package:dsh_mobile_app/turn_navigation.dart';
+import 'package:dsh_mobile_app/widgets/turn_navigator_rail.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+List<TurnAnchor> anchorsOf(List<(int turn, String prompt, String response)> rows) =>
+    [
+      for (final (turn, prompt, response) in rows)
+        TurnAnchor(turn: turn, seq: turn * 10, prompt: prompt, response: response),
+    ];
+
+Future<void> pumpRail(
+  WidgetTester tester, {
+  required List<TurnAnchor> anchors,
+  int? activeTurn,
+  int? busyTurn,
+  void Function(TurnAnchor)? onNavigate,
+}) async {
+  await tester.pumpWidget(MaterialApp(
+    home: Scaffold(
+      body: Center(
+        child: TurnNavigatorRail(
+          anchors: anchors,
+          activeTurn: activeTurn,
+          busyTurn: busyTurn,
+          onNavigate: onNavigate ?? (_) {},
+        ),
+      ),
+    ),
+  ));
+  await tester.pump();
+}
+
+void main() {
+  group('显隐', () {
+    testWidgets('少于 2 轮时完全不渲染（一轮没有导航价值）', (tester) async {
+      await pumpRail(tester, anchors: anchorsOf([(1, '只有一轮', '答')]));
+      expect(tester.getSize(find.byType(TurnNavigatorRail)), Size.zero);
+    });
+
+    testWidgets('0 轮时不渲染', (tester) async {
+      await pumpRail(tester, anchors: anchorsOf([]));
+      expect(tester.getSize(find.byType(TurnNavigatorRail)), Size.zero);
+    });
+
+    testWidgets('至少 2 轮时渲染出刻度轨', (tester) async {
+      await pumpRail(tester, anchors: anchorsOf([(1, '一', 'a'), (2, '二', 'b')]));
+      final size = tester.getSize(find.byType(TurnNavigatorRail));
+      expect(size.width, greaterThan(0));
+      expect(size.height, greaterThan(0));
+      expect(find.byKey(const ValueKey<String>('turn-tick-1')), findsOneWidget);
+      expect(find.byKey(const ValueKey<String>('turn-tick-2')), findsOneWidget);
+    });
+
+    testWidgets('每个已知轮次各有一个刻度', (tester) async {
+      await pumpRail(
+        tester,
+        anchors: anchorsOf([(1, 'a', ''), (2, 'b', ''), (3, 'c', '')]),
+      );
+      expect(find.byKey(const ValueKey<String>('turn-tick-1')), findsOneWidget);
+      expect(find.byKey(const ValueKey<String>('turn-tick-2')), findsOneWidget);
+      expect(find.byKey(const ValueKey<String>('turn-tick-3')), findsOneWidget);
+      expect(find.byKey(const ValueKey<String>('turn-tick-4')), findsNothing);
+    });
+  });
+
+  group('点按 = 直接跳转', () {
+    testWidgets('点某个刻度会用对应的轮次回调', (tester) async {
+      TurnAnchor? navigated;
+      await pumpRail(
+        tester,
+        anchors: anchorsOf([(1, '一', 'a'), (2, '二', 'b'), (3, '三', 'c')]),
+        onNavigate: (a) => navigated = a,
+      );
+      // 刻度轨在手势上是一个整体：帧级 GestureDetector 统一处理点按与长按扫掠，
+      // 因此命中的是父级而不是刻度自身——这里关掉"未命中"告警（行为正确）。
+      await tester.tap(
+        find.byKey(const ValueKey<String>('turn-tick-2')),
+        warnIfMissed: false,
+      );
+      await tester.pump();
+      expect(navigated?.turn, 2);
+      expect(navigated?.seq, 20);
+    });
+  });
+
+  group('长按扫掠 = 预览 + 松手落点', () {
+    testWidgets('长按浮出预览，显示提示词与回复', (tester) async {
+      await pumpRail(
+        tester,
+        anchors: anchorsOf([
+          (1, '第一个问题', '第一个回答'),
+          (2, '第二个问题', '第二个回答'),
+        ]),
+      );
+      final tick = tester.getCenter(find.byKey(const ValueKey<String>('turn-tick-2')));
+      final gesture = await tester.startGesture(tick);
+      await tester.pump(kLongPressTimeout + const Duration(milliseconds: 50));
+      await tester.pump();
+
+      expect(find.text('第二个问题'), findsOneWidget);
+      expect(find.text('第二个回答'), findsOneWidget);
+
+      await gesture.up();
+      await tester.pump();
+    });
+
+    testWidgets('松手落在预览所指的那一轮', (tester) async {
+      TurnAnchor? navigated;
+      await pumpRail(
+        tester,
+        anchors: anchorsOf([(1, '一', 'a'), (2, '二', 'b'), (3, '三', 'c')]),
+        onNavigate: (a) => navigated = a,
+      );
+      final gesture = await tester.startGesture(
+        tester.getCenter(find.byKey(const ValueKey<String>('turn-tick-1'))),
+      );
+      await tester.pump(kLongPressTimeout + const Duration(milliseconds: 50));
+      // 沿轨向下拖到第 3 轮
+      await gesture.moveTo(
+        tester.getCenter(find.byKey(const ValueKey<String>('turn-tick-3'))),
+      );
+      await tester.pump();
+      await gesture.up();
+      await tester.pump();
+
+      expect(navigated?.turn, 3, reason: '松手落在拖动结束时所指的轮次');
+    });
+
+    testWidgets('长按取消（手势被抢走）不落点', (tester) async {
+      TurnAnchor? navigated;
+      await pumpRail(
+        tester,
+        anchors: anchorsOf([(1, '一', 'a'), (2, '二', 'b')]),
+        onNavigate: (a) => navigated = a,
+      );
+      final gesture = await tester.startGesture(
+        tester.getCenter(find.byKey(const ValueKey<String>('turn-tick-1'))),
+      );
+      await tester.pump(kLongPressTimeout + const Duration(milliseconds: 50));
+      await gesture.cancel();
+      await tester.pump();
+      expect(navigated, isNull);
+    });
+  });
+
+  group('预览内容', () {
+    testWidgets('提示词为空（纯图片/纯命令轮）时回退为「第 N 轮」', (tester) async {
+      await pumpRail(
+        tester,
+        anchors: anchorsOf([(1, '', '只有回复'), (2, '有提示词', '')]),
+      );
+      final gesture = await tester.startGesture(
+        tester.getCenter(find.byKey(const ValueKey<String>('turn-tick-1'))),
+      );
+      await tester.pump(kLongPressTimeout + const Duration(milliseconds: 50));
+      await tester.pump();
+
+      expect(find.text('第 1 轮'), findsOneWidget);
+      expect(find.text('只有回复'), findsOneWidget);
+
+      await gesture.up();
+      await tester.pump();
+    });
+
+    testWidgets('回复为空时不渲染回复行', (tester) async {
+      await pumpRail(
+        tester,
+        anchors: anchorsOf([(1, '只有提示词', ''), (2, 'x', 'y')]),
+      );
+      final gesture = await tester.startGesture(
+        tester.getCenter(find.byKey(const ValueKey<String>('turn-tick-1'))),
+      );
+      await tester.pump(kLongPressTimeout + const Duration(milliseconds: 50));
+      await tester.pump();
+
+      expect(find.text('只有提示词'), findsOneWidget);
+      expect(find.text(''), findsNothing);
+
+      await gesture.up();
+      await tester.pump();
+    });
+  });
+
+  group('当前轮与跳转中', () {
+    testWidgets('跳转中的刻度能正常渲染（脉冲不崩）', (tester) async {
+      await pumpRail(
+        tester,
+        anchors: anchorsOf([(1, 'a', ''), (2, 'b', '')]),
+        busyTurn: 2,
+      );
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(find.byKey(const ValueKey<String>('turn-tick-2')), findsOneWidget);
+    });
+
+    testWidgets('当前轮高亮不影响其它刻度的存在', (tester) async {
+      await pumpRail(
+        tester,
+        anchors: anchorsOf([(1, 'a', ''), (2, 'b', ''), (3, 'c', '')]),
+        activeTurn: 2,
+      );
+      for (final turn in [1, 2, 3]) {
+        expect(find.byKey(ValueKey<String>('turn-tick-$turn')), findsOneWidget);
+      }
+    });
+  });
+}
