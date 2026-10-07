@@ -1530,8 +1530,7 @@ class AppStore extends ChangeNotifier {
           (sid != null && sid.isNotEmpty && sessionAgentStatus[sid] != norm);
       if (aid != null && aid.isNotEmpty) agentStatusMap[aid] = norm;
       if (sid != null && sid.isNotEmpty) sessionAgentStatus[sid] = norm;
-      final current =
-          sid != null && sid.isNotEmpty ? sid == sessionId : aid == sessionId;
+      final current = sid != null && sid.isNotEmpty ? sid == sessionId : aid == sessionId;
       // legacy：无 id 的帧只影响当前页显示（保留下方原有语义）
       final legacyUnrouted = sid == null && aid == null;
       if (current || legacyUnrouted) {

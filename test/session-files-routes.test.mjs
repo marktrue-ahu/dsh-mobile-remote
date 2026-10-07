@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { apply } from "../lib/index.js";
 
 const CONFIG = {
@@ -143,7 +143,10 @@ test("directories：空 path 返回根视图", async () => {
 		assert.equal(res.body.path, "");
 		assert.ok(Array.isArray(res.body.dirs));
 		assert.ok(res.body.dirs.length >= 1);
-		assert.equal(res.body.sep, "/", "根视图才带 sep（App 据此拼子目录，Linux 下为 /）");
+		// 平台自适应：服务端回的是**宿主真实分隔符** `path.sep`（Windows `\`、POSIX `/`），
+		// App 据此拼接子目录。原先写死 "/" 会让本用例在 Windows 上必红——
+		// 那是测试的可移植性缺陷，不是服务端缺陷（2026-10-04 修正）。
+		assert.equal(res.body.sep, sep, "根视图才带 sep，且必须等于宿主真实分隔符 path.sep");
 	} finally {
 		clean();
 	}
@@ -281,13 +284,20 @@ test("files：错误响应不回显主机路径（脱敏）", async () => {
  * 这不是"期望的安全行为"，而是把现状固定下来，避免将来收紧时无人察觉，
  * 也避免有人误以为这里已有保护（见 #16；docs/04-security.md 已按现状修正）。
  */
-test("files：当前不校验工作区包含（符号链接可越界，记录现状）", async () => {
+test("files：当前不校验工作区包含（符号链接可越界，记录现状）", async (t) => {
 	const { route, clean } = createHarness();
 	try {
 		const outside = mkdtempSync(join(tmpdir(), "wb-outside-"));
 		writeFileSync(join(outside, "secret.txt"), "outside\n");
 		const root = makeWorkspace();
-		symlinkSync(join(outside, "secret.txt"), join(root, "link.txt"));
+		try {
+			symlinkSync(join(outside, "secret.txt"), join(root, "link.txt"));
+		} catch (err) {
+			// Windows 未开开发者模式/非管理员时 symlinkSync 抛 EPERM。
+			// 这是**宿主权限**限制，与"服务端是否跟随符号链接"无关，故跳过而非判失败。
+			t.skip(`宿主不允许创建符号链接（${err.code}），跳过本用例`);
+			return;
+		}
 
 		const res = await call(route, { url: `/m/api/files?path=${encodeURIComponent(join(root, "link.txt"))}` });
 		assert.equal(res.status, 200, "现状：符号链接会被跟随");
