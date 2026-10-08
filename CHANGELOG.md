@@ -1,5 +1,46 @@
 # Changelog
 
+## v3.2.0（build 42，issue #19 / #21 / #20 / #22）— develop 首次发到上游 v3.2.0 基线
+
+> 版本：插件 `3.2.0` / App `3.2.0+42`。本次把 develop 推到了上游 v3.2.0 基线（`5832efc` 合并 `github/main`），并带上 develop 独有的 #19 / #21 / #20 / #22 修复。
+> **插件副本与已部署副本逐字节一致**（`diff -rq lib/ ~/.dsh/profiles/web/node_modules/dsh-mobile-remote/lib/` 为空），本轮发布**按流程重新执行一次部署与延迟重启以刷新运行中的插件**。
+
+### 上游 v3.2.0 带来的内容（合并 `github/main`，此前不在手机版本里）
+
+- **移动端 Git 只读浏览 + 会话文件浏览**（PR #31 含 PR #28；PR #27 收尾补正）：对话操作栏新增 `git` / `files` 入口，浏览根 = 当前会话工作目录；提交详情、文件改动预览、分支图与工作区事实均为只读。
+- **会话列表运行状态**（PR #30 覆盖 #29）：运行中虚线旋转、等待态静态警示色、子代理可从父会话进入。
+- **斜杠命令在提交时真正执行**（#25）：此前 `/compact` 被当普通消息投给模型，压缩从未发生；现在命中内核命令语法且名字在命令目录里就走 `POST /m/api/commands`，不插乐观气泡、不进 `/send` 回执对账，并把结果 toast 出来。服务端 `commands.execute` 整条命令超时由 15s 放宽到 **180s**（大会话摘要远不止 15s），客户端 `runCommand` 用 200s 保证服务端先收敛。
+- **宽表格横滑不再被消息列表抢走**（#33）：把表格子树的拖拽阈值压到 4px，使横向手势按 hit-test 由最内层表格胜出；修复前"按住表格横滑"会触发 `_loadMoreInfinite()`，用户可被一路带到任意早的历史。
+- **模型未确定时显式说明**（PR #27 复核补正）：强度区域不再静默消失。
+- **扫码地址双重挂载路径修复**（PR #32）：修 `/m/m` —— LAN 桥与回环都中招。
+- **`flutter analyze` 门禁回到 0 issue**：合并后新增的 41 项 info（39 项 `curly_braces_in_flow_control_structures` + 2 项 `use_null_aware_elements`）已用 `dart fix --apply` 机械化修回。
+
+### develop 独有修复（上游没有，这次一并随 App 发布）
+
+- **#19 / #21 宿主 0.2.x 兼容**：子代理列表与 Codex 余额在宿主 0.2.0 下失效——插件改为按能力探测而非按宿主版本号推断，并在缺失/漂移时给出明确原因（三分状态：缺失、语义漂移、可用）。peer 依赖范围去掉上界。
+- **#20 请求级取消**：客户端断开即取消会话枚举与标题折叠，止住枚举放大与死队列复用；逐个标题兜底读取在断开时取消在途请求。
+- **#22 会话列表刷新的在途守卫**：同一时刻只允许一个列表请求在飞，期间到达的刷新合并为「结束后再补一次」；被合并的刷新等到补发真正结束才返回；切换服务器地址后旧地址未完成的请求不再挡住新地址刷新；owner 收尾窗口不再留下 phantom in-flight。
+- **轮次导航**（issue #24，ADR 0018 + `CONTEXT.md` 领域词条）：对话页右侧刻度轨按轮次定位，可见轮次可跳转、未构建轮次以弱化刻度区分——本版只随仓库记录决策，**App 侧实现仍在 `feature/turn-navigation` 工作树、未进本次发布**。
+
+### 门禁与验收证据（2026-10-08 develop）
+
+- `flutter analyze` → **0 issue**；`flutter test` → **399 全绿**。
+- `node --test test/*.mjs` → **132 pass / 0 fail**；`node tools/timeline-contract-check.mjs` → **77 PASS**；`node tools/account-usage-check.mjs` → **15/15**；`node tools/account-usage-adversarial-check.mjs` → **19/19**。
+- Kotlin `UsagePanelModelTest` → **27 项全绿**（用 `:app:cleanTestDebugUnitTest` 强制重跑，核对 `dsh-mobile-app/build/app/test-results/.../TEST-*.xml` 的 mtime，避免把 `UP-TO-DATE` 缓存误判为"门禁空跑"）。
+- 构建环境：Flutter 3.47.1 / JDK 17 / Android SDK 36；`PUB_HOSTED_URL` 跟随 `pubspec.lock` 的 `https://pub.flutter-io.cn`，构建后 `pubspec.lock` 无改动（88 处源保持镜像）。
+- 更新链路：`package-release.sh` → `verify-update-manifest.mjs` **RESULT: PASS**（size/sha256 与 APK 实算一致）；`GET /m/api/update/manifest` 返回 `version=3.2.0+42`、`size=75057490`、`sha256=4db924e4…`，`GET /m/api/update/apk` 下载 75057490 字节、实算 sha256 与 manifest 一致。`aapt2 dump badging` 核对 APK 内置 `versionCode='42'` / `versionName='3.2.0'`（**> 手机已装 `+40`**，不会触发「不能降级安装」）。
+- 宿主重启与自检：`restart-dsh-web-service.sh <pid> 90` 于 13:02:11 停止旧 pid、13:02:13 新 pid 接管、smoke OK；`tools/postrestart-check.sh` 逐项 PASS——端口由新 pid 接管、`bootstrap` capabilities（`eventTimeline` v1）、`update/manifest` 版本 = `3.2.0+42`、`session-config` 取真实会话（`deepseek-v4.1-flash` / `opencode-go-plus` / `reasoningEffort=high`）、`catalog?refresh=1`。**该脚本自带 20s 超时不适用于本机的 `/m/api/sessions`**（见下条），本次是逐端点手工复核补全的，不是脚本一次全绿。
+
+### 观察记录：`/m/api/sessions` 在本机约需 81 秒
+
+- 本机现有 **384 个会话**，`GET /m/api/sessions` 实测返回 200、约 110KB，但耗时 **81.2s**（`bootstrap`/`update/manifest` 均为毫秒级）——列表按会话逐条读取日志，成本随会话数线性增长。
+- 影响：`tools/postrestart-check.sh` 的 `curl -m 20` 取不到 `sessionId`，会判 FAIL；**这是超时口径问题，不是宿主故障**（用 `-m 150` 同一端点正常返回）。手机上该列表也会长时间转圈（#22 的在途守卫保证它不再堆积请求，但单个请求仍慢）。
+- 未在本次修改：属性能问题而非本次发布的回归（发布前后插件副本逐字节一致）。建议后续单独立 issue：给列表加缓存/分页，或让 `postrestart-check.sh` 的会话探测复用可配置超时。
+
+### 已知未解决：issue #20（缺陷本体在上游核心）
+
+插件侧的降级读取（`degraded/current-surface`、`configDegraded`）在 #21 已落地，本版无改动；**缺陷本体在 DSH 核心**——`dsh-session-query.readSession()` 仍走 `Session.create(...)` 快照路径而非 `Session.fromRestore`。上游已加入逃逸口（日志有 `session/end-seed` 且 `data.inherited === true` 时可跳过等长校验），因此是否复现取决于目标会话的日志内容。插件侧降级保留到核心改走 restore 构造路径。
+
 ## v3.2.0（2026-10-04，issue #25 / #26 / #33，PR #27 / #28 / #29 / #30 / #31 / #32）— 移动端 Git 与会话文件浏览 + 会话列表状态 + 命令与手势修复
 
 > 版本：插件 `3.2.0` / App `3.2.0+23`。
