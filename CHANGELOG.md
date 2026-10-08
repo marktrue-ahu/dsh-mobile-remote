@@ -1,5 +1,39 @@
 # Changelog
 
+## v3.2.0（build 43，issue #20）— 会话列表不再「越用越慢」：revision 缓存 + 每请求预算 + single-flight
+
+> 版本：插件 `3.2.0` / App `3.2.0+43`。本版**改动了插件**（新增 `lib/session-title-cache.js`、`lib/session-title-refresh.js`，改 `lib/index.js`）——除了安装新 APK，**必须同步插件副本并重启宿主**才会生效。
+> 内容 = issue #20 第 2 步在 develop 上的集成（merge `a266e76`，分支交付 SHA `b5f8afc`）。
+
+### 问题（issue #20）
+
+手机 App 打开就是会话列表。桌面端积累大量会话后，列表要么挂死、要么极慢：`/sessions` 在响应前**同步折叠全部休眠会话的标题**，而折叠要完整读取每个会话日志（多帧 zstd 解压 → JSON 解析 → 折叠校验）。本机 384 个会话实测冷缓存 **81–113 秒**才返回（维护者 note 702 / note 793 已量化根因：354 会话离线全量折叠 108.8 秒；`persistence.stat()` 全量 21.9 秒）。
+
+### 第 1 步（更早的 develop 版本已落地）
+
+客户端断开即取消**本请求**的枚举与标题折叠：`requestAbort` + 把取消信号传进宿主读取，重试不再叠加。
+
+### 第 2 步（本版）
+
+- **revision 失效的持久化标题缓存**：`~/.dsh/mobile-remote/session-titles.json`，`{ id: { title, revision, at } }`；revision 未变 → **零日志读取**，宿主重启后依然命中（失效键取自不读日志的 `persistence.stat()`）。
+- **每请求时间预算（≤1.5s）+ 增量返回**：预算内只折叠新增/变更会话，其余用短码兜底并**立即返回 200**；预算耗尽时仅在客户端仍连接时转为后台有界预热。
+- **single-flight + 折叠串行门**：并发请求复用同一个 in-flight 轮次；取消清理期间不叠加第二轮（避免读取宽度翻倍）。
+- **有界读取**：整轮 miss **只发一次** `readTitleSnapshots`（其内部读取宽度由宿主 `persistedReadConcurrency`=4 约束，插件不再叠加 per-id 扇出）；旧宿主/整批故障的逐个 `readTitleSnapshot` 兜底同样 ≤4。实测 354 会话的标题链全量枚举由 **91 次降到 3 次**且与 N 无关。
+- **评审 note 908 BLOCKING 修复**（`b5f8afc`）：`mapBounded` 用 `Promise.all` 时**首拒即返回**，会让折叠串行门在其余三路仍在清理时就被释放、重试再开四路 → 实测 `maxActive=7` 突破 ≤4 上限。改为等**全部 worker `allSettled`** 之后再重抛原失败，并在派发前查取消。
+
+### 门禁与验收证据（2026-10-09）
+
+- 分支门禁：`flutter-analyze` / `timeline-contract` / `account-usage` / `kotlin-usage-panel` **PASS**；`flutter-test` 在 main 基线有 3 项既有红灯（`sse_cancel_window_test.dart` 的取消窗口/对照/连续重建），按基线例外放行——本分支只改插件与 Node 测试，**未触及任何 Flutter 代码**。
+- **develop 集成门禁 5/5 全绿**（含 `flutter-test`，develop 侧已有该测试的修复，因此无需例外）：报告 `20-integration-a266e760b708.md`。
+- 合并后 `node --test test/*.mjs` **165/165 通过**（隔离临时 HOME/DSH_HOME）。
+- 变异验证：把 `allSettled` 退回 `Promise.all`，note 908 的两条回归**立刻变红**（重试抢跑，`dispatches=12 ≠ 4`）。
+- 维护者代码评审：note 1041「#20 最终代码复核通过：`25a320b`」，issue 已按用户授权关闭。
+
+### 仍未验（如实标注，勿以本版发布代替）
+
+- **真实语料的冷首屏计时与生产复核**（note 793 验收第 1、7 条：`/m/api/sessions` ≤2s 返回 200+N、`xinfangyb` 的 4 个会话在 App 可见）——需在本次部署后实测。
+- 79 个 seeded 会话的完整冷读失败属另一缺陷（note 788/793 建议单独跟踪）。
+
 ## v3.2.0（build 42，issue #19 / #21 / #20 / #22）— develop 首次发到上游 v3.2.0 基线
 
 > 版本：插件 `3.2.0` / App `3.2.0+42`。本次把 develop 推到了上游 v3.2.0 基线（`5832efc` 合并 `github/main`），并带上 develop 独有的 #19 / #21 / #20 / #22 修复。
