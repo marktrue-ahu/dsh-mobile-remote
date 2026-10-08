@@ -963,3 +963,104 @@ test("逐个标题兜底（批量接口抛错后）：断开会取消**在途**�
 		assert.deepEqual(harness.logs, [], "取消不是失败");
 	} finally { harness.clean(); }
 });
+
+test("逐个标题兜底（宿主无批量接口）：并发读取仍有界（≤4），不把 N 个点读一次性扇出", async () => {
+	// 真实宿主上逐个 readTitleSnapshot 每次都会自带一轮全语料枚举，Promise.all(ids)
+	// 会让 N 个枚举同时开跑（issue #20 评审 note 904 的同类放大）。
+	const dormant = Array.from({ length: 12 }, (_, i) => ({ header: { id: `session-${i}`, createdAt: i + 1, cwd: "/tmp" } }));
+	let active = 0;
+	let maxActive = 0;
+	const harness = createHarness({ records: [], noQuery: true });
+	harness.provide("sessionQuery", {
+		async listSessions() { return dormant; },
+		readTitleSnapshot: async (sessionId, signal) => {
+			signal?.throwIfAborted();
+			active += 1;
+			maxActive = Math.max(maxActive, active);
+			try {
+				await new Promise((resolve) => setTimeout(resolve, 2));
+				return { session: { id: sessionId }, title: { title: `标题 ${sessionId}` } };
+			} finally {
+				active -= 1;
+			}
+		},
+		// 刻意不提供 readTitleSnapshots → 走逐个兜底
+	});
+	try {
+		const result = await sessions(harness.route);
+		assert.equal(result.status, 200);
+		assert.equal(result.body.sessions.length, dormant.length);
+		for (const row of result.body.sessions) assert.equal(row.title, `标题 ${row.id}`);
+		assert.ok(maxActive <= 4, `observed ${maxActive} concurrent fallback title reads`);
+	} finally { harness.clean(); }
+});
+
+/** 评审 note 908 的两个兜底入口：宿主无批量接口 / 批量接口抛错。 */
+const TITLE_FALLBACK_ENTRIES = [
+	{ name: "宿主无批量接口", batch: {} },
+	{ name: "批量接口抛错", batch: { async readTitleSnapshots() { throw new Error("batch unavailable"); } } },
+];
+
+for (const entry of TITLE_FALLBACK_ENTRIES) {
+	test(`逐个标题兜底（${entry.name}）：一路先拒、三路清理挂住时立即 retry，并发仍 ≤4`, async () => {
+		// 评审 note 908：`Promise.all` 首拒即返回 → 折叠串行门在其余三路仍在清理时被释放，
+		// 重试随即再开四路 → 实测 maxActive=7（旧 3 + 新 4），突破 ≤4 的读取宽度。
+		// 注意"一路先拒"指**worker 拒绝**（逐个兜底把单条失败降级为无标题，只有取消才会
+		// 向上抛），因此本用例用取消后的 AbortError 制造这一路，另三路挂住模拟清理未结束。
+		const dormant = Array.from({ length: 8 }, (_, i) => ({ header: { id: `session-${i}`, createdAt: i + 1, cwd: "/tmp" } }));
+		const abortError = () => Object.assign(new Error("The operation was aborted"), { name: "AbortError" });
+		let active = 0;
+		let maxActive = 0;
+		let dispatches = 0;
+		const hung = new Map();
+		let markFourDispatched;
+		const fourDispatched = new Promise((resolve) => { markFourDispatched = resolve; });
+		const harness = createHarness({ records: [], noQuery: true });
+		harness.provide("sessionQuery", {
+			async listSessions() { return dormant; },
+			...entry.batch,
+			readTitleSnapshot: async (sessionId, signal) => {
+				const order = dispatches;
+				dispatches += 1;
+				active += 1;
+				maxActive = Math.max(maxActive, active);
+				if (dispatches === 4) markFourDispatched();
+				try {
+					// 旧轮（前四路）挂住，由测试决定各自何时结束；后继轮正常返回。
+					if (order <= 3) {
+						await new Promise((resolve, reject) => hung.set(order, { resolve, reject }));
+						signal?.throwIfAborted();
+					}
+					return { session: { id: sessionId }, title: { title: `标题 ${sessionId}` } };
+				} finally {
+					active -= 1;
+				}
+			},
+		});
+		try {
+			const first = drive(harness, "/m/api/sessions");
+			await fourDispatched;
+			first.destroy(); // 客户端断开 → 旧轮取消
+			await new Promise((resolve) => setImmediate(resolve));
+
+			// 旧四路里"一路先拒（结束）"：它观察到取消而抛出，另外三路仍在清理。
+			hung.get(1).reject(abortError());
+			await new Promise((resolve) => setImmediate(resolve));
+
+			// 立即重试：旧轮尚未全部 settle，重试不得再派发任何新读取。
+			const retry = call(harness.route, "/m/api/sessions");
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			assert.equal(hung.size, 4, "旧轮应已派出四路（本用例的场景前提）");
+			assert.equal(dispatches, 4, "旧轮清理未结束前重试不得开新读取（Promise.all 首拒即返回时会开）");
+			assert.ok(maxActive <= 4, `observed ${maxActive} concurrent fallback title reads`);
+
+			// 放行旧轮其余三路 → 后继轮才能开工，并自行补齐全部标题。
+			for (const order of [0, 2, 3]) hung.get(order).reject(abortError());
+			const result = await retry;
+			assert.equal(result.status, 200);
+			assert.equal(result.body.sessions.length, dormant.length);
+			for (const row of result.body.sessions) assert.equal(row.title, `标题 ${row.id}`);
+			assert.ok(maxActive <= 4, `observed ${maxActive} concurrent fallback title reads`);
+		} finally { harness.clean(); }
+	});
+}
