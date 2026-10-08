@@ -46,6 +46,35 @@
 > 版本：插件 `3.2.0` / App `3.2.0+23`。
 > 验收门禁：`node --test test/*.mjs`（94 通过 + 1 平台跳过）、`node tools/timeline-contract-check.mjs`（77）、`node tools/account-usage-check.mjs`（15）、`node tools/account-usage-adversarial-check.mjs`（19）、`flutter analyze`（0 issue）、`flutter test`（366）。
 
+### 真机验收补正（2026-10-07，同属本次发布）
+
+以下三处是打 tag 后按真机验收结果补的修复，**仍属 v3.2.0**，未单独升版本。
+
+#### 命令端点对休眠会话直接 404 ——「命令不能用」的真根因（服务端）
+
+- **现象**：用户在 App 里打开**较旧的会话**后点命令列表，弹出「命令列表加载失败：session not found: session-…」。
+- **数据**：本机 `/m/api/sessions` 共 **171** 条会话，其中**只有 1 条已挂载**（当时正在用的那条）；App 首页会把全部持久化会话都列出来，所以随手点开的很可能是休眠会话。
+- **根因**：`GET/POST /m/api/commands` 用 `agents.get(sessionId)` 判定会话存在性，未命中即 `404 session-not-found`；而 `/send` 会自动 `agents.resume` 唤醒休眠会话——**两条通路的语义不一致**。（服务端本身无故障：同一路径 curl 实测 `200 + 6 条命令`。）
+- **修复**：把 `/send` 里的休眠恢复逻辑（`readDormantConfigEvents` + `foldFromEvents` 折叠配置、`agentPresets.mount`、`agents.resume`）抽成 `resumeDormantAgent(sessionId)`，命令端点复用同一条路径。**必须带上折叠出来的模型**：`agents.resume` 会真的挂载 agent，若用默认模型挂载，后续 `/send` 会因 `target` 已存在而跳过折叠，把该会话的模型静默降级。
+- **测试**：`test/dormant-session-read.test.mjs` 新增 2 项（GET/POST `/commands` 对休眠会话返回 200 且触发恢复），harness 增加 `commands` 注入。已做变异验证：把 `resumeDormantAgent` 改为恒返回 `null` → **4 条用例失败**（2 条新增 + 2 条原有 `/send` 恢复用例，helper 共用）。
+
+#### 命令面板：带参数命令点选后不再"看起来没反应"（App）
+
+- **现象**：打开 ⊕ → 命令 → 点选命令后**没有任何可见反馈**，用户判断为"命令不能用"。
+- **原因**：6 条命令里只有 `/compact`、`/export` 是**裸命令**（点选即执行，与 PC 端菜单一致），其余 4 条（`/feedback`、`/goal`、`/permission`、`/plan`）带参数，点选后**只把命令名填入输入框**（对齐 PC 端 `leadingInput` 语义）——而这条路径此前没有任何提示。
+- **修复**：填字后补一条 toast「已填入输入框：补参数后点发送才会执行（用法 …）」，用法取自内核的 `input.hint`（如 `/goal` 显示 `[<objective>|clear|edit <objective>|pause|resume]`）。
+- **真机验证（执行通路本身正常）**：点选 `/goal` → 输入框出现 `/goal ` 且**日志无执行记录** → 点「排队发送」→ 日志出现 `Chat: 执行命令 → … : /goal`、`Chat: 命令完成 → /goal`，内核同时发出 `command/run`、`command/done` 事件，且**未产生 `/goal` 用户气泡**（符合"命令不进乐观气泡"的设计）。服务端 `POST /m/api/commands` 另经 curl 独立验证：`/goal` 与 `/export` 均返回 `200 + kind:"success"`。
+
+#### 对话操作栏：白条不再撑满整屏
+
+- **现象**：右上角「对话操作」打开的右侧图标栏是一条**贯穿整屏的白色长条**，4 个动作只占顶部约 224dp，下方一大片空白。
+- **原因**：`_ConversationActionRail` 用 `SizedBox(width: 56, height: double.infinity)` 承载 `ReorderableListView`（列表自顶部排布），栏体因此被拉满整屏高。
+- **修复**：高度改为按动作数取高（`56 × 动作数`，当前 4 项 = 224dp），并**挂在右上角顶部**——与触发它的「对话操作」按钮同侧同高（真机实测：首项中心 y=228，与触发按钮一致；整条栏 y=144–816）。左侧加 14dp 圆角。中途曾试过垂直居中，真机反馈"与触发按钮脱节、太丑"，已改为顶部对齐。背景变暗（`barrierColor: Colors.black54`）与"覆盖层不挤压内容"属模态交互的既有设计，未改动。
+
+#### 勘误：初次把「命令列表加载失败」误判为连接竞态
+
+本次真机排查中，**我先把一次命令列表加载失败归因为"连接复用 / 半关竞态"——这是错的**。抓到完整提示后确认真实原因是上一节的**休眠会话 404**（`session not found: session-…`），与连接无关；同一路径 curl 始终是 `200 + 6 条命令`。记录在此以免后人被那条推断误导。命令面板的 `catch` 只弹 toast、不写日志，确实是诊断盲点（本次靠 `uiautomator dump` 抓到完整文案才定位），按用户意见未改。
+
 本版把 4 个社区 PR 收进主线（其中 PR #30 覆盖 #29、PR #31 覆盖 #28），并修掉 3 个 App 侧缺陷。
 
 ### 斜杠命令：提交时解析并真正执行（issue #25）
