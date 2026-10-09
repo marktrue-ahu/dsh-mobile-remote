@@ -4,6 +4,8 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart'
+    show RenderSliverMultiBoxAdaptor, SliverMultiBoxAdaptorParentData;
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
@@ -385,6 +387,10 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _turnOutlineNoticeShown = false;
   bool _activeTurnCalibrationScheduled = false; // 滚动期间合并调度几何校准
   final GlobalKey _liveViewportKey = GlobalKey(); // 阅读线基准：消息流视口
+  // 两条消息流列表（center 前后）的渲染对象：定位时用来遍历**已构建子项**的
+  // 真实索引与几何（长回复会挤掉落点附近的轮次边界，只有子项索引是连续可靠的）。
+  final GlobalKey _olderSliverKey = GlobalKey(); // center 之前：_olderItems
+  final GlobalKey _liveSliverKey = GlobalKey(); // center 之后：_items（+草稿）
   QuestionRequest? _question; // 内核问询弹窗（当前会话，思考中途需要拍板）
   ApprovalRequest? _approval; // 内核权限审批弹窗（当前会话）
   final Set<String> _transientFrameKeys =
@@ -689,19 +695,84 @@ class _ChatScreenState extends State<ChatScreen> {
     return bottom > viewTop && top < viewBottom;
   }
 
-  /// 目标持久 seq 在**真实子项列表**中的位置（比例兜底用；-1 表示找不到）。
+  /// 目标持久 seq 在**内容顺序**里的位置（定位的索引坐标；-1 表示找不到）。
   ///
-  /// center 之前是 `_olderItems` 原序；center 之后 `_items` 最新在前、渲染时倒序。
-  int _childIndexOfSeq(int seq) {
+  /// 注意不能用"sliver 内的子项序号"：消息流是 `center` 锚点的 `CustomScrollView`，
+  /// center **之前**那条列表的子项 0 紧贴 center、序号越大越靠**上**（内容偏移越小），
+  /// 与内容顺序正好相反。定位区间必须建立在内容顺序上（索引越大、内容偏移越大），
+  /// 否则"目标在落点之前还是之后"会判反——prepend 后的早期目标正是踩在这个反向上
+  /// （实测：目标被两个实测点夹成 `[0, 0]`，每次落点都被夹回 0，完全不滚动）。
+  ///
+  /// 内容顺序：`_olderItems` 最新在前（`[0]` 紧贴 center），因此内容序号倒序；
+  /// center 之后是「更早」按钮 / 加载条（若有）→ `_items`（最新在前）→ 草稿。
+  int _contentIndexOfSeq(int seq) {
     for (var i = 0; i < _olderItems.length; i++) {
-      if (_olderItems[i].seq == seq) return i;
+      if (_olderItems[i].seq == seq) return _olderItems.length - 1 - i;
     }
+    final base = _olderItems.length + (_olderButtonVisible ? 1 : 0);
     for (var i = 0; i < _items.length; i++) {
       if (_items[i].seq == seq) {
-        return _olderItems.length + (_items.length - 1 - i);
+        return base + (_items.length - 1 - i);
       }
     }
     return -1;
+  }
+
+  /// 内容顺序下的子项总数（比例兜底用）。
+  int get _contentChildCount =>
+      _olderItems.length + (_olderButtonVisible ? 1 : 0) + _items.length;
+
+  /// center 之后那条列表的首项是否为「更早」按钮 / 加载条（与 `_buildChatView` 一致）。
+  bool get _olderButtonVisible =>
+      (!_infiniteMode && _earliestSeq > 0) ||
+      (_infiniteMode && _loadingMore && _earliestSeq > 0);
+
+  /// 已构建**子项**的实测几何（内容顺序索引 + 内容偏移 + 高度），供定位循环判断目标
+  /// 在当前落点的**之前还是之后**并收窄搜索区间。
+  ///
+  /// 为什么不用轮次边界：边界只在恰好被构建时才有 key，长回复会把落点前后变成
+  /// 一大片"没有边界"的区域（复审轨迹里 `measure()` 连续两轮为空）；而 `SliverList`
+  /// 的每个已构建子项都带真实索引与高度，据此维护的上下界收得拢，也能用
+  /// `offset + height` 得到"长回复之后"的有效下界。
+  List<BuiltChildMeasurement> _measureBuiltChildren() {
+    final viewport =
+        _liveViewportKey.currentContext?.findRenderObject() as RenderBox?;
+    if (viewport == null || !viewport.hasSize) return const [];
+    final viewTop = viewport.localToGlobal(Offset.zero).dy;
+    final pixels = _scrollCtrl.hasClients ? _scrollCtrl.position.pixels : 0.0;
+    final out = <BuiltChildMeasurement>[];
+    void collect(
+      GlobalKey key,
+      int base, {
+      required int count,
+      required bool contentOrderReversed,
+    }) {
+      final sliver = key.currentContext?.findRenderObject();
+      if (sliver is! RenderSliverMultiBoxAdaptor) return;
+      for (var child = sliver.firstChild;
+          child != null;
+          child = sliver.childAfter(child)) {
+        final parentData = child.parentData;
+        if (parentData is! SliverMultiBoxAdaptorParentData) continue;
+        final local = parentData.index;
+        if (local == null || !child.hasSize) continue;
+        final contentIndex = contentOrderReversed ? count - 1 - local : local;
+        final offset = pixels + (child.localToGlobal(Offset.zero).dy - viewTop);
+        out.add(BuiltChildMeasurement(
+          index: base + contentIndex,
+          offset: offset,
+          height: child.size.height,
+        ));
+      }
+    }
+
+    // center 之前：`_olderItems` 最新在前，内容顺序与子项序号相反。
+    collect(_olderSliverKey, 0,
+        count: _olderItems.length, contentOrderReversed: true);
+    // center 之后：子项序号即内容顺序（首项可能是「更早」按钮 / 加载条）。
+    collect(_liveSliverKey, _olderItems.length + (_olderButtonVisible ? 1 : 0),
+        count: _items.length, contentOrderReversed: false);
+    return out;
   }
 
   /// 跳转到某一轮：**按实测几何校正的有界迭代定位**。
@@ -717,16 +788,14 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!_scrollCtrl.hasClients) return;
     final generation = token ?? _turnNavGeneration;
     bool current() => mounted && generation == _turnNavGeneration;
-    final existing = _turnKeysBySeq[anchor.seq];
-    if (existing?.currentContext != null) {
-      await _ensureTurnVisible(existing!, token: token);
-      return;
-    }
-
+    // 统一走有界迭代定位：即使边界已构建也由定位器按实测几何落点，并以
+    // "目标与视口相交"复核。此前"已构建就先走 ensureVisible 并直接 return"会在
+    // prepend 等场景下静默不滚动（目标在缓存区、`ensureVisible` 未改变偏移），
+    // 也不复核最终是否真的可见。
     setState(() => _busyTurn = anchor.turn);
     try {
-      final childCount = _olderItems.length + _items.length;
-      final childIndex = _childIndexOfSeq(anchor.seq);
+      final childCount = _contentChildCount;
+      final childIndex = _contentIndexOfSeq(anchor.seq);
       final locator = TurnLocator(
         scrollTo: (offset) {
           // 世代失效后一律不得再滚动：这是"旧操作抢落点"的最后一道闸。
@@ -736,6 +805,11 @@ class _ChatScreenState extends State<ChatScreen> {
             _scrollCtrl.hasClients ? _scrollCtrl.position.minScrollExtent : 0,
         maxScrollExtent: () =>
             _scrollCtrl.hasClients ? _scrollCtrl.position.maxScrollExtent : 0,
+        currentOffset: () =>
+            _scrollCtrl.hasClients ? _scrollCtrl.position.pixels : 0,
+        viewportExtent: () => _scrollCtrl.hasClients
+            ? _scrollCtrl.position.viewportDimension
+            : 0,
         // 目标一律按**边界持久 seq** 绑定：同轮号的重试边界不会误伤规范边界。
         isTargetLoaded: () => _turnAnchors.any((a) => a.seq == anchor.seq),
         isTargetBuilt: () =>
@@ -743,6 +817,7 @@ class _ChatScreenState extends State<ChatScreen> {
         isTargetInView: () => _turnKeyInViewport(_turnKeysBySeq[anchor.seq]),
         reveal: () => _revealTurnKey(_turnKeysBySeq[anchor.seq]),
         measure: _measureTurnBoundaries,
+        measureBuilt: _measureBuiltChildren,
         settle: () => WidgetsBinding.instance.endOfFrame,
       );
       final outcome = await locator.locate(
@@ -766,14 +841,6 @@ class _ChatScreenState extends State<ChatScreen> {
     } finally {
       if (current()) setState(() => _busyTurn = null);
     }
-  }
-
-  Future<void> _ensureTurnVisible(GlobalKey key, {int? token}) async {
-    final generation = token ?? _turnNavGeneration;
-    if (token != null && generation != _turnNavGeneration) return;
-    await _revealTurnKey(key);
-    if (token != null && generation != _turnNavGeneration) return;
-    _updateActiveTurn();
   }
 
   /// 精调：把已构建的目标边界带进视口（不负责判定成功）。
@@ -1461,6 +1528,7 @@ class _ChatScreenState extends State<ChatScreen> {
             SliverPadding(
               padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
               sliver: SliverList(
+                key: _olderSliverKey,
                 delegate: SliverChildBuilderDelegate(
                   (context, index) => _buildItemWithTurnKey(_olderItems[index]),
                   childCount: _olderItems.length,
@@ -1474,6 +1542,7 @@ class _ChatScreenState extends State<ChatScreen> {
             SliverPadding(
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
               sliver: SliverList(
+                key: _liveSliverKey,
                 delegate: SliverChildBuilderDelegate((context, index) {
                   // center 之后：加载条/按钮 → 当前窗口消息（最旧→最新）→ 草稿。
                   if ((topButton || loadingTail) && index == 0) {

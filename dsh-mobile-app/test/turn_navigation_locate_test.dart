@@ -33,6 +33,9 @@ TurnLocator _locator({
   bool Function()? isTargetInView,
   Future<void> Function()? reveal,
   List<TurnMeasurement> Function()? measure,
+  List<BuiltChildMeasurement> Function()? measureBuilt,
+  double Function()? currentOffset,
+  double Function()? viewportExtent,
   Future<void> Function()? settle,
   Duration timeout = const Duration(milliseconds: kTurnLocateTimeoutMs),
   DateTime Function()? clock,
@@ -46,6 +49,9 @@ TurnLocator _locator({
     isTargetInView: isTargetInView ?? () => false,
     reveal: reveal ?? () async {},
     measure: measure ?? () => const [],
+    measureBuilt: measureBuilt ?? () => const [],
+    currentOffset: currentOffset ?? () => 0,
+    viewportExtent: viewportExtent ?? () => 0,
     settle: settle ?? () async {},
     timeout: timeout,
     clock: clock,
@@ -244,8 +250,94 @@ void main() {
     });
   });
 
-  group('TurnLocator 驱动真实懒构建列表（center 锚点，条目不等高）', () {
-    testWidgets('远处轮次能被实测几何迭代定位带入视口', (tester) async {
+  group('TurnLocator：按已构建子项的索引 / 几何收窄区间（第二轮 P1）', () {
+    test('目标被两个已构建子项夹逼时按索引插值（而不是轮次平均步距）', () async {
+      var pixels = 0.0;
+      final offsets = <double>[];
+      final locator = _locator(
+        scrollTo: (o) {
+          offsets.add(o);
+          pixels = o;
+        },
+        minScrollExtent: () => 0,
+        maxScrollExtent: () => 2000,
+        viewportExtent: () => 300,
+        currentOffset: () => pixels,
+        // 目标（子项 5）夹在子项 3（底部 0）与子项 9（顶部 1000）之间。
+        measureBuilt: () => const [
+          BuiltChildMeasurement(index: 3, offset: -100, height: 100),
+          BuiltChildMeasurement(index: 9, offset: 1000),
+        ],
+        // 目标边界未构建：只靠邻居几何收敛。
+        isTargetBuilt: () => false,
+        isTargetInView: () => pixels >= 200 && pixels <= 400,
+      );
+      final outcome =
+          await locator.locate(targetTurn: 5, targetIndex: 5, childCount: 20);
+      expect(outcome.ok, isTrue);
+      expect(offsets.first, closeTo(-100 + 1100 * (2 / 6), 0.01),
+          reason: '按索引比例 (5-3)/(9-3) 插值，而不是按轮次号或平均步距外推');
+    });
+
+    test('长回复在目标之前：用子项"底部"作下界，落点必须越过回复', () async {
+      var pixels = 0.0;
+      final offsets = <double>[];
+      // 子项 1 是超长回复（0..10,000）；目标子项 4 在 10,500，只有落点接近时才被构建。
+      bool targetBuilt() => 10500 < pixels + 400 && 10600 > pixels - 100;
+      final locator = _locator(
+        scrollTo: (o) {
+          offsets.add(o);
+          pixels = o;
+        },
+        minScrollExtent: () => 0,
+        maxScrollExtent: () => 11000,
+        viewportExtent: () => 600,
+        currentOffset: () => pixels,
+        measureBuilt: () => [
+          const BuiltChildMeasurement(index: 1, offset: 0, height: 10000),
+          if (targetBuilt())
+            const BuiltChildMeasurement(index: 4, offset: 10500, height: 100),
+        ],
+        isTargetBuilt: targetBuilt,
+        isTargetInView: () => pixels >= 9900 && pixels <= 10500,
+      );
+      final outcome =
+          await locator.locate(targetTurn: 4, targetIndex: 4, childCount: 8);
+      expect(outcome.ok, isTrue);
+      expect(offsets.first, greaterThanOrEqualTo(10000),
+          reason: '只用子项顶部（0）会把落点留在长回复中段；下界应是 0 + 高度');
+    });
+
+    test('区间被实测点夹成一点时，重复落点触发向目标方向的降级步进', () async {
+      var pixels = 0.0;
+      final offsets = <double>[];
+      final locator = _locator(
+        scrollTo: (o) {
+          offsets.add(o);
+          pixels = o;
+        },
+        minScrollExtent: () => -2000,
+        maxScrollExtent: () => 2000,
+        viewportExtent: () => 600,
+        currentOffset: () => pixels,
+        // 退化区间：子项 3 的底部 = 0，子项 5 的顶部 = 0，目标却在这两点之上。
+        measureBuilt: () => const [
+          BuiltChildMeasurement(index: 3, offset: -100, height: 100),
+          BuiltChildMeasurement(index: 5, offset: 0),
+        ],
+        isTargetBuilt: () => false,
+        isTargetInView: () => pixels <= -800 && pixels >= -1400,
+      );
+      final outcome =
+          await locator.locate(targetTurn: 4, targetIndex: 4, childCount: 10);
+      expect(outcome.ok, isTrue);
+      expect(offsets.first, 0);
+      expect(offsets.any((o) => o <= -100), isTrue,
+          reason: '同一落点重复时必须按视口比例向目标方向步进，而不是原地重复');
+    });
+  });
+
+  group('TurnLocator 驱动真实懒构建列表（center 锚点，条目不等高）', () {    testWidgets('远处轮次能被实测几何迭代定位带入视口', (tester) async {
       const centerKey = ValueKey<String>('center');
       final viewportKey = GlobalKey();
       final turnKeys = <int, GlobalKey>{};

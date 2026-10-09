@@ -7,6 +7,8 @@
 // 预览归属、空白归一、截断）是容易写错又必须与电脑端一致的部分，必须在没有 widget
 // 树的测试里钉死。
 
+import 'dart:math' as math;
+
 /// 一轮在刻度轨上的定位信息。
 ///
 /// [seq] 是该轮 `turn/start` 事件的持久序号——它天然就是"定位到这一轮"的锚点，
@@ -197,6 +199,63 @@ const int kTurnLocateMaxAttempts = 6;
 /// 它是**硬截止**：超时后不再产生任何滚动 / 精调副作用（见 [TurnLocator.locate]）。
 const int kTurnLocateTimeoutMs = 4000;
 
+/// 判定"落点重复 / 振荡"的偏移容差（像素）。
+///
+/// 落点落在同一个位置（±容差）说明按索引估算已不再产生信息，继续重复只会
+/// 把剩余次数耗在同一对位置之间（#24 复审实测的 `22464 ↔ 4759` 就是这样）。
+const double kTurnLocateRepeatEpsilon = 1.0;
+
+/// 降级搜索：沿目标方向按**视口高度的这个比例**步进。
+///
+/// 只有在区间二分也产生不出新落点（区间已小于容差）时才用它。
+const double kTurnLocateStepFactor = 0.9;
+
+/// 视口高度不可用时的降级步长（像素）。
+const double kTurnLocateFallbackStep = 200.0;
+
+/// 目标进入视口后停留的阅读线比例（与页面侧 `ensureVisible` 的 alignment 一致）。
+const double kTurnLocateReadingLineFactor = 0.1;
+
+/// 一个**已构建**子项的实测几何：内容顺序索引 + 内容坐标偏移 + 高度。
+///
+/// 与 [TurnMeasurement] 的区别：后者按**轮次号**记录轮次**边界**的几何（给定位的
+/// 比例兜底与高亮缓存用），而本类按**内容顺序索引**记录任意已构建条目。懒构建 +
+/// 可变高度下，目标是"在前还是在后"必须用真实索引判断：一轮 14,400 字的回复会把
+/// 轮次平均步距彻底带偏，而内容顺序索引与内容偏移是单调的，据此维护的上下界才收得拢。
+///
+/// ⚠ 调用方必须传**内容顺序**索引，不能用 sliver 内的子项序号：`center` 锚点下
+/// center 之前那条列表的子项序号越大越靠上（内容偏移越小），方向正好相反。
+class BuiltChildMeasurement {
+  const BuiltChildMeasurement({
+    required this.index,
+    required this.offset,
+    this.height = 0,
+  });
+
+  /// 该子项在**内容顺序**里的位置（与 `targetIndex` 同一坐标系，越大越靠后）。
+  final int index;
+
+  /// 该子项在滚动内容坐标系里的偏移（= `pixels` + 相对视口顶部的 dy）。
+  final double offset;
+
+  /// 该子项的实测高度；0 表示未知（此时索引只提供 offset 一侧的界）。
+  ///
+  /// 它是长回复场景的关键：一个 14,400 字的回复可以横跨上万个像素，目标若在它
+  /// **之后**，"目标的偏移 ≥ 该子项底部（offset + height）"才是有信息量的下界；
+  /// 只用顶部会把搜索区间留在目标上方很远，二分几乎不前进（#24 复审实测）。
+  final double height;
+
+  /// 该子项在内容坐标里的底部。
+  double get bottom => offset + height;
+
+  @override
+  String toString() =>
+      'BuiltChildMeasurement(index: $index, offset: $offset, height: $height)';
+}
+
+List<BuiltChildMeasurement> _noBuiltChildren() => const [];
+double _zeroExtent() => 0;
+
 /// 一个**已构建**轮次边界的实测几何。
 ///
 /// [offset] 是该边界在滚动内容坐标系里的偏移（= 当前 `pixels` + 边界相对视口顶部的
@@ -305,9 +364,16 @@ double? _secantSlope(
 /// **不依赖 Flutter**，几何与副作用全部由回调注入，因此既能被真实列表驱动，
 /// 也能用假回调做边界测试。
 ///
-/// 与旧实现的关键差别：每轮尝试都用 [measure] 给出的**已构建边界实测几何**校正
-/// 落点，而不是反复用同一个「轮次序号 / 轮次数量」比例；并且最终以
-/// [isTargetInView]（目标与视口相交）而非 [isTargetBuilt]（目标已构建）为成功判据。
+/// 收敛机制（issue #24 复审后修订）：
+/// - [measureBuilt] 给出**已构建子项的真实索引与内容偏移**，据此维护搜索区间
+///   `[lo, hi]`：索引小于目标的实测点抬高 `lo`，大于目标的压低 `hi`；目标被两个
+///   实测点夹逼时按**索引**线性插值，比"轮次平均步距"稳得多。
+/// - 一次定位内保留这个区间与已访问落点；目标已构建时直接用它的**实测内容偏移**
+///   把阅读线对准它（精确一跳，不依赖动画）。
+/// - 落点重复 / 振荡时改走有进展的降级搜索：优先在 `[lo, hi]` 内二分，否则沿已知
+///   目标方向按视口比例步进，而不是把剩余次数耗在同一对位置之间。
+/// - 次数（[maxAttempts]）与时间（[timeout]）预算不变；成功判据始终是
+///   [isTargetInView]（目标与视口相交），不是"已构建"。
 class TurnLocator {
   TurnLocator({
     required this.scrollTo,
@@ -319,6 +385,9 @@ class TurnLocator {
     required this.reveal,
     required this.measure,
     required this.settle,
+    this.measureBuilt = _noBuiltChildren,
+    this.currentOffset = _zeroExtent,
+    this.viewportExtent = _zeroExtent,
     this.maxAttempts = kTurnLocateMaxAttempts,
     this.timeout = const Duration(milliseconds: kTurnLocateTimeoutMs),
     DateTime Function()? clock,
@@ -328,6 +397,12 @@ class TurnLocator {
   final void Function(double offset) scrollTo;
   final double Function() minScrollExtent;
   final double Function() maxScrollExtent;
+
+  /// 当前滚动偏移（降级步进的起点）。未接线时按 0 处理。
+  final double Function() currentOffset;
+
+  /// 视口高度（降级步长按它取比例）。未接线时按 0 处理。
+  final double Function() viewportExtent;
 
   /// 目标（按持久 seq 绑定的那个规范边界）是否仍在已加载窗口内。
   ///
@@ -340,11 +415,16 @@ class TurnLocator {
   /// 目标是否与视口相交——**唯一的成功判据**（「已构建」可能是缓存区里的条目）。
   final bool Function() isTargetInView;
 
-  /// 目标已构建时做一次精调（页面侧是 `Scrollable.ensureVisible`）。
+  /// 目标已构建但量不到几何时做一次精调（页面侧是 `Scrollable.ensureVisible`）。
   final Future<void> Function() reveal;
 
-  /// 已构建轮次边界的实测几何（每次校正前重新采样）。
+  /// 已构建轮次边界的实测几何（比例兜底用；页面侧顺带刷新高亮缓存）。
   final List<TurnMeasurement> Function() measure;
+
+  /// 已构建**子项**的实测几何（真实索引 + 内容偏移）——搜索区间与方向的依据。
+  ///
+  /// 未接线时返回空列表，定位退回 [measure] 的轮次边界估算（旧行为）。
+  final List<BuiltChildMeasurement> Function() measureBuilt;
 
   /// 等待一帧，让新落点处的条目完成构建与布局。
   final Future<void> Function() settle;
@@ -372,12 +452,65 @@ class TurnLocator {
     final start = _clock();
     bool timedOut() => _clock().difference(start) >= timeout;
 
+    // 搜索区间：lo 是"目标一定在其下方"的实测内容偏移（实测索引 < 目标），
+    // hi 是"目标一定在其上方"的（实测索引 > 目标）。两者在一次定位内只收不放。
+    double lo = minScrollExtent();
+    double? hi;
+    final visited = <double>[];
+
     for (var attempt = 0; attempt < maxAttempts; attempt++) {
       if (timedOut()) {
         return const TurnLocateOutcome.failed(TurnLocateFailure.exhausted);
       }
-      // 目标已构建但不在视口内：先按渲染对象精调，避免无效的比例移动。
-      if (isTargetBuilt()) {
+      final min = minScrollExtent();
+      final max = maxScrollExtent();
+      final viewport = viewportExtent();
+      final built = measureBuilt();
+      // 页面侧借这次采样刷新轮次边界缓存（高亮用）；同时是无 measureBuilt 时的兜底。
+      final boundaries = measure();
+
+      int? beforeIndex;
+      double? beforeOffset;
+      int? afterIndex;
+      double? afterOffset;
+      double? targetOffset;
+      for (final b in built) {
+        if (b.index == targetIndex) {
+          targetOffset = b.offset;
+        } else if (b.index < targetIndex) {
+          if (beforeIndex == null || b.index > beforeIndex) {
+            beforeIndex = b.index;
+            beforeOffset = b.offset;
+          }
+          // 目标在该子项之后 → 目标偏移 ≥ 它的底部。
+          if (b.bottom > lo) lo = b.bottom;
+        } else {
+          if (afterIndex == null || b.index < afterIndex) {
+            afterIndex = b.index;
+            afterOffset = b.offset;
+          }
+          // 目标在该子项之前 → 目标偏移 ≤ 它的顶部。
+          if (hi == null || b.offset < hi) hi = b.offset;
+        }
+      }
+
+      if (targetOffset != null) {
+        // 目标已构建：它的真实内容偏移已知，直接把阅读线对准它——精确一跳，
+        // 不受 `ensureVisible` 动画与后续 `jumpTo` 互相打断的影响。
+        final exact = (targetOffset - viewport * kTurnLocateReadingLineFactor)
+            .clamp(min, max)
+            .toDouble();
+        if (!_isRepeat(exact, visited)) {
+          scrollTo(exact);
+          visited.add(exact);
+          await settle();
+        }
+        if (isTargetInView()) return const TurnLocateOutcome.ok();
+        if (timedOut()) {
+          return const TurnLocateOutcome.failed(TurnLocateFailure.exhausted);
+        }
+      } else if (isTargetBuilt()) {
+        // 已构建但量不到几何（渲染对象尚未布局完）：退回 ensureVisible 精调。
         await reveal();
         await settle();
         if (isTargetInView()) return const TurnLocateOutcome.ok();
@@ -385,18 +518,40 @@ class TurnLocator {
           return const TurnLocateOutcome.failed(TurnLocateFailure.exhausted);
         }
       }
-      final min = minScrollExtent();
-      final max = maxScrollExtent();
-      final offset = estimateTurnOffsetFromMeasurements(
+
+      final lower = math.max(lo, min);
+      final upper = math.max(math.min(hi ?? max, max), lower);
+      var probe = _selectProbe(
         targetTurn: targetTurn,
-        measurements: measure(),
         targetIndex: targetIndex,
         childCount: childCount,
-        minScrollExtent: min,
-        maxScrollExtent: max,
-      );
-      scrollTo(offset.clamp(min, max).toDouble());
+        beforeIndex: beforeIndex,
+        beforeOffset: beforeOffset,
+        afterIndex: afterIndex,
+        afterOffset: afterOffset,
+        lo: lo,
+        hi: hi,
+        min: min,
+        max: max,
+        boundaries: boundaries,
+      ).clamp(lower, upper).toDouble();
+      if (_isRepeat(probe, visited)) {
+        // 重复 / 振荡：改走有进展的降级搜索，而不是把剩余次数耗在同一对位置。
+        // 此时**不再**夹回 [lo, hi]——区间本身已经被证伪（例如两端的实测点把目标
+        // 夹成一个点，而那里并没有目标），只有放宽到真实可滚动范围才可能前进。
+        probe = _degradedProbe(
+          visited: visited,
+          lower: lower,
+          upper: upper,
+          targetAbove: afterOffset != null,
+          targetBelow: beforeOffset != null,
+          viewport: viewport,
+        ).clamp(min, max).toDouble();
+      }
+      scrollTo(probe);
+      visited.add(probe);
       await settle();
+      if (isTargetInView()) return const TurnLocateOutcome.ok();
     }
     if (timedOut()) {
       return const TurnLocateOutcome.failed(TurnLocateFailure.exhausted);
@@ -408,5 +563,90 @@ class TurnLocator {
     return isTargetInView()
         ? const TurnLocateOutcome.ok()
         : const TurnLocateOutcome.failed(TurnLocateFailure.exhausted);
+  }
+
+  /// 选下一个落点（未做区间夹紧与重复检测）。
+  ///
+  /// 可信度降级：
+  /// 1. 目标被两个实测子项夹逼 → 按**索引**线性插值；
+  /// 2. 只有"目标之后"的实测点（目标在上方）→ 在 lo 与该点之间二分；
+  /// 3. 只有"目标之前"的实测点（目标在下方）→ 在该点与 hi（或 max）之间二分；
+  /// 4. 没有任何实测 → 退回轮次边界的比例 / 割线估算（旧行为，也是首跳）。
+  double _selectProbe({
+    required int targetTurn,
+    required int targetIndex,
+    required int childCount,
+    required int? beforeIndex,
+    required double? beforeOffset,
+    required int? afterIndex,
+    required double? afterOffset,
+    required double lo,
+    required double? hi,
+    required double min,
+    required double max,
+    required List<TurnMeasurement> boundaries,
+  }) {
+    if (beforeOffset != null && afterOffset != null) {
+      final i0 = beforeIndex!;
+      final i1 = afterIndex!;
+      final span = (i1 - i0).toDouble();
+      final frac = span <= 0 ? 0.5 : (targetIndex - i0) / span;
+      return beforeOffset + (afterOffset - beforeOffset) * frac.clamp(0.0, 1.0);
+    }
+    if (afterOffset != null) {
+      // 目标在实测点上方：在区间下界与该点之间二分（下界可能是列表顶端）。
+      return (lo + afterOffset) / 2;
+    }
+    if (beforeOffset != null) {
+      final upper = hi ?? max;
+      return upper > lo ? (lo + upper) / 2 : lo;
+    }
+    return estimateTurnOffsetFromMeasurements(
+      targetTurn: targetTurn,
+      measurements: boundaries,
+      targetIndex: targetIndex,
+      childCount: childCount,
+      minScrollExtent: min,
+      maxScrollExtent: max,
+    );
+  }
+
+  /// 降级搜索：区间二分优先，其次沿已知目标方向按视口比例步进。
+  double _degradedProbe({
+    required List<double> visited,
+    required double lower,
+    required double upper,
+    required bool targetAbove,
+    required bool targetBelow,
+    required double viewport,
+  }) {
+    if (upper - lower > kTurnLocateRepeatEpsilon * 2) {
+      final mid = (lower + upper) / 2;
+      if (!_isRepeat(mid, visited)) return mid;
+    }
+    final step = viewport > 0
+        ? viewport * kTurnLocateStepFactor
+        : kTurnLocateFallbackStep;
+    final base = visited.isEmpty ? currentOffset() : visited.last;
+    if (targetAbove) {
+      for (var k = 1; k <= 3; k++) {
+        final candidate = base - step * k;
+        if (!_isRepeat(candidate, visited)) return candidate;
+      }
+    } else if (targetBelow) {
+      for (var k = 1; k <= 3; k++) {
+        final candidate = base + step * k;
+        if (!_isRepeat(candidate, visited)) return candidate;
+      }
+    }
+    // 方向未知（一个实测点都没有）：退回区间中点。
+    return (lower + upper) / 2;
+  }
+
+  static bool _isRepeat(double probe, List<double> visited) {
+    for (final v in visited) {
+      if ((v - probe).abs() <= kTurnLocateRepeatEpsilon) return true;
+    }
+    return false;
   }
 }

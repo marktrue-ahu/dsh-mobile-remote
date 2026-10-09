@@ -153,6 +153,30 @@ bool _textInViewport(WidgetTester tester, String text) {
   return finder.evaluate().any((e) => view.overlaps(tester.getRect(finder)));
 }
 
+/// 离开底部（>160px 阈值），让刻度轨出现——导航前的真实前置状态。
+Future<void> _leaveBottom(WidgetTester tester) async {
+  await tester.drag(find.byType(CustomScrollView), const Offset(0, 300));
+  await tester.pumpAndSettle();
+}
+
+/// 点刻度轨上的某一轮，等定位流程（有界迭代 + 精调）走完，并记录滚动落点轨迹。
+///
+/// 轨迹只用于打印证据；断言一律看"目标文本是否与消息流视口相交"。
+Future<List<double>> _navigateTo(WidgetTester tester, int turn) async {
+  final position = _position(tester);
+  final offsets = <double>[];
+  void record() => offsets.add(position.pixels);
+  position.addListener(record);
+  final target = _rail(tester).anchors.firstWhere((a) => a.turn == turn);
+  _rail(tester).onNavigate(target);
+  await tester.pumpAndSettle();
+  position.removeListener(record);
+  // ignore: avoid_print
+  print('TURNLOC turn=$turn offsets=$offsets '
+      'pixels=${position.pixels} max=${position.maxScrollExtent}');
+  return offsets;
+}
+
 void main() {
   group('缺陷 1：不等高已加载轮次必须真正进入视口', () {
     testWidgets('首轮超长回复 + prepend 之后再定位第 4 轮，目标在视口内', (tester) async {
@@ -270,6 +294,82 @@ void main() {
           reason: '两个同轮号、不同 seq 的边界不得共用同一个 GlobalKey');
       // 折叠去重：同号边界只产生一个刻度。
       expect(find.byKey(const ValueKey('turn-tick-1')), findsOneWidget);
+    });
+  });
+
+  group('缺陷 6（第二轮 P1）：长回复夹在目标与当前视口之间时仍要能定位', () {
+    // 评审 #1072 的复现口径：8 轮 / 24 个已加载事件，普通回复各 900 字
+    // （`'回答 N ' * 180`），长回复 14,400 字（`* 2880`），定位前先离开底部。
+    const normalRepeat = 180; // 5 字 × 180 = 900 字
+    const longRepeat = 2880; // 5 字 × 2880 = 14,400 字
+
+    testWidgets('评审新反例：长回复在目标之后（第 6 轮 14,400 字，选第 4 轮）', (tester) async {
+      final backend = _Backend(
+        initialEvents:
+            _turnEvents(1, 8, replyRepeat: normalRepeat, longTurn: 6, longRepeat: longRepeat),
+      );
+      await _pumpChat(tester, backend: backend);
+      await _leaveBottom(tester);
+      expect(find.byType(TurnNavigatorRail), findsOneWidget);
+
+      await _navigateTo(tester, 4);
+
+      expect(tester.takeException(), isNull);
+      expect(_textInViewport(tester, '问题 4'), isTrue,
+          reason: '目标已在轮次索引里，长回复只是位于它与当前视口之间——必须真的进入视口');
+    });
+
+    testWidgets('长回复在首轮（目标在它之后），第 4 轮仍能进入视口', (tester) async {
+      final backend = _Backend(
+        initialEvents:
+            _turnEvents(1, 8, replyRepeat: normalRepeat, longTurn: 1, longRepeat: longRepeat),
+      );
+      await _pumpChat(tester, backend: backend);
+      await _leaveBottom(tester);
+
+      await _navigateTo(tester, 4);
+
+      expect(tester.takeException(), isNull);
+      expect(_textInViewport(tester, '问题 4'), isTrue,
+          reason: '目标在超长首轮回复之后，比例估算会失准，必须用实测索引收窄区间');
+    });
+
+    testWidgets('长回复就在目标轮（第 4 轮 14,400 字），目标边界仍进入视口', (tester) async {
+      final backend = _Backend(
+        initialEvents:
+            _turnEvents(1, 8, replyRepeat: normalRepeat, longTurn: 4, longRepeat: longRepeat),
+      );
+      await _pumpChat(tester, backend: backend);
+      await _leaveBottom(tester);
+
+      await _navigateTo(tester, 4);
+
+      expect(tester.takeException(), isNull);
+      expect(_textInViewport(tester, '问题 4'), isTrue,
+          reason: '长回复属于目标轮本身时，落点常落在回复中段，仍需回到该轮起点');
+    });
+
+    testWidgets('prepend 之后最早的已加载轮次（长回复在其后）也能进入视口', (tester) async {
+      // 初始只有第 5..10 轮，第 8 轮超长；上翻 prepend 第 1..4 轮后定位**第 1 轮**
+      // ——它是最早的已加载轮次，位于 center 之前那条列表的最远处；center 锚点下
+      // 该列表的"子项序号"与内容顺序相反，正是第二轮复现出的反向 bug 的落点。
+      final backend = _Backend(
+        initialEvents:
+            _turnEvents(5, 10, replyRepeat: normalRepeat, longTurn: 8, longRepeat: longRepeat),
+        olderEvents: _turnEvents(1, 4, replyRepeat: normalRepeat),
+      );
+      await _pumpChat(tester, backend: backend);
+
+      _position(tester).jumpTo(0);
+      await tester.pumpAndSettle();
+      expect(_rail(tester).anchors.length, 10,
+          reason: 'prepend 之后已加载窗口应包含 1..10 轮');
+
+      await _navigateTo(tester, 1);
+
+      expect(tester.takeException(), isNull);
+      expect(_textInViewport(tester, '问题 1'), isTrue,
+          reason: 'prepend 后最早的已加载轮次必须真的进入视口');
     });
   });
 }
