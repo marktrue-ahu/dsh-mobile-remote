@@ -250,6 +250,14 @@ if (typeof mod.apply === "function" && typeof mod.Config === "function") {
           });
         }
         if (id === "session-outline-timeout") throw Object.assign(new Error("bounded wait expired"), { name: "TimeoutError" });
+        // 宿主可能把超时的 reason 包进 SessionQueryError.cause：必须仍识别为"超时"，
+        // 而不是按外层 code 误报成"会话损坏"。
+        if (id === "session-outline-timeout-wrapped") {
+          throw Object.assign(new Error("failed to observe session"), {
+            code: "SESSION_QUERY_CORRUPT_SESSION",
+            cause: Object.assign(new Error("bounded wait expired"), { name: "TimeoutError" }),
+          });
+        }
         if (id === "session-outline-seeded") throw new Error("seeded session constructor seed must equal its inherited prefix");
         if (id === "session-outline-corrupt") throw Object.assign(new Error("corrupt storage /private/session.zstd"), { code: "SESSION_QUERY_CORRUPT_SESSION" });
         if (id === "session-outline-missing") throw Object.assign(new Error("missing storage path"), { code: "SESSION_QUERY_SESSION_NOT_FOUND" });
@@ -395,6 +403,14 @@ if (typeof mod.apply === "function" && typeof mod.Config === "function") {
         && outlineTimeout.json.code === "turn-outline-timeout"
         && outlineTimeout.json.degraded === true,
       JSON.stringify(outlineTimeout.json),
+    );
+    const outlineTimeoutWrapped = await call("/m/api/turn-outline?sessionId=session-outline-timeout-wrapped");
+    check(
+      "turn-outline 超时被包进 cause 链时仍识别为超时（不误报会话损坏）",
+      outlineTimeoutWrapped.statusCode === 200
+        && outlineTimeoutWrapped.json?.code === "turn-outline-timeout"
+        && outlineTimeoutWrapped.json.state === "read-failed",
+      JSON.stringify(outlineTimeoutWrapped.json),
     );
     const outlineSeeded = await call("/m/api/turn-outline?sessionId=session-outline-seeded");
     check(
