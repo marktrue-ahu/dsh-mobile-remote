@@ -22,11 +22,14 @@
 | 悬浮球面板用量与额度（v3.1.5，ADR 0008） | 新 App+新插件：面板展开时按需展示三来源区块（金额行文字 + 配额行细条/颜色），整块可点进详情页。新 App+旧插件：区块整体降级为原有单行余额（点击仍=去充值），其余面板功能不受影响；旧 App 忽略新端点。无新增服务端契约 |
 | Flutter 构建环境 | Flutter 3.35+（Dart SDK ^3.13） |
 
+**声明式兼容范围（`peerDependencies`）**：`@deepseek-ai/dsh-{credentials,llm,sandbox-policy,scope}` 声明 `>=0.1.0-rc.6 <0.3.0`。宿主 `@deepseek-ai/dsh-app-boot` 的 `evaluatePluginCompatibility()` 用 `semver.satisfies(runtimeVersion, range, { includePrerelease: true })` 判定（**prerelease 参与比较**），因此该范围同时覆盖 `0.1.x`、`0.2.0-rc.*` 与 `0.2.x` 正式版，而 `0.3.0+` 会被判为不兼容。上界**只用于声明可安装边界**，功能路径仍按能力探测（ADR 0017），不按版本号做功能门禁。
+
 **快速自检**：手机 App → 设置 → 环境诊断。`services` 一节列出每个内核服务是否存在；**v3.1.3+ 看 `checks.approvalMode`**（生效策略）与 **`checks.remoteEvents`**（`true` = `$events` 双端呈现通道就绪，`false` = both 降级 mobile 或配置即 mobile/desktop）；`notes` 说明当前审批策略实际语义与**任何非全绿的宿主能力**。
 
-**v3.1.6+ 新增两项宿主能力自检**（ADR 0017）：
+**v3.1.6+ 新增宿主能力自检**（ADR 0017；issue #30 起补原因码）：
 
 - `checks.hostCapabilities`：逐项给出三态——`ok` / `drift` / `missing`。`drift` 是**能力语义漂移**（服务在、调用不报错，但成员形状不是插件认识的样子），这正是 0.2.0 四处变更的形态，旧的两分法看不见它们。
+- `checks.hostCapabilityReasons`（issue #30 审查修复）：**只对 `drift` 项**给出 allow-list 原因码，避免"只报状态值查不出哪一步坏了"。`settings.read` 的取值：`settings-get-threw` / `settings-describe-threw` / `settings-describe-shape-invalid` / `settings-descriptor-without-value` / `settings-has-no-read-method`。该探针与真实读取**共享严格读取器**——对插件真正读取的命名空间逐个探测，"命名空间不存在"仍算 ok，读不到才报 `drift`。
 - `checks.hostGeneration`：插件**实际走了哪条代际路径**（`jobsCaller` / `settingsRead` / `wireStreamArgs`），排查"为什么同一功能在两台机器上表现不同"时先看这里。
 
 `services.apiProxy` / `checks.respondBridge` / `checks.frameBridge` **已随 v3.1.6 删除**：该服务自 `0.1.2-rc.1` 起就不存在，保留它们只会让人以为有一条可用的旧代降级通道。同样地，`/m/api/respond` 在待办不在本地清单时返回 `404 respond-not-pending`（此前返回 `503` 并归咎于"内核过旧"，属误导——真实原因通常是"另一端已先答"或"已超时"）。

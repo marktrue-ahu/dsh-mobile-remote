@@ -2,10 +2,12 @@
 //
 // 覆盖外部可观察行为：
 //  1. 活跃父会话分支：条目带 `createdAt`，且按 createdAt **降序**输出
-//     （内核 subagent.list 是升序，插件必须显式反转——否则与休眠分支顺序相反）；
+//     （目录/内核列表是升序，插件必须显式反转——否则与休眠分支顺序相反）；
 //  2. 休眠/归档父会话分支：同样带 `createdAt` 且按同一规则降序，与活跃分支一致；
 //  3. 缺 createdAt 的条目排在最后，等值时按 id 升序稳定；
-//  4. `status` 仍原样透传内核 activity/diagnostic reason（本次不改其语义）。
+//  4. `status` 取自**活 agent** 的 AgentStatus（`idle`/`running`，映射为
+//     `running`/`inactive`）：目录条目本身不带状态，issue #21 后不再透传
+//     `subagents/list` 的 activity/diagnostic reason（该 RPC 在宿主 0.2.0 已删除）。
 //
 // 伪宿主 harness 沿用 test/interaction-settlement.test.mjs 的形态。
 import test from "node:test";
