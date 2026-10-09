@@ -1,6 +1,7 @@
 // DSH Mobile App — API 客户端（对接 dsh-mobile-remote 插件的 /m 接口）
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -824,6 +825,16 @@ class Api implements GitReadApi {
         return const TurnOutline.readFailed('session-not-found');
       }
       return TurnOutline.readFailed(e.code ?? 'turn-outline-read-failed');
+    } on TimeoutException {
+      // 客户端等待超时：必须退回一期并说明，不能让异常逃出后台 Future
+      // （`_refreshTurnOutline` 用 unawaited 调用，逃出去就是未处理异步错误）。
+      return const TurnOutline.readFailed('turn-outline-client-timeout');
+    } on http.ClientException {
+      // 断网 / 连接被重置（http 包对这类失败的统一包装）。
+      return const TurnOutline.readFailed('turn-outline-offline');
+    } on SocketException {
+      // 少数路径直接抛 SocketException（未经过 http 包包装）。
+      return const TurnOutline.readFailed('turn-outline-offline');
     }
   }
 

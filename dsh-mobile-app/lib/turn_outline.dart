@@ -357,7 +357,16 @@ String? turnOutlineNotice(TurnOutline outline) {
         'This host has no full turn ladder; showing loaded turns only',
       );
     case TurnOutlineState.readFailed:
-      if (outline.failureCode == 'turn-outline-timeout') {
+      final code = outline.failureCode;
+      if (code == 'turn-outline-offline') {
+        return L10n.t(
+          '当前离线，轮次阶梯暂不可用，仅显示已加载轮次',
+          'Offline: the full turn ladder is unavailable; showing loaded turns only',
+        );
+      }
+      if (code == 'turn-outline-timeout' ||
+          code == 'turn-outline-client-timeout' ||
+          code == 'turn-outline-busy') {
         return L10n.t(
           '轮次大纲重算超时，仅显示已加载轮次',
           'Turn outline recompute timed out; showing loaded turns only',

@@ -259,6 +259,15 @@ if (typeof mod.apply === "function" && typeof mod.Config === "function") {
           });
         }
         if (id === "session-outline-seeded") throw new Error("seeded session constructor seed must equal its inherited prefix");
+        // 真实宿主形状（issue #25 评审 P2）：observeSession 把 seeded 前缀缺陷包进
+        // SessionQueryError(code=SESSION_QUERY_CORRUPT_SESSION, cause=seeded Error)。
+        // 通用分类若先判 corrupt，稳定降级就到不了这个分支。
+        if (id === "session-outline-seeded-wrapped") {
+          throw Object.assign(new Error("stored session is corrupt"), {
+            code: "SESSION_QUERY_CORRUPT_SESSION",
+            cause: new Error("seeded session constructor seed must equal its inherited prefix"),
+          });
+        }
         if (id === "session-outline-corrupt") throw Object.assign(new Error("corrupt storage /private/session.zstd"), { code: "SESSION_QUERY_CORRUPT_SESSION" });
         if (id === "session-outline-missing") throw Object.assign(new Error("missing storage path"), { code: "SESSION_QUERY_SESSION_NOT_FOUND" });
         throw new Error("outline unavailable");
@@ -328,14 +337,39 @@ if (typeof mod.apply === "function" && typeof mod.Config === "function") {
     // issue #25 二期：轮次大纲能力位。宿主没挂投影时必须显式说"不支持"——App 据此退回一期行为，
     // 不允许按宿主版本自行推断，也不允许把"能力缺失"与"该会话无大纲"混为一谈。
     check(
-      "bootstrap 在宿主未挂 turnOutline 投影时声明 supported=false",
+      "bootstrap 在宿主未挂投影服务时声明 supported=false",
       bootstrap.json?.capabilities?.turnOutline?.supported === false,
       JSON.stringify(bootstrap.json?.capabilities?.turnOutline),
     );
+    // issue #25 评审 P2：**只有投影服务存在**不算支持——必须验证 `turnOutline` 单元真的注册，
+    // 且观察接口可用；否则会出现"声明支持、端点却回 capability-missing"的矛盾。
     services.sessionProjections = {};
+    const bootstrapServiceOnly = await call("/m/api/bootstrap");
+    check(
+      "bootstrap 只有投影服务、没有该单元 → supported=false",
+      bootstrapServiceOnly.json?.capabilities?.turnOutline?.supported === false,
+      JSON.stringify(bootstrapServiceOnly.json?.capabilities?.turnOutline),
+    );
+    services.sessionProjections = { registrations: new Map() };
+    const bootstrapNoUnit = await call("/m/api/bootstrap");
+    check(
+      "bootstrap registry 存在但零单元 → supported=false",
+      bootstrapNoUnit.json?.capabilities?.turnOutline?.supported === false,
+      JSON.stringify(bootstrapNoUnit.json?.capabilities?.turnOutline),
+    );
+    services.sessionProjections = { registrations: new Map([["turnOutline", {}]]) };
+    const savedObserve = services.sessionQuery.observeSession;
+    delete services.sessionQuery.observeSession;
+    const bootstrapNoObservable = await call("/m/api/bootstrap");
+    check(
+      "bootstrap 单元已注册但观察接口缺失 → supported=false",
+      bootstrapNoObservable.json?.capabilities?.turnOutline?.supported === false,
+      JSON.stringify(bootstrapNoObservable.json?.capabilities?.turnOutline),
+    );
+    services.sessionQuery.observeSession = savedObserve;
     const bootstrapOutline = await call("/m/api/bootstrap");
     check(
-      "bootstrap 在宿主挂了投影时声明 turnOutline 能力（unloaded/truncated）",
+      "bootstrap 单元注册且观察接口可用时声明 turnOutline 能力（unloaded/truncated）",
       bootstrapOutline.json?.capabilities?.turnOutline?.supported === true
         && bootstrapOutline.json.capabilities.turnOutline.unloaded === true
         && bootstrapOutline.json.capabilities.turnOutline.truncated === true,
@@ -429,6 +463,15 @@ if (typeof mod.apply === "function" && typeof mod.Config === "function") {
         && !JSON.stringify(outlineCorrupt.json).includes("/private/session.zstd"),
       JSON.stringify(outlineCorrupt.json),
     );
+    const outlineSeededWrapped = await call("/m/api/turn-outline?sessionId=session-outline-seeded-wrapped");
+    check(
+      "turn-outline seeded 缺陷被包进 corrupt cause 链时仍走稳定降级（不误报损坏）",
+      outlineSeededWrapped.statusCode === 200
+        && outlineSeededWrapped.json?.state === "read-failed"
+        && outlineSeededWrapped.json.code === "turn-outline-unavailable"
+        && outlineSeededWrapped.json.degraded === true,
+      JSON.stringify(outlineSeededWrapped.json),
+    );
     const outlineMissing = await call("/m/api/turn-outline?sessionId=session-outline-missing");
     check(
       "turn-outline 明确不存在 → 404 session-not-found（只有这一种才 404）",
@@ -441,6 +484,62 @@ if (typeof mod.apply === "function" && typeof mod.Config === "function") {
       mod.clampTurnOutline(Array.from({ length: 100 }, (_, i) => ({ turn: i + 1, seq: i, prompt: "p".repeat(20), response: "r".repeat(20) })), 0).turns.length === 1
         && mod.clampTurnOutline([{ turn: 1 }], 10).truncated === false,
       JSON.stringify(mod.clampTurnOutline([{ turn: 1 }], 0)),
+    );
+    // issue #25 评审 P1：有界执行槽——队列有上限、并发为 1、排队期间已超时的任务不执行。
+    if (typeof mod.createTurnOutlineQueue === "function") {
+      const queue = mod.createTurnOutlineQueue({ maxQueue: 1 });
+      let releaseFirst;
+      const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+      const order = [];
+      const first = queue.run(async () => { order.push("first-start"); await firstGate; order.push("first-end"); return "a"; });
+      const second = queue.run(async () => { order.push("second"); return "b"; });
+      let busyError;
+      const third = queue.run(async () => "c").catch((error) => { busyError = error; });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      check("有界队列：满时立刻拒绝并给稳定 code", busyError?.code === "TURN_OUTLINE_BUSY", String(busyError?.code));
+      check("有界队列：并发恒为 1（第二个未抢占执行槽）", order.join(",") === "first-start", order.join(","));
+      releaseFirst();
+      const settled = await Promise.all([first, second, third]);
+      check(
+        "有界队列：串行完成且顺序正确",
+        settled[0] === "a" && settled[1] === "b" && settled[2] === undefined && order.join(",") === "first-start,first-end,second",
+        order.join(","),
+      );
+
+      const queue2 = mod.createTurnOutlineQueue({ maxQueue: 2 });
+      let release2;
+      const gate2 = new Promise((resolve) => { release2 = resolve; });
+      const controller = new AbortController();
+      let queuedRan = false;
+      const running = queue2.run(async () => { await gate2; });
+      const queued = queue2.run(async () => { queuedRan = true; }, { signal: controller.signal });
+      controller.abort(Object.assign(new Error("deadline passed while queued"), { name: "TimeoutError" }));
+      release2();
+      await running;
+      let queuedError;
+      await queued.catch((error) => { queuedError = error; });
+      check(
+        "有界队列：排队期间已超时的任务出队即拒、不执行",
+        queuedRan === false && queuedError?.name === "TimeoutError",
+        `ran=${queuedRan} name=${queuedError?.name}`,
+      );
+    } else {
+      check("导出 createTurnOutlineQueue", false, "missing export");
+    }
+    // 能力探测：三种情形（只有服务 / 只有单元 / 单元+观察接口），与端点判据同源。
+    check(
+      "turnOutlineCapabilityOf：服务存在≠支持，单元+观察接口才算支持",
+      typeof mod.turnOutlineCapabilityOf === "function"
+        && mod.turnOutlineCapabilityOf({ get: (name) => (name === "sessionProjections" ? {} : undefined) }).supported === false
+        && mod.turnOutlineCapabilityOf({ get: (name) => (name === "sessionProjections" ? { registrations: new Map([["turnOutline", {}]]) } : undefined) }).supported === false
+        && mod.turnOutlineCapabilityOf({
+          get: (name) => (name === "sessionProjections"
+            ? { registrations: new Map([["turnOutline", {}]]) }
+            : name === "sessionQuery"
+              ? { observeSession() {} }
+              : undefined),
+        }).supported === true,
+      "capability probe mismatch",
     );
     const history = await call("/m/api/history?sessionId=session-1&after=0&limit=10");
     check("history 保留未知事件并过滤内部/chunk", history.json?.events?.some((e) => e.type === "future/visible") === true && !history.json?.events?.some((e) => ["assistant/chunk", "request/header", "system/message"].includes(e.type)), `${history.json?.error ?? ''} ${wireWarnings.at(-1) ?? ''}`);
