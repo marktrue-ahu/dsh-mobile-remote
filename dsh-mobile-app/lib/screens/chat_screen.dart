@@ -2,8 +2,10 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart'
+    show RenderSliverMultiBoxAdaptor, SliverMultiBoxAdaptorParentData;
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
@@ -17,11 +19,13 @@ import '../models.dart';
 import '../store.dart';
 import '../timeline.dart';
 import '../theme.dart';
+import '../turn_navigation.dart';
 import '../md.dart';
 import '../fmt.dart';
 import '../git_browser_controller.dart';
 import 'git_browser_sheet.dart';
 import '../widgets/git_logo.dart';
+import '../widgets/turn_navigator_rail.dart';
 import 'sheets.dart';
 import 'session_files_screen.dart';
 import 'session_tools_sheet.dart';
@@ -352,6 +356,27 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _noMoreHistory = false; // 已到会话最顶端（无更早消息），停止再查询
   bool _showJumpToLatest = false; // 上翻后显示"回到底部"浮钮
   bool _pinnedToBottom = true; // 用户是否停留在最新（底部）：流式输出时据此决定是否自动跟随
+
+  // ── issue #24：轮次导航（ADR 0018）──────────────────────────────────
+  // 轮次索引是**派生结构**：turn/start 的持久序号 → 轮次号。此前轮次号只用
+  // 来拼一行显示字符串，事后再也取不回来，因此无法按轮次定位。这里只留存，
+  // 不写入任何持久状态。
+  final Map<int, int> _turnOfStartSeq = {};
+  // 每个轮次边界条目的稳定 key，按**边界持久 seq** 分配：同轮号的重试边界各有其键，
+  // 不再共用同一个 GlobalKey（否则真实页面会出现 needsLayout 断言）。定位一律用
+  // anchor.seq 查规范边界。
+  final Map<int, GlobalKey> _turnKeysBySeq = {};
+  // 已构建边界最后一次实测的**内容偏移**（turn → offset）：边界被懒构建回收后，
+  // 仍能用它推断阅读线落在哪一轮（长回复场景不再无条件回退到最新轮）。
+  final Map<int, double> _turnContentOffset = {};
+  int? _activeTurn; // 当前阅读的轮次（刻度轨高亮）
+  int? _busyTurn; // 跳转进行中的轮次（刻度脉冲）
+  bool _activeTurnCalibrationScheduled = false; // 滚动期间合并调度几何校准
+  final GlobalKey _liveViewportKey = GlobalKey(); // 阅读线基准：消息流视口
+  // 两条消息流列表（center 前后）的渲染对象：定位时用来遍历**已构建子项**的
+  // 真实索引与几何（长回复会挤掉落点附近的轮次边界，只有子项索引是连续可靠的）。
+  final GlobalKey _olderSliverKey = GlobalKey(); // center 之前：_olderItems
+  final GlobalKey _liveSliverKey = GlobalKey(); // center 之后：_items（+草稿）
   QuestionRequest? _question; // 内核问询弹窗（当前会话，思考中途需要拍板）
   ApprovalRequest? _approval; // 内核权限审批弹窗（当前会话）
   final Set<String> _transientFrameKeys =
@@ -465,6 +490,19 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!nearBottom != _showJumpToLatest) {
       setState(() => _showJumpToLatest = !nearBottom);
     }
+    // issue #24：持续滚动也要校准当前轮。跨 160px 阈值只覆盖显隐切换，
+    // 一直停留在"离开底部"时页面不会重建，高亮就会停在旧值。
+    _scheduleActiveTurnCalibration();
+  }
+
+  /// 合并调度一次「当前轮」几何校准：同一帧内多次滚动只校准一次。
+  void _scheduleActiveTurnCalibration() {
+    if (_activeTurnCalibrationScheduled) return;
+    _activeTurnCalibrationScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _activeTurnCalibrationScheduled = false;
+      if (mounted) _updateActiveTurn();
+    });
   }
 
   /// 一键回到最新消息：近距平滑滚动，远距直接跳（避免超长距离动画卡顿）。
@@ -484,6 +522,319 @@ class _ChatScreenState extends State<ChatScreen> {
         curve: Curves.easeOutCubic,
       );
     }
+  }
+
+  // ── issue #24：轮次导航（ADR 0018）──────────────────────────────────
+
+  /// 已加载窗口里的轮次锚点（按轮次号升序）。
+  ///
+  /// 两条列表的物理顺序都不是时间序：`_olderItems` 靠近 center 的在前面（远→近），
+  /// `_items` 最新在前。折叠要求时间正序，所以两者都反转后拼接。
+  List<TurnAnchor> get _turnAnchors {
+    final rows = <TurnRow>[];
+    void addItem(_MsgItem item) {
+      final seq = item.seq;
+      final boundary = seq == null ? null : _turnOfStartSeq[seq];
+      if (boundary != null && item.kind == _MsgKind.divider) {
+        rows.add(TurnRow(boundaryTurn: boundary, seq: seq));
+        return;
+      }
+      switch (item.kind) {
+        case _MsgKind.user:
+          // 只有**真人来源**的 user 消息才算提示词：显式非 user 来源
+          // （agent-instructions / plugin / tool…）与旧内核的注入噪声都不占用 prompt，
+          // 判据复用时间线既有的一份（`_MsgItem.injected` + `timelineIsInjectedNoise`），
+          // 不在这里另起一套，也不因普通/调试模式而分叉。
+          final human = !item.injected && !timelineIsInjectedNoise(item.text);
+          rows.add(TurnRow(
+            role: human ? TurnRowRole.user : TurnRowRole.other,
+            text: item.text,
+          ));
+        case _MsgKind.assistant:
+          rows.add(TurnRow(role: TurnRowRole.assistant, text: item.text));
+        default:
+          rows.add(const TurnRow());
+      }
+    }
+
+    for (final item in _olderItems.reversed) {
+      addItem(item);
+    }
+    for (final item in _items.reversed) {
+      addItem(item);
+    }
+    return foldTurnAnchors(rows);
+  }
+
+  /// 给轮次边界条目挂稳定 key，供定位与"当前轮"判定读取真实几何。
+  /// 非边界条目原样构建（不引入额外包装）。
+  ///
+  /// 键身份是**边界持久 seq**，不是轮次号：同一轮号可以有多个相邻的 `turn/start`
+  /// （重试边界），按轮号分配会让它们共用同一个 GlobalKey。
+  Widget _buildItemWithTurnKey(_MsgItem item) {
+    final seq = item.seq;
+    final turn = seq == null ? null : _turnOfStartSeq[seq];
+    if (turn == null || seq == null || item.kind != _MsgKind.divider) {
+      return _buildItem(item);
+    }
+    final key = _turnKeysBySeq.putIfAbsent(seq, () => GlobalKey());
+    return KeyedSubtree(key: key, child: _buildItem(item));
+  }
+
+  /// 当前阅读的轮次。
+  ///
+  /// 懒构建下屏幕外的条目没有渲染对象，因此只用**已构建**的边界几何做选择：
+  /// 取起点不晚于阅读线的最后一个刻度；边界恰好被回收（长回复）时，用阅读线的
+  /// 内容偏移与最后一次实测缓存推断；再不行就**保留上一次判定**，绝不无条件跳最新。
+  void _updateActiveTurn() {
+    if (!mounted) return;
+    final anchors = _turnAnchors;
+    int? next;
+    if (anchors.isNotEmpty) {
+      if (_pinnedToBottom) {
+        next = anchors.last.turn;
+      } else {
+        final viewport =
+            _liveViewportKey.currentContext?.findRenderObject() as RenderBox?;
+        if (viewport != null && viewport.hasSize) {
+          final viewportTop = viewport.localToGlobal(Offset.zero).dy;
+          final lineOffset = math.min(96.0, viewport.size.height * 0.2);
+          final line = viewportTop + lineOffset;
+          final pixels =
+              _scrollCtrl.hasClients ? _scrollCtrl.position.pixels : 0.0;
+          final mountedTurns = <({int turn, double top})>[];
+          for (final anchor in anchors) {
+            final box = _turnKeysBySeq[anchor.seq]?.currentContext
+                ?.findRenderObject() as RenderBox?;
+            if (box == null || !box.hasSize) continue;
+            final top = box.localToGlobal(Offset.zero).dy;
+            mountedTurns.add((turn: anchor.turn, top: top));
+            // 顺手刷新内容偏移缓存——边界一旦被回收就再也量不到了。
+            _turnContentOffset[anchor.turn] = pixels + (top - viewportTop);
+          }
+          if (mountedTurns.isEmpty) {
+            // 目标轮起始边界未构建：用阅读线的内容偏移 + 缓存反查所属轮次。
+            next = _turnAtContentOffset(pixels + lineOffset);
+          } else {
+            next = activeTurnFromMounted(mountedTurns, readingLine: line);
+          }
+        }
+        next ??= _activeTurn;
+        next ??= anchors.last.turn;
+      }
+    }
+    if (next != _activeTurn) setState(() => _activeTurn = next);
+    _pruneTurnOffsets(anchors);
+  }
+
+  /// 阅读线落在哪一轮：取内容偏移不晚于 [contentOffset] 的最大已实测轮次。
+  int? _turnAtContentOffset(double contentOffset) {
+    int? best;
+    var bestOffset = double.negativeInfinity;
+    _turnContentOffset.forEach((turn, offset) {
+      if (offset <= contentOffset && offset > bestOffset) {
+        bestOffset = offset;
+        best = turn;
+      }
+    });
+    return best;
+  }
+
+  /// 丢弃已不在窗口内的轮次缓存，避免陈旧偏移把高亮拉回旧轮。
+  void _pruneTurnOffsets(List<TurnAnchor> anchors) {
+    if (_turnContentOffset.isEmpty) return;
+    final live = anchors.map((a) => a.turn).toSet();
+    _turnContentOffset.removeWhere((turn, _) => !live.contains(turn));
+  }
+
+  /// 已构建轮次边界的实测几何（内容坐标），供定位循环逐帧校正。
+  List<TurnMeasurement> _measureTurnBoundaries() {
+    final viewport =
+        _liveViewportKey.currentContext?.findRenderObject() as RenderBox?;
+    if (viewport == null || !viewport.hasSize) return const [];
+    final viewTop = viewport.localToGlobal(Offset.zero).dy;
+    final pixels = _scrollCtrl.hasClients ? _scrollCtrl.position.pixels : 0.0;
+    final out = <TurnMeasurement>[];
+    for (final anchor in _turnAnchors) {
+      final box = _turnKeysBySeq[anchor.seq]?.currentContext?.findRenderObject()
+          as RenderBox?;
+      if (box == null || !box.hasSize) continue;
+      final offset = pixels + (box.localToGlobal(Offset.zero).dy - viewTop);
+      _turnContentOffset[anchor.turn] = offset;
+      out.add(TurnMeasurement(turn: anchor.turn, offset: offset));
+    }
+    return out;
+  }
+
+  /// 目标边界是否与消息流视口相交（"已构建"不等于"看得见"）。
+  bool _turnKeyInViewport(GlobalKey? key) {
+    final box = key?.currentContext?.findRenderObject() as RenderBox?;
+    final viewport =
+        _liveViewportKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize || viewport == null || !viewport.hasSize) {
+      return false;
+    }
+    final top = box.localToGlobal(Offset.zero).dy;
+    final bottom = top + box.size.height;
+    final viewTop = viewport.localToGlobal(Offset.zero).dy;
+    final viewBottom = viewTop + viewport.size.height;
+    return bottom > viewTop && top < viewBottom;
+  }
+
+  /// 目标持久 seq 在**内容顺序**里的位置（定位的索引坐标；-1 表示找不到）。
+  ///
+  /// 注意不能用"sliver 内的子项序号"：消息流是 `center` 锚点的 `CustomScrollView`，
+  /// center **之前**那条列表的子项 0 紧贴 center、序号越大越靠**上**（内容偏移越小），
+  /// 与内容顺序正好相反。定位区间必须建立在内容顺序上（索引越大、内容偏移越大），
+  /// 否则"目标在落点之前还是之后"会判反——prepend 后的早期目标正是踩在这个反向上
+  /// （实测：目标被两个实测点夹成 `[0, 0]`，每次落点都被夹回 0，完全不滚动）。
+  ///
+  /// 内容顺序：`_olderItems` 最新在前（`[0]` 紧贴 center），因此内容序号倒序；
+  /// center 之后是「更早」按钮 / 加载条（若有）→ `_items`（最新在前）→ 草稿。
+  int _contentIndexOfSeq(int seq) {
+    for (var i = 0; i < _olderItems.length; i++) {
+      if (_olderItems[i].seq == seq) return _olderItems.length - 1 - i;
+    }
+    final base = _olderItems.length + (_olderButtonVisible ? 1 : 0);
+    for (var i = 0; i < _items.length; i++) {
+      if (_items[i].seq == seq) {
+        return base + (_items.length - 1 - i);
+      }
+    }
+    return -1;
+  }
+
+  /// 内容顺序下的子项总数（比例兜底用）。
+  int get _contentChildCount =>
+      _olderItems.length + (_olderButtonVisible ? 1 : 0) + _items.length;
+
+  /// center 之后那条列表的首项是否为「更早」按钮 / 加载条（与 `_buildChatView` 一致）。
+  bool get _olderButtonVisible =>
+      (!_infiniteMode && _earliestSeq > 0) ||
+      (_infiniteMode && _loadingMore && _earliestSeq > 0);
+
+  /// 已构建**子项**的实测几何（内容顺序索引 + 内容偏移 + 高度），供定位循环判断目标
+  /// 在当前落点的**之前还是之后**并收窄搜索区间。
+  ///
+  /// 为什么不用轮次边界：边界只在恰好被构建时才有 key，长回复会把落点前后变成
+  /// 一大片"没有边界"的区域（复审轨迹里 `measure()` 连续两轮为空）；而 `SliverList`
+  /// 的每个已构建子项都带真实索引与高度，据此维护的上下界收得拢，也能用
+  /// `offset + height` 得到"长回复之后"的有效下界。
+  List<BuiltChildMeasurement> _measureBuiltChildren() {
+    final viewport =
+        _liveViewportKey.currentContext?.findRenderObject() as RenderBox?;
+    if (viewport == null || !viewport.hasSize) return const [];
+    final viewTop = viewport.localToGlobal(Offset.zero).dy;
+    final pixels = _scrollCtrl.hasClients ? _scrollCtrl.position.pixels : 0.0;
+    final out = <BuiltChildMeasurement>[];
+    void collect(
+      GlobalKey key,
+      int base, {
+      required int count,
+      required bool contentOrderReversed,
+    }) {
+      final sliver = key.currentContext?.findRenderObject();
+      if (sliver is! RenderSliverMultiBoxAdaptor) return;
+      for (var child = sliver.firstChild;
+          child != null;
+          child = sliver.childAfter(child)) {
+        final parentData = child.parentData;
+        if (parentData is! SliverMultiBoxAdaptorParentData) continue;
+        final local = parentData.index;
+        if (local == null || !child.hasSize) continue;
+        final contentIndex = contentOrderReversed ? count - 1 - local : local;
+        final offset = pixels + (child.localToGlobal(Offset.zero).dy - viewTop);
+        out.add(BuiltChildMeasurement(
+          index: base + contentIndex,
+          offset: offset,
+          height: child.size.height,
+        ));
+      }
+    }
+
+    // center 之前：`_olderItems` 最新在前，内容顺序与子项序号相反。
+    collect(_olderSliverKey, 0,
+        count: _olderItems.length, contentOrderReversed: true);
+    // center 之后：`SliverMultiBoxAdaptorParentData.index` **已经包含**首项
+    // 「更早」按钮 / 加载条，所以基准只加前一条 sliver 的长度，不能再加一次首项偏移——
+    // 否则加载条显示期间消息的实测 index 会比目标坐标系大 1，定位器把前一条消息当成目标
+    // （第二轮评审 note 1080 的对照复现：同样数据，仅"上翻在途"这一项不同就跳不到）。
+    collect(_liveSliverKey, _olderItems.length,
+        count: _items.length, contentOrderReversed: false);
+    return out;
+  }
+
+  /// 跳转到某一轮：**按实测几何校正的有界迭代定位**。
+  ///
+  /// `Scrollable.ensureVisible` 只能作用于已构建的渲染对象，而消息流是懒构建的
+  /// `SliverList`——屏幕外的轮次根本没有 element。所以先按目标真实子项序号做比例
+  /// 兜底，再用已构建边界的**实测内容偏移**插值/割线外推逐帧校正；重试有界且受
+  /// `kTurnLocateTimeoutMs` 硬截止，最终必须让目标**与视口相交**才算成功。
+  Future<void> _jumpToTurn(TurnAnchor anchor) async {
+    if (!_scrollCtrl.hasClients) return;
+    // 统一走有界迭代定位：即使边界已构建也由定位器按实测几何落点，并以
+    // "目标与视口相交"复核。此前"已构建就先走 ensureVisible 并直接 return"会在
+    // prepend 等场景下静默不滚动（目标在缓存区、`ensureVisible` 未改变偏移），
+    // 也不复核最终是否真的可见。
+    setState(() => _busyTurn = anchor.turn);
+    try {
+      final childCount = _contentChildCount;
+      final childIndex = _contentIndexOfSeq(anchor.seq);
+      final locator = TurnLocator(
+        scrollTo: (offset) {
+          if (mounted && _scrollCtrl.hasClients) _scrollCtrl.jumpTo(offset);
+        },
+        minScrollExtent: () =>
+            _scrollCtrl.hasClients ? _scrollCtrl.position.minScrollExtent : 0,
+        maxScrollExtent: () =>
+            _scrollCtrl.hasClients ? _scrollCtrl.position.maxScrollExtent : 0,
+        currentOffset: () =>
+            _scrollCtrl.hasClients ? _scrollCtrl.position.pixels : 0,
+        viewportExtent: () => _scrollCtrl.hasClients
+            ? _scrollCtrl.position.viewportDimension
+            : 0,
+        // 目标一律按**边界持久 seq** 绑定：同轮号的重试边界不会误伤规范边界。
+        isTargetLoaded: () => _turnAnchors.any((a) => a.seq == anchor.seq),
+        isTargetBuilt: () =>
+            _turnKeysBySeq[anchor.seq]?.currentContext != null,
+        isTargetInView: () => _turnKeyInViewport(_turnKeysBySeq[anchor.seq]),
+        reveal: () => _revealTurnKey(_turnKeysBySeq[anchor.seq]),
+        measure: _measureTurnBoundaries,
+        measureBuilt: _measureBuiltChildren,
+        settle: () => WidgetsBinding.instance.endOfFrame,
+      );
+      final outcome = await locator.locate(
+        targetTurn: anchor.turn,
+        targetIndex: childIndex < 0 ? childCount - 1 : childIndex,
+        childCount: childCount,
+      );
+      if (!mounted || outcome.ok) return;
+      final message = switch (outcome.failure) {
+        TurnLocateFailure.notInWindow => L10n.t(
+            '未能定位到第 ${anchor.turn} 轮：它不在当前已加载范围内',
+            'Could not locate turn ${anchor.turn}: it is outside the loaded range',
+          ),
+        _ => L10n.t(
+            '未能定位到第 ${anchor.turn} 轮：多次尝试后仍未进入视图',
+            'Could not locate turn ${anchor.turn}: still out of view after several attempts',
+          ),
+      };
+      showToast(context, message);
+    } finally {
+      if (mounted) setState(() => _busyTurn = null);
+    }
+  }
+
+  /// 精调：把已构建的目标边界带进视口（不负责判定成功）。
+  Future<void> _revealTurnKey(GlobalKey? key) async {
+    final ctx = key?.currentContext;
+    if (ctx == null) return;
+    await Scrollable.ensureVisible(
+      ctx,
+      alignment: 0.1,
+      duration: const Duration(milliseconds: 180),
+      curve: Curves.easeOutCubic,
+    );
   }
 
   /// 提交问询答案（answers 顺序与提问一致），失败时弹窗保留可重试。
@@ -632,6 +983,9 @@ class _ChatScreenState extends State<ChatScreen> {
         _items.clear();
         _olderItems.clear();
         _histItems.clear();
+        _turnOfStartSeq.clear(); // issue #24：条目重建后轮次索引一并失效
+        _turnKeysBySeq.clear();
+        _turnContentOffset.clear();
         _timelineReducer.reset();
         _transientFrameKeys.clear();
         _debugPreviewCache.clear(); // 重建后 rawData 全变，旧预览缓存无意义
@@ -973,14 +1327,16 @@ class _ChatScreenState extends State<ChatScreen> {
       child: NotificationListener<ScrollNotification>(
         onNotification: _onLiveScroll,
         child: CustomScrollView(
+          key: _liveViewportKey,
           controller: _scrollCtrl,
           center: _liveCenterKey,
           slivers: [
             SliverPadding(
               padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
               sliver: SliverList(
+                key: _olderSliverKey,
                 delegate: SliverChildBuilderDelegate(
-                  (context, index) => _buildItem(_olderItems[index]),
+                  (context, index) => _buildItemWithTurnKey(_olderItems[index]),
                   childCount: _olderItems.length,
                 ),
               ),
@@ -992,6 +1348,7 @@ class _ChatScreenState extends State<ChatScreen> {
             SliverPadding(
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
               sliver: SliverList(
+                key: _liveSliverKey,
                 delegate: SliverChildBuilderDelegate((context, index) {
                   // center 之后：加载条/按钮 → 当前窗口消息（最旧→最新）→ 草稿。
                   if ((topButton || loadingTail) && index == 0) {
@@ -1014,7 +1371,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   }
                   final dataIndex = index - (topButton || loadingTail ? 1 : 0);
                   if (dataIndex < _items.length) {
-                    return _buildItem(_items[_items.length - 1 - dataIndex]);
+                    return _buildItemWithTurnKey(_items[_items.length - 1 - dataIndex]);
                   }
                   if (hasDraft) {
                     return _AssistantBubble(text: _draft, streaming: true);
@@ -2182,6 +2539,11 @@ class _ChatScreenState extends State<ChatScreen> {
       case 'todo/write':
         _appendVisibleEvent(out, ev, history: history);
       case 'turn/start':
+        // issue #24：轮次索引的唯一写点（实时与历史回放共用本函数）。
+        final startTurn = d?['turn'];
+        if (startTurn is num && ev.seq != null) {
+          _turnOfStartSeq[ev.seq!] = startTurn.toInt();
+        }
         if (history) {
           out.add(
             _MsgItem.divider(
@@ -3147,6 +3509,17 @@ class _ChatScreenState extends State<ChatScreen> {
     final brand = DshColors.brand(context);
     final surface = DshColors.surface(context);
 
+    // issue #24：刻度轨只在"离开底部且有 ≥2 轮"时出现（复用 160px 判据，
+    // 与"回到底部"圆钮同进同出；见 ADR 0018）。
+    final turnAnchors = _turnAnchors;
+    final showTurnRail = shouldShowTurnRail(
+      nearBottom: _pinnedToBottom,
+      turnCount: turnAnchors.length,
+    );
+    // 条目增删/分页会改变几何：本帧结束后校准"当前轮"。
+    // 只在取值变化时 setState，因此会收敛，不会自激。
+    WidgetsBinding.instance.addPostFrameCallback((_) => _updateActiveTurn());
+
     return Scaffold(
       backgroundColor: Theme.of(context).scaffoldBackgroundColor,
       appBar: AppBar(
@@ -3243,6 +3616,23 @@ class _ChatScreenState extends State<ChatScreen> {
                 Positioned.fill(
                   child: _inHistory ? _buildHistoryView() : _buildLiveView(),
                 ),
+                // issue #24：轮次导航刻度轨。放在消息流之上、右下角圆钮之下；
+                // 只占右侧约 28px，空白区域不吸收命中，消息流照常滚动。
+                if (!_inHistory && showTurnRail)
+                  Positioned.fill(
+                    child: Align(
+                      alignment: Alignment.centerRight,
+                      child: Padding(
+                        padding: const EdgeInsets.only(right: 12),
+                        child: TurnNavigatorRail(
+                          anchors: turnAnchors,
+                          activeTurn: _activeTurn,
+                          busyTurn: _busyTurn,
+                          onNavigate: (anchor) => unawaited(_jumpToTurn(anchor)),
+                        ),
+                      ),
+                    ),
+                  ),
                 if (!_inHistory)
                   Positioned(
                     bottom: 12,
