@@ -523,6 +523,28 @@ if (typeof mod.apply === "function" && typeof mod.Config === "function") {
         queuedRan === false && queuedError?.name === "TimeoutError",
         `ran=${queuedRan} name=${queuedError?.name}`,
       );
+
+      // 截止时间到达时**立刻**拒绝排队中的任务，而不是等执行槽空出
+      // （否则 App 已超时放弃、服务端还在替它排队）。
+      const queue3 = mod.createTurnOutlineQueue({ maxQueue: 2 });
+      let release3;
+      const gate3 = new Promise((resolve) => { release3 = resolve; });
+      const controller3 = new AbortController();
+      let queuedRan3 = false;
+      const running3 = queue3.run(async () => { await gate3; });
+      const queued3 = queue3
+        .run(async () => { queuedRan3 = true; }, { signal: controller3.signal })
+        .catch((error) => { queuedError = error; });
+      controller3.abort(Object.assign(new Error("deadline"), { name: "TimeoutError" }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      check(
+        "有界队列：排队中的任务在截止时间到达时立即被拒（不等执行槽）",
+        queuedError?.name === "TimeoutError" && queuedRan3 === false && queue3.pending === 0,
+        `ran=${queuedRan3} pending=${queue3.pending}`,
+      );
+      release3();
+      await running3;
+      await queued3;
     } else {
       check("导出 createTurnOutlineQueue", false, "missing export");
     }
