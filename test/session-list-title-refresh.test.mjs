@@ -130,6 +130,7 @@ function createHarness(fixtures, {
 	listDelayMs = () => 0,
 	listNeverSettles = false,
 	beforeTitleRead,
+	config = {},
 	persistenceRoot = fixtures[0]?.root,
 	persistenceName = "session-persistence-jsonl",
 	persistenceCompression = "zstd",
@@ -274,7 +275,7 @@ function createHarness(fixtures, {
 		},
 		inject() {},
 	};
-	const dispose = apply(ctx, CONFIG);
+	const dispose = apply(ctx, { ...CONFIG, ...config });
 	return {
 		route: routes.find((route) => route.path === "/m/api").handler,
 		records,
@@ -486,7 +487,7 @@ test("/subagents 标题预算同样包含完整语料枚举耗时", async (t) =>
 	assert.ok(elapsedMs < 2000, `subagent enumeration + title wait took ${elapsedMs.toFixed(1)} ms`);
 });
 
-test("语料枚举超过总预算时 /sessions 与 /subagents 明确返回超时", async (t) => {
+test("语料枚举超过**枚举预算**时 /sessions 与 /subagents 明确返回超时", async (t) => {
 	const home = await mkdtemp(join(tmpdir(), "session-title-refresh-home-"));
 	const root = await mkdtemp(join(tmpdir(), "session-title-enumeration-timeout-"));
 	process.env.HOME = home;
@@ -497,19 +498,52 @@ test("语料枚举超过总预算时 /sessions 与 /subagents 明确返回超时
 		await rm(root, { recursive: true, force: true });
 	});
 	const fixtures = writeSessionCorpusFixtures(root, { count: 2, largePayloadBytes: 0 });
-	harness = createHarness(fixtures, { listNeverSettles: true });
+	// issue #27：枚举有**自己的**预算（不再借用 1.5s 标题预算），这里把它压小以便快速复现超时。
+	const smallBudget = { config: { enumerationBudgetMs: 300 } };
+	harness = createHarness(fixtures, { listNeverSettles: true, ...smallBudget });
 	let startedAt = performance.now();
 	let result = await request(harness.route);
 	assert.equal(result.status, 504);
 	assert.equal(result.body.error, "sessions-timeout");
 	assert.ok(performance.now() - startedAt < 2000, "slow /sessions enumeration must not hang the sole entry point");
 	harness.clean();
-	harness = createHarness(fixtures, { listDelayMs: () => 5_000 });
+	harness = createHarness(fixtures, { listDelayMs: () => 5_000, ...smallBudget });
 	startedAt = performance.now();
 	result = await request(harness.route, `/m/api/subagents?parentSessionId=${encodeURIComponent(fixtures[0].id)}`);
 	assert.equal(result.status, 504);
 	assert.equal(result.body.error, "subagents-timeout");
 	assert.ok(performance.now() - startedAt < 2000, "slow persisted subagent enumeration must fail clearly too");
+});
+
+test("冷启动枚举慢于标题预算、但快于枚举预算时 /sessions 仍返回 200 + N（issue #27）", async (t) => {
+	// issue #27：宿主刚重启时内核语料是冷的（note 793 实测全量 stat 约 22 秒），枚举必然超过
+	// 1.5s 的**标题**预算。此前枚举被标题预算掐断 → 冷启动首次请求直接 504、用户拿不到列表；
+	// 现在枚举用**自己的**预算，必须返回 200 + N（标题可以是短码，随后后台预热）。
+	const home = await mkdtemp(join(tmpdir(), "session-title-refresh-home-"));
+	const root = await mkdtemp(join(tmpdir(), "session-title-enumeration-budget-"));
+	process.env.HOME = home;
+	let harness;
+	t.after(async () => {
+		harness?.clean();
+		await rm(home, { recursive: true, force: true });
+		await rm(root, { recursive: true, force: true });
+	});
+	const fixtures = writeSessionCorpusFixtures(root, { count: 6, largePayloadBytes: 0 });
+	harness = createHarness(fixtures, {
+		listDelayMs: () => 1_700, // 慢于标题预算（1500ms），远快于枚举预算（5000ms）
+		config: { enumerationBudgetMs: 5_000 },
+	});
+	const startedAt = performance.now();
+	const result = await request(harness.route);
+	const elapsedMs = performance.now() - startedAt;
+	assert.equal(result.status, 200, "枚举慢于标题预算时必须返回列表，而不是 504");
+	assert.equal(result.body.sessions.length, fixtures.length);
+	assert.ok(elapsedMs >= 1_700, `枚举应跑过标题预算（实测 ${elapsedMs.toFixed(1)} ms）`);
+	// 标题预算已耗尽：休眠会话用短码兜底，不能为了标题把枚举再拖回去。
+	const shortOf = (id) => (id.length > 12 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id);
+	for (const row of result.body.sessions) {
+		assert.equal(row.title, shortOf(row.id), "标题预算耗尽后应使用短码兜底");
+	}
 });
 
 test("并发 /sessions 共享同一标题折叠；一个客户端断开不取消另一个", async (t) => {
