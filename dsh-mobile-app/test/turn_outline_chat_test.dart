@@ -4,6 +4,7 @@
 // `ChatScreen` 接上假后端，验证"未加载刻度长什么样、点它会怎样、不可达时说什么、
 // 能力位为假时退不退回一期"这些**用户可观察**行为。不锁死内部实现。
 
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:dsh_mobile_app/api.dart';
@@ -95,6 +96,9 @@ class _OutlineBackend {
   final List<Map<String, String>> olderRequests = [];
   int outlineRequests = 0;
 
+  /// 置上时，带 `before` 的上翻请求会挂起，直到测试 complete 它。
+  Completer<void>? holdOlder;
+
   int get _firstLoadedTurn => (sessionTurns - loadedTurns + 1).clamp(1, sessionTurns);
 
   /// 更早的一页：**服务端最多返回 `limit` 条事件**（每轮 3 条），所以一次上翻覆盖
@@ -147,6 +151,9 @@ class _OutlineBackend {
       final params = request.url.queryParameters;
       if (params.containsKey('before')) {
         olderRequests.add(params);
+        // 需要"挂起旧请求"的用例：先卡住这一页，等测试放行再返回。
+        final hold = holdOlder;
+        if (hold != null) await hold.future;
         final before = int.tryParse(params['before'] ?? '') ?? 0;
         final limit = int.tryParse(params['limit'] ?? '') ?? 30;
         body = _olderPage(before, limit);
@@ -194,6 +201,20 @@ Future<void> _pumpChat(
 Future<void> _scrollUp(WidgetTester tester, {double by = 600}) async {
   await tester.drag(find.byType(CustomScrollView), Offset(0, by));
   await tester.pumpAndSettle();
+}
+
+/// `hello` 帧会起 debounce / collect 定时器；用例结束前先卸载页面再释放 store，
+/// 否则 flutter_test 会以 "A Timer is still pending after the widget tree was disposed" 失败。
+Future<void> _teardownStore(WidgetTester tester, AppStore store) async {
+  await tester.pumpWidget(const SizedBox());
+  store.dispose();
+}
+
+/// 有界推进若干帧：跳转进行中时该齿在脉冲（无限动画），`pumpAndSettle` 不会收敛。
+Future<void> _pumpFrames(WidgetTester tester, {int frames = 16}) async {
+  for (var i = 0; i < frames; i++) {
+    await tester.pump(const Duration(milliseconds: 60));
+  }
 }
 
 /// 轨道内第 [index] 个刻度（0 基）的中心在轨道本地坐标里的 y。
@@ -317,5 +338,149 @@ void main() {
     expect(find.byType(TurnNavigatorRail), findsOneWidget);
     expect(find.byKey(const ValueKey<String>('turn-tick-6')), findsOneWidget);
     expect(find.byKey(const ValueKey<String>('turn-tick-7')), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  // ── issue #25 评审 note 1066 的回归 ──────────────────────────────────
+
+  testWidgets('能力后到：能力声明到达后补拉大纲，不再只有本地刻度', (tester) async {
+    final backend = _OutlineBackend(
+      sessionTurns: 20,
+      loadedTurns: 2,
+      supported: false,
+    );
+    final store = AppStore()..sessionId = 'session-outline';
+    await _pumpChat(tester, backend: backend, store: store);
+    await _scrollUp(tester);
+    expect(backend.outlineRequests, 0, reason: '声明不支持时不该发请求');
+
+    // 首连时序：历史先完成，能力声明后到（supported=false → true）。
+    backend.api.turnOutlineCapabilities = const TurnOutlineCapabilities(
+      version: 1,
+      supported: true,
+      unloaded: true,
+      truncated: true,
+    );
+    store.injectFrame({
+      'type': 'hello',
+      'capabilities': {
+        'turnOutline': {
+          'version': 1,
+          'supported': true,
+          'unloaded': true,
+          'truncated': true,
+        },
+      },
+    });
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(backend.outlineRequests, greaterThan(0),
+        reason: '能力后到时必须补拉一次大纲（评测 P2 反例：0 次请求）');
+    expect(find.byKey(const ValueKey<String>('turn-tick-1')), findsOneWidget,
+        reason: '补拉后未加载刻度应出现');
+    expect(tester.takeException(), isNull);
+    await _teardownStore(tester, store);
+  });
+
+  testWidgets('能力被撤销：旧大纲刻度立即失效，不再显示陈旧阶梯', (tester) async {
+    final backend = _OutlineBackend(sessionTurns: 20, loadedTurns: 2);
+    final store = AppStore()..sessionId = 'session-outline';
+    await _pumpChat(tester, backend: backend, store: store);
+    await _scrollUp(tester);
+    expect(find.byKey(const ValueKey<String>('turn-tick-1')), findsOneWidget);
+
+    backend.api.turnOutlineCapabilities = const TurnOutlineCapabilities(
+      version: 1,
+      supported: false,
+    );
+    store.injectFrame({
+      'type': 'hello',
+      'capabilities': {
+        'turnOutline': {'version': 1, 'supported': false},
+      },
+    });
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(find.byKey(const ValueKey<String>('turn-tick-1')), findsNothing,
+        reason: '能力撤销后不得继续渲染上一台机器的大纲刻度');
+    expect(tester.takeException(), isNull);
+    await _teardownStore(tester, store);
+  });
+
+  testWidgets('连续选择：旧跨页跳转完成后不得再改落点', (tester) async {
+    final backend = _OutlineBackend(sessionTurns: 20, loadedTurns: 2);
+    final store = AppStore()..sessionId = 'session-outline';
+    await _pumpChat(tester, backend: backend, store: store);
+    await _scrollUp(tester);
+
+    final listScrollable = find.descendant(
+      of: find.byType(CustomScrollView),
+      matching: find.byType(Scrollable),
+    );
+    double offset() =>
+        tester.state<ScrollableState>(listScrollable).position.pixels;
+
+    // 1) 选未加载的第 6 轮，把它的跨页请求挂起（该齿开始脉冲）。
+    backend.holdOlder = Completer<void>();
+    await tester.tap(
+      find.byKey(const ValueKey<String>('turn-tick-6')),
+      warnIfMissed: false,
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+
+    // 2) 期间改选已加载的第 19 轮。旧跳转仍在脉冲 → `pumpAndSettle` 永远不会收敛，
+    //    所以这里用有界 pump 推进。
+    await tester.tap(
+      find.byKey(const ValueKey<String>('turn-tick-19')),
+      warnIfMissed: false,
+    );
+    await _pumpFrames(tester);
+    final afterSecondChoice = offset();
+    expect(find.text('第 19 轮的问题'), findsOneWidget,
+        reason: '第二次选择应先落在第 19 轮');
+
+    // 3) 放行旧请求：它已完成（或已作废），但**不得**再把视口拉回第 6 轮。
+    backend.holdOlder!.complete();
+    await _pumpFrames(tester);
+    expect(find.text('第 19 轮的问题'), findsOneWidget,
+        reason: '旧跳转完成后不得覆盖新选择的落点（评测 P2 反例：视口被拉回第 6 轮附近）');
+    expect((offset() - afterSecondChoice).abs(), lessThan(3000),
+        reason: '旧跳转不得把视口整体搬走（未被取消时会冲向第 6 轮，位移数千像素）');
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('该会话无大纲：给出与"能力缺失"不同的明确说明', (tester) async {
+    final backend = _OutlineBackend(
+      sessionTurns: 6,
+      loadedTurns: 6,
+      outlineState: 'empty',
+    );
+    final store = AppStore()..sessionId = 'session-outline';
+    await _pumpChat(tester, backend: backend, store: store);
+    await _scrollUp(tester);
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(find.textContaining('这个会话'), findsOneWidget,
+        reason: 'empty 必须有说明（评测 P2 反例：说明被 UI 排除）');
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('能力缺失：给出与"该会话无大纲"不同的明确说明', (tester) async {
+    final backend = _OutlineBackend(
+      sessionTurns: 6,
+      loadedTurns: 6,
+      supported: false,
+    );
+    final store = AppStore()..sessionId = 'session-outline';
+    await _pumpChat(tester, backend: backend, store: store);
+    await _scrollUp(tester);
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(find.textContaining('这台电脑'), findsOneWidget,
+        reason: 'capability-missing 必须有说明（评测 P2 反例：说明被 UI 排除）');
+    expect(tester.takeException(), isNull);
   });
 }

@@ -368,8 +368,13 @@ class _ChatScreenState extends State<ChatScreen> {
   // issue #25 二期：宿主轮次大纲（三态 + 读取失败态）。能力缺失/读取失败时退回一期
   // 「只用已加载轮次」，但必须把原因说明白（见 turnOutlineNotice）。
   TurnOutline _turnOutline = const TurnOutline.capabilityMissing();
+  // 是否**已经问过**（能力声明到达 / 请求返回）。没问过之前不得给"能力缺失"结论，
+  // 否则首帧就会对用户说"这台电脑不支持"（issue #25 评审 P2）。
+  bool _turnOutlineResolved = false;
   // 跨页跳转期间：用户主动滚动即取消（故事 18），说明文字只在他能看到刻度轨时给一次。
   bool _turnJumpCancelled = false;
+  // 导航世代：连续点选时旧操作不得覆盖新操作的落点 / busy / 提示（issue #25 评审 P2）。
+  int _turnNavGeneration = 0;
   bool _turnOutlineNoticeShown = false;
   final GlobalKey _liveViewportKey = GlobalKey(); // 阅读线基准：消息流视口
   QuestionRequest? _question; // 内核问询弹窗（当前会话，思考中途需要拍板）
@@ -791,7 +796,10 @@ class _ChatScreenState extends State<ChatScreen> {
         // issue #25 二期：大纲同属"这一条会话"，重建/切换后一并失效，
         // 否则旧会话的未加载刻度会短暂挂到新会话的刻度轨上（串台）。
         _turnOutline = const TurnOutline.capabilityMissing();
+        _turnOutlineResolved = false; // 还没问过新会话：不得据此给"能力缺失"结论
         _turnOutlineNoticeShown = false;
+        // 历史重建作废进行中的跳转：其落点/提示/busy 清理都不再对当前列表有效。
+        _turnNavGeneration += 1;
         _timelineReducer.reset();
         _transientFrameKeys.clear();
         _debugPreviewCache.clear(); // 重建后 rawData 全变，旧预览缓存无意义
@@ -986,10 +994,12 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _onLiveScroll(ScrollNotification n) {
     // issue #25 二期：跨页跳转进行中，用户主动滚动 = 取消本次跳转（故事 18）——
     // 只有带 dragDetails 的通知才是用户手势，自动滚动不受影响。
+    // 同时作废导航世代：旧的落点/提示/清理一律不得再动（评审 P2）。
     if (_busyTurn != null &&
         ((n is ScrollStartNotification && n.dragDetails != null) ||
             (n is ScrollUpdateNotification && n.dragDetails != null))) {
       _turnJumpCancelled = true;
+      _turnNavGeneration += 1;
     }
     if (shouldLoadOlderFromScroll(n, infiniteMode: _infiniteMode)) {
       _loadMoreInfinite();
@@ -1001,13 +1011,18 @@ class _ChatScreenState extends State<ChatScreen> {
 
   /// 拉取宿主轮次大纲。**先读能力声明**：声明不支持就不发请求，直接保留"能力缺失"态
   /// （退回一期行为），而不是把"能力缺失"和"这个会话没有轮次"混成一件事。
+  ///
+  /// 能力是**后到**的（首连/重连时序不定），所以会话打开、能力事件到达、历史重建后
+  /// 都会调用一次；世代 + 会话守卫保证迟到结果不会写回。
   Future<void> _refreshTurnOutline() async {
     final id = _mySessionId ?? widget.store.sessionId;
     if (id == null) return;
     if (!_api.turnOutlineCapabilities.supported) {
-      if (mounted) {
-        setState(() => _turnOutline = const TurnOutline.capabilityMissing());
-      }
+      if (!mounted) return;
+      setState(() {
+        _turnOutline = const TurnOutline.capabilityMissing();
+        _turnOutlineResolved = true;
+      });
       return;
     }
     final generation = _loadGeneration;
@@ -1015,39 +1030,57 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!mounted || generation != _loadGeneration || id != _mySessionId) return;
     setState(() {
       _turnOutline = outline;
+      _turnOutlineResolved = true;
       _turnOutlineNoticeShown = false; // 新大纲：允许再说明一次
     });
   }
 
   /// 刻度轨条目 = 已加载轮次 ∪ 宿主大纲（issue #25 两路合并）。
-  List<TurnTick> get _turnTicks =>
-      mergeTurnTicks(loaded: _turnAnchors, outline: _turnOutline.turns);
+  ///
+  /// 合并前先看**最新能力声明**：能力被撤销（换宿主 / 宿主降级）时旧大纲必须立刻失效，
+  /// 不能继续把上次连接拿到的大纲当成本机能力（issue #25 评审 P2）。
+  List<TurnTick> get _turnTicks => mergeTurnTicks(
+        loaded: _turnAnchors,
+        outline: _api.turnOutlineCapabilities.supported
+            ? _turnOutline.turns
+            : const [],
+      );
 
   /// 选中某一轮：已加载的直接定位（一期）；未加载的先跨页加载再定位（二期）。
+  ///
+  /// 每次选择都创建一个**导航世代**（issue #25 评审 P2）：连续点选时，旧操作的
+  /// 完成 / 提示 / 清理不得覆盖新操作的落点与 busy 状态；用户主动滚动与历史重建也会作废它。
   Future<void> _navigateToTurn(TurnAnchor anchor) async {
+    final token = ++_turnNavGeneration;
+    _turnJumpCancelled = false;
     final loaded =
         _turnAnchors.any((a) => a.turn == anchor.turn && a.seq == anchor.seq);
     if (loaded) {
+      // 已加载轮次的定位由 #24 修复改写为"按实际几何校正"；届时一并接入同一导航世代守卫，
+      // 这里先沿用既有定位（跨页那条路径已经按世代守卫，是评审反例里真正会抢落点的那条）。
       await _jumpToTurn(anchor);
       return;
     }
-    _turnJumpCancelled = false;
-    await _jumpToUnloadedTurn(anchor);
+    await _jumpToUnloadedTurn(anchor, token);
   }
+
+  /// 该导航世代是否仍有效（旧操作一律不得再改落点、状态或弹提示）。
+  bool _turnNavCurrent(int token) => mounted && token == _turnNavGeneration;
 
   /// 跳到"还没加载"的轮次：按 200 条/页**有界**地向前翻，直到覆盖该轮起始序号，
   /// 再走一期定位。翻页期间该齿脉冲；到顶/超预算/取消都**明确说明**。
-  Future<void> _jumpToUnloadedTurn(TurnAnchor anchor) async {
+  Future<void> _jumpToUnloadedTurn(TurnAnchor anchor, int token) async {
     setState(() => _busyTurn = anchor.turn);
     try {
       final pager = TurnPager(
         loadOlder: _loadOlderForTurnJump,
         snapshot: () =>
             TurnPageLoad(earliestSeq: _earliestSeq, hasMore: !_noMoreHistory),
-        isCancelled: () => _turnJumpCancelled,
+        // 用户主动滚动，或这次操作已被新选择/历史重建作废 → 取消。
+        isCancelled: () => _turnJumpCancelled || !_turnNavCurrent(token),
       );
       final outcome = await pager.jumpTo(targetSeq: anchor.seq);
-      if (!mounted) return;
+      if (!_turnNavCurrent(token) || !mounted) return;
       if (outcome == TurnJumpOutcome.covered) {
         final match = _turnAnchors.where((a) => a.turn == anchor.turn);
         if (match.isNotEmpty) {
@@ -1065,16 +1098,21 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
       final message = turnJumpOutcomeMessage(outcome, anchor.turn);
-      if (message != null) showToast(context, message);
+      if (message != null) {
+        showToast(context, message);
+      }
     } catch (e) {
-      if (mounted) {
+      if (mounted && _turnNavCurrent(token)) {
         showToast(
           context,
           '${L10n.t('跳转失败：', 'Jump failed: ')}$e',
         );
       }
     } finally {
-      if (mounted) setState(() => _busyTurn = null);
+      // 只有仍是当前操作才清 busy：旧操作的 finally 不得清掉新操作的脉冲。
+      if (mounted && _turnNavCurrent(token)) {
+        setState(() => _busyTurn = null);
+      }
     }
   }
 
@@ -1480,6 +1518,9 @@ class _ChatScreenState extends State<ChatScreen> {
     if (ev.type == '_capabilities') {
       // Bootstrap/SSE hello can arrive after history; rebuild detail affordances.
       setState(() {});
+      // issue #25 评审 P2：能力是**后到**的（首连/重连时序不定）。能力声明到达后补拉一次
+      // 大纲，否则"历史先完成、supported 稍后才变 true"就永远只有本地刻度。
+      unawaited(_refreshTurnOutline());
       return;
     }
     if (ev.type == '_catchup') {
@@ -3452,13 +3493,12 @@ class _ChatScreenState extends State<ChatScreen> {
       nearBottom: _pinnedToBottom,
       turnCount: turnTicks.length,
     );
-    // 阶梯被截断 / 大纲读取失败时，在用户**能看到刻度轨**时说明一次，不静默。
-    // 「能力缺失」与「该会话暂时没有大纲」不发提示：这两种情况下退回的一期行为本身
-    // 就是完整正确的，反复提示只会变成噪声（两种状态各自的说明文字见 turnOutlineNotice）。
-    final needsOutlineNotice =
-        _turnOutline.state == TurnOutlineState.available ||
-        _turnOutline.state == TurnOutlineState.readFailed;
-    if (showTurnRail && needsOutlineNotice && !_turnOutlineNoticeShown) {
+    // 阶梯被截断 / 读取失败 / 能力缺失 / 该会话无大纲：在用户**能看到刻度轨**时
+    // 各说明一次（四态文案互不相同，见 `turnOutlineNotice`），绝不静默。
+    // 评审 P2 指出：三态"给出不同说明"是正文与 ADR 的验收项，不能因为"退回一期本身
+    // 完整正确"就把 empty / capabilityMissing 的说明整个吞掉——用户需要知道为什么阶梯短。
+    // 只在**问过之后**才说明：首帧还没拿到能力声明时不得下"能力缺失"结论。
+    if (showTurnRail && _turnOutlineResolved && !_turnOutlineNoticeShown) {
       final notice = turnOutlineNotice(_turnOutline);
       if (notice != null) {
         _turnOutlineNoticeShown = true;
