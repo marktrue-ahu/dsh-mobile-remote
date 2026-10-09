@@ -168,6 +168,8 @@ if (typeof mod.apply === "function" && typeof mod.Config === "function") {
   const routes = [];
   const hooks = new Map();
   const wireWarnings = [];
+  const outlineObserved = [];
+  const outlineDisposed = [];
   const events = [
     { seq: 0, type: "request/header", data: { systemPrompt: "SECRET", toolSchema: "SECRET" } },
     { seq: 1, type: "user/message", data: { text: "inspect" } },
@@ -222,6 +224,36 @@ if (typeof mod.apply === "function" && typeof mod.Config === "function") {
         if (id === "session-seeded") return { events: seededSurface };
         if (id === "session-seeded-missing") return { events: [{ seq: 9, type: "future/other", data: {} }] };
         throw new Error("surface unavailable");
+      },
+      // issue #25 二期：投影感知观察面。宿主真实接口是
+      // `sessionQuery.observeSession(id, { projectionMode, signal })`，返回带 `.projections`
+      // （`{ asOfSeq, values }`）的 lease；App 侧刻度轨消费的正是 values.turnOutline。
+      async observeSession(id, options = {}) {
+        outlineObserved.push({ id, projectionMode: options.projectionMode, hasSignal: options.signal !== undefined });
+        const leaseOf = (projections) => ({
+          projections,
+          [Symbol.dispose]() { outlineDisposed.push(id); },
+        });
+        const outlineTurns = [
+          { turn: 1, seq: 0, prompt: "第一轮提示", response: "第一轮回复" },
+          { turn: 2, seq: 12, prompt: "", response: "纯命令轮的回复" },
+          { turn: 3, seq: 40, prompt: "第三轮提示", response: "" },
+        ];
+        if (id === "session-outline-ok") return leaseOf({ asOfSeq: 40, values: { turnOutline: outlineTurns } });
+        if (id === "session-outline-empty") return leaseOf({ asOfSeq: 3, values: { turnOutline: [] } });
+        if (id === "session-outline-no-unit") return leaseOf({ asOfSeq: 3, values: { title: "只有别的投影" } });
+        if (id === "session-outline-no-snapshot") return leaseOf(undefined);
+        if (id === "session-outline-huge") {
+          return leaseOf({
+            asOfSeq: 99_999,
+            values: { turnOutline: Array.from({ length: 3000 }, (_, index) => ({ turn: index + 1, seq: index, prompt: "P".repeat(50), response: "R".repeat(120) })) },
+          });
+        }
+        if (id === "session-outline-timeout") throw Object.assign(new Error("bounded wait expired"), { name: "TimeoutError" });
+        if (id === "session-outline-seeded") throw new Error("seeded session constructor seed must equal its inherited prefix");
+        if (id === "session-outline-corrupt") throw Object.assign(new Error("corrupt storage /private/session.zstd"), { code: "SESSION_QUERY_CORRUPT_SESSION" });
+        if (id === "session-outline-missing") throw Object.assign(new Error("missing storage path"), { code: "SESSION_QUERY_SESSION_NOT_FOUND" });
+        throw new Error("outline unavailable");
       },
     },
   };
@@ -285,6 +317,115 @@ if (typeof mod.apply === "function" && typeof mod.Config === "function") {
     const bootstrap = await call("/m/api/bootstrap");
     check("bootstrap 宣布 eventTimeline capability", bootstrap.json?.capabilities?.eventTimeline?.detail === true, `${bootstrap.json?.error ?? ''} ${wireWarnings.at(-1) ?? ''}`);
     check("bootstrap 下发 agentId→sessionId 映射", bootstrap.json?.agents?.[0]?.sessionId === "session-1" && bootstrap.json.agents[0].id === "session:session-1", JSON.stringify(bootstrap.json?.agents));
+    // issue #25 二期：轮次大纲能力位。宿主没挂投影时必须显式说"不支持"——App 据此退回一期行为，
+    // 不允许按宿主版本自行推断，也不允许把"能力缺失"与"该会话无大纲"混为一谈。
+    check(
+      "bootstrap 在宿主未挂 turnOutline 投影时声明 supported=false",
+      bootstrap.json?.capabilities?.turnOutline?.supported === false,
+      JSON.stringify(bootstrap.json?.capabilities?.turnOutline),
+    );
+    services.sessionProjections = {};
+    const bootstrapOutline = await call("/m/api/bootstrap");
+    check(
+      "bootstrap 在宿主挂了投影时声明 turnOutline 能力（unloaded/truncated）",
+      bootstrapOutline.json?.capabilities?.turnOutline?.supported === true
+        && bootstrapOutline.json.capabilities.turnOutline.unloaded === true
+        && bootstrapOutline.json.capabilities.turnOutline.truncated === true,
+      JSON.stringify(bootstrapOutline.json?.capabilities?.turnOutline),
+    );
+    // /turn-outline：只读契约。三态（能力缺失 / 该会话无大纲 / 可用）+ 读取失败态必须可区分。
+    const outlineUnauthorized = await call("/m/api/turn-outline?sessionId=session-outline-ok", { token: null });
+    check("turn-outline 缺 token 返回 401", outlineUnauthorized.statusCode === 401 && outlineUnauthorized.json?.error === "auth-required", JSON.stringify(outlineUnauthorized.json));
+    const outlineWrongHost = await call("/m/api/turn-outline?sessionId=session-outline-ok", { host: "evil.example:3080" });
+    check("turn-outline 非法 Host 返回 403", outlineWrongHost.statusCode === 403 && outlineWrongHost.json?.error === "host-not-allowed", JSON.stringify(outlineWrongHost.json));
+    const outlinePost = await call("/m/api/turn-outline?sessionId=session-outline-ok", { method: "POST" });
+    check("turn-outline 只接受 GET", outlinePost.statusCode === 405 && outlinePost.json?.error === "method-not-allowed", JSON.stringify(outlinePost.json));
+    const outlineNoSession = await call("/m/api/turn-outline");
+    check("turn-outline 缺 sessionId 返回 400", outlineNoSession.statusCode === 400 && outlineNoSession.json?.error === "bad-request", JSON.stringify(outlineNoSession.json));
+    const outlineOk = await call("/m/api/turn-outline?sessionId=session-outline-ok");
+    check(
+      "turn-outline 可用态：轮次升序、字段齐备、asOfSeq 透出",
+      outlineOk.json?.state === "available"
+        && outlineOk.json.turns?.length === 3
+        && outlineOk.json.turns.map((t) => t.turn).join(",") === "1,2,3"
+        && outlineOk.json.turns.every((t) => typeof t.seq === "number" && typeof t.prompt === "string" && typeof t.response === "string")
+        && outlineOk.json.asOfSeq === 40,
+      `${outlineOk.json?.error ?? ''} ${JSON.stringify(outlineOk.json)}`,
+    );
+    check(
+      "turn-outline 空提示词/空回复原样下发（App 侧回退「第 N 轮」）",
+      outlineOk.json?.turns?.[1]?.prompt === "" && outlineOk.json?.turns?.[2]?.response === "",
+      JSON.stringify(outlineOk.json?.turns),
+    );
+    check(
+      "turn-outline 走投影感知观察面（projectionMode=all + 有界 signal）",
+      outlineObserved.at(-1)?.id === "session-outline-ok"
+        && outlineObserved.at(-1)?.projectionMode === "all"
+        && outlineObserved.at(-1)?.hasSignal === true,
+      JSON.stringify(outlineObserved.at(-1)),
+    );
+    check("turn-outline 释放观察 lease（不泄漏 prepared 会话 pin）", outlineDisposed.includes("session-outline-ok"), JSON.stringify(outlineDisposed));
+    const outlineEmpty = await call("/m/api/turn-outline?sessionId=session-outline-empty");
+    check(
+      "turn-outline 该会话无大纲 → state=empty（与能力缺失区分，不靠空数组推断）",
+      outlineEmpty.statusCode === 200 && outlineEmpty.json?.state === "empty" && Array.isArray(outlineEmpty.json.turns) && outlineEmpty.json.turns.length === 0,
+      JSON.stringify(outlineEmpty.json),
+    );
+    const outlineNoUnit = await call("/m/api/turn-outline?sessionId=session-outline-no-unit");
+    check("turn-outline 投影单元未注册 → state=capability-missing", outlineNoUnit.json?.state === "capability-missing", JSON.stringify(outlineNoUnit.json));
+    const outlineNoSnapshot = await call("/m/api/turn-outline?sessionId=session-outline-no-snapshot");
+    check("turn-outline 观察面没有投影快照 → state=capability-missing", outlineNoSnapshot.json?.state === "capability-missing", JSON.stringify(outlineNoSnapshot.json));
+    const outlineHuge = await callSlow("/m/api/turn-outline?sessionId=session-outline-huge");
+    check(
+      "turn-outline 超体积上限只回最近 N 轮并显式标 truncated/dropped",
+      outlineHuge.json?.state === "available"
+        && outlineHuge.json.truncated === true
+        && outlineHuge.json.dropped > 0
+        && outlineHuge.json.turns.length < 3000
+        && outlineHuge.json.turns.at(-1).turn === 3000
+        && outlineHuge.json.turns[0].turn === 3000 - outlineHuge.json.turns.length + 1
+        && Buffer.byteLength(JSON.stringify(outlineHuge.json.turns)) <= 256 * 1024 + 64,
+      `${outlineHuge.statusCode} turns=${outlineHuge.json?.turns?.length} dropped=${outlineHuge.json?.dropped}`,
+    );
+    const outlineTimeout = await call("/m/api/turn-outline?sessionId=session-outline-timeout");
+    check(
+      "turn-outline 有界等待超时 → 明确降级结果（不静默、不无限等待）",
+      outlineTimeout.statusCode === 200
+        && outlineTimeout.json?.state === "read-failed"
+        && outlineTimeout.json.code === "turn-outline-timeout"
+        && outlineTimeout.json.degraded === true,
+      JSON.stringify(outlineTimeout.json),
+    );
+    const outlineSeeded = await call("/m/api/turn-outline?sessionId=session-outline-seeded");
+    check(
+      "turn-outline seeded 核心缺陷 → 显式降级而非 500",
+      outlineSeeded.statusCode === 200
+        && outlineSeeded.json?.state === "read-failed"
+        && outlineSeeded.json.code === "turn-outline-unavailable"
+        && outlineSeeded.json.degraded === true,
+      JSON.stringify(outlineSeeded.json),
+    );
+    const outlineCorrupt = await call("/m/api/turn-outline?sessionId=session-outline-corrupt");
+    check(
+      "turn-outline 会话损坏 → 稳定 500 session-corrupt 且不泄露原始错误",
+      outlineCorrupt.statusCode === 500
+        && outlineCorrupt.json?.error === "session-corrupt"
+        && !JSON.stringify(outlineCorrupt.json).includes("/private/session.zstd"),
+      JSON.stringify(outlineCorrupt.json),
+    );
+    const outlineMissing = await call("/m/api/turn-outline?sessionId=session-outline-missing");
+    check(
+      "turn-outline 明确不存在 → 404 session-not-found（只有这一种才 404）",
+      outlineMissing.statusCode === 404 && outlineMissing.json?.error === "session-not-found",
+      JSON.stringify(outlineMissing.json),
+    );
+    // 纯函数：截断按体积而不是轮数（12 轮的会话也可能只有 3 KB），且至少保留 1 轮。
+    check(
+      "clampTurnOutline 按体积从最新往回截断且至少保留 1 轮",
+      mod.clampTurnOutline(Array.from({ length: 100 }, (_, i) => ({ turn: i + 1, seq: i, prompt: "p".repeat(20), response: "r".repeat(20) })), 0).turns.length === 1
+        && mod.clampTurnOutline([{ turn: 1 }], 10).truncated === false,
+      JSON.stringify(mod.clampTurnOutline([{ turn: 1 }], 0)),
+    );
     const history = await call("/m/api/history?sessionId=session-1&after=0&limit=10");
     check("history 保留未知事件并过滤内部/chunk", history.json?.events?.some((e) => e.type === "future/visible") === true && !history.json?.events?.some((e) => ["assistant/chunk", "request/header", "system/message"].includes(e.type)), `${history.json?.error ?? ''} ${wireWarnings.at(-1) ?? ''}`);
     check("history 返回 hasMore/cursor", history.json?.hasMore === true && history.json?.after === history.json?.events?.at(-1)?.seq, `${JSON.stringify(history.json)} ${wireWarnings.at(-1) ?? ''}`);
