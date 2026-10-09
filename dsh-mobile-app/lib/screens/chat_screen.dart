@@ -20,6 +20,7 @@ import '../store.dart';
 import '../timeline.dart';
 import '../theme.dart';
 import '../turn_navigation.dart';
+import '../turn_outline.dart';
 import '../md.dart';
 import '../fmt.dart';
 import '../git_browser_controller.dart';
@@ -371,6 +372,19 @@ class _ChatScreenState extends State<ChatScreen> {
   final Map<int, double> _turnContentOffset = {};
   int? _activeTurn; // 当前阅读的轮次（刻度轨高亮）
   int? _busyTurn; // 跳转进行中的轮次（刻度脉冲）
+  // issue #25 二期：宿主轮次大纲（三态 + 读取失败态）。能力缺失/读取失败时退回一期
+  // 「只用已加载轮次」，但必须把原因说明白（见 turnOutlineNotice）。
+  TurnOutline _turnOutline = const TurnOutline.capabilityMissing();
+  // 是否**已经问过**（能力声明到达 / 请求返回）。没问过之前不得给"能力缺失"结论，
+  // 否则首帧就会对用户说"这台电脑不支持"（issue #25 评审 P2）。
+  bool _turnOutlineResolved = false;
+  // 跨页跳转期间：用户主动滚动即取消（故事 18），说明文字只在他能看到刻度轨时给一次。
+  bool _turnJumpCancelled = false;
+  // 导航世代：连续点选时旧操作不得覆盖新操作的落点 / busy / 提示（issue #25 评审 P2）。
+  int _turnNavGeneration = 0;
+  // 大纲刷新的请求身份：同一会话/同一历史世代下也会重叠多次刷新，迟到结果不得覆盖新结果。
+  int _turnOutlineRefreshId = 0;
+  bool _turnOutlineNoticeShown = false;
   bool _activeTurnCalibrationScheduled = false; // 滚动期间合并调度几何校准
   final GlobalKey _liveViewportKey = GlobalKey(); // 阅读线基准：消息流视口
   // 两条消息流列表（center 前后）的渲染对象：定位时用来遍历**已构建子项**的
@@ -770,8 +784,13 @@ class _ChatScreenState extends State<ChatScreen> {
   /// `SliverList`——屏幕外的轮次根本没有 element。所以先按目标真实子项序号做比例
   /// 兜底，再用已构建边界的**实测内容偏移**插值/割线外推逐帧校正；重试有界且受
   /// `kTurnLocateTimeoutMs` 硬截止，最终必须让目标**与视口相交**才算成功。
-  Future<void> _jumpToTurn(TurnAnchor anchor) async {
+  ///
+  /// [token] 是这次导航的世代（issue #25 评审 P2）：跨页跳转定位到目标、或被新选择
+  /// 取代时旧的定位不得再滚动视口 / 弹提示 / 清 busy。
+  Future<void> _jumpToTurn(TurnAnchor anchor, {int? token}) async {
     if (!_scrollCtrl.hasClients) return;
+    final generation = token ?? _turnNavGeneration;
+    bool current() => mounted && generation == _turnNavGeneration;
     // 统一走有界迭代定位：即使边界已构建也由定位器按实测几何落点，并以
     // "目标与视口相交"复核。此前"已构建就先走 ensureVisible 并直接 return"会在
     // prepend 等场景下静默不滚动（目标在缓存区、`ensureVisible` 未改变偏移），
@@ -782,7 +801,8 @@ class _ChatScreenState extends State<ChatScreen> {
       final childIndex = _contentIndexOfSeq(anchor.seq);
       final locator = TurnLocator(
         scrollTo: (offset) {
-          if (mounted && _scrollCtrl.hasClients) _scrollCtrl.jumpTo(offset);
+          // 世代失效后一律不得再滚动：这是"旧操作抢落点"的最后一道闸。
+          if (current() && _scrollCtrl.hasClients) _scrollCtrl.jumpTo(offset);
         },
         minScrollExtent: () =>
             _scrollCtrl.hasClients ? _scrollCtrl.position.minScrollExtent : 0,
@@ -808,7 +828,8 @@ class _ChatScreenState extends State<ChatScreen> {
         targetIndex: childIndex < 0 ? childCount - 1 : childIndex,
         childCount: childCount,
       );
-      if (!mounted || outcome.ok) return;
+      if (!current() || outcome.ok) return;
+      if (!mounted) return; // 让分析器认得 context 守卫（current() 已含 mounted）
       final message = switch (outcome.failure) {
         TurnLocateFailure.notInWindow => L10n.t(
             '未能定位到第 ${anchor.turn} 轮：它不在当前已加载范围内',
@@ -821,7 +842,7 @@ class _ChatScreenState extends State<ChatScreen> {
       };
       showToast(context, message);
     } finally {
-      if (mounted) setState(() => _busyTurn = null);
+      if (current()) setState(() => _busyTurn = null);
     }
   }
 
@@ -986,6 +1007,15 @@ class _ChatScreenState extends State<ChatScreen> {
         _turnOfStartSeq.clear(); // issue #24：条目重建后轮次索引一并失效
         _turnKeysBySeq.clear();
         _turnContentOffset.clear();
+        // issue #25 二期：大纲同属"这一条会话"，重建/切换后一并失效，
+        // 否则旧会话的未加载刻度会短暂挂到新会话的刻度轨上（串台）。
+        _turnOutline = const TurnOutline.capabilityMissing();
+        _turnOutlineResolved = false; // 还没问过新会话：不得据此给"能力缺失"结论
+        _turnOutlineNoticeShown = false;
+        // 历史重建作废进行中的跳转：其落点/提示/busy 清理都不再对当前列表有效；
+        // 已在 setState 内，这里直接清 busy（旧 finally 已因世代失效不再收尾）。
+        _turnNavGeneration += 1;
+        _busyTurn = null;
         _timelineReducer.reset();
         _transientFrameKeys.clear();
         _debugPreviewCache.clear(); // 重建后 rawData 全变，旧预览缓存无意义
@@ -1063,6 +1093,8 @@ class _ChatScreenState extends State<ChatScreen> {
       _scrollToBottom(force: true); // 初始定位到最新消息
       _refreshUsage();
       widget.store.refreshSessionConfig();
+      // issue #25 二期：会话打开后拉一次轮次大纲（能力缺失/读取失败都退回一期行为）。
+      unawaited(_refreshTurnOutline());
     } catch (e) {
       if (!mounted || generation != _loadGeneration || id != _mySessionId) {
         return;
@@ -1089,40 +1121,31 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   // ── 无限上翻（微信式） ──
-  /// 滑到 live 顶部时静默加载更早一页：追加到 center 之前的旧消息 sliver。
-  /// center 让顶部增长不会改变当前 viewport 锚点，视觉连续无缝（最新在底部）。
-  Future<void> _loadMoreInfinite() async {
+  /// 上翻一页的**共用实现**：页大小由调用方给——滚动上翻用 `_histPageSize`（30），
+  /// 轮次跨页跳转用 `kTurnJumpPageSize`（200，issue #25 要求不改动既有 30 条/页）。
+  Future<_PrependOutcome> _prependOlderPage({required int limit}) async {
     final id = _mySessionId ?? widget.store.sessionId;
     if (id == null || _loadingMore || _earliestSeq <= 0 || _noMoreHistory) {
-      return;
+      return _PrependOutcome.skipped;
     }
     _loadingMore = true;
     final generation = _loadGeneration;
-    AppLog.instance.log('Chat: 无限上翻 before=$_earliestSeq');
+    AppLog.instance.log('Chat: 上翻一页 before=$_earliestSeq limit=$limit');
     try {
       final page = await _api.historyPage(
         id,
         before: _earliestSeq,
-        limit: _histPageSize,
+        limit: limit,
       );
       final events = page.events;
       if (!mounted || generation != _loadGeneration || id != _mySessionId) {
-        return;
+        return _PrependOutcome.skipped;
       }
       // v3.1.6（app-audit ②）：降级标记在守卫之后才写——过期响应不得改写横幅状态
       if (page.degraded) _historyDegraded = true;
       if (events.isEmpty) {
         _noMoreHistory = true;
-        showToast(
-          context,
-          L10n.t(
-            _historyDegraded ? '更早历史不可恢复' : '没有更早的消息了',
-            _historyDegraded
-                ? 'Earlier history unavailable'
-                : 'No earlier messages',
-          ),
-        );
-        return; // 已到最顶：不再查询，_earliestSeq 保持不动
+        return _PrependOutcome.exhausted;
       }
       final pageItems = <_MsgItem>[];
       for (final ev in events) {
@@ -1135,23 +1158,197 @@ class _ChatScreenState extends State<ChatScreen> {
         _earliestSeq = events.first.seq ?? _earliestSeq;
       });
       AppLog.instance.log(
-        'Chat: 无限上翻完成 items=${_items.length + _olderItems.length} firstSeq=$_earliestSeq',
+        'Chat: 上翻完成 items=${_items.length + _olderItems.length} firstSeq=$_earliestSeq',
       );
+      return _PrependOutcome.loaded;
     } catch (e) {
-      AppLog.instance.log('Chat: 无限上翻失败 $e');
+      AppLog.instance.log('Chat: 上翻失败 $e');
+      return _PrependOutcome.failed;
     } finally {
       _loadingMore = false;
       if (mounted) setState(() {});
     }
   }
 
+  /// 滑到 live 顶部时静默加载更早一页：追加到 center 之前的旧消息 sliver。
+  /// center 让顶部增长不会改变当前 viewport 锚点，视觉连续无缝（最新在底部）。
+  Future<void> _loadMoreInfinite() async {
+    final outcome = await _prependOlderPage(limit: _histPageSize);
+    if (!mounted || outcome != _PrependOutcome.exhausted) return;
+    showToast(
+      context,
+      L10n.t(
+        _historyDegraded ? '更早历史不可恢复' : '没有更早的消息了',
+        _historyDegraded
+            ? 'Earlier history unavailable'
+            : 'No earlier messages',
+      ),
+    );
+  }
+
+  /// 跨页跳转专用上翻：页大小 200，且**不弹**"没有更早消息"——
+  /// 终止说明统一由 `turnJumpOutcomeMessage` 给出，避免两处口径。
+  Future<TurnPageLoad> _loadOlderForTurnJump() async {
+    // 滚动上翻可能正在加载同一页：先等它结束，避免两次 prepend 竞争同一游标。
+    var waited = 0;
+    while (_loadingMore && waited < 120 && mounted) {
+      await Future<void>.delayed(const Duration(milliseconds: 16));
+      waited += 1;
+    }
+    final outcome = await _prependOlderPage(limit: kTurnJumpPageSize);
+    // 到顶（exhausted）不是失败：如实回报"没有更早历史"，由跳转结果统一说明**不可达**。
+    // 但请求失败或没有取得任何进展（仍在加载）必须**显式失败**——否则跳转循环会
+    // 对着不变的 earliestSeq 一直空转到页数上限（最坏 32 次 × 等待）。
+    if (outcome == _PrependOutcome.failed || outcome == _PrependOutcome.skipped) {
+      throw StateError(L10n.t('未能继续加载更早历史', 'Could not load earlier history'));
+    }
+    return TurnPageLoad(earliestSeq: _earliestSeq, hasMore: !_noMoreHistory);
+  }
+
   /// 无限模式滚动监测：距视觉顶部 80px 内触发加载更早。
   /// v2.8.0：live 视图统一普通（非 reverse）列表，视觉顶部是 pixels≈0。
   bool _onLiveScroll(ScrollNotification n) {
+    // issue #25 二期：跨页跳转进行中，用户主动滚动 = 取消本次跳转（故事 18）——
+    // 只有带 dragDetails 的通知才是用户手势，自动滚动不受影响。
+    // 同时作废导航世代：旧的落点/提示/清理一律不得再动（第二轮评审 P2）。
+    if (_busyTurn != null &&
+        ((n is ScrollStartNotification && n.dragDetails != null) ||
+            (n is ScrollUpdateNotification && n.dragDetails != null))) {
+      _turnJumpCancelled = true;
+      _cancelTurnJumpVisual();
+    }
     if (shouldLoadOlderFromScroll(n, infiniteMode: _infiniteMode)) {
       _loadMoreInfinite();
     }
     return false;
+  }
+
+  /// 作废当前导航世代并**主动清掉它自己的"跳转中"视觉状态**。
+  ///
+  /// 世代守卫保证旧操作不再改落点，但正因为世代失效，旧操作的 `finally` 也不会再清
+  /// `_busyTurn`——取消入口必须自己收尾，否则该齿会一直脉冲（第二轮评审 P2）。
+  void _cancelTurnJumpVisual() {
+    _turnNavGeneration += 1;
+    if (_busyTurn != null) {
+      setState(() => _busyTurn = null);
+    }
+  }
+
+  // ── issue #25 二期：宿主轮次大纲 ───────────────────────────────────
+
+  /// 拉取宿主轮次大纲。**先读能力声明**：声明不支持就不发请求，直接保留"能力缺失"态
+  /// （退回一期行为），而不是把"能力缺失"和"这个会话没有轮次"混成一件事。
+  ///
+  /// 能力是**后到**的（首连/重连时序不定），所以会话打开、能力事件到达、历史重建后
+  /// 都会调用一次；**大纲刷新有独立请求身份**：同一会话、同一历史世代也会重叠多次
+  /// （能力事件与初始刷新并发），迟到的旧响应——无论成功还是失败——都不得覆盖新结果
+  /// （第二轮评审 P2）。历史世代/会话身份仍是第一道守卫。
+  Future<void> _refreshTurnOutline() async {
+    final id = _mySessionId ?? widget.store.sessionId;
+    if (id == null) return;
+    final requestId = ++_turnOutlineRefreshId;
+    if (!_api.turnOutlineCapabilities.supported) {
+      if (!mounted || requestId != _turnOutlineRefreshId) return;
+      setState(() {
+        _turnOutline = const TurnOutline.capabilityMissing();
+        _turnOutlineResolved = true;
+      });
+      return;
+    }
+    final generation = _loadGeneration;
+    final outline = await _api.turnOutline(id);
+    if (!mounted ||
+        generation != _loadGeneration ||
+        id != _mySessionId ||
+        requestId != _turnOutlineRefreshId) {
+      return; // 已有更新的刷新：旧结果（含失败）一律丢弃
+    }
+    setState(() {
+      _turnOutline = outline;
+      _turnOutlineResolved = true;
+      _turnOutlineNoticeShown = false; // 新大纲：允许再说明一次
+    });
+  }
+
+  /// 刻度轨条目 = 已加载轮次 ∪ 宿主大纲（issue #25 两路合并）。
+  ///
+  /// 合并前先看**最新能力声明**：能力被撤销（换宿主 / 宿主降级）时旧大纲必须立刻失效，
+  /// 不能继续把上次连接拿到的大纲当成本机能力（issue #25 评审 P2）。
+  List<TurnTick> get _turnTicks => mergeTurnTicks(
+        loaded: _turnAnchors,
+        outline: _api.turnOutlineCapabilities.supported
+            ? _turnOutline.turns
+            : const [],
+      );
+
+  /// 选中某一轮：已加载的直接定位（一期）；未加载的先跨页加载再定位（二期）。
+  ///
+  /// 每次选择都创建一个**导航世代**（issue #25 评审 P2）：连续点选时，旧操作的
+  /// 完成 / 提示 / 清理不得覆盖新操作的落点与 busy 状态；用户主动滚动与历史重建也会作废它。
+  Future<void> _navigateToTurn(TurnAnchor anchor) async {
+    final token = ++_turnNavGeneration;
+    _turnJumpCancelled = false;
+    final loaded =
+        _turnAnchors.any((a) => a.turn == anchor.turn && a.seq == anchor.seq);
+    if (loaded) {
+      // 一条路径到底：已加载轮次也走同一个世代守卫（#24 修复后 `_jumpToTurn` 支持 token），
+      // 连续点选时旧定位不得再把视口搬走。
+      await _jumpToTurn(anchor, token: token);
+      return;
+    }
+    await _jumpToUnloadedTurn(anchor, token);
+  }
+
+  /// 该导航世代是否仍有效（旧操作一律不得再改落点、状态或弹提示）。
+  bool _turnNavCurrent(int token) => mounted && token == _turnNavGeneration;
+
+  /// 跳到"还没加载"的轮次：按 200 条/页**有界**地向前翻，直到覆盖该轮起始序号，
+  /// 再走一期定位。翻页期间该齿脉冲；到顶/超预算/取消都**明确说明**。
+  Future<void> _jumpToUnloadedTurn(TurnAnchor anchor, int token) async {
+    setState(() => _busyTurn = anchor.turn);
+    try {
+      final pager = TurnPager(
+        loadOlder: _loadOlderForTurnJump,
+        snapshot: () =>
+            TurnPageLoad(earliestSeq: _earliestSeq, hasMore: !_noMoreHistory),
+        // 用户主动滚动，或这次操作已被新选择/历史重建作废 → 取消。
+        isCancelled: () => _turnJumpCancelled || !_turnNavCurrent(token),
+      );
+      final outcome = await pager.jumpTo(targetSeq: anchor.seq);
+      if (!_turnNavCurrent(token) || !mounted) return;
+      if (outcome == TurnJumpOutcome.covered) {
+        final match = _turnAnchors.where((a) => a.turn == anchor.turn);
+        if (match.isNotEmpty) {
+          await _jumpToTurn(match.first, token: token);
+          return;
+        }
+        // 序号已覆盖却取不到该轮边界（历史表面不连续）：如实说明，不静默。
+        showToast(
+          context,
+          L10n.t(
+            '已加载到第 ${anchor.turn} 轮附近，但未能定位到该轮',
+            'Loaded near turn ${anchor.turn} but could not locate it',
+          ),
+        );
+        return;
+      }
+      final message = turnJumpOutcomeMessage(outcome, anchor.turn);
+      if (message != null) {
+        showToast(context, message);
+      }
+    } catch (e) {
+      if (mounted && _turnNavCurrent(token)) {
+        showToast(
+          context,
+          '${L10n.t('跳转失败：', 'Jump failed: ')}$e',
+        );
+      }
+    } finally {
+      // 只有仍是当前操作才清 busy：旧操作的 finally 不得清掉新操作的脉冲。
+      if (mounted && _turnNavCurrent(token)) {
+        setState(() => _busyTurn = null);
+      }
+    }
   }
 
   /// 历史分段浏览 ──
@@ -1558,6 +1755,9 @@ class _ChatScreenState extends State<ChatScreen> {
     if (ev.type == '_capabilities') {
       // Bootstrap/SSE hello can arrive after history; rebuild detail affordances.
       setState(() {});
+      // issue #25 评审 P2：能力是**后到**的（首连/重连时序不定）。能力声明到达后补拉一次
+      // 大纲，否则"历史先完成、supported 稍后才变 true"就永远只有本地刻度。
+      unawaited(_refreshTurnOutline());
       return;
     }
     if (ev.type == '_catchup') {
@@ -3511,11 +3711,39 @@ class _ChatScreenState extends State<ChatScreen> {
 
     // issue #24：刻度轨只在"离开底部且有 ≥2 轮"时出现（复用 160px 判据，
     // 与"回到底部"圆钮同进同出；见 ADR 0018）。
-    final turnAnchors = _turnAnchors;
+    // issue #25 二期：刻度 = 已加载轮次 ∪ 宿主大纲；未加载的刻度短而淡、可跳转。
+    final turnTicks = _turnTicks;
+    final turnAnchors = [
+      for (final tick in turnTicks)
+        TurnAnchor(
+          turn: tick.turn,
+          seq: tick.seq,
+          prompt: tick.prompt,
+          response: tick.response,
+        ),
+    ];
+    final unloadedTurns = {
+      for (final tick in turnTicks)
+        if (!tick.loaded) tick.turn,
+    };
     final showTurnRail = shouldShowTurnRail(
       nearBottom: _pinnedToBottom,
-      turnCount: turnAnchors.length,
+      turnCount: turnTicks.length,
     );
+    // 阶梯被截断 / 读取失败 / 能力缺失 / 该会话无大纲：在用户**能看到刻度轨**时
+    // 各说明一次（四态文案互不相同，见 `turnOutlineNotice`），绝不静默。
+    // 评审 P2 指出：三态"给出不同说明"是正文与 ADR 的验收项，不能因为"退回一期本身
+    // 完整正确"就把 empty / capabilityMissing 的说明整个吞掉——用户需要知道为什么阶梯短。
+    // 只在**问过之后**才说明：首帧还没拿到能力声明时不得下"能力缺失"结论。
+    if (showTurnRail && _turnOutlineResolved && !_turnOutlineNoticeShown) {
+      final notice = turnOutlineNotice(_turnOutline);
+      if (notice != null) {
+        _turnOutlineNoticeShown = true;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) showToast(context, notice);
+        });
+      }
+    }
     // 条目增删/分页会改变几何：本帧结束后校准"当前轮"。
     // 只在取值变化时 setState，因此会收敛，不会自激。
     WidgetsBinding.instance.addPostFrameCallback((_) => _updateActiveTurn());
@@ -3626,9 +3854,10 @@ class _ChatScreenState extends State<ChatScreen> {
                         padding: const EdgeInsets.only(right: 12),
                         child: TurnNavigatorRail(
                           anchors: turnAnchors,
+                          unloadedTurns: unloadedTurns,
                           activeTurn: _activeTurn,
                           busyTurn: _busyTurn,
-                          onNavigate: (anchor) => unawaited(_jumpToTurn(anchor)),
+                          onNavigate: (anchor) => unawaited(_navigateToTurn(anchor)),
                         ),
                       ),
                     ),
@@ -4927,6 +5156,9 @@ class _ChatScreenState extends State<ChatScreen> {
 
 // ── 消息模型 ──
 enum _MsgKind { user, assistant, divider, tool, event }
+
+/// 上翻一页的结果（issue #25：滚动上翻与跨页跳转共用同一实现，但提示口径不同）。
+enum _PrependOutcome { loaded, exhausted, skipped, failed }
 
 class _MsgItem {
   final _MsgKind kind;
