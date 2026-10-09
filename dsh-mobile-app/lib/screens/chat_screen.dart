@@ -370,6 +370,11 @@ class _ChatScreenState extends State<ChatScreen> {
   // 已构建边界最后一次实测的**内容偏移**（turn → offset）：边界被懒构建回收后，
   // 仍能用它推断阅读线落在哪一轮（长回复场景不再无条件回退到最新轮）。
   final Map<int, double> _turnContentOffset = {};
+  /// issue #31（方案 B）：**条目尺寸缓存**——已构建子项的实测高度，按稳定 key
+  /// （`seq` 优先，工具卡用 `latestSeq`）记录。定位时用它算"索引 → 偏移"的估算，
+  /// 这是本体虚拟化列表 `getOffsetForIndex` 的等价物：长跳一步落到目标附近，
+  /// 而不是盲二分十几次（真机上第 2 轮离底部约 2900 个条目）。
+  final Map<int, double> _itemHeights = {};
   int? _activeTurn; // 当前阅读的轮次（刻度轨高亮）
   int? _busyTurn; // 跳转进行中的轮次（刻度脉冲）
   // issue #25 二期：宿主轮次大纲（三态 + 读取失败态）。能力缺失/读取失败时退回一期
@@ -758,11 +763,20 @@ class _ChatScreenState extends State<ChatScreen> {
         if (local == null || !child.hasSize) continue;
         final contentIndex = contentOrderReversed ? count - 1 - local : local;
         final offset = pixels + (child.localToGlobal(Offset.zero).dy - viewTop);
+        final index = base + contentIndex;
+        final height = child.size.height;
         out.add(BuiltChildMeasurement(
-          index: base + contentIndex,
+          index: index,
           offset: offset,
-          height: child.size.height,
+          height: height,
         ));
+        // issue #31（方案 B）：顺手把实测高度回填进尺寸缓存（key 稳定，prepend/
+        // 加载条出现都不会错位）。缓存只增不改，超过上限时整体清空重建。
+        final stableKey = _itemKeyAtIndex(index);
+        if (stableKey != null && height > 0) {
+          if (_itemHeights.length > 6000) _itemHeights.clear();
+          _itemHeights[stableKey] = height;
+        }
       }
     }
 
@@ -776,6 +790,72 @@ class _ChatScreenState extends State<ChatScreen> {
     collect(_liveSliverKey, _olderItems.length,
         count: _items.length, contentOrderReversed: false);
     return out;
+  }
+
+  /// 内容索引 → 该子项的**稳定尺寸缓存 key**（`seq` 优先，工具卡用 `latestSeq`）。
+  ///
+  /// 「更早」按钮 / 加载条 / 草稿不是消息，返回 null（它们不参与尺寸缓存）。
+  int? _itemKeyAtIndex(int index) {
+    if (index < 0) return null;
+    _MsgItem? item;
+    if (index < _olderItems.length) {
+      item = _olderItems[_olderItems.length - 1 - index];
+    } else {
+      final base = _olderItems.length + (_olderButtonVisible ? 1 : 0);
+      final local = index - base;
+      if (local < 0) return null; // 首项按钮 / 加载条
+      final i = _items.length - 1 - local;
+      if (i >= 0 && i < _items.length) item = _items[i];
+    }
+    return item == null ? null : (item.seq ?? item.latestSeq);
+  }
+
+  /// 内容索引 → 该子项**顶部的内容偏移估算**（issue #31 方案 B）。
+  ///
+  /// 本体虚拟化列表用 `itemSizeCache + estimateSize` 做 `getOffsetForIndex`；这里用
+  /// 等价的两段式估算：
+  ///   `已缓存条目的实测高度和 + 平均高度 × 未缓存条目数`
+  /// 平均高度优先取缓存实测均值（热缓存下很准），冷缓存退化为
+  /// `(maxScrollExtent - minScrollExtent) / childCount` 的比例估算——**仍远优于盲二分**
+  /// （目标在 20% 处就估 20%，而不是先跳 50%）。返回 null 表示无法估算，定位器会退回
+  /// 区间二分/割线估算。
+  double? _estimateOffsetForIndex(int targetIndex) {
+    if (targetIndex <= 0) return 0;
+    if (!_scrollCtrl.hasClients) return null;
+    final childCount = _contentChildCount;
+    if (childCount <= 0) return null;
+
+    var cachedBeforeSum = 0.0;
+    var cachedBeforeCount = 0;
+    for (var index = 0; index < targetIndex; index++) {
+      final key = _itemKeyAtIndex(index);
+      final height = key == null ? null : _itemHeights[key];
+      if (height != null && height > 0) {
+        cachedBeforeSum += height;
+        cachedBeforeCount += 1;
+      }
+    }
+
+    var average = 0.0;
+    if (_itemHeights.isNotEmpty) {
+      var total = 0.0;
+      var count = 0;
+      for (final height in _itemHeights.values) {
+        if (height > 0) {
+          total += height;
+          count += 1;
+        }
+      }
+      if (count > 0) average = total / count;
+    }
+    if (average <= 0) {
+      final extent = _scrollCtrl.position.maxScrollExtent -
+          _scrollCtrl.position.minScrollExtent;
+      if (extent <= 0) return null;
+      average = extent / childCount;
+    }
+    if (!average.isFinite || average <= 0) return null;
+    return cachedBeforeSum + average * (targetIndex - cachedBeforeCount);
   }
 
   /// 跳转到某一轮：**按实测几何校正的有界迭代定位**。
@@ -821,6 +901,8 @@ class _ChatScreenState extends State<ChatScreen> {
         reveal: () => _revealTurnKey(_turnKeysBySeq[anchor.seq]),
         measure: _measureTurnBoundaries,
         measureBuilt: _measureBuiltChildren,
+        // issue #31（方案 B）：尺寸缓存给出的"索引 → 偏移"估算（本体 getOffsetForIndex 的等价物）。
+        estimateOffsetForIndex: _estimateOffsetForIndex,
         settle: () => WidgetsBinding.instance.endOfFrame,
       );
       final outcome = await locator.locate(
@@ -1016,6 +1098,9 @@ class _ChatScreenState extends State<ChatScreen> {
         // 已在 setState 内，这里直接清 busy（旧 finally 已因世代失效不再收尾）。
         _turnNavGeneration += 1;
         _busyTurn = null;
+        // issue #31：条目重建（会话切换/重同步）后尺寸缓存一并失效——同一 seq 的高度
+        // 在新一轮渲染里可能不同（流式结束、折叠状态变化），留着会给出错的估算。
+        _itemHeights.clear();
         _timelineReducer.reset();
         _transientFrameKeys.clear();
         _debugPreviewCache.clear(); // 重建后 rawData 全变，旧预览缓存无意义

@@ -464,4 +464,80 @@ void main() {
       expect(dy, lessThan(viewport.size.height));
     });
   });
+
+  // issue #31（方案 B）：尺寸缓存给出的"索引 → 偏移"估算应当**优先于盲二分**。
+  group('TurnLocator：索引→偏移估算（尺寸缓存）', () {
+    test('首个探针直接用估算值，而不是二分中点', () async {
+      final probes = <double>[];
+      var built = const <BuiltChildMeasurement>[];
+      final locator = TurnLocator(
+        scrollTo: probes.add,
+        minScrollExtent: () => 0,
+        maxScrollExtent: () => 100000,
+        currentOffset: () => probes.isEmpty ? 100000 : probes.last,
+        viewportExtent: () => 600,
+        isTargetLoaded: () => true,
+        isTargetBuilt: () => false,
+        // 估算值 20000 附近即视为进入视口（阅读线内缩 10% 视口高）。
+        isTargetInView: () =>
+            probes.isNotEmpty && (probes.last - 20000).abs() < 600,
+        reveal: () async {},
+        measure: () => const [],
+        measureBuilt: () => built,
+        estimateOffsetForIndex: (index) => index == 40 ? 20000.0 : null,
+        settle: () async {
+          // 落点之后目标附近变成"已构建"，后续走精确对准。
+          built = const [
+            BuiltChildMeasurement(index: 40, offset: 20000, height: 100),
+          ];
+        },
+      );
+
+      final outcome = await locator.locate(
+        targetTurn: 2,
+        targetIndex: 40,
+        childCount: 100,
+      );
+
+      expect(outcome.ok, isTrue);
+      expect(probes.first, 20000.0,
+          reason: '估算可用时应一步落到目标附近，而不是先跳到区间中点（50000）');
+      expect(probes.length, lessThanOrEqualTo(2), reason: '查表式估算让长跳 1–2 步收敛');
+    });
+
+    test('估算落在搜索区间之外时被拒绝（退回实测区间）', () async {
+      final probes = <double>[];
+      // 一个实测子项把下界抬到 60000；估算值 1000 低于下界 → 已被证伪，不得采用。
+      var built = const [
+        BuiltChildMeasurement(index: 10, offset: 60000, height: 100),
+      ];
+      final locator = TurnLocator(
+        scrollTo: probes.add,
+        minScrollExtent: () => 0,
+        maxScrollExtent: () => 100000,
+        currentOffset: () => probes.isEmpty ? 100000 : probes.last,
+        viewportExtent: () => 600,
+        isTargetLoaded: () => true,
+        isTargetBuilt: () => false,
+        isTargetInView: () => probes.isNotEmpty && probes.last >= 99000,
+        reveal: () async {},
+        measure: () => const [],
+        measureBuilt: () => built,
+        estimateOffsetForIndex: (index) => 1000.0,
+        settle: () async {
+          built = const [
+            BuiltChildMeasurement(index: 10, offset: 60000, height: 100),
+            BuiltChildMeasurement(index: 90, offset: 99000, height: 100),
+          ];
+        },
+      );
+
+      await locator.locate(targetTurn: 8, targetIndex: 80, childCount: 100);
+
+      expect(probes.contains(1000.0), isFalse,
+          reason: '估算值低于实测下界 60000，已被证伪，不得采用');
+      expect(probes.every((p) => p >= 60000), isTrue,
+          reason: '落点必须尊重实测区间下界');
+    });
+  });
 }

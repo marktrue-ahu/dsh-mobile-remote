@@ -442,4 +442,60 @@ void main() {
       });
     }
   });
+
+  // ── issue #31：真机缺陷「长会话里跳不到早期轮次」──
+  // 真机会话只有 10 轮却有 ~2967 个条目（每轮含大量工具调用与长回复），第 2 轮在最上方；
+  // 旧的 6 次尝试预算 + 盲二分在 3000 条目下跳不到。
+  group('缺陷 7（issue #31）：长会话里跳早期轮次', () {
+    testWidgets('3000 条目从底部跳第 2 轮：进入视口且探针次数很少', (tester) async {
+      final backend = _Backend(initialEvents: _turnEvents(1, 1000, replyRepeat: 2));
+      await _pumpChat(tester, backend: backend);
+      await _leaveBottom(tester);
+
+      final offsets = await _navigateTo(tester, 2);
+
+      expect(_textInViewport(tester, '问题 2'), isTrue,
+          reason: '长会话里第 2 轮必须真的进入视口（真机报「多次尝试后仍未进入视图」）');
+      expect(offsets.length, lessThanOrEqualTo(6),
+          reason: '尺寸缓存 + 索引估算应让长跳在少数几步内收敛，而不是靠 24 次硬试');
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('同一会话第二次跳转更快（尺寸缓存已热）', (tester) async {
+      final backend = _Backend(initialEvents: _turnEvents(1, 1000, replyRepeat: 2));
+      await _pumpChat(tester, backend: backend);
+      await _leaveBottom(tester);
+
+      await _navigateTo(tester, 2);
+      final second = await _navigateTo(tester, 3);
+
+      expect(_textInViewport(tester, '问题 3'), isTrue);
+      expect(second.length, lessThanOrEqualTo(3),
+          reason: '热缓存下第二次长跳应在 1–3 步内到位');
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('条目高度极不均匀（长回复按块穿插）时也收敛', (tester) async {
+      final events = <Map<String, dynamic>>[];
+      for (var block = 0; block < 10; block++) {
+        final from = block * 60 + 1;
+        events.addAll(_turnEvents(
+          from,
+          from + 59,
+          replyRepeat: 2,
+          longTurn: from + 30,
+          longRepeat: 400,
+        ));
+      }
+      final backend = _Backend(initialEvents: events);
+      await _pumpChat(tester, backend: backend);
+      await _leaveBottom(tester);
+
+      await _navigateTo(tester, 2);
+
+      expect(_textInViewport(tester, '问题 2'), isTrue,
+          reason: '全局平均高度完全不可用时也要收敛（靠实测几何校正）');
+      expect(tester.takeException(), isNull);
+    });
+  });
 }

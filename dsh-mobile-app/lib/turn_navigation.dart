@@ -191,8 +191,16 @@ double estimateTurnOffset({
   return minScrollExtent + (maxScrollExtent - minScrollExtent) * ratio;
 }
 
-/// 有界迭代定位的最大尝试次数：有界，避免病态布局下无限抖动。
-const int kTurnLocateMaxAttempts = 6;
+/// 有界迭代定位的最大尝试次数。
+///
+/// **为什么是 24**（issue #31 真机缺陷）：没有尺寸缓存时，目标在很远处的定位退化为
+/// 区间二分，需要约 `log2(条目数)` 步——3000 条要 ~12 步，旧的 6 步会以
+/// 「多次尝试后仍未进入视图」失败（真机上第 2 轮离底部约 2900 个条目）。现在
+/// [TurnLocator.estimateOffsetForIndex] 提供了"索引→偏移"的估算（本体虚拟化列表
+/// `getOffsetForIndex` 的等价物），常见长跳 1–3 步即收敛；24 步只是**冷缓存 + 条目
+/// 高度极端不均匀**时的兜底。区间只收不放、落点重复即转降级搜索，因此多给预算不会
+/// 死循环，只是给收敛留够余量。
+const int kTurnLocateMaxAttempts = 24;
 
 /// 跳转进行中允许的最大时长（毫秒），超时按「未能定位」明说。
 ///
@@ -386,6 +394,7 @@ class TurnLocator {
     required this.measure,
     required this.settle,
     this.measureBuilt = _noBuiltChildren,
+    this.estimateOffsetForIndex,
     this.currentOffset = _zeroExtent,
     this.viewportExtent = _zeroExtent,
     this.maxAttempts = kTurnLocateMaxAttempts,
@@ -425,6 +434,17 @@ class TurnLocator {
   ///
   /// 未接线时返回空列表，定位退回 [measure] 的轮次边界估算（旧行为）。
   final List<BuiltChildMeasurement> Function() measureBuilt;
+
+  /// 内容索引 → **该子项顶部的内容偏移估算**（issue #31 方案 B）。
+  ///
+  /// 这是本体虚拟化列表 `getOffsetForIndex` 的等价物：页面侧用"条目尺寸缓存"（已构建
+  /// 子项的实测高度，按稳定 key 记录）+ 平均值兜底算前缀高度和，因此**不必先跳过去**
+  /// 就能估出目标的偏移。冷缓存时它退化为 `extent / childCount` 的比例估算（仍远优于
+  /// 盲二分：目标在 20% 处就估 20%，而不是先跳 50%）。
+  ///
+  /// 返回值只在"可信"时才被采用：必须严格落在当前搜索区间 `(lo, hi)` 内；否则退回
+  /// 区间二分等既有策略。落点之后仍以实测几何校正，估算错了也不会跑偏。
+  final double? Function(int index)? estimateOffsetForIndex;
 
   /// 等待一帧，让新落点处的条目完成构建与布局。
   final Future<void> Function() settle;
@@ -593,14 +613,25 @@ class TurnLocator {
       final frac = span <= 0 ? 0.5 : (targetIndex - i0) / span;
       return beforeOffset + (afterOffset - beforeOffset) * frac.clamp(0.0, 1.0);
     }
+    // 尺寸缓存的"索引→偏移"估算：目标在很远处的常见情形下比盲二分准得多。
+    // 只在严格落在区间 (lo, hi) 内时采用——区间外说明估算已被实测证伪。
+    final estimate = estimateOffsetForIndex?.call(targetIndex);
+    final usableEstimate = estimate != null &&
+        estimate.isFinite &&
+        estimate > lo &&
+        (hi == null || estimate < hi);
     if (afterOffset != null) {
-      // 目标在实测点上方：在区间下界与该点之间二分（下界可能是列表顶端）。
+      // 目标在实测点上方：优先用估算，否则在区间下界与该点之间二分（下界可能是列表顶端）。
+      if (usableEstimate) return estimate;
       return (lo + afterOffset) / 2;
     }
     if (beforeOffset != null) {
       final upper = hi ?? max;
+      // 目标在实测点下方：估算必须在实测点之下才有意义。
+      if (usableEstimate && estimate > beforeOffset) return estimate;
       return upper > lo ? (lo + upper) / 2 : lo;
     }
+    if (usableEstimate) return estimate;
     return estimateTurnOffsetFromMeasurements(
       targetTurn: targetTurn,
       measurements: boundaries,
