@@ -545,6 +545,65 @@ if (typeof mod.apply === "function" && typeof mod.Config === "function") {
       release3();
       await running3;
       await queued3;
+
+      // 预取消 signal：在容量判断**之前**就拒，不白占队列条目（第二轮评审 P3）。
+      const queue4 = mod.createTurnOutlineQueue({ maxQueue: 1 });
+      let release4;
+      const gate4 = new Promise((resolve) => { release4 = resolve; });
+      const running4 = queue4.run(async () => { await gate4; });
+      const pre = new AbortController();
+      pre.abort(Object.assign(new Error("already aborted"), { name: "AbortError" }));
+      let preError;
+      let preRan = false;
+      await queue4
+        .run(async () => { preRan = true; }, { signal: pre.signal })
+        .catch((error) => { preError = error; });
+      let liveAccepted = true;
+      const live = queue4.run(async () => "live").catch(() => { liveAccepted = false; });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      check(
+        "有界队列：预取消 signal 立即被拒且不占容量（后续有效任务不被挤成 busy）",
+        preError?.name === "AbortError" && preRan === false && queue4.pending === 1 && liveAccepted === true,
+        `pre=${preError?.name} ran=${preRan} pending=${queue4.pending}`,
+      );
+      release4();
+      await running4;
+      await live;
+
+      // 有界等待：响应与工作分离（第二轮评审 P1）。
+      if (typeof mod.raceWithDeadline === "function") {
+        let resolveWork;
+        const work = new Promise((resolve) => { resolveWork = resolve; });
+        const settledFirst = await mod.raceWithDeadline(
+          Promise.resolve("done"),
+          { deadlineMs: 200 },
+        );
+        check(
+          "raceWithDeadline：工作先完成 → settled",
+          settledFirst.status === "settled" && settledFirst.value === "done",
+          JSON.stringify(settledFirst),
+        );
+        const lateValues = [];
+        const timedOut = await mod.raceWithDeadline(work, { deadlineMs: 30, onLate: (value) => lateValues.push(value) });
+        check("raceWithDeadline：到截止时间 → timedOut（不回写成功）", timedOut.status === "timedOut", JSON.stringify(timedOut));
+        check("raceWithDeadline：截止时迟到的结果尚未处理（工作仍在进行）", lateValues.length === 0, JSON.stringify(lateValues));
+        resolveWork("late-lease");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        check(
+          "raceWithDeadline：底层完成后把迟到结果交给 onLate（用于 dispose 迟到 lease）",
+          lateValues.length === 1 && lateValues[0] === "late-lease",
+          JSON.stringify(lateValues),
+        );
+        const preAborted = new AbortController();
+        preAborted.abort();
+        const timedOutBySignal = await mod.raceWithDeadline(new Promise(() => {}), {
+          deadlineMs: 5000,
+          signal: preAborted.signal,
+        });
+        check("raceWithDeadline：已取消的 signal → 立即 timedOut", timedOutBySignal.status === "timedOut", JSON.stringify(timedOutBySignal));
+      } else {
+        check("导出 raceWithDeadline", false, "missing export");
+      }
     } else {
       check("导出 createTurnOutlineQueue", false, "missing export");
     }
@@ -563,6 +622,114 @@ if (typeof mod.apply === "function" && typeof mod.Config === "function") {
         }).supported === true,
       "capability probe mismatch",
     );
+
+    // ── 端点级定时/取消测试（第二轮评审 P1/P2）──
+    // 两个**独立实例**（各自一个执行槽，互不排队干扰）；截止时间压到 60ms 以便门禁里做定时断言。
+    const { EventEmitter } = await import("node:events");
+    const buildTimedInstance = () => {
+      const observed = [];
+      const disposed = [];
+      let release;
+      const hangGate = new Promise((resolve) => { release = resolve; });
+      const servicesT = {
+        sessions: { get: () => undefined, list: () => [] },
+        agents: { get: () => undefined, list: () => [] },
+        sessionProjections: { registrations: new Map([["turnOutline", {}]]) },
+        sessionQuery: {
+          async observeSession(id, options) {
+            observed.push({ id, signal: options?.signal });
+            // 不合作观察：完全不看 signal，只有测试放行才结束。
+            if (id.startsWith("hang")) await hangGate;
+            return {
+              projections: { asOfSeq: 1, values: { turnOutline: [] } },
+              [Symbol.dispose]() { disposed.push(id); },
+            };
+          },
+        },
+      };
+      const routesT = [];
+      const ctxT = {
+        logger: { info() {}, warn() {}, error() {}, debug() {} },
+        get: (name) => servicesT[name],
+        on: () => () => {},
+        inject() {},
+        provide() {},
+        effect(fn) { const dispose = fn(); return typeof dispose === "function" ? dispose : () => {}; },
+        waterfall: async (_name, _args, next) => next(),
+        webServer: { host: "127.0.0.1", port: 3080, register(route) { routesT.push(route); return () => {}; } },
+      };
+      mod.apply(ctxT, mod.Config({
+        path: "/m",
+        authToken: "secret-secret-secret-1234",
+        pushUrls: [],
+        lanBridge: { enabled: false },
+        turnOutlineTimeoutMs: 60,
+      }));
+      return { route: routesT.find((r) => r.path === "/m/api"), observed, disposed, release: () => release() };
+    };
+    const timedCall = async (route, url, attempts = 200) => {
+      const res = response();
+      route?.handler(request(url), res);
+      for (let i = 0; i < attempts && !res.ended; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+      return res;
+    };
+
+    const timedA = buildTimedInstance();
+    const slowRes = await timedCall(timedA.route, "/m/api/turn-outline?sessionId=hang-slow");
+    check(
+      "端点级：执行中的不合作观察也在截止时间回 turn-outline-timeout（不无限等待）",
+      slowRes.ended && slowRes.json?.code === "turn-outline-timeout" && slowRes.json?.state === "read-failed",
+      JSON.stringify(slowRes.json),
+    );
+    check("端点级：响应已结束但观察仍未结束（迟到 lease 尚未释放）", timedA.disposed.length === 0, JSON.stringify(timedA.disposed));
+    timedA.release();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    check("端点级：迟到 lease 在底层完成后被释放（不泄漏 pin、不回写成功）", timedA.disposed.length === 1, JSON.stringify(timedA.disposed));
+    const afterLate = await timedCall(timedA.route, "/m/api/turn-outline?sessionId=ok-after");
+    check(
+      "端点级：迟到观察结束后执行槽释放，后续请求正常成功",
+      afterLate.json?.state === "empty",
+      JSON.stringify(afterLate.json),
+    );
+
+    const timedB = buildTimedInstance();
+    const reqB = Object.assign(new EventEmitter(), {
+      url: "/m/api/turn-outline?sessionId=hang-disconnect",
+      method: "GET",
+      headers: { host: "127.0.0.1:3080", "x-mobile-token": "secret-secret-secret-1234" },
+      socket: { remoteAddress: "127.0.0.1" },
+      pause() {},
+      resume() {},
+    });
+    const resB = Object.assign(new EventEmitter(), {
+      statusCode: 0,
+      headersSent: false,
+      writableEnded: false,
+      ended: false,
+      writeHead(status) { this.statusCode = status; this.headersSent = true; },
+      setHeader() {},
+      write() { return true; },
+      end() { this.writableEnded = true; this.ended = true; },
+      destroy() { this.ended = true; },
+    });
+    timedB.route.handler(reqB, resB);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const signalBefore = timedB.observed.at(-1)?.signal;
+    check(
+      "端点级：断开前观察拿到的 signal 未 aborted（正常请求不误判为断开）",
+      signalBefore !== undefined && signalBefore.aborted === false,
+      `signal=${signalBefore === undefined ? "missing" : signalBefore.aborted}`,
+    );
+    reqB.emit("aborted");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    check(
+      "端点级：客户端断开 → 观察的 signal 被 abort（不再白占唯一执行槽）",
+      timedB.observed.at(-1)?.signal?.aborted === true,
+      `aborted=${timedB.observed.at(-1)?.signal?.aborted}`,
+    );
+    timedB.release();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    check("端点级：断开后迟到 lease 仍被释放", timedB.disposed.length === 1, JSON.stringify(timedB.disposed));
     const history = await call("/m/api/history?sessionId=session-1&after=0&limit=10");
     check("history 保留未知事件并过滤内部/chunk", history.json?.events?.some((e) => e.type === "future/visible") === true && !history.json?.events?.some((e) => ["assistant/chunk", "request/header", "system/message"].includes(e.type)), `${history.json?.error ?? ''} ${wireWarnings.at(-1) ?? ''}`);
     check("history 返回 hasMore/cursor", history.json?.hasMore === true && history.json?.after === history.json?.events?.at(-1)?.seq, `${JSON.stringify(history.json)} ${wireWarnings.at(-1) ?? ''}`);
