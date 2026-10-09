@@ -9,6 +9,7 @@
 //
 // 复用 `turn_navigation_chat_test.dart` 的假后端注入先例。
 
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:dsh_mobile_app/api.dart';
@@ -80,6 +81,10 @@ class _Backend {
 
   final List<Map<String, dynamic>> initialEvents;
   final List<Map<String, dynamic>> olderEvents;
+
+  /// 置上时，带 `before` 的上翻请求会挂起（用于让加载条保持可见）。
+  Completer<http.Response>? olderGate;
+
   late final Api api = Api(client: MockClient(_handle))
     ..baseUrl = 'http://review.test'
     ..path = '/m'
@@ -97,6 +102,8 @@ class _Backend {
     Map<String, dynamic> body;
     if (request.url.path == '/m/api/history') {
       final older = request.url.queryParameters.containsKey('before');
+      final gate = olderGate;
+      if (older && gate != null) return gate.future;
       body = {
         'ok': true,
         'events': older ? olderEvents : initialEvents,
@@ -116,6 +123,13 @@ class _Backend {
     );
   }
 }
+
+/// 空的上翻页（放行挂起的请求用）。
+http.Response _emptyPage() => http.Response(
+      jsonEncode({'ok': true, 'events': <Object>[], 'hasMore': false}),
+      200,
+      headers: {'content-type': 'application/json; charset=utf-8'},
+    );
 
 Future<void> _pumpChat(
   WidgetTester tester, {
@@ -371,5 +385,61 @@ void main() {
       expect(_textInViewport(tester, '问题 1'), isTrue,
           reason: 'prepend 后最早的已加载轮次必须真的进入视口');
     });
+  });
+
+  // ── 第二轮评审 note 1080：加载条让实测索引比目标坐标系多 1 ──
+  group('缺陷 6：加载条不得让实测索引与目标错位', () {
+    for (final pending in [false, true]) {
+      testWidgets('上翻在途（pending=$pending）时，已加载目标仍进入视口', (tester) async {
+        final gate = Completer<http.Response>();
+        final backend = _Backend(
+          initialEvents: _turnEvents(1, 8, longTurn: 3, longRepeat: 2400),
+          olderEvents: _turnEvents(1, 2),
+        )..olderGate = gate;
+        await _pumpChat(tester, backend: backend);
+
+        // 滑到顶部触发上翻：请求挂起时 live sliver 首项就是加载条。
+        final position = _position(tester);
+        position.jumpTo(0);
+        await tester.pump();
+        for (var i = 0; i < 6; i++) {
+          await tester.pump(const Duration(milliseconds: 50));
+        }
+        if (!pending) {
+          // 对照：让上翻先完成，加载条消失。
+          gate.complete(_emptyPage());
+          for (var i = 0; i < 6; i++) {
+            await tester.pump(const Duration(milliseconds: 50));
+          }
+          expect(gate.isCompleted, isTrue);
+        } else {
+          expect(gate.isCompleted, isFalse, reason: '加载条应保持可见');
+        }
+
+        // 定位期间用有界 pump（加载条的动画会让 pumpAndSettle 永不收敛）。
+        final target = _rail(tester).anchors.firstWhere((a) => a.turn == 4);
+        _rail(tester).onNavigate(target);
+        for (var i = 0; i < 30; i++) {
+          await tester.pump(const Duration(milliseconds: 40));
+        }
+
+        // ignore: avoid_print
+        print('TURNLOC pending=$pending turn=4 pixels=${position.pixels} '
+            'max=${position.maxScrollExtent}');
+
+        expect(_textInViewport(tester, '问题 4'), isTrue,
+            reason: pending
+                ? '加载条显示时测量索引必须与目标同一坐标系（此前多算一项，跳成前一条消息）'
+                : '对照：加载条消失后同样必须进入视口（防止过度纠正）');
+
+        if (!gate.isCompleted) {
+          gate.complete(_emptyPage());
+          for (var i = 0; i < 10; i++) {
+            await tester.pump(const Duration(milliseconds: 60));
+          }
+        }
+        expect(tester.takeException(), isNull);
+      });
+    }
   });
 }
