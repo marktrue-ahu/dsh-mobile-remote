@@ -24,6 +24,25 @@ const double _kTickPitch = 10;
 const double _kBarWidth = 20;
 const double _kBarHeight = 2;
 
+/// 单个刻度的条宽缩放：当前轮最长，被预览的次之，**未加载的更短**（短淡刻度），
+/// 其余短而淡。抽成纯函数，好让"未加载轮次在视觉上确实更弱"这条契约能被单测钉死，
+/// 而不是只写在 build 里靠肉眼。
+double turnTickScale({
+  required bool active,
+  required bool previewed,
+  required bool unloaded,
+}) =>
+    active
+        ? 1.0
+        : previewed
+            ? 0.9
+            : unloaded
+                ? 0.4
+                : 0.6;
+
+/// 单个刻度在"非当前/非预览"时的透明度：未加载刻度更淡。
+double turnTickAlpha({required bool unloaded}) => unloaded ? 0.3 : 0.55;
+
 /// 轨道两端的内边距（避免首尾刻度贴边）。
 const double _kRailInset = 6;
 
@@ -40,12 +59,19 @@ class TurnNavigatorRail extends StatefulWidget {
     required this.activeTurn,
     required this.busyTurn,
     required this.onNavigate,
+    this.unloadedTurns = const <int>{},
     this.width = 28,
     this.maxHeight = 420,
   });
 
-  /// 已加载轮次（按轮次号升序）。少于 2 轮时不渲染。
+  /// 全部刻度（已加载轮次 + 宿主大纲的并集，按轮次号升序）。
+  ///
+  /// 二期的未加载轮次由调用方合并进来：它没有已加载锚点，但带着大纲锚点序号
+  /// 与预览文字，因此可以跳转（跳转时先跨页加载）。少于 2 轮时不渲染。
   final List<TurnAnchor> anchors;
+
+  /// 尚未加载的轮次号（短而淡的刻度；点它先跨页加载再定位）。
+  final Set<int> unloadedTurns;
 
   /// 当前阅读的轮次（高亮）。
   final int? activeTurn;
@@ -266,6 +292,7 @@ class _TurnNavigatorRailState extends State<TurnNavigatorRail>
                     active: anchor.turn == widget.activeTurn,
                     busy: anchor.turn == widget.busyTurn,
                     previewed: anchor.turn == _previewTurn,
+                    unloaded: widget.unloadedTurns.contains(anchor.turn),
                     pulse: _pulse,
                   ),
                 ),
@@ -356,12 +383,17 @@ class _TickBar extends StatelessWidget {
     required this.active,
     required this.busy,
     required this.previewed,
+    required this.unloaded,
     required this.pulse,
   });
 
   final bool active;
   final bool busy;
   final bool previewed;
+
+  /// 未加载轮次：短而淡，与"已在本地可读"的刻度在视觉上区分。
+  final bool unloaded;
+
   final Animation<double> pulse;
 
   @override
@@ -370,13 +402,13 @@ class _TickBar extends StatelessWidget {
         ? DshColors.ink(context)
         : previewed
             ? DshColors.ink2(context)
-            : DshColors.ink3(context).withValues(alpha: 0.55);
-    // 当前轮最长最亮；被预览的次之；其余短而淡（见 ADR 0018 的刻度态说明）。
-    final double scale = active
-        ? 1.0
-        : previewed
-            ? 0.9
-            : 0.6;
+            : DshColors.ink3(context).withValues(alpha: turnTickAlpha(unloaded: unloaded));
+    // 当前轮最长最亮；被预览的次之；未加载的更短；其余短而淡（见 ADR 0018 的刻度态说明）。
+    final double scale = turnTickScale(
+      active: active,
+      previewed: previewed,
+      unloaded: unloaded,
+    );
 
     Widget bar = Container(
       width: _kBarWidth * scale,
