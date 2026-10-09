@@ -1,0 +1,275 @@
+// issue #24：评审 5 项缺陷的**永久回归测试**（第一轮 #1054 / 复核 #1065）。
+//
+// 这些用例是把评审留在 /tmp 的临时反例转正而来，断言的是**用户可观察结果**：
+//   1. 不等高会话里，已加载的中间轮次跳转后**真的进入视口**（不只是被构建）；
+//   2. 超长刻度轨的边缘扫掠 / 初次可见见 `turn_navigator_rail_test.dart`；
+//   3. 持续滚动时当前轮高亮跟随（含长回复导致边界被回收的情形）；
+//   4. 非真人注入不抢占提示词预览、纯图片轮回退「第 N 轮」；
+//   5. 同轮号不同 seq 的重复边界不再共用 GlobalKey（不再出现渲染断言）。
+//
+// 复用 `turn_navigation_chat_test.dart` 的假后端注入先例。
+
+import 'dart:convert';
+
+import 'package:dsh_mobile_app/api.dart';
+import 'package:dsh_mobile_app/models.dart';
+import 'package:dsh_mobile_app/screens/chat_screen.dart';
+import 'package:dsh_mobile_app/store.dart';
+import 'package:dsh_mobile_app/widgets/turn_navigator_rail.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+
+/// 按 turn 生成时间线事件；seq 由轮次号推导，保证多页拼接时全局一致。
+List<Map<String, dynamic>> _turnEvents(
+  int fromTurn,
+  int toTurn, {
+  int replyRepeat = 40,
+  int? longTurn,
+  int longRepeat = 2400,
+  bool injected = false,
+  bool duplicateFirstBoundary = false,
+  bool imageOnlyFirstTurn = false,
+}) {
+  final out = <Map<String, dynamic>>[];
+  final stride = injected ? 4 : 3;
+  var seq = (fromTurn - 1) * stride + 1;
+  for (var turn = fromTurn; turn <= toTurn; turn++) {
+    out.add({'seq': seq++, 'type': 'turn/start', 'data': {'turn': turn}});
+    if (duplicateFirstBoundary && turn == fromTurn) {
+      out.add({'seq': seq++, 'type': 'turn/start', 'data': {'turn': turn}});
+    }
+    if (injected) {
+      out.add({
+        'seq': seq++,
+        'type': 'user/message',
+        'data': {
+          'messageId': 'injected-$turn',
+          'sourceKind': 'agent-instructions',
+          'text': '注入指令 $turn',
+        },
+      });
+    }
+    final imageOnly = imageOnlyFirstTurn && turn == fromTurn;
+    out.add({
+      'seq': seq++,
+      'type': 'user/message',
+      'data': {
+        'messageId': 'user-$turn',
+        'sourceKind': 'user',
+        'text': imageOnly ? '' : '问题 $turn',
+      },
+    });
+    out.add({
+      'seq': seq++,
+      'type': 'assistant/message',
+      'data': {
+        'messageId': 'assistant-$turn',
+        'turn': turn,
+        'text': '回答 $turn ' * (longTurn == turn ? longRepeat : replyRepeat),
+      },
+    });
+  }
+  return out;
+}
+
+class _Backend {
+  _Backend({required this.initialEvents, this.olderEvents = const []});
+
+  final List<Map<String, dynamic>> initialEvents;
+  final List<Map<String, dynamic>> olderEvents;
+  late final Api api = Api(client: MockClient(_handle))
+    ..baseUrl = 'http://review.test'
+    ..path = '/m'
+    ..token = ''
+    ..timelineCapabilities = const TimelineCapabilities(
+      version: 1,
+      live: true,
+      history: true,
+      detail: true,
+      unknownEvents: true,
+      callCorrelation: true,
+    );
+
+  Future<http.Response> _handle(http.Request request) async {
+    Map<String, dynamic> body;
+    if (request.url.path == '/m/api/history') {
+      final older = request.url.queryParameters.containsKey('before');
+      body = {
+        'ok': true,
+        'events': older ? olderEvents : initialEvents,
+        'hasMore': false,
+      };
+    } else if (request.url.path == '/m/api/queue') {
+      body = {'ok': true, 'rows': <Object>[]};
+    } else if (request.url.path == '/m/api/todos') {
+      body = {'ok': true, 'todos': <Object>[]};
+    } else {
+      body = {'ok': true};
+    }
+    return http.Response(
+      jsonEncode(body),
+      200,
+      headers: {'content-type': 'application/json; charset=utf-8'},
+    );
+  }
+}
+
+Future<void> _pumpChat(
+  WidgetTester tester, {
+  required _Backend backend,
+  String sessionId = 'review-session',
+}) async {
+  await tester.pumpWidget(MaterialApp(
+    home: ChatScreen(
+      store: AppStore()..sessionId = sessionId,
+      apiClient: backend.api,
+      onTitleChanged: () {},
+    ),
+  ));
+  await tester.pump(const Duration(milliseconds: 350));
+  await tester.pumpAndSettle();
+}
+
+ScrollPosition _position(WidgetTester tester) => tester
+    .state<ScrollableState>(
+      find.descendant(
+        of: find.byType(CustomScrollView),
+        matching: find.byType(Scrollable),
+      ),
+    )
+    .position;
+
+TurnNavigatorRail _rail(WidgetTester tester) =>
+    tester.widget<TurnNavigatorRail>(find.byType(TurnNavigatorRail));
+
+/// 该文本当前是否与消息流视口相交（"已构建"不等于"看得见"）。
+bool _textInViewport(WidgetTester tester, String text) {
+  final view = tester.getRect(find.byType(CustomScrollView));
+  final finder = find.text(text);
+  if (finder.evaluate().isEmpty) return false;
+  return finder.evaluate().any((e) => view.overlaps(tester.getRect(finder)));
+}
+
+void main() {
+  group('缺陷 1：不等高已加载轮次必须真正进入视口', () {
+    testWidgets('首轮超长回复 + prepend 之后再定位第 4 轮，目标在视口内', (tester) async {
+      // 初始窗口只有第 3..8 轮；更早的第 1..2 轮等上翻时再 prepend。
+      final backend = _Backend(
+        initialEvents: _turnEvents(3, 8, longTurn: 4, longRepeat: 2400),
+        olderEvents: _turnEvents(1, 2),
+      );
+      await _pumpChat(tester, backend: backend);
+
+      // 滚到顶部触发无限上翻（prepend 更早的两轮），同时离开底部让刻度轨出现。
+      _position(tester).jumpTo(0);
+      await tester.pumpAndSettle();
+      expect(find.byType(TurnNavigatorRail), findsOneWidget);
+      expect(_rail(tester).anchors.length, 8,
+          reason: 'prepend 之后已加载窗口应包含 1..8 轮');
+
+      final target = _rail(tester).anchors.firstWhere((a) => a.turn == 4);
+      _rail(tester).onNavigate(target);
+      await tester.pumpAndSettle();
+
+      expect(tester.takeException(), isNull);
+      expect(_textInViewport(tester, '问题 4'), isTrue,
+          reason: '目标轮必须真的与视口相交，而不是只停留在已构建范围');
+    });
+  });
+
+  group('缺陷 3：当前轮高亮跟随持续滚动', () {
+    testWidgets('离开底部区间内跨多轮滚动，高亮跟随', (tester) async {
+      final backend = _Backend(initialEvents: _turnEvents(1, 8));
+      await _pumpChat(tester, backend: backend);
+
+      _position(tester).jumpTo(0);
+      await tester.pumpAndSettle();
+      expect(find.byType(TurnNavigatorRail), findsOneWidget);
+      expect(_rail(tester).activeTurn, 1);
+
+      final max = _position(tester).maxScrollExtent;
+      _position(tester).jumpTo(max * 0.55);
+      await tester.pumpAndSettle();
+      expect(_rail(tester).activeTurn, isNot(1),
+          reason: '始终在 160px 阈值外，滚动本身也必须触发几何校准');
+    });
+
+    testWidgets('长回复导致起始边界被回收时，用可见轮次推断而不跳到最新轮', (tester) async {
+      // 第 3 轮回复极长：进入其中段后，第 3 轮起始边界会被懒构建回收。
+      final backend =
+          _Backend(initialEvents: _turnEvents(1, 6, longTurn: 3, longRepeat: 2600));
+      await _pumpChat(tester, backend: backend);
+
+      _position(tester).jumpTo(0);
+      await tester.pumpAndSettle();
+      expect(find.byType(TurnNavigatorRail), findsOneWidget);
+
+      final target = _rail(tester).anchors.firstWhere((a) => a.turn == 3);
+      _rail(tester).onNavigate(target);
+      await tester.pumpAndSettle();
+      expect(_rail(tester).activeTurn, 3);
+
+      // 深入长回复 1500px：起始边界被回收，但高亮应仍是第 3 轮（不是第 6 轮）。
+      _position(tester).jumpTo(_position(tester).pixels + 1500);
+      await tester.pumpAndSettle();
+      expect(_rail(tester).activeTurn, 3,
+          reason: '边界未构建时应按阅读线推断，不能无条件回退到最新轮');
+    });
+  });
+
+  group('缺陷 4：注入消息不抢占真人提示词预览', () {
+    testWidgets('agent-instructions 先于真人问题时，预览是真人那句', (tester) async {
+      final backend = _Backend(initialEvents: _turnEvents(1, 6, injected: true));
+      await _pumpChat(tester, backend: backend);
+
+      _position(tester).jumpTo(0);
+      await tester.pumpAndSettle();
+      final anchors = _rail(tester).anchors;
+      expect(anchors.first.prompt, '问题 1');
+    });
+
+    testWidgets('纯图片轮（无文本）预览回退为「第 N 轮」', (tester) async {
+      final backend = _Backend(initialEvents: _turnEvents(1, 3, imageOnlyFirstTurn: true));
+      await _pumpChat(tester, backend: backend);
+
+      _position(tester).jumpTo(0);
+      await tester.pumpAndSettle();
+      expect(_rail(tester).anchors.first.prompt, isEmpty);
+
+      // 长按第一个刻度：气泡回退为「第 1 轮」。
+      final gesture = await tester.startGesture(
+        tester.getCenter(find.byKey(const ValueKey('turn-tick-1'))),
+      );
+      await tester.pump(kLongPressTimeout + const Duration(milliseconds: 50));
+      await tester.pump();
+      expect(
+        find.descendant(
+          of: find.byType(TurnNavigatorRail),
+          matching: find.text('第 1 轮'),
+        ),
+        findsOneWidget,
+      );
+      await gesture.up();
+      await tester.pump();
+    });
+  });
+
+  group('缺陷 5：同号重试边界不共用 GlobalKey', () {
+    testWidgets('同一轮号两个相邻 turn/start 不触发渲染断言', (tester) async {
+      final backend = _Backend(
+        initialEvents: _turnEvents(1, 6, duplicateFirstBoundary: true),
+      );
+      await _pumpChat(tester, backend: backend);
+      _position(tester).jumpTo(0);
+      await tester.pumpAndSettle();
+
+      expect(tester.takeException(), isNull,
+          reason: '两个同轮号、不同 seq 的边界不得共用同一个 GlobalKey');
+      // 折叠去重：同号边界只产生一个刻度。
+      expect(find.byKey(const ValueKey('turn-tick-1')), findsOneWidget);
+    });
+  });
+}

@@ -14,6 +14,7 @@ import 'package:dsh_mobile_app/models.dart';
 import 'package:dsh_mobile_app/screens/chat_screen.dart';
 import 'package:dsh_mobile_app/store.dart';
 import 'package:dsh_mobile_app/widgets/turn_navigator_rail.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -179,7 +180,7 @@ void main() {
         reason: '定位后该轮应进入已构建范围');
   });
 
-  testWidgets('刻度轨不是滚动死区：在轨道上拖动会扫掠轮次并落点', (tester) async {
+  testWidgets('刻度轨不是滚动死区：沿轨扫掠出预览并落到所指轮次', (tester) async {
     final backend = _TurnBackend(turns: 6);
     final store = AppStore()..sessionId = 'session-turns';
     await _pumpChat(tester, backend: backend, store: store);
@@ -188,24 +189,35 @@ void main() {
     expect(find.byType(TurnNavigatorRail), findsOneWidget);
 
     // 刻度轨用 opaque 命中（2px 的刻度条对拇指太小），因此它必须**消费**竖直拖动，
-    // 否则右侧 28px 会变成一条什么都不做的死区。此处断言这个手势有实际效果：
-    // 拖动过程中出预览，松手落在所指轮次。
-    final railCenter = tester.getCenter(find.byType(TurnNavigatorRail));
-    final gesture = await tester.startGesture(railCenter);
-    await gesture.moveBy(const Offset(0, 24));
+    // 否则右侧 28px 会变成一条什么都不做的死区。这里把它钉死为两条可观察结果：
+    // 扫掠中浮出**具体那一轮**的预览；松手落在预览所指轮次，且目标真的进入视口。
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.byKey(const ValueKey<String>('turn-tick-2'))),
+    );
+    await tester.pump(kLongPressTimeout + const Duration(milliseconds: 50));
     await tester.pump();
+    expect(
+      find.descendant(
+        of: find.byType(TurnNavigatorRail),
+        matching: find.text('第 2 轮的问题'),
+      ),
+      findsOneWidget,
+      reason: '扫掠中必须浮出该轮的提示词预览（不是"没有异常就算过"）',
+    );
 
-    // 拖动中应出现某一轮的预览（提示词或「第 N 轮」回退）。
-    final previewVisible = find
-        .byType(IgnorePointer)
-        .evaluate()
-        .any((e) => e.widget is IgnorePointer) &&
-        tester.any(find.textContaining('轮'));
-    expect(previewVisible || tester.takeException() == null, isTrue);
-
+    await gesture.moveTo(
+      tester.getCenter(find.byKey(const ValueKey<String>('turn-tick-4'))),
+    );
+    await tester.pump();
     await gesture.up();
     await tester.pumpAndSettle();
+
     expect(tester.takeException(), isNull);
+    final viewport = tester.getRect(find.byType(CustomScrollView));
+    final landed = find.text('第 4 轮的问题');
+    expect(landed, findsOneWidget, reason: '松手后目标轮应已构建');
+    expect(viewport.overlaps(tester.getRect(landed)), isTrue,
+        reason: '落点是"目标与视口相交"，不只是已构建');
   });
 
   testWidgets('消息流本身仍可正常上翻（轨道之外的滚动不受影响）', (tester) async {

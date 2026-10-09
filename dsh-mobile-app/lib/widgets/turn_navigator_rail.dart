@@ -9,8 +9,10 @@
 // 本组件只负责呈现与手势，不决定何时可见、也不做定位——那两件事分别由
 // `shouldShowTurnRail` 与聊天页的定位循环负责（见 ADR 0018）。
 
+import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../l10n.dart';
@@ -48,6 +50,12 @@ const double _kRailInset = 6;
 
 /// 轨内滚动到两端时的渐隐带宽。
 const double _kFadeBand = 24;
+
+/// 扫掠指针进入上/下边缘多少像素内触发轨内自动滚动。
+const double _kEdgeBand = 24;
+
+/// 边缘自动滚动的推进步距（每帧一个刻度步距）。
+const Duration _kEdgeTickInterval = Duration(milliseconds: 16);
 
 /// 预览气泡宽度上限（与电脑端一致：至多 300，且不超过容器宽度减 120）。
 const double _kPreviewMaxWidth = 300;
@@ -99,6 +107,15 @@ class _TurnNavigatorRailState extends State<TurnNavigatorRail>
   /// 是否处于长按扫掠中（决定松手是落点还是取消、以及是否让出自动跟随）。
   bool _scrubbing = false;
 
+  /// 边缘自动滚动的按帧定时器（仅在扫掠贴近轨道上/下沿时运行）。
+  Timer? _edgeTimer;
+
+  /// 扫掠指针最近一次的轨内 y：按住不动时靠它持续推进滚动 + 预览。
+  double? _lastScrubLocalY;
+
+  /// 上一次布局的可用高度：高度变化也要重新保证当前轮可见。
+  double? _lastFrameHeight;
+
   late final AnimationController _pulse = AnimationController(
     vsync: this,
     duration: const Duration(milliseconds: 1000),
@@ -108,16 +125,27 @@ class _TurnNavigatorRailState extends State<TurnNavigatorRail>
   void initState() {
     super.initState();
     _syncPulse();
+    // 初次布局就要把当前轮带进视野（不能只在 activeTurn 变化时做）。
+    _scheduleRevealActive();
   }
 
   @override
   void didUpdateWidget(covariant TurnNavigatorRail oldWidget) {
     super.didUpdateWidget(oldWidget);
     _syncPulse();
-    // 当前轮变化时把它滚进视野；扫掠期间不移动轨道（不把手底下的东西抽走）。
-    if (!_scrubbing && oldWidget.activeTurn != widget.activeTurn) {
-      WidgetsBinding.instance.addPostFrameCallback((_) => _revealActive());
+    // 当前轮变化、或锚点集合变化（分页 / 二期阶梯带来的刻度数变化）时把它滚进视野；
+    // 扫掠期间不移动轨道（不把手底下的东西抽走）。
+    final anchorsChanged = !listEquals(oldWidget.anchors, widget.anchors);
+    if (!_scrubbing &&
+        (oldWidget.activeTurn != widget.activeTurn || anchorsChanged)) {
+      _scheduleRevealActive();
     }
+  }
+
+  void _scheduleRevealActive() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _revealActive();
+    });
   }
 
   void _syncPulse() {
@@ -131,6 +159,7 @@ class _TurnNavigatorRailState extends State<TurnNavigatorRail>
 
   @override
   void dispose() {
+    _stopEdgeScroll();
     _pulse.dispose();
     _railCtrl.dispose();
     super.dispose();
@@ -173,6 +202,75 @@ class _TurnNavigatorRailState extends State<TurnNavigatorRail>
     setState(() => _previewTurn = turn);
   }
 
+  /// 开始扫掠（长按或沿轨拖动）。
+  void _beginScrub(double localY) {
+    _stopEdgeScroll();
+    setState(() => _scrubbing = true);
+    _updateScrub(localY);
+  }
+
+  /// 扫掠中：更新预览；指针贴近上/下沿时启动轨内自动滚动。
+  void _updateScrub(double localY) {
+    _lastScrubLocalY = localY;
+    _setPreviewFromLocalY(localY);
+    _maybeEdgeScroll();
+  }
+
+  /// 结束扫掠：停止滚动的副作用，然后按预览落点。
+  void _endScrub() {
+    _stopEdgeScroll();
+    _lastScrubLocalY = null;
+    _commitPreview();
+  }
+
+  /// 指针停在边缘时启动按帧推进；已启动或是死区时什么也不做。
+  void _maybeEdgeScroll() {
+    if (!_scrubbing || _edgeTimer != null || !_railCtrl.hasClients) return;
+    final y = _lastScrubLocalY;
+    if (y == null) return;
+    final viewport = _railCtrl.position.viewportDimension;
+    if (y >= _kEdgeBand && y <= viewport - _kEdgeBand) return;
+    _edgeTimer = Timer.periodic(_kEdgeTickInterval, (_) => _edgeScrollTick());
+  }
+
+  /// 一帧的边缘滚动：推进 `_railCtrl` 并用同一指针 y 刷新预览（按住不动也能连续扫）。
+  void _edgeScrollTick() {
+    if (!mounted || !_scrubbing || !_railCtrl.hasClients) {
+      _stopEdgeScroll();
+      return;
+    }
+    final y = _lastScrubLocalY;
+    if (y == null) {
+      _stopEdgeScroll();
+      return;
+    }
+    final viewport = _railCtrl.position.viewportDimension;
+    final double direction;
+    if (y < _kEdgeBand) {
+      direction = -1;
+    } else if (y > viewport - _kEdgeBand) {
+      direction = 1;
+    } else {
+      _stopEdgeScroll();
+      return;
+    }
+    final maxOffset = math.max(0.0, _contentHeight - viewport);
+    final next = (_railCtrl.offset + direction * _kTickPitch)
+        .clamp(0.0, maxOffset)
+        .toDouble();
+    if ((next - _railCtrl.offset).abs() < 0.5) {
+      _stopEdgeScroll(); // 已到轨道尽头，再推也没有新刻度
+      return;
+    }
+    _railCtrl.jumpTo(next);
+    _setPreviewFromLocalY(y);
+  }
+
+  void _stopEdgeScroll() {
+    _edgeTimer?.cancel();
+    _edgeTimer = null;
+  }
+
   void _commitPreview() {
     final turn = _previewTurn;
     setState(() {
@@ -187,6 +285,8 @@ class _TurnNavigatorRailState extends State<TurnNavigatorRail>
 
   /// 手势被抢走：清掉预览，不落点。
   void _cancelScrub() {
+    _stopEdgeScroll();
+    _lastScrubLocalY = null;
     if (_previewTurn == null && !_scrubbing) return;
     setState(() {
       _previewTurn = null;
@@ -210,6 +310,11 @@ class _TurnNavigatorRailState extends State<TurnNavigatorRail>
           math.max(0.0, available - 64),
         );
         if (frameHeight < _kTickPitch * 2) return const SizedBox.shrink();
+        if (_lastFrameHeight != frameHeight) {
+          _lastFrameHeight = frameHeight;
+          // 可用高度变化会改变可见刻度区间：重新保证当前轮可见。
+          if (!_scrubbing) _scheduleRevealActive();
+        }
 
         final overflow = _contentHeight > frameHeight;
         final preview = _previewTurn == null
@@ -237,23 +342,16 @@ class _TurnNavigatorRailState extends State<TurnNavigatorRail>
                     widget.onNavigate(widget.anchors[index]);
                   },
                   // 沿轨拖动直接进入扫掠（不必先长按）：这是"死区"的正解——
-                  // 同样的手势在别处滚动消息流，在轨道上则扫掠轮次。
-                  onVerticalDragStart: (d) {
-                    setState(() => _scrubbing = true);
-                    _setPreviewFromLocalY(d.localPosition.dy);
-                  },
-                  onVerticalDragUpdate: (d) =>
-                      _setPreviewFromLocalY(d.localPosition.dy),
-                  onVerticalDragEnd: (_) => _commitPreview(),
+                  // 同样的手势在别处滚动消息流，在轨道上则扫掠轮次；贴近边缘时
+                  // 还会按帧推进轨内滚动，从而浏览被裁出的刻度。
+                  onVerticalDragStart: (d) => _beginScrub(d.localPosition.dy),
+                  onVerticalDragUpdate: (d) => _updateScrub(d.localPosition.dy),
+                  onVerticalDragEnd: (_) => _endScrub(),
                   onVerticalDragCancel: _cancelScrub,
                   // 长按原地不动也能预览（拖动识别器要等位移才生效）。
-                  onLongPressStart: (d) {
-                    setState(() => _scrubbing = true);
-                    _setPreviewFromLocalY(d.localPosition.dy);
-                  },
-                  onLongPressMoveUpdate: (d) =>
-                      _setPreviewFromLocalY(d.localPosition.dy),
-                  onLongPressEnd: (_) => _commitPreview(),
+                  onLongPressStart: (d) => _beginScrub(d.localPosition.dy),
+                  onLongPressMoveUpdate: (d) => _updateScrub(d.localPosition.dy),
+                  onLongPressEnd: (_) => _endScrub(),
                   onLongPressCancel: _cancelScrub,
                   child: _buildTickColumn(frameHeight, overflow),
                 ),
