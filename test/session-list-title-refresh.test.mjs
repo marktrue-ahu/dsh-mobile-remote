@@ -31,6 +31,8 @@ const CONFIG = {
 	sessionTtlMs: 60_000,
 	rechargeUrl: "https://example.test/top-up",
 	maxConnections: 4,
+	// issue #28：预热默认开启；无关用例一律显式关掉，避免 1 秒后自动跑的预热打乱计数断言。
+	warmUpOnStart: false,
 	pushUrls: [],
 	pushCooldownMs: 1,
 	doneGraceMs: 1,
@@ -723,4 +725,48 @@ test("休眠父会话的子代理列表复用 revision 标题缓存", async (t) 
 	assert.equal(result.body.subagents.length, 1);
 	assert.equal(result.body.subagents[0].title, fixtures[1].title);
 	assert.equal(harness.readCalls.sessions, 1);
+});
+
+test("初始化预热（issue #28）：没有任何请求也会跑一遍枚举 + 标题折叠", async (t) => {
+	// 冷路径会长时间占住事件循环（实测轻端点被推迟 8.48 秒），所以要在初始化后主动跑一遍
+	// 与请求**同一条**路径，把冷代价挪到用户请求之前。
+	const home = await mkdtemp(join(tmpdir(), "session-title-refresh-home-"));
+	const root = await mkdtemp(join(tmpdir(), "session-title-warmup-"));
+	process.env.HOME = home;
+	let harness;
+	t.after(async () => {
+		harness?.clean();
+		await rm(home, { recursive: true, force: true });
+		await rm(root, { recursive: true, force: true });
+	});
+	const fixtures = writeSessionCorpusFixtures(root, { count: 4, largePayloadBytes: 0 });
+	harness = createHarness(fixtures, { config: { warmUpOnStart: true } });
+	await new Promise((resolve) => setTimeout(resolve, 1_400)); // 预热延迟 1s + 余量
+	assert.equal(harness.listCalls.count, 1, "初始化后应主动枚举一次语料（此间没有任何请求）");
+	assert.equal(harness.readCalls.batches, 1, "预热应顺带折叠一轮标题（复用同一条路径）");
+	// 预热之后发请求：结果不变，且标题命中缓存（不再重复折叠）
+	const result = await request(harness.route);
+	assert.equal(result.status, 200);
+	assert.equal(result.body.sessions.length, fixtures.length);
+	const byId = new Map(result.body.sessions.map((row) => [row.id, row]));
+	for (const fixture of fixtures) {
+		assert.equal(byId.get(fixture.id)?.title, fixture.title, "标题应来自语料（预热已折叠并缓存）");
+	}
+});
+
+test("关闭预热（warmUpOnStart: false）：初始化后不发起任何枚举（issue #28）", async (t) => {
+	const home = await mkdtemp(join(tmpdir(), "session-title-refresh-home-"));
+	const root = await mkdtemp(join(tmpdir(), "session-title-warmup-off-"));
+	process.env.HOME = home;
+	let harness;
+	t.after(async () => {
+		harness?.clean();
+		await rm(home, { recursive: true, force: true });
+		await rm(root, { recursive: true, force: true });
+	});
+	const fixtures = writeSessionCorpusFixtures(root, { count: 4, largePayloadBytes: 0 });
+	harness = createHarness(fixtures, { config: { warmUpOnStart: false } });
+	await new Promise((resolve) => setTimeout(resolve, 1_400));
+	assert.equal(harness.listCalls.count, 0, "关闭预热后不得有任何枚举");
+	assert.equal(harness.readCalls.batches, 0, "关闭预热后不得有任何标题折叠");
 });
