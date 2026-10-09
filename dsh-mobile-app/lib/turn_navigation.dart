@@ -189,54 +189,207 @@ double estimateTurnOffset({
   return minScrollExtent + (maxScrollExtent - minScrollExtent) * ratio;
 }
 
-/// 迭代定位的最大尝试次数：有界，避免病态布局下无限抖动。
+/// 有界迭代定位的最大尝试次数：有界，避免病态布局下无限抖动。
 const int kTurnLocateMaxAttempts = 6;
 
-/// 跳转进行中允许的最大时长（毫秒），超时按"未能定位"明说。
+/// 跳转进行中允许的最大时长（毫秒），超时按「未能定位」明说。
+///
+/// 它是**硬截止**：超时后不再产生任何滚动 / 精调副作用（见 [TurnLocator.locate]）。
 const int kTurnLocateTimeoutMs = 4000;
+
+/// 一个**已构建**轮次边界的实测几何。
+///
+/// [offset] 是该边界在滚动内容坐标系里的偏移（= 当前 `pixels` + 边界相对视口顶部的
+/// dy）。它可以在不同落点之间比较、插值——这正是「按实际落点校正」的依据。
+class TurnMeasurement {
+  const TurnMeasurement({required this.turn, required this.offset});
+
+  final int turn;
+  final double offset;
+}
+
+/// 定位失败的原因（两者提示文案不同，调用方必须区分）。
+enum TurnLocateFailure {
+  /// 目标持久序号根本不在已加载窗口内（例如已翻出窗口 / 属于未分页的更早部分）。
+  notInWindow,
+
+  /// 目标在窗口内，但有界尝试次数或截止时间用尽仍未把它带进视口。
+  exhausted,
+}
+
+/// 定位结果：成功（目标与视口相交）或带有明确原因的失败。
+class TurnLocateOutcome {
+  const TurnLocateOutcome.ok() : ok = true, failure = null;
+  const TurnLocateOutcome.failed(TurnLocateFailure this.failure) : ok = false;
+
+  final bool ok;
+  final TurnLocateFailure? failure;
+}
+
+/// 用实测点估算「把 [targetTurn] 带进视口」所需的内容偏移。
+///
+/// 规则（按可信度降级）：
+/// 1. 目标被两个实测点夹逼 → 在两者之间线性插值；
+/// 2. 只有目标之前 / 之后的实测点 → 用最近两个实测点做割线外推；
+/// 3. 一个实测点都没有 → 退回 [estimateTurnOffset] 的比例估算（兜底）。
+///
+/// 实测点的 [TurnMeasurement.offset] 已经是内容坐标，因此返回值也是内容坐标。
+double estimateTurnOffsetFromMeasurements({
+  required int targetTurn,
+  required List<TurnMeasurement> measurements,
+  required int targetIndex,
+  required int childCount,
+  required double minScrollExtent,
+  required double maxScrollExtent,
+}) {
+  final sorted = [...measurements]..sort((a, b) => a.turn.compareTo(b.turn));
+  TurnMeasurement? before;
+  TurnMeasurement? after;
+  for (final m in sorted) {
+    if (m.turn <= targetTurn && (before == null || m.turn > before.turn)) {
+      before = m;
+    }
+    if (m.turn >= targetTurn && (after == null || m.turn < after.turn)) {
+      after = m;
+    }
+  }
+  if (before != null && after != null) {
+    if (before.turn == after.turn) return before.offset;
+    final f = (targetTurn - before.turn) / (after.turn - before.turn);
+    return before.offset + (after.offset - before.offset) * f;
+  }
+  if (before != null) {
+    final slope = _secantSlope(sorted, targetTurn, useBefore: true);
+    if (slope != null) return before.offset + slope * (targetTurn - before.turn);
+  }
+  if (after != null) {
+    final slope = _secantSlope(sorted, targetTurn, useBefore: false);
+    if (slope != null) return after.offset - slope * (after.turn - targetTurn);
+  }
+  return estimateTurnOffset(
+    targetIndex: targetIndex,
+    childCount: childCount,
+    minScrollExtent: minScrollExtent,
+    maxScrollExtent: maxScrollExtent,
+  );
+}
+
+/// 每个刻度在内容坐标里的平均步距（最近两点割线）；点数不足或斜率非正时返回 null。
+double? _secantSlope(
+  List<TurnMeasurement> sorted,
+  int targetTurn, {
+  required bool useBefore,
+}) {
+  final candidates = useBefore
+      ? sorted.where((m) => m.turn < targetTurn).toList()
+      : sorted.where((m) => m.turn > targetTurn).toList();
+  if (candidates.length < 2) return null;
+  final TurnMeasurement a;
+  final TurnMeasurement b;
+  if (useBefore) {
+    a = candidates[candidates.length - 1];
+    b = candidates[candidates.length - 2];
+  } else {
+    a = candidates[0];
+    b = candidates[1];
+  }
+  if (a.turn == b.turn) return null;
+  final slope = (a.offset - b.offset) / (a.turn - b.turn);
+  return slope > 0 ? slope : null;
+}
 
 /// 有界迭代定位的执行器。
 ///
-/// 把"估算 → 落点 → 检查目标是否已构建"这条控制流从页面里抽出来：它是最容易
-/// 写错、也最需要回归保护的部分（懒构建 + center 锚点 + 条目高度可变）。本类
+/// 把「估算 → 落点 → 检查目标是否真的进入视口」这条控制流从页面里抽出来：它是最
+/// 容易写错、也最需要回归保护的部分（懒构建 + center 锚点 + 条目高度可变）。本类
 /// **不依赖 Flutter**，几何与副作用全部由回调注入，因此既能被真实列表驱动，
 /// 也能用假回调做边界测试。
+///
+/// 与旧实现的关键差别：每轮尝试都用 [measure] 给出的**已构建边界实测几何**校正
+/// 落点，而不是反复用同一个「轮次序号 / 轮次数量」比例；并且最终以
+/// [isTargetInView]（目标与视口相交）而非 [isTargetBuilt]（目标已构建）为成功判据。
 class TurnLocator {
   TurnLocator({
     required this.scrollTo,
     required this.minScrollExtent,
     required this.maxScrollExtent,
+    required this.isTargetLoaded,
     required this.isTargetBuilt,
+    required this.isTargetInView,
+    required this.reveal,
+    required this.measure,
     required this.settle,
     this.maxAttempts = kTurnLocateMaxAttempts,
-  });
+    this.timeout = const Duration(milliseconds: kTurnLocateTimeoutMs),
+    DateTime Function()? clock,
+  }) : _clock = clock ?? DateTime.now;
 
   /// 跳到某个可滚动偏移。
   final void Function(double offset) scrollTo;
   final double Function() minScrollExtent;
   final double Function() maxScrollExtent;
 
-  /// 目标是否已经构建（懒构建下这是"能不能精调"的唯一判据）。
+  /// 目标（按持久 seq 绑定的那个规范边界）是否仍在已加载窗口内。
+  ///
+  /// 这是 [TurnLocateFailure.notInWindow] 与 [TurnLocateFailure.exhausted] 的分界。
+  final bool Function() isTargetLoaded;
+
+  /// 目标是否已经构建（懒构建下这是「能不能精调」的判据）。
   final bool Function() isTargetBuilt;
+
+  /// 目标是否与视口相交——**唯一的成功判据**（「已构建」可能是缓存区里的条目）。
+  final bool Function() isTargetInView;
+
+  /// 目标已构建时做一次精调（页面侧是 `Scrollable.ensureVisible`）。
+  final Future<void> Function() reveal;
+
+  /// 已构建轮次边界的实测几何（每次校正前重新采样）。
+  final List<TurnMeasurement> Function() measure;
 
   /// 等待一帧，让新落点处的条目完成构建与布局。
   final Future<void> Function() settle;
 
   final int maxAttempts;
 
-  /// 尝试把 [targetIndex] 带进构建范围。
+  /// 硬截止时间：超时后不再滚动 / 精调。
+  final Duration timeout;
+
+  final DateTime Function() _clock;
+
+  /// 尝试把 [targetTurn] 带进视口。
   ///
-  /// 返回 true 表示目标已构建（调用方可继续做精确对齐）；false 表示在有界
-  /// 尝试内未能定位——**调用方必须把这个结果如实告诉用户**，不得静默停下。
-  Future<bool> locate({
+  /// 返回 [TurnLocateOutcome]；失败原因由 [TurnLocateFailure] 区分，**调用方必须
+  /// 把这个结果如实告诉用户**，不得静默停下。
+  Future<TurnLocateOutcome> locate({
+    required int targetTurn,
     required int targetIndex,
     required int childCount,
   }) async {
+    if (!isTargetLoaded()) {
+      return const TurnLocateOutcome.failed(TurnLocateFailure.notInWindow);
+    }
+    if (isTargetInView()) return const TurnLocateOutcome.ok();
+    final start = _clock();
+    bool timedOut() => _clock().difference(start) >= timeout;
+
     for (var attempt = 0; attempt < maxAttempts; attempt++) {
-      if (isTargetBuilt()) return true;
+      if (timedOut()) {
+        return const TurnLocateOutcome.failed(TurnLocateFailure.exhausted);
+      }
+      // 目标已构建但不在视口内：先按渲染对象精调，避免无效的比例移动。
+      if (isTargetBuilt()) {
+        await reveal();
+        await settle();
+        if (isTargetInView()) return const TurnLocateOutcome.ok();
+        if (timedOut()) {
+          return const TurnLocateOutcome.failed(TurnLocateFailure.exhausted);
+        }
+      }
       final min = minScrollExtent();
       final max = maxScrollExtent();
-      final offset = estimateTurnOffset(
+      final offset = estimateTurnOffsetFromMeasurements(
+        targetTurn: targetTurn,
+        measurements: measure(),
         targetIndex: targetIndex,
         childCount: childCount,
         minScrollExtent: min,
@@ -245,6 +398,15 @@ class TurnLocator {
       scrollTo(offset.clamp(min, max).toDouble());
       await settle();
     }
-    return isTargetBuilt();
+    if (timedOut()) {
+      return const TurnLocateOutcome.failed(TurnLocateFailure.exhausted);
+    }
+    if (isTargetBuilt()) {
+      await reveal();
+      await settle();
+    }
+    return isTargetInView()
+        ? const TurnLocateOutcome.ok()
+        : const TurnLocateOutcome.failed(TurnLocateFailure.exhausted);
   }
 }
