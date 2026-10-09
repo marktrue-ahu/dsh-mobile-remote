@@ -788,6 +788,10 @@ class _ChatScreenState extends State<ChatScreen> {
         _histItems.clear();
         _turnOfStartSeq.clear(); // issue #24：条目重建后轮次索引一并失效
         _turnKeys.clear();
+        // issue #25 二期：大纲同属"这一条会话"，重建/切换后一并失效，
+        // 否则旧会话的未加载刻度会短暂挂到新会话的刻度轨上（串台）。
+        _turnOutline = const TurnOutline.capabilityMissing();
+        _turnOutlineNoticeShown = false;
         _timelineReducer.reset();
         _transientFrameKeys.clear();
         _debugPreviewCache.clear(); // 重建后 rawData 全变，旧预览缓存无意义
