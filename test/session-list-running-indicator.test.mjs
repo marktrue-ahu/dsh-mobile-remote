@@ -40,6 +40,8 @@ const CONFIG = {
 	sessionTtlMs: 60_000,
 	rechargeUrl: "https://example.test/top-up",
 	maxConnections: 4,
+	// issue #28：预热默认开启；无关用例一律显式关掉，避免 1 秒后自动跑的预热打乱计数断言。
+	warmUpOnStart: false,
 	pushUrls: [],
 	pushCooldownMs: 1,
 	doneGraceMs: 1,

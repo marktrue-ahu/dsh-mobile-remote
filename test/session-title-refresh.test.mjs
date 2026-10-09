@@ -211,3 +211,58 @@ test("已 abort 但未结束的 run 不复用：新请求进入后继任务且�
 	assert.ok(reads.length >= 2, "后继任务必须重新读取 revision");
 	refresher.dispose();
 });
+
+// issue #28 复核 3：`runDeadlineMs` 是 run 级政策，声称「取所有声明中最早者」——
+// 但 armRunDeadline 见到已有 deadlineTimer 会直接返回，若收紧时不先清旧 timer，收紧会静默失效。
+const hangingRevision = (state) => (_id, signal) => {
+	state.signal = signal;
+	return new Promise((_resolve, reject) => {
+		signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+	});
+};
+
+test("共享 run 的截止只收紧：后来者更短的截止必须生效（issue #28 复核 3）", async () => {
+	const state = { signal: null };
+	const refresher = createSessionTitleRefresher({
+		readRevision: hangingRevision(state),
+		readTitles: async () => new Map(),
+	});
+	const startedAt = Date.now();
+	void refresher.refresh(["a"], { budgetMs: 10_000, runDeadlineMs: 300 });
+	await new Promise((resolve) => setTimeout(resolve, 30));
+	void refresher.refresh(["b"], { budgetMs: 10_000, runDeadlineMs: 20 }); // 后来者更短：必须收紧
+	await waitFor(() => state.signal?.aborted === true, "更短的截止未生效：源未被取消");
+	assert.ok(Date.now() - startedAt < 250, `应在收紧后的截止附近取消（实测 ${Date.now() - startedAt}ms）`);
+	refresher.dispose();
+});
+
+test("共享 run 的截止不得被后来者延长（issue #28 复核 3）", async () => {
+	const state = { signal: null };
+	const refresher = createSessionTitleRefresher({
+		readRevision: hangingRevision(state),
+		readTitles: async () => new Map(),
+	});
+	const startedAt = Date.now();
+	void refresher.refresh(["a"], { budgetMs: 10_000, runDeadlineMs: 120 });
+	await new Promise((resolve) => setTimeout(resolve, 30));
+	void refresher.refresh(["b"], { budgetMs: 10_000, runDeadlineMs: 5_000 }); // 后来者更长：不得延长
+	await waitFor(() => state.signal?.aborted === true, "原截止被延长：源未按最早截止取消");
+	assert.ok(Date.now() - startedAt < 400, `应按最早的截止取消（实测 ${Date.now() - startedAt}ms）`);
+	refresher.dispose();
+});
+
+test("run 正常完成后清理截止计时器：不得留下迟到取消（issue #28 复核 3）", async () => {
+	const state = { signal: null };
+	const refresher = createSessionTitleRefresher({
+		readRevision: (_id, signal) => {
+			state.signal = signal;
+			return "r1";
+		},
+		readTitles: async (ids) => new Map(ids.map((id) => [id, { ok: true, title: `t-${id}` }])),
+	});
+	await refresher.refresh(["a"], { budgetMs: 500, runDeadlineMs: 60 });
+	assert.equal(state.signal?.aborted, false, "正常完成时不得取消信号");
+	await new Promise((resolve) => setTimeout(resolve, 150)); // 越过原截止
+	assert.equal(state.signal?.aborted, false, "完成后不得留下迟到的取消");
+	refresher.dispose();
+});

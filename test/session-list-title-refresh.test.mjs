@@ -31,6 +31,8 @@ const CONFIG = {
 	sessionTtlMs: 60_000,
 	rechargeUrl: "https://example.test/top-up",
 	maxConnections: 4,
+	// issue #28：预热默认开启；无关用例一律显式关掉，避免 1 秒后自动跑的预热打乱计数断言。
+	warmUpOnStart: false,
 	pushUrls: [],
 	pushCooldownMs: 1,
 	doneGraceMs: 1,
@@ -723,4 +725,149 @@ test("休眠父会话的子代理列表复用 revision 标题缓存", async (t) 
 	assert.equal(result.body.subagents.length, 1);
 	assert.equal(result.body.subagents[0].title, fixtures[1].title);
 	assert.equal(harness.readCalls.sessions, 1);
+});
+
+test("初始化预热（issue #28）：没有任何请求也会跑一遍枚举 + 标题折叠", async (t) => {
+	// 冷路径会长时间占住事件循环（实测轻端点被推迟 8.48 秒），所以要在初始化后主动跑一遍
+	// 与请求**同一条**路径，把冷代价挪到用户请求之前。
+	const home = await mkdtemp(join(tmpdir(), "session-title-refresh-home-"));
+	const root = await mkdtemp(join(tmpdir(), "session-title-warmup-"));
+	process.env.HOME = home;
+	let harness;
+	t.after(async () => {
+		harness?.clean();
+		await rm(home, { recursive: true, force: true });
+		await rm(root, { recursive: true, force: true });
+	});
+	const fixtures = writeSessionCorpusFixtures(root, { count: 4, largePayloadBytes: 0 });
+	harness = createHarness(fixtures, { config: { warmUpOnStart: true } });
+	await new Promise((resolve) => setTimeout(resolve, 1_400)); // 预热延迟 1s + 余量
+	assert.equal(harness.listCalls.count, 1, "初始化后应主动枚举一次语料（此间没有任何请求）");
+	assert.equal(harness.readCalls.batches, 1, "预热应顺带折叠一轮标题（复用同一条路径）");
+	// 预热之后发请求：结果不变，且标题命中缓存（不再重复折叠）
+	const result = await request(harness.route);
+	assert.equal(result.status, 200);
+	assert.equal(result.body.sessions.length, fixtures.length);
+	const byId = new Map(result.body.sessions.map((row) => [row.id, row]));
+	for (const fixture of fixtures) {
+		assert.equal(byId.get(fixture.id)?.title, fixture.title, "标题应来自语料（预热已折叠并缓存）");
+	}
+});
+
+test("关闭预热（warmUpOnStart: false）：初始化后不发起任何枚举（issue #28）", async (t) => {
+	const home = await mkdtemp(join(tmpdir(), "session-title-refresh-home-"));
+	const root = await mkdtemp(join(tmpdir(), "session-title-warmup-off-"));
+	process.env.HOME = home;
+	let harness;
+	t.after(async () => {
+		harness?.clean();
+		await rm(home, { recursive: true, force: true });
+		await rm(root, { recursive: true, force: true });
+	});
+	const fixtures = writeSessionCorpusFixtures(root, { count: 4, largePayloadBytes: 0 });
+	harness = createHarness(fixtures, { config: { warmUpOnStart: false } });
+	await new Promise((resolve) => setTimeout(resolve, 1_400));
+	assert.equal(harness.listCalls.count, 0, "关闭预热后不得有任何枚举");
+	assert.equal(harness.readCalls.batches, 0, "关闭预热后不得有任何标题折叠");
+});
+
+test("预热与请求重叠：共享同一次在途枚举，只枚举一次（issue #28 复核 BLOCKING 1）", async (t) => {
+	// 评审实测：预热挂住时 HTTP 进入会各自 new controller、各发一次 listSessions（lists=2/maxActive=2）。
+	// 修法是 owner 共享：请求必须加入预热那次在途枚举。
+	const home = await mkdtemp(join(tmpdir(), "session-title-refresh-home-"));
+	const root = await mkdtemp(join(tmpdir(), "session-title-warmup-shared-"));
+	process.env.HOME = home;
+	let harness;
+	t.after(async () => {
+		harness?.clean();
+		await rm(home, { recursive: true, force: true });
+		await rm(root, { recursive: true, force: true });
+	});
+	const fixtures = writeSessionCorpusFixtures(root, { count: 4, largePayloadBytes: 0 });
+	harness = createHarness(fixtures, {
+		config: { warmUpOnStart: true },
+		listDelayMs: () => 2_000, // 枚举很慢：保证 HTTP 请求到达时预热仍在途
+	});
+	await new Promise((resolve) => setTimeout(resolve, 1_100)); // 预热已启动、正卡在枚举里
+	assert.equal(harness.listCalls.count, 1, "预热应已在途（场景前提）");
+	const result = await request(harness.route);
+	assert.equal(result.status, 200);
+	assert.equal(result.body.sessions.length, fixtures.length);
+	assert.equal(harness.listCalls.count, 1, "请求必须加入预热那次在途枚举，而不是再发一次全量枚举");
+});
+
+test("预热挂住后恢复：健康请求能重新读取真实标题（issue #28 复核 BLOCKING 2）", async (t) => {
+	// 评审实测：预热 revision 扫描不 settle 时，之后的请求仍 join 旧 run（revisions=1/folds=0、
+	// HTTP 200 仅短码）。修法是预热用**自己的有限生命期**且不提升为永久后台，到点退休坏 run。
+	const home = await mkdtemp(join(tmpdir(), "session-title-refresh-home-"));
+	const root = await mkdtemp(join(tmpdir(), "session-title-warmup-hung-"));
+	process.env.HOME = home;
+	let harness;
+	t.after(async () => {
+		harness?.clean();
+		await rm(home, { recursive: true, force: true });
+		await rm(root, { recursive: true, force: true });
+	});
+	const fixtures = writeSessionCorpusFixtures(root, { count: 4, largePayloadBytes: 0 });
+	let revisionListCalls = 0;
+	harness = createHarness(fixtures, {
+		// 预热自己的标题生命期压短，便于快速复现「预热挂住 → 到点退休」
+		config: { warmUpOnStart: true, warmUpTitleBudgetMs: 300 },
+		// 第一次 revision 扫描挂住（预热的），之后恢复健康（请求的）
+		revisionListDelayMs: () => (revisionListCalls++ === 0 ? 60_000 : 0),
+	});
+	await new Promise((resolve) => setTimeout(resolve, 1_800)); // 预热启动 → 卡在 revision 扫描 → 到点退休
+	const result = await request(harness.route);
+	assert.equal(result.status, 200);
+	const byId = new Map(result.body.sessions.map((row) => [row.id, row]));
+	for (const fixture of fixtures) {
+		assert.equal(
+			byId.get(fixture.id)?.title,
+			fixture.title,
+			"健康请求必须重新折叠出真实标题，而不是沿用坏 run 的短码",
+		);
+	}
+	assert.ok(harness.readCalls.batches >= 1, "请求应自己发起折叠");
+});
+
+test("预热挂起 + HTTP 先到响应预算：warm 截止仍须退休坏源（issue #28 复核 2）", async (t) => {
+	// 评审复核 2 的窗口：HTTP 在 warm 期限**之前**加入，并先到自己的 1.5s 响应预算 → 它会把 run
+	// 提升为**永久后台**；此时只有调用者级的 `backgroundOnBudget: false` 挡不住坏源永生。
+	// 修法必须是 **run 级**硬截止：到点即中止并退休，不看 background。
+	const home = await mkdtemp(join(tmpdir(), "session-title-refresh-home-"));
+	const root = await mkdtemp(join(tmpdir(), "session-title-warmup-promotion-"));
+	process.env.HOME = home;
+	let harness;
+	t.after(async () => {
+		harness?.clean();
+		await rm(home, { recursive: true, force: true });
+		await rm(root, { recursive: true, force: true });
+	});
+	const fixtures = writeSessionCorpusFixtures(root, { count: 4, largePayloadBytes: 0 });
+	let revisionListCalls = 0;
+	harness = createHarness(fixtures, {
+		config: { warmUpOnStart: true, warmUpTitleBudgetMs: 2_500 },
+		// 第一次 revision 扫描挂住（预热的），之后恢复健康
+		revisionListDelayMs: () => (revisionListCalls++ === 0 ? 60_000 : 0),
+	});
+	await new Promise((resolve) => setTimeout(resolve, 1_100)); // 预热已启动并卡在 revision 扫描
+	const first = await request(harness.route); // HTTP 加入 → 自己的 1.5s 响应预算先到点 → run 被提升为后台
+	assert.equal(first.status, 200);
+	const firstTitles = new Map(first.body.sessions.map((row) => [row.id, row.title]));
+	assert.equal(
+		fixtures.filter((fixture) => firstTitles.get(fixture.id) === fixture.title).length,
+		0,
+		"场景前提：预热挂住时这一轮折叠不出来（只有短码）",
+	);
+	await new Promise((resolve) => setTimeout(resolve, 1_500)); // 严格等过 warm 截止（1.0s + 2.5s）
+	const healthy = await request(harness.route); // provider 已健康 → 必须重新折叠
+	assert.equal(healthy.status, 200);
+	const healthyTitles = new Map(healthy.body.sessions.map((row) => [row.id, row.title]));
+	for (const fixture of fixtures) {
+		assert.equal(
+			healthyTitles.get(fixture.id),
+			fixture.title,
+			"warm 截止退休坏源后，健康请求必须重新折叠出真实标题",
+		);
+	}
 });
