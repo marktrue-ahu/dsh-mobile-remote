@@ -769,8 +769,11 @@ class _ChatScreenState extends State<ChatScreen> {
     // center 之前：`_olderItems` 最新在前，内容顺序与子项序号相反。
     collect(_olderSliverKey, 0,
         count: _olderItems.length, contentOrderReversed: true);
-    // center 之后：子项序号即内容顺序（首项可能是「更早」按钮 / 加载条）。
-    collect(_liveSliverKey, _olderItems.length + (_olderButtonVisible ? 1 : 0),
+    // center 之后：`SliverMultiBoxAdaptorParentData.index` **已经包含**首项
+    // 「更早」按钮 / 加载条，所以基准只加前一条 sliver 的长度，不能再加一次首项偏移——
+    // 否则加载条显示期间消息的实测 index 会比目标坐标系大 1，定位器把前一条消息当成目标
+    // （第二轮评审 note 1080 的对照复现：同样数据，仅"上翻在途"这一项不同就跳不到）。
+    collect(_liveSliverKey, _olderItems.length,
         count: _items.length, contentOrderReversed: false);
     return out;
   }
