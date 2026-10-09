@@ -530,8 +530,10 @@ test("冷启动枚举慢于标题预算、但快于枚举预算时 /sessions 仍
 	});
 	const fixtures = writeSessionCorpusFixtures(root, { count: 6, largePayloadBytes: 0 });
 	harness = createHarness(fixtures, {
-		listDelayMs: () => 1_700, // 慢于标题预算（1500ms），远快于枚举预算（5000ms）
-		config: { enumerationBudgetMs: 5_000 },
+		// 1.7s：慢于标题预算（1500ms），快于**默认**枚举预算（12s）。刻意**不传** config——
+		// 这条同时钉住真实部署路径：宿主 config 里没有 enumerationBudgetMs 字段时，
+		// 必须回落到 DEFAULT_ENUMERATION_BUDGET_MS（防御性默认），而不是 NaN → 立即 504。
+		listDelayMs: () => 1_700,
 	});
 	const startedAt = performance.now();
 	const result = await request(harness.route);
