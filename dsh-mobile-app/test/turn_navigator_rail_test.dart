@@ -210,4 +210,127 @@ void main() {
       }
     });
   });
+
+  group('缺陷 2：超长刻度轨可浏览被裁出的刻度', () {
+    List<TurnAnchor> anchors100() =>
+        [for (var i = 1; i <= 100; i++) TurnAnchor(turn: i, seq: i * 10)];
+
+    Future<void> pumpRail(WidgetTester tester, {required int activeTurn}) async {
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: Center(
+            child: TurnNavigatorRail(
+              anchors: anchors100(),
+              activeTurn: activeTurn,
+              busyTurn: null,
+              onNavigate: (_) {},
+            ),
+          ),
+        ),
+      ));
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('初次显示时当前轮（90）在轨内可见，首个刻度不在', (tester) async {
+      await pumpRail(tester, activeTurn: 90);
+      final railRect = tester.getRect(find.byType(TurnNavigatorRail));
+      final tick90 = tester.getRect(find.byKey(const ValueKey('turn-tick-90')));
+      final tick1 = tester.getRect(find.byKey(const ValueKey('turn-tick-1')));
+      expect(railRect.overlaps(tick90), isTrue, reason: '初次布局就要保证当前轮可见');
+      expect(railRect.overlaps(tick1), isFalse, reason: '首个刻度被裁出，必须靠轨内滚动浏览');
+    });
+
+    testWidgets('从下沿持续扫掠可连续浏览更靠后的轮次并落点', (tester) async {
+      TurnAnchor? selected;
+      final anchors = anchors100();
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: Center(
+            child: TurnNavigatorRail(
+              anchors: anchors,
+              activeTurn: 10,
+              busyTurn: null,
+              onNavigate: (a) => selected = a,
+            ),
+          ),
+        ),
+      ));
+      await tester.pumpAndSettle();
+
+      final bounds = tester.getRect(find.byType(TurnNavigatorRail));
+      final gesture = await tester.startGesture(
+        Offset(bounds.center.dx, bounds.bottom - 6),
+      );
+      await gesture.moveBy(const Offset(0, 6)); // 越过拖动 slop，进入扫掠
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 2)); // 按住不动：边缘自动滚动
+      await gesture.up();
+      await tester.pumpAndSettle();
+
+      expect(selected, isNotNull);
+      expect(selected!.turn, greaterThan(42),
+          reason: '贴住下沿应持续推进轨内滚动，扫到第一屏之外的轮次');
+    });
+
+    testWidgets('从上沿持续扫掠可连续浏览更靠前的轮次并落点', (tester) async {
+      TurnAnchor? selected;
+      final anchors = anchors100();
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: Center(
+            child: TurnNavigatorRail(
+              anchors: anchors,
+              activeTurn: 90,
+              busyTurn: null,
+              onNavigate: (a) => selected = a,
+            ),
+          ),
+        ),
+      ));
+      await tester.pumpAndSettle();
+
+      final bounds = tester.getRect(find.byType(TurnNavigatorRail));
+      final gesture = await tester.startGesture(
+        Offset(bounds.center.dx, bounds.top + 6),
+      );
+      await gesture.moveBy(const Offset(0, -6));
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 2));
+      await gesture.up();
+      await tester.pumpAndSettle();
+
+      expect(selected, isNotNull);
+      expect(selected!.turn, lessThan(58),
+          reason: '贴住上沿应反向推进轨内滚动');
+    });
+
+    testWidgets('取消扫掠：停止自动滚动且不落点', (tester) async {
+      TurnAnchor? selected;
+      final anchors = anchors100();
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: Center(
+            child: TurnNavigatorRail(
+              anchors: anchors,
+              activeTurn: 10,
+              busyTurn: null,
+              onNavigate: (a) => selected = a,
+            ),
+          ),
+        ),
+      ));
+      await tester.pumpAndSettle();
+
+      final bounds = tester.getRect(find.byType(TurnNavigatorRail));
+      final gesture = await tester.startGesture(
+        Offset(bounds.center.dx, bounds.bottom - 6),
+      );
+      await gesture.moveBy(const Offset(0, 6));
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 1));
+      await gesture.cancel();
+      await tester.pumpAndSettle();
+      expect(selected, isNull, reason: '取消手势不得落点');
+    });
+  });
 }
