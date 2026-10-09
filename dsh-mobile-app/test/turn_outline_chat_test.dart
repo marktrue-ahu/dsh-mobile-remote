@@ -99,6 +99,16 @@ class _OutlineBackend {
   /// 置上时，带 `before` 的上翻请求会挂起，直到测试 complete 它。
   Completer<void>? holdOlder;
 
+  /// 置上时，每个 `/turn-outline` 请求都挂起，直到 `releaseOutline(nth)` 放行
+  /// （用于制造"更早的请求后完成"的逆序场景）。
+  bool holdOutlineCalls = false;
+  final Map<int, Completer<void>> _outlineGates = {};
+  final Map<int, String> outlineStateByCall = {};
+
+  void releaseOutline(int index) {
+    _outlineGates.remove(index)?.complete();
+  }
+
   int get _firstLoadedTurn => (sessionTurns - loadedTurns + 1).clamp(1, sessionTurns);
 
   /// 更早的一页：**服务端最多返回 `limit` 条事件**（每轮 3 条），所以一次上翻覆盖
@@ -122,8 +132,14 @@ class _OutlineBackend {
     final path = request.url.path;
     Map<String, dynamic> body;
     if (path == '/m/api/turn-outline') {
+      final nth = outlineRequests;
       outlineRequests += 1;
-      body = switch (outlineState) {
+      if (holdOutlineCalls) {
+        final gate = Completer<void>();
+        _outlineGates[nth] = gate;
+        await gate.future;
+      }
+      body = switch (outlineStateByCall[nth] ?? outlineState) {
         'empty' => {'ok': true, 'state': 'empty', 'turns': <Object>[]},
         'read-failed' => {
             'ok': true,
@@ -482,5 +498,77 @@ void main() {
     expect(find.textContaining('这台电脑'), findsOneWidget,
         reason: 'capability-missing 必须有说明（评测 P2 反例：说明被 UI 排除）');
     expect(tester.takeException(), isNull);
+  });
+
+  // ── 第二轮评审 note 1073 的回归 ──────────────────────────────────────
+
+  Finder pulsingTicks() => find.descendant(
+        of: find.byType(TurnNavigatorRail),
+        matching: find.byType(FadeTransition),
+      );
+
+  testWidgets('用户主动滚动取消跳转后，旧刻度不再一直脉冲', (tester) async {
+    final backend = _OutlineBackend(sessionTurns: 20, loadedTurns: 2);
+    final store = AppStore()..sessionId = 'session-outline';
+    await _pumpChat(tester, backend: backend, store: store);
+    await _scrollUp(tester);
+
+    backend.holdOlder = Completer<void>();
+    await tester.tap(
+      find.byKey(const ValueKey<String>('turn-tick-6')),
+      warnIfMissed: false,
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(pulsingTicks(), findsWidgets, reason: '跳转进行中该齿应在脉冲');
+
+    // 用户主动拖动消息流 = 取消本次跳转。
+    await tester.drag(find.byType(CustomScrollView), const Offset(0, 200));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 200));
+
+    backend.holdOlder!.complete();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 1200));
+
+    expect(pulsingTicks(), findsNothing,
+        reason: '取消入口必须主动结束旧操作的脉冲（旧 finally 因世代失效不会再收尾）');
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('大纲刷新：迟到的旧失败不得覆盖更新的成功', (tester) async {
+    final backend = _OutlineBackend(sessionTurns: 20, loadedTurns: 2);
+    backend.holdOutlineCalls = true;
+    backend.outlineStateByCall[0] = 'read-failed';
+    backend.outlineStateByCall[1] = 'available';
+    final store = AppStore()..sessionId = 'session-outline';
+    await _pumpChat(tester, backend: backend, store: store);
+    await _scrollUp(tester);
+
+    // 第二次刷新（能力事件）→ 请求 #1
+    store.injectFrame({
+      'type': 'hello',
+      'capabilities': {
+        'turnOutline': {'version': 1, 'supported': true, 'unloaded': true, 'truncated': true},
+      },
+    });
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(backend.outlineRequests, greaterThanOrEqualTo(2),
+        reason: '应有两个重叠的大纲刷新请求');
+
+    backend.releaseOutline(1);
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.byKey(const ValueKey<String>('turn-tick-1')), findsOneWidget,
+        reason: '较新的刷新给出完整阶梯（20 轮）');
+
+    // 更早的 #0 现在才返回失败：不得抹掉较新的成功。
+    backend.releaseOutline(0);
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.byKey(const ValueKey<String>('turn-tick-1')), findsOneWidget,
+        reason: '迟到的旧失败不得覆盖新成功（评测 P2 反例：退回 2 个本地刻度）');
+    expect(backend.outlineRequests, greaterThanOrEqualTo(2));
+    expect(tester.takeException(), isNull);
+    await _teardownStore(tester, store);
   });
 }

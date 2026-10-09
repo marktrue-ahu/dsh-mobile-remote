@@ -380,6 +380,8 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _turnJumpCancelled = false;
   // 导航世代：连续点选时旧操作不得覆盖新操作的落点 / busy / 提示（issue #25 评审 P2）。
   int _turnNavGeneration = 0;
+  // 大纲刷新的请求身份：同一会话/同一历史世代下也会重叠多次刷新，迟到结果不得覆盖新结果。
+  int _turnOutlineRefreshId = 0;
   bool _turnOutlineNoticeShown = false;
   bool _activeTurnCalibrationScheduled = false; // 滚动期间合并调度几何校准
   final GlobalKey _liveViewportKey = GlobalKey(); // 阅读线基准：消息流视口
@@ -940,8 +942,10 @@ class _ChatScreenState extends State<ChatScreen> {
         _turnOutline = const TurnOutline.capabilityMissing();
         _turnOutlineResolved = false; // 还没问过新会话：不得据此给"能力缺失"结论
         _turnOutlineNoticeShown = false;
-        // 历史重建作废进行中的跳转：其落点/提示/busy 清理都不再对当前列表有效。
+        // 历史重建作废进行中的跳转：其落点/提示/busy 清理都不再对当前列表有效；
+        // 已在 setState 内，这里直接清 busy（旧 finally 已因世代失效不再收尾）。
         _turnNavGeneration += 1;
+        _busyTurn = null;
         _timelineReducer.reset();
         _transientFrameKeys.clear();
         _debugPreviewCache.clear(); // 重建后 rawData 全变，旧预览缓存无意义
@@ -1136,17 +1140,28 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _onLiveScroll(ScrollNotification n) {
     // issue #25 二期：跨页跳转进行中，用户主动滚动 = 取消本次跳转（故事 18）——
     // 只有带 dragDetails 的通知才是用户手势，自动滚动不受影响。
-    // 同时作废导航世代：旧的落点/提示/清理一律不得再动（评审 P2）。
+    // 同时作废导航世代：旧的落点/提示/清理一律不得再动（第二轮评审 P2）。
     if (_busyTurn != null &&
         ((n is ScrollStartNotification && n.dragDetails != null) ||
             (n is ScrollUpdateNotification && n.dragDetails != null))) {
       _turnJumpCancelled = true;
-      _turnNavGeneration += 1;
+      _cancelTurnJumpVisual();
     }
     if (shouldLoadOlderFromScroll(n, infiniteMode: _infiniteMode)) {
       _loadMoreInfinite();
     }
     return false;
+  }
+
+  /// 作废当前导航世代并**主动清掉它自己的"跳转中"视觉状态**。
+  ///
+  /// 世代守卫保证旧操作不再改落点，但正因为世代失效，旧操作的 `finally` 也不会再清
+  /// `_busyTurn`——取消入口必须自己收尾，否则该齿会一直脉冲（第二轮评审 P2）。
+  void _cancelTurnJumpVisual() {
+    _turnNavGeneration += 1;
+    if (_busyTurn != null) {
+      setState(() => _busyTurn = null);
+    }
   }
 
   // ── issue #25 二期：宿主轮次大纲 ───────────────────────────────────
@@ -1155,12 +1170,15 @@ class _ChatScreenState extends State<ChatScreen> {
   /// （退回一期行为），而不是把"能力缺失"和"这个会话没有轮次"混成一件事。
   ///
   /// 能力是**后到**的（首连/重连时序不定），所以会话打开、能力事件到达、历史重建后
-  /// 都会调用一次；世代 + 会话守卫保证迟到结果不会写回。
+  /// 都会调用一次；**大纲刷新有独立请求身份**：同一会话、同一历史世代也会重叠多次
+  /// （能力事件与初始刷新并发），迟到的旧响应——无论成功还是失败——都不得覆盖新结果
+  /// （第二轮评审 P2）。历史世代/会话身份仍是第一道守卫。
   Future<void> _refreshTurnOutline() async {
     final id = _mySessionId ?? widget.store.sessionId;
     if (id == null) return;
+    final requestId = ++_turnOutlineRefreshId;
     if (!_api.turnOutlineCapabilities.supported) {
-      if (!mounted) return;
+      if (!mounted || requestId != _turnOutlineRefreshId) return;
       setState(() {
         _turnOutline = const TurnOutline.capabilityMissing();
         _turnOutlineResolved = true;
@@ -1169,7 +1187,12 @@ class _ChatScreenState extends State<ChatScreen> {
     }
     final generation = _loadGeneration;
     final outline = await _api.turnOutline(id);
-    if (!mounted || generation != _loadGeneration || id != _mySessionId) return;
+    if (!mounted ||
+        generation != _loadGeneration ||
+        id != _mySessionId ||
+        requestId != _turnOutlineRefreshId) {
+      return; // 已有更新的刷新：旧结果（含失败）一律丢弃
+    }
     setState(() {
       _turnOutline = outline;
       _turnOutlineResolved = true;
