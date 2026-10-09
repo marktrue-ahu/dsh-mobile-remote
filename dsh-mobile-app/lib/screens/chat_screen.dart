@@ -968,8 +968,11 @@ class _ChatScreenState extends State<ChatScreen> {
       waited += 1;
     }
     final outcome = await _prependOlderPage(limit: kTurnJumpPageSize);
-    if (outcome == _PrependOutcome.failed) {
-      throw StateError(L10n.t('上翻历史失败', 'Failed to load earlier history'));
+    // 到顶（exhausted）不是失败：如实回报"没有更早历史"，由跳转结果统一说明**不可达**。
+    // 但请求失败或没有取得任何进展（仍在加载）必须**显式失败**——否则跳转循环会
+    // 对着不变的 earliestSeq 一直空转到页数上限（最坏 32 次 × 等待）。
+    if (outcome == _PrependOutcome.failed || outcome == _PrependOutcome.skipped) {
+      throw StateError(L10n.t('未能继续加载更早历史', 'Could not load earlier history'));
     }
     return TurnPageLoad(earliestSeq: _earliestSeq, hasMore: !_noMoreHistory);
   }
