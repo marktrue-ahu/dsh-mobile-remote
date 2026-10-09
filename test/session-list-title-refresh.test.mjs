@@ -770,3 +770,62 @@ test("关闭预热（warmUpOnStart: false）：初始化后不发起任何枚举
 	assert.equal(harness.listCalls.count, 0, "关闭预热后不得有任何枚举");
 	assert.equal(harness.readCalls.batches, 0, "关闭预热后不得有任何标题折叠");
 });
+
+test("预热与请求重叠：共享同一次在途枚举，只枚举一次（issue #28 复核 BLOCKING 1）", async (t) => {
+	// 评审实测：预热挂住时 HTTP 进入会各自 new controller、各发一次 listSessions（lists=2/maxActive=2）。
+	// 修法是 owner 共享：请求必须加入预热那次在途枚举。
+	const home = await mkdtemp(join(tmpdir(), "session-title-refresh-home-"));
+	const root = await mkdtemp(join(tmpdir(), "session-title-warmup-shared-"));
+	process.env.HOME = home;
+	let harness;
+	t.after(async () => {
+		harness?.clean();
+		await rm(home, { recursive: true, force: true });
+		await rm(root, { recursive: true, force: true });
+	});
+	const fixtures = writeSessionCorpusFixtures(root, { count: 4, largePayloadBytes: 0 });
+	harness = createHarness(fixtures, {
+		config: { warmUpOnStart: true },
+		listDelayMs: () => 2_000, // 枚举很慢：保证 HTTP 请求到达时预热仍在途
+	});
+	await new Promise((resolve) => setTimeout(resolve, 1_100)); // 预热已启动、正卡在枚举里
+	assert.equal(harness.listCalls.count, 1, "预热应已在途（场景前提）");
+	const result = await request(harness.route);
+	assert.equal(result.status, 200);
+	assert.equal(result.body.sessions.length, fixtures.length);
+	assert.equal(harness.listCalls.count, 1, "请求必须加入预热那次在途枚举，而不是再发一次全量枚举");
+});
+
+test("预热挂住后恢复：健康请求能重新读取真实标题（issue #28 复核 BLOCKING 2）", async (t) => {
+	// 评审实测：预热 revision 扫描不 settle 时，之后的请求仍 join 旧 run（revisions=1/folds=0、
+	// HTTP 200 仅短码）。修法是预热用**自己的有限生命期**且不提升为永久后台，到点退休坏 run。
+	const home = await mkdtemp(join(tmpdir(), "session-title-refresh-home-"));
+	const root = await mkdtemp(join(tmpdir(), "session-title-warmup-hung-"));
+	process.env.HOME = home;
+	let harness;
+	t.after(async () => {
+		harness?.clean();
+		await rm(home, { recursive: true, force: true });
+		await rm(root, { recursive: true, force: true });
+	});
+	const fixtures = writeSessionCorpusFixtures(root, { count: 4, largePayloadBytes: 0 });
+	let revisionListCalls = 0;
+	harness = createHarness(fixtures, {
+		// 预热自己的标题生命期压短，便于快速复现「预热挂住 → 到点退休」
+		config: { warmUpOnStart: true, warmUpTitleBudgetMs: 300 },
+		// 第一次 revision 扫描挂住（预热的），之后恢复健康（请求的）
+		revisionListDelayMs: () => (revisionListCalls++ === 0 ? 60_000 : 0),
+	});
+	await new Promise((resolve) => setTimeout(resolve, 1_800)); // 预热启动 → 卡在 revision 扫描 → 到点退休
+	const result = await request(harness.route);
+	assert.equal(result.status, 200);
+	const byId = new Map(result.body.sessions.map((row) => [row.id, row]));
+	for (const fixture of fixtures) {
+		assert.equal(
+			byId.get(fixture.id)?.title,
+			fixture.title,
+			"健康请求必须重新折叠出真实标题，而不是沿用坏 run 的短码",
+		);
+	}
+	assert.ok(harness.readCalls.batches >= 1, "请求应自己发起折叠");
+});
