@@ -601,6 +601,27 @@ if (typeof mod.apply === "function" && typeof mod.Config === "function") {
           signal: preAborted.signal,
         });
         check("raceWithDeadline：已取消的 signal → 立即 timedOut", timedOutBySignal.status === "timedOut", JSON.stringify(timedOutBySignal));
+
+        // 第三轮评审 P3：work 先完成时也要清掉定时器/监听器，不留无用资源。
+        let listenerAdded = 0;
+        let listenerRemoved = 0;
+        const fakeSignal = {
+          aborted: false,
+          addEventListener() { listenerAdded += 1; },
+          removeEventListener() { listenerRemoved += 1; },
+        };
+        const startedAt = Date.now();
+        const quick = await mod.raceWithDeadline(Promise.resolve("ok"), { deadlineMs: 60_000, signal: fakeSignal });
+        check(
+          "raceWithDeadline：work 先完成 → 立即 settled（不等 60s 截止）",
+          quick.status === "settled" && quick.value === "ok" && Date.now() - startedAt < 1000,
+          `${JSON.stringify(quick)} took=${Date.now() - startedAt}ms`,
+        );
+        check(
+          "raceWithDeadline：竞速结束后移除 abort listener（不留无用监听）",
+          listenerAdded === 1 && listenerRemoved === 1,
+          `added=${listenerAdded} removed=${listenerRemoved}`,
+        );
       } else {
         check("导出 raceWithDeadline", false, "missing export");
       }
@@ -701,15 +722,17 @@ if (typeof mod.apply === "function" && typeof mod.Config === "function") {
       pause() {},
       resume() {},
     });
+    let bWriteHead = 0;
+    let bEnd = 0;
     const resB = Object.assign(new EventEmitter(), {
       statusCode: 0,
       headersSent: false,
       writableEnded: false,
       ended: false,
-      writeHead(status) { this.statusCode = status; this.headersSent = true; },
+      writeHead(status) { bWriteHead += 1; this.statusCode = status; this.headersSent = true; },
       setHeader() {},
       write() { return true; },
-      end() { this.writableEnded = true; this.ended = true; },
+      end() { bEnd += 1; this.writableEnded = true; this.ended = true; },
       destroy() { this.ended = true; },
     });
     timedB.route.handler(reqB, resB);
@@ -721,15 +744,55 @@ if (typeof mod.apply === "function" && typeof mod.Config === "function") {
       `signal=${signalBefore === undefined ? "missing" : signalBefore.aborted}`,
     );
     reqB.emit("aborted");
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise((resolve) => setTimeout(resolve, 40));
     check(
       "端点级：客户端断开 → 观察的 signal 被 abort（不再白占唯一执行槽）",
       timedB.observed.at(-1)?.signal?.aborted === true,
       `aborted=${timedB.observed.at(-1)?.signal?.aborted}`,
     );
+    check(
+      "端点级：断开后不再向已断开的响应写入（writeHead/end 均为 0）",
+      bWriteHead === 0 && bEnd === 0,
+      `writeHead=${bWriteHead} end=${bEnd}`,
+    );
     timedB.release();
     await new Promise((resolve) => setTimeout(resolve, 30));
     check("端点级：断开后迟到 lease 仍被释放", timedB.disposed.length === 1, JSON.stringify(timedB.disposed));
+
+    // 仅 res 'close'（未 end、未 aborted）：同样取消且不写响应。
+    const timedC = buildTimedInstance();
+    const reqC = Object.assign(new EventEmitter(), {
+      url: "/m/api/turn-outline?sessionId=hang-close",
+      method: "GET",
+      headers: { host: "127.0.0.1:3080", "x-mobile-token": "secret-secret-secret-1234" },
+      socket: { remoteAddress: "127.0.0.1" },
+      pause() {},
+      resume() {},
+    });
+    let cWrites = 0;
+    const resC = Object.assign(new EventEmitter(), {
+      statusCode: 0,
+      headersSent: false,
+      writableEnded: false,
+      destroyed: true,
+      ended: false,
+      writeHead() { cWrites += 1; },
+      setHeader() {},
+      write() { return true; },
+      end() { cWrites += 1; this.writableEnded = true; },
+    });
+    timedC.route.handler(reqC, resC);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    resC.emit("close");
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    check(
+      "端点级：仅 res.close（未 end）也取消，且不写入已断开的响应",
+      timedC.observed.at(-1)?.signal?.aborted === true && cWrites === 0,
+      `aborted=${timedC.observed.at(-1)?.signal?.aborted} writes=${cWrites}`,
+    );
+    timedC.release();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    check("端点级：仅 close 场景的迟到 lease 仍被释放", timedC.disposed.length === 1, JSON.stringify(timedC.disposed));
     const history = await call("/m/api/history?sessionId=session-1&after=0&limit=10");
     check("history 保留未知事件并过滤内部/chunk", history.json?.events?.some((e) => e.type === "future/visible") === true && !history.json?.events?.some((e) => ["assistant/chunk", "request/header", "system/message"].includes(e.type)), `${history.json?.error ?? ''} ${wireWarnings.at(-1) ?? ''}`);
     check("history 返回 hasMore/cursor", history.json?.hasMore === true && history.json?.after === history.json?.events?.at(-1)?.seq, `${JSON.stringify(history.json)} ${wireWarnings.at(-1) ?? ''}`);
