@@ -1,5 +1,34 @@
 # Changelog
 
+## v3.2.0（build 44，issue #27）— 冷启动首次 /sessions 不再 504：枚举与标题预算解耦
+
+> 版本：插件 `3.2.0` / App `3.2.0+44`。本版**改动了插件**（`lib/index.js`）——除安装新 APK，**必须同步插件副本并重启宿主**才会生效。
+> 内容 = issue #27 的修复（提交 `58e0a0f` + `9c0cb78`，merge `8770bf5` / `d5dba5b` @ develop）。
+
+### 问题（issue #27，`+43` 部署后实测）
+
+宿主重启后最初三次 `/m/api/sessions` 返回 **504 `sessions-timeout`**（1.37–1.47 秒、28 字节），而从第二分钟起为 `200` / 1.37 秒（386 个会话、386 个真实标题）；对照部署前是 `200` / **82.45 秒**。即把「永远很慢」修成了「稳态很快」，但**冷启动首次请求从「慢但成功」退化成了「快但失败」**。
+
+根因：`listSessionsWithinTitleBudget` 把**枚举本身**（`query.listSessions`）也放进了**标题折叠的 1.5 秒预算**。宿主刚起来时内核语料是冷的（note 793 实测全量 `persistence.stat()` 约 22 秒），枚举必然超过 1.5 秒 → `{timedOut:true}` → 路由 `504`。1.5 秒预算的意图是限制**可延后的标题折叠**，不是核心枚举。
+
+### 修法
+
+- **枚举与标题预算解耦**：新增 `Config.enumerationBudgetMs`（默认 `DEFAULT_ENUMERATION_BUDGET_MS`）作为枚举自己的预算；标题折叠继续 ≤1.5 秒（超预算的会话先用短码兜底、随后后台有界预热）。
+- **默认 12 秒——先于客户端超时给出结论**：App 对 `/sessions` 用的是 `getJson` 的默认超时 **15 秒**（`dsh-mobile-app/lib/api.dart`）。若服务端预算更大，冷首轮落在 15–30 秒之间会出现「服务端最终 200、客户端已经先放弃」——用户既拿不到列表、也拿不到明确失败，服务端还在为一个没人等的请求继续烧 CPU。12 秒 = 15 秒 − 3 秒余量（网络往返 + ~110KB JSON 序列化）。
+- **防御性默认**：宿主传给 `apply()` 的是**原始** config（schema 默认值不在这里生效），缺字段必须回落到常量，否则 `undefined - elapsed` 得到 NaN、`setTimeout(NaN)` 立即触发 → 冷启动被误判成超时。
+
+### 门禁与验收证据（2026-10-09）
+
+- 插件测试：`node --test test/*.mjs` **134/134 通过**。含新回归——枚举 1.7 秒（慢于标题预算、快于默认预算）→ **200 + N**，且标题为短码兜底（证明标题预算仍生效）；该用例刻意**不传** config，同时钉住生产部署路径的防御性默认。
+- 变异验证：把枚举预算退回标题预算 → 新回归立刻变红（`504 !== 200`），正是本 issue 报告的缺陷。
+- 分支门禁：`flutter-analyze` / `timeline-contract` / `account-usage` / `kotlin-usage-panel` **PASS**；`flutter-test` 为 main 基线既有 3 项红灯（`sse_cancel_window_test.dart`），按基线例外放行——改动只碰插件与 Node 测试。
+- **develop 集成门禁 5/5 全绿**（含 `flutter-test`，develop 侧已有该测试的修复）：`20-integration-8770bf571bcd.md`、`20-integration-d5dba5b1eef1.md`。
+- 维护者代码评审：note 1055「#27 代码评审通过：`58e0a0f`」，未发现 BLOCKING/WARNING。
+
+### 仍未验（本版部署后实测）
+
+note 1055 明确要求「部署后仍需实测真实冷首轮/稳态及 App 15s 超时与服务端预算的匹配」。本版把预算压到 12 秒后需实测：宿主重启后**首次**请求应为 `200 + N`（而非 504），且耗时 <15 秒。
+
 ## v3.2.0（build 43，issue #20）— 会话列表不再「越用越慢」：revision 缓存 + 每请求预算 + single-flight
 
 > 版本：插件 `3.2.0` / App `3.2.0+43`。本版**改动了插件**（新增 `lib/session-title-cache.js`、`lib/session-title-refresh.js`，改 `lib/index.js`）——除了安装新 APK，**必须同步插件副本并重启宿主**才会生效。
