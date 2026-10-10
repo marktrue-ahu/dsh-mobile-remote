@@ -1517,18 +1517,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _checkUpdate() async {
     final store = widget.store;
-    // 两端编排（评审 R9）：**插件先行**——把 App 升到需要新端点插件的版本、而插件还旧，
-    // 正是本次要消灭的形态。所以任一 App 更新入口都先确保插件已对齐。
-    if (api.pluginUpdate.contentUpdateAvailable) {
-      showToast(context, L10n.t('电脑端插件有更新：请先更新插件，再更新 App',
-          'Desktop plugin has an update — update it first'));
-      if (api.pluginUpdate.canSelfUpdate) {
-        await _triggerPluginUpdate();
-      } else {
-        await _showPluginUpdateGuidance();
-      }
-      return;
-    }
+    // 两端编排（F8）：**唯一判据在 store.appUpdateGate()**，这里只是同一个门禁的入口
+    if (!await ensurePluginAlignedFirst(context, store)) return;
     store.updateChecking = true;
     if (mounted) setState(() {});
     final outcome = await Updater.check(store);

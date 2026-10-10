@@ -124,6 +124,21 @@ void main() {
       expect(decide(j: journal(), loaded: hashOld).action, ResumeAction.wait);
     });
 
+    test('F7：回滚中间态（rolling-back）绝不被判成功——哪怕此刻内容恰好等于原目标', () {
+      final d = decide(
+        j: journal(),
+        loaded: hashNew, // 恰好等于原升级目标（矛盾的中间态）
+        transaction: tx(phase: 'rolling-back', rolledBack: true),
+      );
+      expect(d.action, ResumeAction.rolledBack);
+      expect(d.reason, 'transaction-rolling-back');
+    });
+
+    test('F7：rolledBack 标记优先于阶段判定（不改写原始目标也要判回滚）', () {
+      final d = decide(j: journal(), loaded: hashOld, transaction: tx(phase: 'restart-pending', rolledBack: true));
+      expect(d.action, ResumeAction.rolledBack);
+    });
+
     test('等太久仍无法确认 → timedOut（不无限等）', () {
       final d = decide(
         j: journal(),

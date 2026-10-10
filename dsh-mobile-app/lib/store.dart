@@ -22,6 +22,13 @@ import 'session_list.dart';
 String normalizeAgentStatus(Object? status) =>
     status == 'running' ? 'running' : 'idle';
 
+/// App 自身更新的前置门禁结果（F8：编排只判一次，所有入口共用）。
+class UpdateGate {
+  const UpdateGate(this.allowed, this.reason);
+  final bool allowed;
+  final String reason;
+}
+
 class AppStore extends ChangeNotifier {
   // ── 数据 ──
   String? sessionId; // 当前会话
@@ -106,7 +113,27 @@ class AppStore extends ChangeNotifier {
   /// 当前对齐状态（界面按 state 本地化文案）。
   AppAlignment get alignment => api.alignment;
 
-  /// 进行中的**插件自更新**记录（跨断线、跨进程持久化，见 CONTEXT「更新接续」）。
+  /// App 自身更新的**统一前置门禁**（F8）。
+  ///
+  /// 编排只在这里判一次：插件有内容更新、事务在飞、检查不可用、或本机形态需要人工指引时，
+  /// 都**不允许**先把 App 升上去——否则正是"App 新、插件旧"的坏形态。
+  UpdateGate appUpdateGate() {
+    if (pluginUpdateJournal != null) {
+      return const UpdateGate(false, 'plugin-update-in-progress');
+    }
+    final st = api.pluginUpdate;
+    if (st.contentUpdateAvailable) {
+      return UpdateGate(false, st.canSelfUpdate ? 'plugin-update-available' : 'plugin-update-guidance');
+    }
+    if (st.checkUnavailable) return const UpdateGate(false, 'plugin-check-unavailable');
+    final tx = st.transaction;
+    if (tx != null && !const {'settled', 'rolled-back', 'failed'}.contains(tx.phase)) {
+      return const UpdateGate(false, 'plugin-transaction-pending');
+    }
+    return const UpdateGate(true, '');
+  }
+
+  /// 进行中的**两端更新**记录（跨断线、跨进程持久化，见 CONTEXT「更新接续」）。
   PluginUpdateJournal? pluginUpdateJournal;
 
   /// 一次性提示（更新完成/失败/结果待确认），由界面消费后清空。
@@ -128,6 +155,9 @@ class AppStore extends ChangeNotifier {
       targetVersion: '',
       targetContentSha256: '',
       startedAt: DateTime.now().toUtc(),
+      phase: UpdatePhase.pluginPending,
+      // F9：固定清单身份——App 阶段必须用同一份清单，不能因为改源/上游发新版而跨版本拼接
+      manifestUrl: _manifestIdentity(),
     );
     pluginUpdateNotice = null;
     await _persistPrefs(_kPluginUpdateJournal, jsonEncode(pluginUpdateJournal!.toJson()));
@@ -184,10 +214,22 @@ class AppStore extends ChangeNotifier {
         return;
       case ResumeAction.completed:
         final tx = api.pluginUpdate.transaction;
-        pluginUpdateNotice = '插件已更新到 v${tx?.targetVersion ?? journal.targetVersion}';
-        await _clearPluginUpdateJournal();
-        // 两端编排（评审 R9）：插件健康之后才轮到 App 自己那半边
-        unawaited(_continueAppUpdateAfterPlugin());
+        final target = tx?.targetVersion ?? journal.targetVersion;
+        if (journal.phase == UpdatePhase.appPending) {
+          // App 自身那半边也已确认（调用方在装完后会把阶段推进到 done）
+          pluginUpdateNotice = '两端已更新到 v$target';
+          await _clearPluginUpdateJournal();
+        } else {
+          // F9：**先持久化阶段**再继续，App 被杀掉后重启仍知道"插件已好、该装 App 了"
+          pluginUpdateJournal = journal.copyWith(
+            phase: UpdatePhase.pluginConfirmed,
+            targetVersion: target,
+            targetContentSha256: tx?.targetContentSha256 ?? journal.targetContentSha256,
+          );
+          await _persistPrefs(_kPluginUpdateJournal, jsonEncode(pluginUpdateJournal!.toJson()));
+          pluginUpdateNotice = '电脑端插件已更新到 v$target';
+          unawaited(_continueAppUpdateAfterPlugin());
+        }
       case ResumeAction.rolledBack:
         pluginUpdateNotice = '插件更新未生效，电脑端已回滚到旧版本';
         await _clearPluginUpdateJournal();
@@ -207,16 +249,50 @@ class AppStore extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 插件已健康对齐后，再推进 App 自己那半边的更新（同一份清单/来源）。
+  /// 插件已健康对齐后，再推进 App 自己那半边的更新（**同一份清单**，F9）。
   Future<void> _continueAppUpdateAfterPlugin() async {
     try {
       final outcome = await Updater.check(this);
-      if (outcome.candidate != null) {
-        setUpdateCandidate(outcome.candidate);
+      // G3：只在确实有新版本时接纳候选——upToDate/remoteOlder 也带 candidate，
+      // 直接挂到首页会诱导重装同版甚至降级。
+      if (outcome.verdict == UpdateVerdict.updateAvailable && outcome.candidate != null) {
+        final candidate = outcome.candidate!;
+        pluginUpdateJournal = pluginUpdateJournal?.copyWith(
+          phase: UpdatePhase.appPending,
+          appVersion: candidate.version,
+        );
+        if (pluginUpdateJournal != null) {
+          await _persistPrefs(_kPluginUpdateJournal, jsonEncode(pluginUpdateJournal!.toJson()));
+        }
+        setUpdateCandidate(candidate);
+        notifyListeners();
+      } else {
+        // 没有 App 侧更新 → 两端编排完成
+        pluginUpdateNotice = '两端都已是最新';
+        await _clearPluginUpdateJournal();
+        notifyListeners();
       }
     } catch (_) {
       // 取不到候选不阻断：用户仍可手动检查
     }
+  }
+
+  /// App 自身更新安装完成后的收尾（F9：把阶段推进到 done 再清记录）。
+  Future<void> markAppUpdateConfirmed() async {
+    if (pluginUpdateJournal == null) return;
+    pluginUpdateJournal = pluginUpdateJournal!.copyWith(phase: UpdatePhase.done);
+    await _persistPrefs(_kPluginUpdateJournal, jsonEncode(pluginUpdateJournal!.toJson()));
+    await _clearPluginUpdateJournal();
+    notifyListeners();
+  }
+
+  /// 当前更新源的清单身份（F9：固定下来供 App 阶段复用）。
+  String _manifestIdentity() {
+    if (updateSource == 'host') {
+      final base = api.baseUrl.isNotEmpty ? api.baseUrl : '';
+      return 'host:$base';
+    }
+    return 'github:201222-L/dsh-mobile-remote';
   }
 
   /// 独立的超时推进（评审 R8）：只靠请求成功才能推进的话，长期离线会永久停在"等待重启"。

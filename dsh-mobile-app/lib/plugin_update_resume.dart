@@ -65,7 +65,22 @@ class PluginTransaction {
   }
 }
 
-/// 一次插件更新的记录（持久化在手机上，跨断线、跨进程）。
+/// 两端更新的阶段（F9：**必须持久化**，否则 App 被系统杀掉后不知道走到哪一步）。
+class UpdatePhase {
+  /// 已提交插件更新，等电脑端重启生效。
+  static const pluginPending = 'plugin-pending';
+
+  /// 插件已确认健康，尚未开始 App 自身更新。
+  static const pluginConfirmed = 'plugin-confirmed';
+
+  /// 正在装 App 自身的新版本。
+  static const appPending = 'app-pending';
+
+  /// 两端都已确认。
+  static const done = 'done';
+}
+
+/// 一次两端更新的记录（持久化在手机上，跨断线、跨进程、跨 App 重启）。
 class PluginUpdateJournal {
   const PluginUpdateJournal({
     required this.opId,
@@ -73,7 +88,19 @@ class PluginUpdateJournal {
     required this.targetContentSha256,
     required this.startedAt,
     this.attempts = 0,
+    this.phase = UpdatePhase.pluginPending,
+    this.manifestUrl = '',
+    this.appVersion = '',
   });
+
+  /// 固定下来的清单身份（F9）：两端必须用**同一份**清单，不能在 App 阶段
+  /// 因为用户改了更新源或上游发了新 Release 而"跨版本拼接"。
+  final String manifestUrl;
+
+  /// App 自身的目标版本（插件确认后填）。
+  final String appVersion;
+
+  final String phase;
 
   /// 提交意图时就生成的 operation id：重连后据此查询**同一个**事务（评审 R6/R7）。
   final String opId;
@@ -87,12 +114,22 @@ class PluginUpdateJournal {
   final DateTime startedAt;
   final int attempts;
 
-  PluginUpdateJournal copyWith({String? targetVersion, String? targetContentSha256}) => PluginUpdateJournal(
+  PluginUpdateJournal copyWith({
+    String? targetVersion,
+    String? targetContentSha256,
+    String? phase,
+    String? manifestUrl,
+    String? appVersion,
+  }) =>
+      PluginUpdateJournal(
         opId: opId,
         targetVersion: targetVersion ?? this.targetVersion,
         targetContentSha256: targetContentSha256 ?? this.targetContentSha256,
         startedAt: startedAt,
         attempts: attempts,
+        phase: phase ?? this.phase,
+        manifestUrl: manifestUrl ?? this.manifestUrl,
+        appVersion: appVersion ?? this.appVersion,
       );
 
   Map<String, dynamic> toJson() => {
@@ -101,6 +138,9 @@ class PluginUpdateJournal {
         'targetContentSha256': targetContentSha256,
         'startedAt': startedAt.toUtc().toIso8601String(),
         'attempts': attempts,
+        'phase': phase,
+        'manifestUrl': manifestUrl,
+        'appVersion': appVersion,
       };
 
   static PluginUpdateJournal? fromJson(Map<String, dynamic>? json) {
@@ -116,6 +156,9 @@ class PluginUpdateJournal {
       targetContentSha256: ((json['targetContentSha256'] as String?) ?? '').toLowerCase(),
       startedAt: at,
       attempts: attempts is int ? attempts : 0,
+      phase: (json['phase'] as String?) ?? UpdatePhase.pluginPending,
+      manifestUrl: (json['manifestUrl'] as String?) ?? '',
+      appVersion: (json['appVersion'] as String?) ?? '',
     );
   }
 }
@@ -158,6 +201,10 @@ ResumeDecision decidePluginUpdateResume({
 
   // 有事务且身份一致：以事务为准（这才是"结果待确认"的权威来源）
   if (transaction != null && (journal.opId.isEmpty || transaction.opId.isEmpty || transaction.opId == journal.opId)) {
+    // F7：**正在回滚**时绝不能判成功——即使此刻跑着的内容恰好等于原目标（那是矛盾的中间态）
+    if (transaction.rolledBack || transaction.phase == 'rolling-back') {
+      return const ResumeDecision(ResumeAction.rolledBack, 'transaction-rolling-back');
+    }
     switch (transaction.phase) {
       case 'settled':
         return const ResumeDecision(ResumeAction.completed, 'transaction-settled');
