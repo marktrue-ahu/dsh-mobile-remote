@@ -848,17 +848,37 @@ class _ChatScreenState extends State<ChatScreen> {
     // **有符号**：相对 `CustomScrollView.center` 的坐标（older 侧为负、live 侧为正），
     // 与定位器实测的 measureBuilt 偏移同一坐标系（复审 P2：非负前缀会整体平移，
     // 估算永远通不过 (lo, hi) 判据）。center 处的内容索引 = 内容子项数 − live 条数。
-    return estimateSignedContentOffset(
+    double? heightOf(int index) {
+      final key = _itemKeyAtIndex(index);
+      final height = key == null ? null : _itemHeights[key];
+      return (height != null && height > 0) ? height : null;
+    }
+
+    final centerIndex = childCount - _items.length;
+    final raw = estimateSignedContentOffset(
       targetIndex: targetIndex,
-      centerIndex: childCount - _items.length,
+      centerIndex: centerIndex,
       childCount: childCount,
-      cachedHeight: (index) {
-        final key = _itemKeyAtIndex(index);
-        final height = key == null ? null : _itemHeights[key];
-        return (height != null && height > 0) ? height : null;
-      },
+      cachedHeight: heightOf,
       averageHeight: average,
     );
+    if (raw == null) return null;
+    // **归一化到真实 extent**（复审二轮修订）：未缓存区间用平均高度时，权重总和与真实
+    // 内容高度未必同尺度——实测里热跳的首个估算因此偏小近 2 倍，逼出 3–4 步二分。
+    // 把"已缓存实测高度 + 未缓存均值"的总权重映射到布局给出的真实 extent，缓存只影响
+    // **相对权重**，估算随实际高度分布伸缩而不是随样本均值漂移。
+    final extent = _scrollCtrl.position.maxScrollExtent -
+        _scrollCtrl.position.minScrollExtent;
+    if (extent <= 0) return null;
+    final total = estimateSignedContentOffset(
+      targetIndex: childCount,
+      centerIndex: 0,
+      childCount: childCount,
+      cachedHeight: heightOf,
+      averageHeight: average,
+    );
+    if (total == null || total <= 0) return null;
+    return raw * extent / total;
   }
 
   /// 跳转到某一轮：**按实测几何校正的有界迭代定位**。

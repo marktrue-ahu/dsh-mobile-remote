@@ -718,6 +718,8 @@ class TurnLocator {
     );
   }
 
+
+
   /// 降级搜索：区间二分优先，其次沿已知目标方向按视口比例步进。
   double _degradedProbe({
     required List<double> visited,
