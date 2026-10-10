@@ -1427,6 +1427,10 @@ class _ChatScreenState extends State<ChatScreen> {
       if (outcome == TurnJumpOutcome.covered) {
         final match = _turnAnchors.where((a) => a.turn == anchor.turn);
         if (match.isNotEmpty) {
+          // 分页刚把更早历史 prepend 进来：先等一帧让布局/极值稳定（`minScrollExtent`
+          // 会向负方向扩展），并复核导航 token，然后才进入定位（issue #31 复审 P1）。
+          await WidgetsBinding.instance.endOfFrame;
+          if (!_turnNavCurrent(token)) return;
           await _jumpToTurn(match.first, token: token);
           return;
         }
