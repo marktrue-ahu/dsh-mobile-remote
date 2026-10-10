@@ -1126,20 +1126,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     ? Icon(Icons.brightness_1, size: 9, color: DshColors.danger(context))
                     : null),
           ),
-          // 插件落后于 App 时，手机端可以直接触发电脑端更新（ADR 0019：不加 PC 二次确认）。
-          // 更新包含一次宿主重启 → 连接会短暂断开，那由「更新接续」处理。
-          if (store.alignment.state == AlignmentState.pluginOutdated ||
-              store.pluginUpdateJournal != null)
+          // 插件更新入口由**内容状态**驱动（评审 R11）：同版本不同内容时也必须能操作，
+          // 而不是只看版本号对齐。不能自更新的形态给出**对应那一条**可复制指引。
+          if (api.pluginUpdate.contentUpdateAvailable || store.pluginUpdateJournal != null)
             _row(
               leading: const Icon(Icons.desktop_windows_outlined),
               title: L10n.t('更新电脑端插件', 'Update desktop plugin'),
               sub: store.pluginUpdateJournal != null
                   ? L10n.t('等待电脑端完成更新并重启…', 'Waiting for the desktop plugin to restart…')
-                  : L10n.t('电脑端插件落后于 App：可在这里直接触发更新',
-                      'Desktop plugin is behind the app — trigger the update here'),
-              onTap: store.pluginUpdateJournal != null ? null : _triggerPluginUpdate,
+                  : api.pluginUpdate.canSelfUpdate
+                      ? L10n.t('电脑端插件有新版本：可在这里直接触发更新',
+                          'A newer desktop plugin is available — trigger the update here')
+                      : L10n.t('电脑端插件有新版本：本机形态需按指引更新',
+                          'A newer desktop plugin is available — follow the guide for your install'),
+              onTap: store.pluginUpdateJournal != null
+                  ? null
+                  : (api.pluginUpdate.canSelfUpdate ? _triggerPluginUpdate : _showPluginUpdateGuidance),
               trailing: store.pluginUpdateJournal == null
-                  ? Text(L10n.t('更新 ▸', 'Update ▸'),
+                  ? Text(
+                      api.pluginUpdate.canSelfUpdate ? L10n.t('更新 ▸', 'Update ▸') : L10n.t('指引 ▸', 'Guide ▸'),
                       style: TextStyle(fontSize: 12, color: brand))
                   : null,
             ),
@@ -1248,6 +1253,61 @@ class _SettingsScreenState extends State<SettingsScreen> {
           showToastAt(msgr, '${L10n.t('设置失败：', 'Failed: ')}$e');
         }
       },
+    );
+  }
+
+  /// 不能自更新时展示**与实际安装方式对应的那一条**指引（可复制），而不是先诱导点"一键更新"。
+  Future<void> _showPluginUpdateGuidance() async {
+    final g = api.pluginUpdate.guidance;
+    final shape = api.pluginUpdate.installShape;
+    final lines = <String>[
+      if (g != null && g.summary.isNotEmpty) g.summary,
+      if (g != null) ...g.steps.map((s) => '· $s'),
+      if (shape.isNotEmpty) '${L10n.t('安装方式', 'install shape')}: $shape',
+    ];
+    final commands = g?.commands ?? const <String>[];
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(L10n.t('电脑端插件更新指引', 'Desktop plugin update guide')),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (final l in lines)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: Text(l, style: const TextStyle(fontSize: 13)),
+                ),
+              if (commands.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                for (final c in commands)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 4),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: SelectableText(c, style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
+                        ),
+                        TextButton(
+                          onPressed: () async {
+                            await Clipboard.setData(ClipboardData(text: c));
+                            if (ctx.mounted) showToast(ctx, L10n.t('已复制', 'Copied'));
+                          },
+                          child: Text(L10n.t('复制', 'Copy'), style: const TextStyle(fontSize: 12)),
+                        ),
+                      ],
+                    ),
+                  ),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: Text(L10n.t('关闭', 'Close'))),
+        ],
+      ),
     );
   }
 
@@ -1457,6 +1517,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _checkUpdate() async {
     final store = widget.store;
+    // 两端编排（评审 R9）：**插件先行**——把 App 升到需要新端点插件的版本、而插件还旧，
+    // 正是本次要消灭的形态。所以任一 App 更新入口都先确保插件已对齐。
+    if (api.pluginUpdate.contentUpdateAvailable) {
+      showToast(context, L10n.t('电脑端插件有更新：请先更新插件，再更新 App',
+          'Desktop plugin has an update — update it first'));
+      if (api.pluginUpdate.canSelfUpdate) {
+        await _triggerPluginUpdate();
+      } else {
+        await _showPluginUpdateGuidance();
+      }
+      return;
+    }
     store.updateChecking = true;
     if (mounted) setState(() {});
     final outcome = await Updater.check(store);

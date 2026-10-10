@@ -10,6 +10,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'logger.dart';
 import 'models.dart';
 import 'git_models.dart';
+import 'plugin_update_status.dart';
 import 'version_alignment.dart';
 
 class ApiException implements Exception {
@@ -88,6 +89,18 @@ class Api implements GitReadApi {
 
   /// 电脑端插件版本（bootstrap 返回，设置页「版本」展示用）。
   String pluginVersion = '';
+
+  /// 电脑端**正在运行**的插件内容标识（bootstrap 返回）。
+  /// 更新接续据此确认"新实例已健康生效"，而不是只看版本号（评审 R7）。
+  String pluginContentSha256 = '';
+
+  /// 电脑端下发的插件自更新状态（含安装形态、能否自更新、降级指引、事务摘要）。
+  PluginUpdateStatus pluginUpdate = const PluginUpdateStatus.unknown();
+
+  /// 每次成功吸收 bootstrap 后的回调——**统一的接续入口**（评审 R8）：
+  /// 首次连接、SSE 自动重连、下拉刷新、存活探测都走 `absorbBootstrap`，
+  /// 因此把"接续推进"挂在这里，就不会漏掉"用户什么都没做、只是自动重连"的路径。
+  void Function()? onBootstrapAbsorbed;
 
   /// 手机端自身版本（`X.Y.Z+build`，启动时由 package_info_plus 填入）。
   /// 随每个请求以 `x-mobile-app-version` 上报：电脑端据此判定两端对齐，
@@ -274,6 +287,13 @@ class Api implements GitReadApi {
                 : null,
           )
         : const TimelineCapabilities();
+    // 正在运行的内容标识 + 插件自更新状态（含事务摘要）：接续判定与"能不能一键"的依据
+    if (p is Map && p['contentSha256'] is String) {
+      pluginContentSha256 = (p['contentSha256'] as String).toLowerCase();
+    }
+    pluginUpdate = PluginUpdateStatus.fromJson(d['pluginUpdate']);
+    // 统一接续入口：所有吸收 bootstrap 的路径（首连/自动重连/刷新/探测）都走到这里
+    onBootstrapAbsorbed?.call();
   }
 
   /// 连接成功后收集电脑全部地址（/api/bootstrap 的 server.urls 含 Tailscale/ZeroTier 等虚拟网段 IP）。
@@ -459,11 +479,14 @@ class Api implements GitReadApi {
   }
 
   /// 触发**电脑端插件自更新**（ADR 0019：手机可独立触发，不需要坐到电脑前）。
-  /// 返回 `{action, version?}`；成功后宿主要重启，因此**随后必然断线**——
-  /// 那由「更新接续」处理，不是失败。超时给 30s：下载与安装都在电脑侧完成。
-  Future<Map<String, dynamic>> triggerPluginUpdate() =>
-      postJson('/api/plugin-update', <String, dynamic>{},
-          timeout: const Duration(seconds: 30));
+  /// 返回 `{action, opId?, check?}`；服务端**先应答、再后台推进**，因此超时不代表没开始
+  /// ——带同一个 [opId] 重试是幂等的，重连后凭它查询同一事务（评审 R6/R10）。
+  Future<Map<String, dynamic>> triggerPluginUpdate({String opId = ''}) =>
+      postJson(
+        '/api/plugin-update',
+        <String, dynamic>{if (opId.isNotEmpty) 'opId': opId},
+        timeout: const Duration(seconds: 15),
+      );
 
   // ── v2.6：模型提供商（与 PC 端 设置→模型 同一配置通道） ──
   /// 提供商列表（含 dormant 未激活项、baseURL、密钥状态）。

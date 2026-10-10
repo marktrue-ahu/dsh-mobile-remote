@@ -1,99 +1,145 @@
-// 更新接续（plugin_update_resume.dart）的纯逻辑单测：
-// 插件更新必然包含一次宿主重启，重启会断开连接——那是**正常环节**，不是失败。
-// 这里钉死"什么时候继续等、什么时候算完成、什么时候明确失败"。
+// 更新接续（plugin_update_resume.dart）的纯逻辑单测。
+// 评审 #32 note 1286 的 R7 要求：判定必须依据**事务 + 正在运行的内容标识**，
+// 只比 X.Y.Z 会在"同版本不同内容"上两头误判。这里把那四种情形钉死。
 import 'package:flutter_test/flutter_test.dart';
 import 'package:dsh_mobile_app/plugin_update_resume.dart';
 
 void main() {
   final started = DateTime.utc(2026, 10, 10, 12, 0, 0);
-  PluginUpdateJournal journal({String target = '3.3.0'}) =>
-      PluginUpdateJournal(targetVersion: target, startedAt: started);
+  const hashOld = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const hashNew = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+
+  PluginUpdateJournal journal({String opId = 'op-1', String target = hashNew, String version = '3.2.0'}) =>
+      PluginUpdateJournal(opId: opId, targetVersion: version, targetContentSha256: target, startedAt: started);
+
+  PluginTransaction tx({
+    String opId = 'op-1',
+    String phase = 'restart-pending',
+    String target = hashNew,
+    String version = '3.2.0',
+    bool rolledBack = false,
+    String? reason,
+  }) =>
+      PluginTransaction(
+        opId: opId,
+        phase: phase,
+        targetVersion: version,
+        targetContentSha256: target,
+        rolledBack: rolledBack,
+        reason: reason,
+      );
+
+  ResumeDecision decide({
+    PluginUpdateJournal? j,
+    String loaded = '',
+    PluginTransaction? transaction,
+    Duration? elapsed,
+  }) =>
+      decidePluginUpdateResume(
+        journal: j,
+        loadedContentSha256: loaded,
+        transaction: transaction,
+        now: started.add(elapsed ?? const Duration(seconds: 20)),
+      );
 
   group('PluginUpdateJournal 序列化', () {
-    test('往返保持字段', () {
-      final j = journal().withAttempt();
+    test('往返保留 opId / 目标内容标识 / 版本', () {
+      final j = journal();
       final back = PluginUpdateJournal.fromJson(j.toJson())!;
-      expect(back.targetVersion, '3.3.0');
-      expect(back.attempts, 1);
+      expect(back.opId, 'op-1');
+      expect(back.targetContentSha256, hashNew);
+      expect(back.targetVersion, '3.2.0');
       expect(back.startedAt.toUtc(), started);
     });
 
-    test('缺字段/坏时间/非法输入一律丢弃（不阻塞启动）', () {
+    test('缺 startedAt / 坏时间 → 丢弃（不阻塞启动）', () {
       expect(PluginUpdateJournal.fromJson(null), isNull);
-      expect(PluginUpdateJournal.fromJson({}), isNull);
-      expect(PluginUpdateJournal.fromJson({'targetVersion': '', 'startedAt': 'x'}), isNull);
-      expect(PluginUpdateJournal.fromJson({'targetVersion': '3.3.0', 'startedAt': 'not-a-date'}), isNull);
-      expect(PluginUpdateJournal.fromJson({'targetVersion': '3.3.0'}), isNull);
-      expect(
-        PluginUpdateJournal.fromJson({'targetVersion': '3.3.0', 'startedAt': started.toIso8601String()})
-            ?.attempts,
-        0,
-      );
+      expect(PluginUpdateJournal.fromJson({'opId': 'x'}), isNull);
+      expect(PluginUpdateJournal.fromJson({'startedAt': 'not-a-date'}), isNull);
+      expect(PluginUpdateJournal.fromJson({'startedAt': started.toIso8601String()})!.opId, '');
+    });
+  });
+
+  group('PluginTransaction', () {
+    test('解析事务摘要；缺 phase 视为无效', () {
+      final t = PluginTransaction.fromJson({
+        'opId': 'op-1',
+        'phase': 'failed',
+        'targetVersion': '3.3.0',
+        'targetContentSha256': hashNew.toUpperCase(),
+        'rolledBack': true,
+        'result': {'reason': 'rollback-exhausted'},
+      })!;
+      expect(t.phase, 'failed');
+      expect(t.targetContentSha256, hashNew, reason: '统一小写');
+      expect(t.rolledBack, isTrue);
+      expect(t.reason, 'rollback-exhausted');
+      expect(PluginTransaction.fromJson({}), isNull);
+      expect(PluginTransaction.fromJson({'phase': ''}), isNull);
     });
   });
 
   group('decidePluginUpdateResume', () {
-    test('没有记录 → 什么都不做', () {
-      final d = decidePluginUpdateResume(
-        journal: null,
-        pluginVersion: '',
-        now: started,
-      );
-      expect(d.action, ResumeAction.none);
-      expect(d.phase, ResumePhase.idle);
+    test('没有记录 → none', () {
+      expect(decide().action, ResumeAction.none);
     });
 
-    test('连不上（宿主重启中）且在超时内 → 继续等，不报错', () {
-      final d = decidePluginUpdateResume(
-        journal: journal(),
-        pluginVersion: '',
-        now: started.add(const Duration(seconds: 20)),
-      );
+    test('同版本、旧内容仍在服务（重启前旧实例响应）→ wait，不误报完成', () {
+      final d = decide(j: journal(), loaded: hashOld, transaction: tx());
       expect(d.action, ResumeAction.wait);
-      expect(d.phase, ResumePhase.waitingPlugin);
-      expect(d.reason, 'host-restarting');
+      expect(d.reason, 'restart-in-progress');
     });
 
-    test('超过超时仍连不上 → 明确失败（不无限等）', () {
-      final d = decidePluginUpdateResume(
-        journal: journal(),
-        pluginVersion: '',
-        now: started.add(const Duration(minutes: 6)),
-        timeout: const Duration(minutes: 5),
+    test('同版本、新内容已生效（重启后新实例响应）→ completed', () {
+      final d = decide(j: journal(), loaded: hashNew, transaction: tx());
+      expect(d.action, ResumeAction.completed);
+      expect(d.reason, 'loaded-target-content');
+    });
+
+    test('事务已 settled → completed（即使 App 还没看到新内容标识）', () {
+      final d = decide(j: journal(), loaded: hashNew, transaction: tx(phase: 'settled'));
+      expect(d.action, ResumeAction.completed);
+      expect(d.reason, 'transaction-settled');
+    });
+
+    test('同版本、电脑端已回滚 → rolledBack（不是"完成"，也不是"版本不符"）', () {
+      final d = decide(j: journal(), loaded: hashOld, transaction: tx(phase: 'rolled-back', rolledBack: true));
+      expect(d.action, ResumeAction.rolledBack);
+    });
+
+    test('事务明确失败 → failed，并带上电脑端给的原因', () {
+      final d = decide(j: journal(), loaded: hashOld, transaction: tx(phase: 'failed', reason: 'rollback-exhausted'));
+      expect(d.action, ResumeAction.failed);
+      expect(d.reason, 'rollback-exhausted');
+    });
+
+    test('事务身份不匹配（另一次更新）→ 不据它下结论，走内容兜底', () {
+      final d = decide(j: journal(opId: 'op-A'), loaded: hashOld, transaction: tx(opId: 'op-B', phase: 'settled'));
+      expect(d.action, ResumeAction.wait);
+      expect(d.reason, 'awaiting-transaction');
+    });
+
+    test('没有事务信息（旧插件）→ 用已加载内容标识兜底', () {
+      expect(decide(j: journal(), loaded: hashNew).action, ResumeAction.completed);
+      expect(decide(j: journal(), loaded: hashOld).action, ResumeAction.wait);
+    });
+
+    test('等太久仍无法确认 → timedOut（不无限等）', () {
+      final d = decide(
+        j: journal(),
+        loaded: hashOld,
+        transaction: tx(),
+        elapsed: const Duration(minutes: 6),
       );
       expect(d.action, ResumeAction.timedOut);
-      expect(d.phase, ResumePhase.failed);
       expect(d.reason, 'reconnect-timeout');
     });
 
-    test('回来了且版本符合预期 → 完成', () {
-      final d = decidePluginUpdateResume(
-        journal: journal(),
-        pluginVersion: '3.3.0',
-        now: started.add(const Duration(seconds: 40)),
-      );
-      expect(d.action, ResumeAction.completed);
-      expect(d.phase, ResumePhase.pluginReady);
-    });
-
-    test('版本比较只看语义版本（+build 不参与）', () {
-      final d = decidePluginUpdateResume(
-        journal: journal(target: '3.3.0'),
-        pluginVersion: '3.3.0+7',
-        now: started.add(const Duration(seconds: 30)),
-      );
-      expect(d.action, ResumeAction.completed);
-    });
-
-    test('回来了但版本不符 → 立刻失败（不空等到超时，用户更早得到结论）', () {
-      final d = decidePluginUpdateResume(
-        journal: journal(),
-        pluginVersion: '3.2.0',
-        now: started.add(const Duration(seconds: 10)),
-      );
-      expect(d.action, ResumeAction.versionMismatch);
-      expect(d.phase, ResumePhase.failed);
-      expect(d.reason, 'plugin-version-mismatch');
+    test('终态集合：completed / rolledBack / failed / timedOut', () {
+      expect(decide(j: journal(), loaded: hashNew, transaction: tx()).isTerminal, isTrue);
+      expect(decide(j: journal(), loaded: hashOld, transaction: tx()).isTerminal, isFalse);
+      expect(decide(j: journal(), loaded: hashOld, transaction: tx(phase: 'rolled-back')).isTerminal, isTrue);
+      expect(decide().isTerminal, isFalse);
     });
   });
 }

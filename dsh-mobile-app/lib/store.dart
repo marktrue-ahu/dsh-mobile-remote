@@ -11,6 +11,7 @@ import 'l10n.dart';
 import 'logger.dart';
 import 'models.dart';
 import 'update_core.dart';
+import 'updater.dart';
 import 'plugin_update_resume.dart';
 import 'version_alignment.dart';
 import 'session_list.dart';
@@ -108,59 +109,93 @@ class AppStore extends ChangeNotifier {
   /// 进行中的**插件自更新**记录（跨断线、跨进程持久化，见 CONTEXT「更新接续」）。
   PluginUpdateJournal? pluginUpdateJournal;
 
-  /// 一次性提示（更新完成/失败），由界面消费后清空。
+  /// 一次性提示（更新完成/失败/结果待确认），由界面消费后清空。
   String? pluginUpdateNotice;
 
-  /// 触发一次插件自更新。
-  /// 目标版本**由电脑端回答**（App 只知道插件当前版本，不知道新版号），所以先调接口、
-  /// 拿到 `restarting` 之后才写接续记录——只有真的开始了才需要跨重启记着。
+  /// 接续超时的独立推进定时器（评审 R8）：不依赖任何一次请求成功。
+  Timer? _pluginUpdateTimer;
+
+  /// 提交一次插件自更新。
+  ///
+  /// **先持久化提交意图（带 opId），再发请求**（评审 R6）：下载/安装可能在电脑侧跑很久，
+  /// 响应超时、App 被杀、网络抖动都不该让"已经开始的事"在手机上消失。超时按
+  /// "结果待确认"表达，重连后凭同一个 opId 查询同一事务，而不是另开一次更新。
   Future<void> beginPluginUpdate() async {
+    if (pluginUpdateJournal != null) return; // 已有在飞的事务：不重复提交
+    final opId = 'app-${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
+    pluginUpdateJournal = PluginUpdateJournal(
+      opId: opId,
+      targetVersion: '',
+      targetContentSha256: '',
+      startedAt: DateTime.now().toUtc(),
+    );
     pluginUpdateNotice = null;
+    await _persistPrefs(_kPluginUpdateJournal, jsonEncode(pluginUpdateJournal!.toJson()));
     notifyListeners();
+    _armPluginUpdateTimer();
     try {
-      final resp = await api.triggerPluginUpdate();
-      if (resp['action'] != 'restarting') {
-        pluginUpdateNotice = '电脑端插件无需更新';
-        notifyListeners();
-        return;
+      final resp = await api.triggerPluginUpdate(opId: opId);
+      final action = resp['action'];
+      if (action == 'accepted') {
+        pluginUpdateNotice = '已提交更新，等待电脑端完成并重启…';
+      } else if (action == 'none') {
+        // 检查没做成时**不能**说成"无需更新"（评审 W3）：只有明确的 up-to-date / local-ahead
+        // 才是"没有新版"，其余（unavailable / disabled / unknown）如实说不可用。
+        final check = resp['check'];
+        final state = check is Map ? ((check['state'] as String?) ?? '') : '';
+        final reason = check is Map ? ((check['reason'] as String?) ?? '') : '';
+        if (state == 'up-to-date' || state == 'local-ahead') {
+          pluginUpdateNotice = '电脑端插件已是最新';
+        } else {
+          pluginUpdateNotice = '无法确认更新（${state.isEmpty ? 'unknown' : state}${reason.isEmpty ? '' : '：$reason'}）';
+        }
+        await _clearPluginUpdateJournal();
+      } else {
+        pluginUpdateNotice = '结果待确认：重连后会自动确认';
       }
-      final target = (resp['version'] as String?) ?? '';
-      pluginUpdateJournal = PluginUpdateJournal(
-        targetVersion: target,
-        startedAt: DateTime.now().toUtc(),
-      );
-      await _persistPrefs(_kPluginUpdateJournal, jsonEncode(pluginUpdateJournal!.toJson()));
-      pluginUpdateNotice = '已开始更新电脑端插件，等待重启…';
-      notifyListeners();
     } on ApiException catch (e) {
-      pluginUpdateNotice = '插件更新未启动：${e.code}';
-      notifyListeners();
+      // 超时/网络错误：**保留记录**，按"结果待确认"处理——电脑端可能已经动手了
+      pluginUpdateNotice = '结果待确认（${e.code}）：电脑端可能已在更新，重连后会自动确认';
     } catch (e) {
-      pluginUpdateNotice = '插件更新未启动：$e';
-      notifyListeners();
+      pluginUpdateNotice = '结果待确认（$e）：重连后会自动确认';
     }
+    notifyListeners();
   }
 
-  /// 接续判定：宿主重启造成的断线是**正常环节**。
-  /// [connected] 为假表示这次压根没连上（仍等待或已超时）。
+  /// 接续判定：宿主重启造成的断线是**正常环节**（评审 R7/R8）。
+  /// 判定依据是电脑端下发的事务 + **正在运行的内容标识**，不是版本号。
   Future<void> resumePluginUpdate({bool connected = true}) async {
     final journal = pluginUpdateJournal;
-    if (journal == null) return;
+    if (journal == null) {
+      _pluginUpdateTimer?.cancel();
+      _pluginUpdateTimer = null;
+      return;
+    }
     final decision = decidePluginUpdateResume(
       journal: journal,
-      pluginVersion: connected ? api.pluginVersion : '',
+      loadedContentSha256: connected ? api.pluginContentSha256 : '',
+      transaction: connected ? api.pluginUpdate.transaction : null,
       now: DateTime.now().toUtc(),
     );
     switch (decision.action) {
       case ResumeAction.none:
       case ResumeAction.wait:
-        return; // 宿主重启中：继续等，不提示失败
+        _armPluginUpdateTimer(); // 继续等；超时由独立定时器推进
+        return;
       case ResumeAction.completed:
-        pluginUpdateNotice = '插件已更新到 v${journal.targetVersion}';
+        final tx = api.pluginUpdate.transaction;
+        pluginUpdateNotice = '插件已更新到 v${tx?.targetVersion ?? journal.targetVersion}';
+        await _clearPluginUpdateJournal();
+        // 两端编排（评审 R9）：插件健康之后才轮到 App 自己那半边
+        unawaited(_continueAppUpdateAfterPlugin());
+      case ResumeAction.rolledBack:
+        pluginUpdateNotice = '插件更新未生效，电脑端已回滚到旧版本';
+        await _clearPluginUpdateJournal();
+      case ResumeAction.failed:
+        pluginUpdateNotice = '插件更新失败（${decision.reason}）：请在电脑上确认插件状态';
         await _clearPluginUpdateJournal();
       case ResumeAction.timedOut:
-      case ResumeAction.versionMismatch:
-        pluginUpdateNotice = '插件更新未完成（${decision.reason}）：请在电脑上确认插件状态';
+        pluginUpdateNotice = '插件更新结果未确认（超时）：请在电脑上确认插件状态';
         await _clearPluginUpdateJournal();
     }
     notifyListeners();
@@ -172,8 +207,31 @@ class AppStore extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 插件已健康对齐后，再推进 App 自己那半边的更新（同一份清单/来源）。
+  Future<void> _continueAppUpdateAfterPlugin() async {
+    try {
+      final outcome = await Updater.check(this);
+      if (outcome.candidate != null) {
+        setUpdateCandidate(outcome.candidate);
+      }
+    } catch (_) {
+      // 取不到候选不阻断：用户仍可手动检查
+    }
+  }
+
+  /// 独立的超时推进（评审 R8）：只靠请求成功才能推进的话，长期离线会永久停在"等待重启"。
+  void _armPluginUpdateTimer() {
+    _pluginUpdateTimer?.cancel();
+    if (pluginUpdateJournal == null) return;
+    _pluginUpdateTimer = Timer(const Duration(seconds: 30), () {
+      unawaited(resumePluginUpdate(connected: api.pluginVersion.isNotEmpty));
+    });
+  }
+
   Future<void> _clearPluginUpdateJournal() async {
     pluginUpdateJournal = null;
+    _pluginUpdateTimer?.cancel();
+    _pluginUpdateTimer = null;
     await _persistPrefs(_kPluginUpdateJournal, '');
   }
 
@@ -372,6 +430,10 @@ class AppStore extends ChangeNotifier {
     } catch (_) {
       pluginUpdateJournal = null; // 记录损坏即丢弃，不阻塞启动
     }
+    // 统一接续入口（评审 R8）：首连、SSE 自动重连、下拉刷新、存活探测都会吸收 bootstrap，
+    // 因此把"接续推进"挂在这里，就不会漏掉"用户什么都没做、只是自动重连"的路径。
+    api.onBootstrapAbsorbed = () => unawaited(resumePluginUpdate());
+    if (pluginUpdateJournal != null) _armPluginUpdateTimer();
     gitTabs = List.unmodifiable(_defaultGitTabs);
     try {
       final raw = prefs.getString(_kGitTabs);
@@ -857,8 +919,6 @@ class AppStore extends ChangeNotifier {
       ok = true;
       // v2.7：下拉刷新也收集地址（蒲公英等新地址及时进候选）+ 同步 agent 状态
       api.absorbBootstrap(d);
-      // 插件自更新接续：宿主重启造成的断线是正常环节，重连后在这里确认是否生效
-      unawaited(resumePluginUpdate());
       _emitChatEvent(ChatEvent(type: '_capabilities', data: {}));
       _syncAgentStatus(d, snapshotEpoch: epoch);
     } catch (_) {
@@ -872,8 +932,6 @@ class AppStore extends ChangeNotifier {
           );
           ok = true;
           api.absorbBootstrap(d);
-          // 插件自更新接续：宿主重启造成的断线是正常环节，重连后在这里确认是否生效
-          unawaited(resumePluginUpdate());
           _emitChatEvent(ChatEvent(type: '_capabilities', data: {}));
           _syncAgentStatus(d, snapshotEpoch: epoch);
           // 当前 SSE 大概率也指向旧地址：重建连接
@@ -1193,8 +1251,6 @@ class AppStore extends ChangeNotifier {
       );
       // 合并服务端返回的全部地址（含 Tailscale IP）+ 记录插件版本
       api.absorbBootstrap(d);
-      // 插件自更新接续：宿主重启造成的断线是正常环节，重连后在这里确认是否生效
-      unawaited(resumePluginUpdate());
       _emitChatEvent(ChatEvent(type: '_capabilities', data: {}));
       _syncAgentStatus(d, snapshotEpoch: epoch);
       _setConnState('connected');
