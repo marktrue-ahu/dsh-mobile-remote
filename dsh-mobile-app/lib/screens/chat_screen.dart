@@ -820,22 +820,11 @@ class _ChatScreenState extends State<ChatScreen> {
   /// （目标在 20% 处就估 20%，而不是先跳 50%）。返回 null 表示无法估算，定位器会退回
   /// 区间二分/割线估算。
   double? _estimateOffsetForIndex(int targetIndex) {
-    if (targetIndex <= 0) return 0;
     if (!_scrollCtrl.hasClients) return null;
     final childCount = _contentChildCount;
     if (childCount <= 0) return null;
 
-    var cachedBeforeSum = 0.0;
-    var cachedBeforeCount = 0;
-    for (var index = 0; index < targetIndex; index++) {
-      final key = _itemKeyAtIndex(index);
-      final height = key == null ? null : _itemHeights[key];
-      if (height != null && height > 0) {
-        cachedBeforeSum += height;
-        cachedBeforeCount += 1;
-      }
-    }
-
+    // 回退均值：优先用缓存实测均值，冷缓存退化为 extent / childCount 的比例估算。
     var average = 0.0;
     if (_itemHeights.isNotEmpty) {
       var total = 0.0;
@@ -855,7 +844,21 @@ class _ChatScreenState extends State<ChatScreen> {
       average = extent / childCount;
     }
     if (!average.isFinite || average <= 0) return null;
-    return cachedBeforeSum + average * (targetIndex - cachedBeforeCount);
+
+    // **有符号**：相对 `CustomScrollView.center` 的坐标（older 侧为负、live 侧为正），
+    // 与定位器实测的 measureBuilt 偏移同一坐标系（复审 P2：非负前缀会整体平移，
+    // 估算永远通不过 (lo, hi) 判据）。center 处的内容索引 = 内容子项数 − live 条数。
+    return estimateSignedContentOffset(
+      targetIndex: targetIndex,
+      centerIndex: childCount - _items.length,
+      childCount: childCount,
+      cachedHeight: (index) {
+        final key = _itemKeyAtIndex(index);
+        final height = key == null ? null : _itemHeights[key];
+        return (height != null && height > 0) ? height : null;
+      },
+      averageHeight: average,
+    );
   }
 
   /// 跳转到某一轮：**按实测几何校正的有界迭代定位**。
@@ -863,7 +866,7 @@ class _ChatScreenState extends State<ChatScreen> {
   /// `Scrollable.ensureVisible` 只能作用于已构建的渲染对象，而消息流是懒构建的
   /// `SliverList`——屏幕外的轮次根本没有 element。所以先按目标真实子项序号做比例
   /// 兜底，再用已构建边界的**实测内容偏移**插值/割线外推逐帧校正；重试有界且受
-  /// `kTurnLocateTimeoutMs` 硬截止，最终必须让目标**与视口相交**才算成功。
+  /// `kTurnLocateHardCapMs` 绝对安全网，最终必须让目标**与视口相交**才算成功。
   ///
   /// [token] 是这次导航的世代（issue #25 评审 P2）：跨页跳转定位到目标、或被新选择
   /// 取代时旧的定位不得再滚动视口 / 弹提示 / 清 busy。
@@ -1404,6 +1407,10 @@ class _ChatScreenState extends State<ChatScreen> {
       if (outcome == TurnJumpOutcome.covered) {
         final match = _turnAnchors.where((a) => a.turn == anchor.turn);
         if (match.isNotEmpty) {
+          // 分页刚把更早历史 prepend 进来：先等一帧让布局/极值稳定（`minScrollExtent`
+          // 会向负方向扩展），并复核导航 token，然后才进入定位（issue #31 复审 P1）。
+          await WidgetsBinding.instance.endOfFrame;
+          if (!_turnNavCurrent(token)) return;
           await _jumpToTurn(match.first, token: token);
           return;
         }
