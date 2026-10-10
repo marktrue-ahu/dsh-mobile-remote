@@ -81,6 +81,7 @@ if ($LASTEXITCODE -ne 0) { Write-Error "manifest verification failed"; exit 1 }
 
 if ($env:UPDATE_DIR) {
     New-Item -ItemType Directory -Force -Path $env:UPDATE_DIR | Out-Null
-    Copy-Item $apkOut $tgzOut $manifest $env:UPDATE_DIR -Force
+    # 三个位置参数会被 PowerShell 判为 ParameterBindingException：必须显式 -Path/-Destination
+    Copy-Item -Path @($apkOut, $tgzOut, $manifest) -Destination $env:UPDATE_DIR -Force
     Write-Output ("Copied to updateDir: " + $env:UPDATE_DIR)
 }

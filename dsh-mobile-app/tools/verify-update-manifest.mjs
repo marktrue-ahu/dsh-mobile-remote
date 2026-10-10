@@ -18,6 +18,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import { pluginContentDigest } from "../../lib/plugin-content-digest.js";
 
 const dir = process.argv[2]
@@ -89,6 +90,27 @@ if (tgz && fs.existsSync(tgz)) {
 				plugin.contentSha256 === digest,
 				`manifest=${plugin.contentSha256} 实际=${digest}`,
 			);
+			// R13：tgz 必须**自包含运行时依赖**——离线 / vendored 安装解包后要能直接 require。
+			// 只核哈希会放过"哈希正确但装不起来"的包。
+			try {
+				const pkg = JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8"));
+				const deps = Object.keys(pkg.dependencies ?? {});
+				const missing = [];
+				for (const dep of deps) {
+					try {
+						createRequire(path.join(pkgDir, "package.json")).resolve(dep);
+					} catch {
+						missing.push(dep);
+					}
+				}
+				check(
+					"tgz 自包含运行时依赖（解包后可解析）",
+					missing.length === 0,
+					missing.length === 0 ? `dependencies=${deps.join(",") || "无"}` : `缺：${missing.join(",")}（需 bundleDependencies）`,
+				);
+			} catch (e) {
+				check("tgz 自包含运行时依赖（解包后可解析）", false, `读取 package.json 失败：${e.message}`);
+			}
 		}
 	}
 	fs.rmSync(tmp, { recursive: true, force: true });
@@ -99,8 +121,19 @@ if (tgz && fs.existsSync(tgz)) {
 }
 
 check(
-	"plugin.url 若给出则为 http(s)",
-	plugin.url === undefined || (typeof plugin.url === "string" && /^https?:\/\/\S+$/.test(plugin.url)),
+	"plugin.url 若给出则为可解析的 https / 回环 http",
+	(() => {
+		if (plugin.url === undefined) return true;
+		try {
+			const u = new URL(String(plugin.url));
+			if (u.hostname === "") return false;
+			if (u.port !== "" && !/^\d+$/.test(u.port)) return false;
+			if (u.protocol === "https:") return true;
+			return u.protocol === "http:" && (u.hostname === "127.0.0.1" || u.hostname === "localhost");
+		} catch {
+			return false;
+		}
+	})(),
 	`plugin.url=${plugin.url}`,
 );
 

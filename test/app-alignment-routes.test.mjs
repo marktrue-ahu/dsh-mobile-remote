@@ -2,7 +2,7 @@
 // diagnostics 必须把它作为 PC 端的失配提示入口；两者都不得破坏既有字段。
 // 真实服务/重启相关的部分不在自动门禁内（见 AGENT-RULES）。
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -261,10 +261,19 @@ test("POST /plugin-update：来源关闭 → 503；来源非法 → 400（fail-c
 	}, { pluginUpdateManifest: "http://insecure.host/m.json" });
 });
 
+test("POST /plugin-update：拿不到 profile 目录 → 409，绝不动文件（R3）", async () => {
+	// 测试树的祖先里没有声明本插件依赖的 package.json，因此 profile 解析为空——
+	// 这正是"不确定就先拒绝"的路径（比盲目改文件安全）。
+	await withHarness(async ({ api }) => {
+		const r = await request(api, { url: "/m/api/plugin-update", method: "POST" });
+		assert.equal(r.status, 409);
+		assert.equal(r.json().error, "profile-not-found");
+	}, { pluginUpdateManifest: "https://my.host/update/manifest.json" });
+});
+
 test("POST /plugin-update：本机形态不支持自重启 → 409（在做任何改动之前就拒绝）", async () => {
 	// 形态判定读进程环境（本仓库的测试就跑在 systemd 服务里），所以这里显式清掉相关变量，
-	// 让它稳定落到 unsupported。这一条钉住"先判形态、再动手"的顺序：
-	// 不支持就在进入下载/安装路径之前拒绝。
+	// 让它稳定落到 unsupported；同时给一个真实的 profile 目录，好走到能力判定这一步。
 	const saved = {
 		INVOCATION_ID: process.env.INVOCATION_ID,
 		DSH_PROFILE: process.env.DSH_PROFILE,
@@ -273,16 +282,22 @@ test("POST /plugin-update：本机形态不支持自重启 → 409（在做任�
 	delete process.env.INVOCATION_ID;
 	delete process.env.DSH_PROFILE;
 	delete process.env.DSH_WEB_FOREGROUND;
+	const dir = await mkdtemp(join(tmpdir(), "plugin-profile-"));
 	try {
+		await writeFile(join(dir, "package.json"), JSON.stringify({
+			name: "web-profile",
+			dependencies: { "dsh-mobile-remote": "file:/somewhere" },
+		}));
 		await withHarness(async ({ api }) => {
 			const r = await request(api, { url: "/m/api/plugin-update", method: "POST" });
 			assert.equal(r.status, 409);
 			assert.equal(r.json().error, "restart-unsupported");
-		}, { pluginUpdateManifest: "https://my.host/update/manifest.json" });
+		}, { pluginUpdateManifest: "https://my.host/update/manifest.json", updateProfileDir: dir });
 	} finally {
 		for (const [k, v] of Object.entries(saved)) {
 			if (v === undefined) delete process.env[k];
 			else process.env[k] = v;
 		}
+		await rm(dir, { recursive: true, force: true });
 	}
 });
