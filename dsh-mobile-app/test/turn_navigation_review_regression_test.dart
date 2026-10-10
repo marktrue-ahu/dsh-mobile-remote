@@ -442,4 +442,72 @@ void main() {
       });
     }
   });
+
+  // ── issue #31：真机缺陷「长会话里跳不到早期轮次」──
+  // 真机会话只有 10 轮却有 ~2967 个条目（每轮含大量工具调用与长回复），第 2 轮在最上方；
+  // 旧的 6 次尝试预算 + 盲二分在 3000 条目下跳不到。
+  group('缺陷 7（issue #31）：长会话里跳早期轮次', () {
+    testWidgets('3000 条目从底部跳第 2 轮：进入视口且探针次数很少', (tester) async {
+      final backend = _Backend(initialEvents: _turnEvents(1, 1000, replyRepeat: 2));
+      await _pumpChat(tester, backend: backend);
+      await _leaveBottom(tester);
+
+      final offsets = await _navigateTo(tester, 2);
+
+      expect(_textInViewport(tester, '问题 2'), isTrue,
+          reason: '长会话里第 2 轮必须真的进入视口（真机报「多次尝试后仍未进入视图」）');
+      expect(offsets.length, lessThanOrEqualTo(6),
+          reason: '尺寸缓存 + 索引估算应让长跳在少数几步内收敛，而不是靠 24 次硬试');
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('同一会话第二次跳转更快（尺寸缓存已热；先离开再重跳同一目标）', (tester) async {
+      final backend = _Backend(initialEvents: _turnEvents(1, 1000, replyRepeat: 2));
+      await _pumpChat(tester, backend: backend);
+      await _leaveBottom(tester);
+
+      final cold = await _navigateTo(tester, 2);
+      expect(_textInViewport(tester, '问题 2'), isTrue);
+
+      // 复审指出上一版直接跳**相邻**的第 3 轮、且目标已可见 → 0 次滚动也能绿，证明不了
+      // 缓存起作用。改成：先回到列表另一端并断言目标已离开视口，再重跳**同一**目标。
+      final position = _position(tester);
+      position.jumpTo(position.maxScrollExtent);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(_textInViewport(tester, '问题 2'), isFalse,
+          reason: '重跳前目标必须不在视口，否则测不到热缓存');
+      await _leaveBottom(tester);
+
+      final hot = await _navigateTo(tester, 2);
+
+      expect(_textInViewport(tester, '问题 2'), isTrue, reason: '热跳同样必须落到目标');
+      expect(hot.length, lessThanOrEqualTo(cold.length),
+          reason: '热缓存不应比冷跳更慢（冷 ${cold.length} 步 / 热 ${hot.length} 步）');
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('条目高度极不均匀（长回复按块穿插）时也收敛', (tester) async {
+      final events = <Map<String, dynamic>>[];
+      for (var block = 0; block < 10; block++) {
+        final from = block * 60 + 1;
+        events.addAll(_turnEvents(
+          from,
+          from + 59,
+          replyRepeat: 2,
+          longTurn: from + 30,
+          longRepeat: 400,
+        ));
+      }
+      final backend = _Backend(initialEvents: events);
+      await _pumpChat(tester, backend: backend);
+      await _leaveBottom(tester);
+
+      await _navigateTo(tester, 2);
+
+      expect(_textInViewport(tester, '问题 2'), isTrue,
+          reason: '全局平均高度完全不可用时也要收敛（靠实测几何校正）');
+      expect(tester.takeException(), isNull);
+    });
+  });
 }

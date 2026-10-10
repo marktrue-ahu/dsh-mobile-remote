@@ -370,6 +370,11 @@ class _ChatScreenState extends State<ChatScreen> {
   // 已构建边界最后一次实测的**内容偏移**（turn → offset）：边界被懒构建回收后，
   // 仍能用它推断阅读线落在哪一轮（长回复场景不再无条件回退到最新轮）。
   final Map<int, double> _turnContentOffset = {};
+  /// issue #31（方案 B）：**条目尺寸缓存**——已构建子项的实测高度，按稳定 key
+  /// （`seq` 优先，工具卡用 `latestSeq`）记录。定位时用它算"索引 → 偏移"的估算，
+  /// 这是本体虚拟化列表 `getOffsetForIndex` 的等价物：长跳一步落到目标附近，
+  /// 而不是盲二分十几次（真机上第 2 轮离底部约 2900 个条目）。
+  final Map<int, double> _itemHeights = {};
   int? _activeTurn; // 当前阅读的轮次（刻度轨高亮）
   int? _busyTurn; // 跳转进行中的轮次（刻度脉冲）
   // issue #25 二期：宿主轮次大纲（三态 + 读取失败态）。能力缺失/读取失败时退回一期
@@ -758,11 +763,20 @@ class _ChatScreenState extends State<ChatScreen> {
         if (local == null || !child.hasSize) continue;
         final contentIndex = contentOrderReversed ? count - 1 - local : local;
         final offset = pixels + (child.localToGlobal(Offset.zero).dy - viewTop);
+        final index = base + contentIndex;
+        final height = child.size.height;
         out.add(BuiltChildMeasurement(
-          index: base + contentIndex,
+          index: index,
           offset: offset,
-          height: child.size.height,
+          height: height,
         ));
+        // issue #31（方案 B）：顺手把实测高度回填进尺寸缓存（key 稳定，prepend/
+        // 加载条出现都不会错位）。缓存只增不改，超过上限时整体清空重建。
+        final stableKey = _itemKeyAtIndex(index);
+        if (stableKey != null && height > 0) {
+          if (_itemHeights.length > 6000) _itemHeights.clear();
+          _itemHeights[stableKey] = height;
+        }
       }
     }
 
@@ -778,12 +792,101 @@ class _ChatScreenState extends State<ChatScreen> {
     return out;
   }
 
+  /// 内容索引 → 该子项的**稳定尺寸缓存 key**（`seq` 优先，工具卡用 `latestSeq`）。
+  ///
+  /// 「更早」按钮 / 加载条 / 草稿不是消息，返回 null（它们不参与尺寸缓存）。
+  int? _itemKeyAtIndex(int index) {
+    if (index < 0) return null;
+    _MsgItem? item;
+    if (index < _olderItems.length) {
+      item = _olderItems[_olderItems.length - 1 - index];
+    } else {
+      final base = _olderItems.length + (_olderButtonVisible ? 1 : 0);
+      final local = index - base;
+      if (local < 0) return null; // 首项按钮 / 加载条
+      final i = _items.length - 1 - local;
+      if (i >= 0 && i < _items.length) item = _items[i];
+    }
+    return item == null ? null : (item.seq ?? item.latestSeq);
+  }
+
+  /// 内容索引 → 该子项**顶部的内容偏移估算**（issue #31 方案 B）。
+  ///
+  /// 本体虚拟化列表用 `itemSizeCache + estimateSize` 做 `getOffsetForIndex`；这里用
+  /// 等价的两段式估算：
+  ///   `已缓存条目的实测高度和 + 平均高度 × 未缓存条目数`
+  /// 平均高度优先取缓存实测均值（热缓存下很准），冷缓存退化为
+  /// `(maxScrollExtent - minScrollExtent) / childCount` 的比例估算——**仍远优于盲二分**
+  /// （目标在 20% 处就估 20%，而不是先跳 50%）。返回 null 表示无法估算，定位器会退回
+  /// 区间二分/割线估算。
+  double? _estimateOffsetForIndex(int targetIndex) {
+    if (!_scrollCtrl.hasClients) return null;
+    final childCount = _contentChildCount;
+    if (childCount <= 0) return null;
+
+    // 回退均值：优先用缓存实测均值，冷缓存退化为 extent / childCount 的比例估算。
+    var average = 0.0;
+    if (_itemHeights.isNotEmpty) {
+      var total = 0.0;
+      var count = 0;
+      for (final height in _itemHeights.values) {
+        if (height > 0) {
+          total += height;
+          count += 1;
+        }
+      }
+      if (count > 0) average = total / count;
+    }
+    if (average <= 0) {
+      final extent = _scrollCtrl.position.maxScrollExtent -
+          _scrollCtrl.position.minScrollExtent;
+      if (extent <= 0) return null;
+      average = extent / childCount;
+    }
+    if (!average.isFinite || average <= 0) return null;
+
+    // **有符号**：相对 `CustomScrollView.center` 的坐标（older 侧为负、live 侧为正），
+    // 与定位器实测的 measureBuilt 偏移同一坐标系（复审 P2：非负前缀会整体平移，
+    // 估算永远通不过 (lo, hi) 判据）。center 处的内容索引 = 内容子项数 − live 条数。
+    double? heightOf(int index) {
+      final key = _itemKeyAtIndex(index);
+      final height = key == null ? null : _itemHeights[key];
+      return (height != null && height > 0) ? height : null;
+    }
+
+    final centerIndex = childCount - _items.length;
+    final raw = estimateSignedContentOffset(
+      targetIndex: targetIndex,
+      centerIndex: centerIndex,
+      childCount: childCount,
+      cachedHeight: heightOf,
+      averageHeight: average,
+    );
+    if (raw == null) return null;
+    // **归一化到真实 extent**（复审二轮修订）：未缓存区间用平均高度时，权重总和与真实
+    // 内容高度未必同尺度——实测里热跳的首个估算因此偏小近 2 倍，逼出 3–4 步二分。
+    // 把"已缓存实测高度 + 未缓存均值"的总权重映射到布局给出的真实 extent，缓存只影响
+    // **相对权重**，估算随实际高度分布伸缩而不是随样本均值漂移。
+    final extent = _scrollCtrl.position.maxScrollExtent -
+        _scrollCtrl.position.minScrollExtent;
+    if (extent <= 0) return null;
+    final total = estimateSignedContentOffset(
+      targetIndex: childCount,
+      centerIndex: 0,
+      childCount: childCount,
+      cachedHeight: heightOf,
+      averageHeight: average,
+    );
+    if (total == null || total <= 0) return null;
+    return raw * extent / total;
+  }
+
   /// 跳转到某一轮：**按实测几何校正的有界迭代定位**。
   ///
   /// `Scrollable.ensureVisible` 只能作用于已构建的渲染对象，而消息流是懒构建的
   /// `SliverList`——屏幕外的轮次根本没有 element。所以先按目标真实子项序号做比例
   /// 兜底，再用已构建边界的**实测内容偏移**插值/割线外推逐帧校正；重试有界且受
-  /// `kTurnLocateTimeoutMs` 硬截止，最终必须让目标**与视口相交**才算成功。
+  /// `kTurnLocateHardCapMs` 绝对安全网，最终必须让目标**与视口相交**才算成功。
   ///
   /// [token] 是这次导航的世代（issue #25 评审 P2）：跨页跳转定位到目标、或被新选择
   /// 取代时旧的定位不得再滚动视口 / 弹提示 / 清 busy。
@@ -821,6 +924,8 @@ class _ChatScreenState extends State<ChatScreen> {
         reveal: () => _revealTurnKey(_turnKeysBySeq[anchor.seq]),
         measure: _measureTurnBoundaries,
         measureBuilt: _measureBuiltChildren,
+        // issue #31（方案 B）：尺寸缓存给出的"索引 → 偏移"估算（本体 getOffsetForIndex 的等价物）。
+        estimateOffsetForIndex: _estimateOffsetForIndex,
         settle: () => WidgetsBinding.instance.endOfFrame,
       );
       final outcome = await locator.locate(
@@ -1016,6 +1121,9 @@ class _ChatScreenState extends State<ChatScreen> {
         // 已在 setState 内，这里直接清 busy（旧 finally 已因世代失效不再收尾）。
         _turnNavGeneration += 1;
         _busyTurn = null;
+        // issue #31：条目重建（会话切换/重同步）后尺寸缓存一并失效——同一 seq 的高度
+        // 在新一轮渲染里可能不同（流式结束、折叠状态变化），留着会给出错的估算。
+        _itemHeights.clear();
         _timelineReducer.reset();
         _transientFrameKeys.clear();
         _debugPreviewCache.clear(); // 重建后 rawData 全变，旧预览缓存无意义
