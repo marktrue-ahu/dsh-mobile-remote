@@ -10,6 +10,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'logger.dart';
 import 'models.dart';
 import 'git_models.dart';
+import 'version_alignment.dart';
 
 class ApiException implements Exception {
   final String message;
@@ -87,6 +88,24 @@ class Api implements GitReadApi {
 
   /// 电脑端插件版本（bootstrap 返回，设置页「版本」展示用）。
   String pluginVersion = '';
+
+  /// 手机端自身版本（`X.Y.Z+build`，启动时由 package_info_plus 填入）。
+  /// 随每个请求以 `x-mobile-app-version` 上报：电脑端据此判定两端对齐，
+  /// 并在**缺失**时把"旧 App"作为可靠信号（旧版 App 不上报）。
+  String appVersion = '';
+
+  /// 两端对齐状态（电脑端下发优先；旧插件不下发时本地自行判定）。
+  AppAlignment alignment = const AppAlignment.unknown();
+
+  /// 记录手机端自身版本，并立即重算对齐状态。
+  void setAppVersion(String value) {
+    appVersion = value;
+    alignment = computeAlignment(
+      pluginVersion: pluginVersion,
+      appVersion: appVersion,
+      server: null,
+    );
+  }
 
   /// 对话时间线能力由服务端显式声明，不能只按 package version 猜测。
   TimelineCapabilities timelineCapabilities = const TimelineCapabilities();
@@ -239,6 +258,12 @@ class Api implements GitReadApi {
         } catch (_) {}
       }());
     }
+    final align = d['alignment'];
+    alignment = computeAlignment(
+      pluginVersion: pluginVersion,
+      appVersion: appVersion,
+      server: align is Map ? Map<String, dynamic>.from(align) : null,
+    );
     final capabilities = d['capabilities'];
     timelineCapabilities = capabilities is Map
         ? TimelineCapabilities.fromJson(
@@ -299,6 +324,8 @@ class Api implements GitReadApi {
   Map<String, String> get _headers => {
     'content-type': 'application/json',
     if (token.isNotEmpty) 'x-mobile-token': token,
+    // 电脑端据此判定两端对齐；旧 App 不带这个头，那本身就是"旧 App"的信号
+    if (appVersion.isNotEmpty) 'x-mobile-app-version': appVersion,
   };
 
   Future<Map<String, dynamic>> getJson(
@@ -430,6 +457,13 @@ class Api implements GitReadApi {
     final d = await getJson('/api/update/manifest');
     return (d['manifest'] as Map<String, dynamic>?) ?? const {};
   }
+
+  /// 触发**电脑端插件自更新**（ADR 0019：手机可独立触发，不需要坐到电脑前）。
+  /// 返回 `{action, version?}`；成功后宿主要重启，因此**随后必然断线**——
+  /// 那由「更新接续」处理，不是失败。超时给 30s：下载与安装都在电脑侧完成。
+  Future<Map<String, dynamic>> triggerPluginUpdate() =>
+      postJson('/api/plugin-update', <String, dynamic>{},
+          timeout: const Duration(seconds: 30));
 
   // ── v2.6：模型提供商（与 PC 端 设置→模型 同一配置通道） ──
   /// 提供商列表（含 dormant 未激活项、baseURL、密钥状态）。

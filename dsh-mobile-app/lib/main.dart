@@ -5,6 +5,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'l10n.dart';
 import 'api.dart';
 import 'store.dart';
@@ -55,6 +56,14 @@ void main() async {
     );
   };
   await api.load();
+  // 自身版本：随每个请求上报给电脑端（两端对齐判定的依据）。取不到就按"无法判定"处理，
+  // 不影响任何功能。
+  try {
+    final info = await PackageInfo.fromPlatform();
+    api.setAppVersion('${info.version}+${info.buildNumber}');
+  } catch (_) {
+    // 版本取不到时对齐提示显示为"无法判定"，不是错误
+  }
   await store.loadPrefs();
   // v2.7.1：启动即把余额预警配置同步给悬浮球（可能已在后台运行，判定以 App 端设置为准）
   unawaited(Floating.setBalanceAlert(store.balanceAlert, store.balanceThreshold));

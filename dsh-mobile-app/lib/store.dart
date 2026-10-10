@@ -11,6 +11,8 @@ import 'l10n.dart';
 import 'logger.dart';
 import 'models.dart';
 import 'update_core.dart';
+import 'plugin_update_resume.dart';
+import 'version_alignment.dart';
 import 'session_list.dart';
 
 /// 内核 `AgentStatus` 是 **`idle | running` 二元联合**（ADR 0013）——不存在 `waiting`。
@@ -80,6 +82,100 @@ class AppStore extends ChangeNotifier {
   String updateSource = 'github'; // 自动更新源：'github' | 'host'（持久化，默认 GitHub）
   UpdateCandidate? updateCandidate; // 最近一次检查命中的候选（null = 无）
   bool updateChecking = false; // 「检查更新」进行中（手动按钮状态）
+
+  /// 两端对齐提示被忽略时的判定身份（见 AppAlignment.signature）。
+  /// **不持久化**：重启后重新提醒一次，避免把真实的版本失配永久藏起来。
+  String? _alignmentDismissedFor;
+
+  /// 是否需要显示两端不对齐的提示（判定变化后会再次出现）。
+  /// `unknown`（未连接 / 版本不可解析）不进首页横幅——那是设置页版本行的信息，
+  /// 拿来弹横幅只会变成噪声。
+  bool get alignmentVisible {
+    final a = api.alignment;
+    if (a.state != AlignmentState.appOutdated && a.state != AlignmentState.pluginOutdated) return false;
+    return _alignmentDismissedFor != a.signature;
+  }
+
+  /// 本次忽略对齐提示（判定未变化期间不再打扰）。
+  void dismissAlignment() {
+    _alignmentDismissedFor = api.alignment.signature;
+    notifyListeners();
+  }
+
+  /// 当前对齐状态（界面按 state 本地化文案）。
+  AppAlignment get alignment => api.alignment;
+
+  /// 进行中的**插件自更新**记录（跨断线、跨进程持久化，见 CONTEXT「更新接续」）。
+  PluginUpdateJournal? pluginUpdateJournal;
+
+  /// 一次性提示（更新完成/失败），由界面消费后清空。
+  String? pluginUpdateNotice;
+
+  /// 触发一次插件自更新。
+  /// 目标版本**由电脑端回答**（App 只知道插件当前版本，不知道新版号），所以先调接口、
+  /// 拿到 `restarting` 之后才写接续记录——只有真的开始了才需要跨重启记着。
+  Future<void> beginPluginUpdate() async {
+    pluginUpdateNotice = null;
+    notifyListeners();
+    try {
+      final resp = await api.triggerPluginUpdate();
+      if (resp['action'] != 'restarting') {
+        pluginUpdateNotice = '电脑端插件无需更新';
+        notifyListeners();
+        return;
+      }
+      final target = (resp['version'] as String?) ?? '';
+      pluginUpdateJournal = PluginUpdateJournal(
+        targetVersion: target,
+        startedAt: DateTime.now().toUtc(),
+      );
+      await _persistPrefs(_kPluginUpdateJournal, jsonEncode(pluginUpdateJournal!.toJson()));
+      pluginUpdateNotice = '已开始更新电脑端插件，等待重启…';
+      notifyListeners();
+    } on ApiException catch (e) {
+      pluginUpdateNotice = '插件更新未启动：${e.code}';
+      notifyListeners();
+    } catch (e) {
+      pluginUpdateNotice = '插件更新未启动：$e';
+      notifyListeners();
+    }
+  }
+
+  /// 接续判定：宿主重启造成的断线是**正常环节**。
+  /// [connected] 为假表示这次压根没连上（仍等待或已超时）。
+  Future<void> resumePluginUpdate({bool connected = true}) async {
+    final journal = pluginUpdateJournal;
+    if (journal == null) return;
+    final decision = decidePluginUpdateResume(
+      journal: journal,
+      pluginVersion: connected ? api.pluginVersion : '',
+      now: DateTime.now().toUtc(),
+    );
+    switch (decision.action) {
+      case ResumeAction.none:
+      case ResumeAction.wait:
+        return; // 宿主重启中：继续等，不提示失败
+      case ResumeAction.completed:
+        pluginUpdateNotice = '插件已更新到 v${journal.targetVersion}';
+        await _clearPluginUpdateJournal();
+      case ResumeAction.timedOut:
+      case ResumeAction.versionMismatch:
+        pluginUpdateNotice = '插件更新未完成（${decision.reason}）：请在电脑上确认插件状态';
+        await _clearPluginUpdateJournal();
+    }
+    notifyListeners();
+  }
+
+  /// 消费一次性提示。
+  void clearPluginUpdateNotice() {
+    pluginUpdateNotice = null;
+    notifyListeners();
+  }
+
+  Future<void> _clearPluginUpdateJournal() async {
+    pluginUpdateJournal = null;
+    await _persistPrefs(_kPluginUpdateJournal, '');
+  }
 
   /// 已注册工作区（PC 端 workspaceRegistry）：[{id, path, title}]。
   List<Map<String, dynamic>> workspaces = [];
@@ -234,6 +330,7 @@ class AppStore extends ChangeNotifier {
   static const _kBalanceThreshold = 'dsh_mr_balance_threshold';
   static const _kFloating = 'dsh_mr_floating';
   static const _kUpdateSource = 'dsh_mr_update_source';
+  static const _kPluginUpdateJournal = 'dsh_mr_plugin_update_journal';
   static const _kGitTabs = 'dsh_mr_git_tabs';
   static const _kConversationActionOrder = 'dsh_mr_conversation_action_order';
 
@@ -265,6 +362,16 @@ class AppStore extends ChangeNotifier {
     floatingEnabled = prefs.getBool(_kFloating) ?? false;
     final src = prefs.getString(_kUpdateSource);
     updateSource = (src == 'host' || src == 'github') ? src! : 'github';
+    // 进行中的插件自更新记录（跨断线/跨进程）：宿主重启会断线，重连后据此接续
+    try {
+      final rawJournal = prefs.getString(_kPluginUpdateJournal);
+      pluginUpdateJournal = (rawJournal == null || rawJournal.isEmpty)
+          ? null
+          : PluginUpdateJournal.fromJson(
+              jsonDecode(rawJournal) as Map<String, dynamic>);
+    } catch (_) {
+      pluginUpdateJournal = null; // 记录损坏即丢弃，不阻塞启动
+    }
     gitTabs = List.unmodifiable(_defaultGitTabs);
     try {
       final raw = prefs.getString(_kGitTabs);
@@ -750,6 +857,8 @@ class AppStore extends ChangeNotifier {
       ok = true;
       // v2.7：下拉刷新也收集地址（蒲公英等新地址及时进候选）+ 同步 agent 状态
       api.absorbBootstrap(d);
+      // 插件自更新接续：宿主重启造成的断线是正常环节，重连后在这里确认是否生效
+      unawaited(resumePluginUpdate());
       _emitChatEvent(ChatEvent(type: '_capabilities', data: {}));
       _syncAgentStatus(d, snapshotEpoch: epoch);
     } catch (_) {
@@ -763,6 +872,8 @@ class AppStore extends ChangeNotifier {
           );
           ok = true;
           api.absorbBootstrap(d);
+          // 插件自更新接续：宿主重启造成的断线是正常环节，重连后在这里确认是否生效
+          unawaited(resumePluginUpdate());
           _emitChatEvent(ChatEvent(type: '_capabilities', data: {}));
           _syncAgentStatus(d, snapshotEpoch: epoch);
           // 当前 SSE 大概率也指向旧地址：重建连接
@@ -778,6 +889,10 @@ class AppStore extends ChangeNotifier {
       _refreshAllInner(),
       Future<void>.delayed(const Duration(seconds: 8)),
     ]);
+    if (!ok) {
+      // 离线也接续判定一次：宿主重启期间连不上是正常的，但等太久要如实收敛为超时
+      unawaited(resumePluginUpdate(connected: false));
+    }
     return ok;
   }
 
@@ -1078,6 +1193,8 @@ class AppStore extends ChangeNotifier {
       );
       // 合并服务端返回的全部地址（含 Tailscale IP）+ 记录插件版本
       api.absorbBootstrap(d);
+      // 插件自更新接续：宿主重启造成的断线是正常环节，重连后在这里确认是否生效
+      unawaited(resumePluginUpdate());
       _emitChatEvent(ChatEvent(type: '_capabilities', data: {}));
       _syncAgentStatus(d, snapshotEpoch: epoch);
       _setConnState('connected');

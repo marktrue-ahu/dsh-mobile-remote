@@ -18,6 +18,7 @@ import '../fmt.dart';
 import '../update_core.dart';
 import '../update_flow.dart';
 import '../updater.dart';
+import '../version_alignment.dart';
 import 'sheets.dart';
 import 'providers_screen.dart';
 import 'usage_screen.dart';
@@ -1108,6 +1109,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             sub:
                 'App v${_appVersion.isEmpty ? '…' : _appVersion}'
                 ' · ${L10n.t('插件', 'plugin')} v${api.pluginVersion.isEmpty ? '…' : api.pluginVersion}'
+                '${_alignmentNote()}'
                 '${store.updateCandidate != null ? ' · ${L10n.t('有新版本', 'update available')} ${store.updateCandidate!.version}' : ''}',
             onTap: store.updateCandidate == null
                 ? null
@@ -1120,8 +1122,27 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   },
             trailing: store.updateCandidate != null
                 ? Icon(Icons.brightness_1, size: 9, color: DshColors.danger(context))
-                : null,
+                : (store.alignment.needsAttention
+                    ? Icon(Icons.brightness_1, size: 9, color: DshColors.danger(context))
+                    : null),
           ),
+          // 插件落后于 App 时，手机端可以直接触发电脑端更新（ADR 0019：不加 PC 二次确认）。
+          // 更新包含一次宿主重启 → 连接会短暂断开，那由「更新接续」处理。
+          if (store.alignment.state == AlignmentState.pluginOutdated ||
+              store.pluginUpdateJournal != null)
+            _row(
+              leading: const Icon(Icons.desktop_windows_outlined),
+              title: L10n.t('更新电脑端插件', 'Update desktop plugin'),
+              sub: store.pluginUpdateJournal != null
+                  ? L10n.t('等待电脑端完成更新并重启…', 'Waiting for the desktop plugin to restart…')
+                  : L10n.t('电脑端插件落后于 App：可在这里直接触发更新',
+                      'Desktop plugin is behind the app — trigger the update here'),
+              onTap: store.pluginUpdateJournal != null ? null : _triggerPluginUpdate,
+              trailing: store.pluginUpdateJournal == null
+                  ? Text(L10n.t('更新 ▸', 'Update ▸'),
+                      style: TextStyle(fontSize: 12, color: brand))
+                  : null,
+            ),
           _row(
             leading: const Icon(Icons.sync_outlined),
             title: L10n.t('检查更新', 'Check for updates'),
@@ -1228,6 +1249,50 @@ class _SettingsScreenState extends State<SettingsScreen> {
         }
       },
     );
+  }
+
+  /// 在手机上触发电脑端插件更新。
+  ///
+  /// 只做一次确认弹窗（说明"宿主会重启、连接会短暂断开"），**不要求用户再到电脑上确认**——
+  /// 那正是 ADR 0019 的产品取舍。真正的下载/安装/重启都在电脑侧完成。
+  Future<void> _triggerPluginUpdate() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(L10n.t('更新电脑端插件？', 'Update desktop plugin?')),
+        content: Text(L10n.t(
+          '电脑上的插件会被替换为最新版，并且宿主会重启——连接会短暂断开，这是正常过程。',
+          'The plugin on your computer will be replaced with the latest version and the host will restart. '
+              'The connection drops briefly; that is expected.',
+        )),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text(L10n.t('取消', 'Cancel')),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text(L10n.t('开始更新', 'Update')),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    await widget.store.beginPluginUpdate();
+    if (!mounted) return;
+    final notice = widget.store.pluginUpdateNotice;
+    if (notice != null) showToast(context, notice);
+  }
+
+  /// 版本行的对齐尾注：未连接不判定；对齐时不加噪声；失配时说清**该动哪一端**。
+  String _alignmentNote() {
+    if (api.pluginVersion.isEmpty) return '';
+    return switch (widget.store.alignment.state) {
+      AlignmentState.ok => '',
+      AlignmentState.appOutdated => ' · ${L10n.t('App 需更新', 'App needs update')}',
+      AlignmentState.pluginOutdated => ' · ${L10n.t('插件需更新', 'plugin needs update')}',
+      AlignmentState.unknown => ' · ${L10n.t('对齐无法判定', 'alignment unknown')}',
+    };
   }
 
   /// 悬浮球操作说明弹窗（状态含义 + 手势操作）。
