@@ -37,6 +37,7 @@ TurnLocator _locator({
   double Function()? currentOffset,
   double Function()? viewportExtent,
   Future<void> Function()? settle,
+  int maxAttempts = kTurnLocateMaxAttempts,
   Duration timeout = const Duration(milliseconds: kTurnLocateHardCapMs),
   DateTime Function()? clock,
 }) {
@@ -53,6 +54,7 @@ TurnLocator _locator({
     currentOffset: currentOffset ?? () => 0,
     viewportExtent: viewportExtent ?? () => 0,
     settle: settle ?? () async {},
+    maxAttempts: maxAttempts,
     timeout: timeout,
     clock: clock,
   );
@@ -176,6 +178,39 @@ void main() {
           await locator.locate(targetTurn: 5, targetIndex: 5, childCount: 10);
       expect(outcome.ok, isFalse);
       expect(outcome.failure, TurnLocateFailure.exhausted);
+      expect(scrolls, 1, reason: '安全网到时后不得再滚动');
+    });
+
+    test('尾部安全网：最后一次等待跨过绝对上限后不得再 reveal', () async {
+      // issue #31 三轮复审 P2 回归：loop 内每轮入口都有超时检查，但**最后一次**落点之后的
+      // 等待跨过安全网时已经没有下一轮入口——尾部必须自己早退，否则会在"硬截止"之后
+      // 仍发起页面的 reveal（ensureVisible 动画/等待）。复审判例：cap=20s，最后一次等待
+      // 让时钟走到 24s，实际仍 reveal 了一次。
+      final start = DateTime(2026, 1, 1);
+      var now = start;
+      var built = false;
+      var scrolls = 0;
+      final revealAtMs = <int>[];
+      final locator = _locator(
+        scrollTo: (_) => scrolls++,
+        maxScrollExtent: () => 1000,
+        isTargetBuilt: () => built,
+        isTargetInView: () => false,
+        reveal: () async => revealAtMs.add(now.difference(start).inMilliseconds),
+        settle: () async {
+          built = true; // 最后一轮等待之后目标"已构建但不可见"
+          now = now.add(const Duration(seconds: 8));
+        },
+        maxAttempts: 1,
+        clock: () => now,
+      );
+
+      final outcome =
+          await locator.locate(targetTurn: 2, targetIndex: 4, childCount: 10);
+
+      expect(outcome.failure, TurnLocateFailure.exhausted);
+      expect(revealAtMs, isEmpty,
+          reason: '最后一次等待已跨过绝对安全网，不得再发起 reveal 精调');
       expect(scrolls, 1, reason: '安全网到时后不得再滚动');
     });
 

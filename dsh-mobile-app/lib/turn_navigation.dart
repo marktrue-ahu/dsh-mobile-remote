@@ -638,6 +638,13 @@ class TurnLocator {
       visited.add(probe);
       if (await _settleUntilInView()) return const TurnLocateOutcome.ok();
     }
+    // **尾部**（loop 内每轮入口已有同样检查，这里补的是"没有下一轮"的情形）：
+    // 最后一次落点后的等待可能正好跨过绝对安全网；此时不得再发起 reveal 精调或继续等待，
+    // 否则"硬截止"之后仍会有滚动副作用（issue #31 三轮复审实测：cap=20s 时在 24s 又
+    // reveal 一次）。
+    if (timedOut()) {
+      return const TurnLocateOutcome.failed(TurnLocateFailure.exhausted);
+    }
     // 次数用尽前再给布局一点时间：大列表 prepend 之后"落点对了但目标还没布局完"
     // 是常见情形，只等一帧就报失败会给出假的「未能定位」（issue #31 复审）。
     if (isTargetBuilt()) {
