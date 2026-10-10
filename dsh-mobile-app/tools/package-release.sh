@@ -60,17 +60,31 @@ if [ ! -f "$tgz_out" ]; then
 fi
 echo "Archived: $tgz_out ($(du -h "$tgz_out" | cut -f1))"
 
-# 3) manifest.json（共享生成器：合法 JSON / 无 BOM / notes=CHANGELOG 最新条目全文 / sha256+size）
+# 3) 发布清单（共享生成器：合法 JSON / 无 BOM / notes=CHANGELOG 最新条目全文 /
+#    app 与 plugin 两段 + 各自 sha256 / plugin 的 contentSha256）
+#    PLUGIN_URL：把 tgz 的下载地址写进清单（GitHub Release 等托管场景）；不设则只写文件名，
+#    由消费方相对清单地址解析。
 manifest="$dist/manifest.json"
+plugin_url_args=()
+[ -n "${PLUGIN_URL:-}" ] && plugin_url_args=(--plugin-url "$PLUGIN_URL")
 node "$app_dir/tools/gen-manifest.js" \
     --apk "$apk_out" \
     --version "$full_ver" \
+    --plugin-tgz "$tgz_out" \
+    --plugin-root "$repo_dir" \
     --changelog "$repo_dir/CHANGELOG.md" \
-    --out "$manifest"
+    --out "$manifest" \
+    "${plugin_url_args[@]}"
 
-# 4) 可选：拷入插件 updateDir（应用「主机源」更新通道）
+# 4) 校验清单与产物一致（fail-closed：不一致即中止发布）
+node "$app_dir/tools/verify-update-manifest.mjs" "$dist" || {
+    echo "manifest verification failed" >&2
+    exit 1
+}
+
+# 5) 可选：拷入插件 updateDir（应用「主机源」更新通道；tgz 一并落位，使该目录自包含）
 if [ -n "${UPDATE_DIR:-}" ]; then
     mkdir -p "$UPDATE_DIR"
-    cp "$apk_out" "$manifest" "$UPDATE_DIR/"
+    cp "$apk_out" "$tgz_out" "$manifest" "$UPDATE_DIR/"
     echo "Copied to updateDir: $UPDATE_DIR"
 fi

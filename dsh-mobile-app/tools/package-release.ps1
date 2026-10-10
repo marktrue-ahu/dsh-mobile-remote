@@ -66,12 +66,21 @@ if (Test-Path $packed) {
     Write-Warning "Plugin tarball not found - check npm pack output"
 }
 
-# 3) Update manifest for the host update source.
+# 3) Release manifest: describes both artifacts (app + plugin) and their digests.
+#    PLUGIN_URL writes the tarball's download URL; without it only the file name is emitted
+#    and consumers resolve it relative to the manifest location.
 $manifest = Join-Path $dist 'manifest.json'
-node (Join-Path $PSScriptRoot 'gen-manifest.js') --apk $apkOut --version $fullVersion --changelog (Join-Path $repoDir 'CHANGELOG.md') --out $manifest
+$pluginUrlArgs = @()
+if ($env:PLUGIN_URL) { $pluginUrlArgs = @('--plugin-url', $env:PLUGIN_URL) }
+node (Join-Path $PSScriptRoot 'gen-manifest.js') --apk $apkOut --version $fullVersion --plugin-tgz $tgzOut --plugin-root $repoDir --changelog (Join-Path $repoDir 'CHANGELOG.md') --out $manifest @pluginUrlArgs
 if ($LASTEXITCODE -ne 0) { Write-Error "gen-manifest.js failed with exit code $LASTEXITCODE"; exit 1 }
+
+# 4) Verify the manifest against the artifacts (fail-closed).
+node (Join-Path $PSScriptRoot 'verify-update-manifest.mjs') $dist
+if ($LASTEXITCODE -ne 0) { Write-Error "manifest verification failed"; exit 1 }
+
 if ($env:UPDATE_DIR) {
     New-Item -ItemType Directory -Force -Path $env:UPDATE_DIR | Out-Null
-    Copy-Item $apkOut $manifest $env:UPDATE_DIR -Force
+    Copy-Item $apkOut $tgzOut $manifest $env:UPDATE_DIR -Force
     Write-Output ("Copied to updateDir: " + $env:UPDATE_DIR)
 }
