@@ -3,7 +3,7 @@
 // 所以「清单与产物不一致」必须是**可检出的失败**，而不是靠人眼看。
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { appendFile, cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -226,7 +226,60 @@ test("tgz 未内联运行时依赖 → 校验器失败（R13：不能只看哈�
 		const r = verify(f.dist);
 		assert.notEqual(r.status, 0);
 		assert.match(r.stdout, /tgz 自包含运行时依赖/);
-		assert.match(r.stdout, /缺：qrcode/);
+		assert.match(r.stdout, /qrcode:无法解析/);
+	} finally {
+		await rm(f.base, { recursive: true, force: true });
+	}
+});
+
+test("依赖是指向解包目录之外的 symlink → 校验器失败（F10 的假绿）", async () => {
+	const f = await makeFixture({
+		pluginPkg: { name: "dsh-mobile-remote", version: "3.2.0", dependencies: { qrcode: "^1.5.4" } },
+	});
+	try {
+		// 模拟 pnpm 的符号链接布局：包内 node_modules/qrcode 指向**解包目录之外**
+		const outside = join(f.base, "store", "qrcode");
+		await mkdir(outside, { recursive: true });
+		await writeFile(join(outside, "package.json"), '{"name":"qrcode","version":"1.5.4","main":"index.js"}\n');
+		await writeFile(join(outside, "index.js"), "module.exports = {};\n");
+		const inside = join(f.base, "stage", "package", "node_modules");
+		await mkdir(inside, { recursive: true });
+		await symlink(outside, join(inside, "qrcode"), "dir");
+
+		const tar = spawnSync("tar", ["-czf", f.tgz, "-C", join(f.base, "stage"), "package"], { encoding: "utf8" });
+		assert.equal(tar.status, 0, tar.stderr);
+		const gen = spawnSync(process.execPath, [
+			GEN, "--apk", f.apk, "--version", "3.2.0+44", "--plugin-tgz", f.tgz,
+			"--plugin-root", f.plugin, "--changelog", join(f.base, "CHANGELOG.md"), "--out", f.manifest,
+		], { encoding: "utf8" });
+		assert.equal(gen.status, 0, gen.stderr);
+		const r = verify(f.dist);
+		assert.notEqual(r.status, 0);
+		assert.match(r.stdout, /qrcode:解析到解包目录之外/);
+	} finally {
+		await rm(f.base, { recursive: true, force: true });
+	}
+});
+
+test("依赖能解析但加载即抛 → 校验器失败（只 require.resolve 会漏，F10）", async () => {
+	const f = await makeFixture({
+		pluginPkg: { name: "dsh-mobile-remote", version: "3.2.0", dependencies: { qrcode: "^1.5.4" } },
+	});
+	try {
+		const bundled = join(f.base, "stage", "package", "node_modules", "qrcode");
+		await mkdir(bundled, { recursive: true });
+		await writeFile(join(bundled, "package.json"), '{"name":"qrcode","version":"1.5.4","main":"index.js"}\n');
+		await writeFile(join(bundled, "index.js"), "throw new Error('boom-on-load');\n");
+		const tar = spawnSync("tar", ["-czf", f.tgz, "-C", join(f.base, "stage"), "package"], { encoding: "utf8" });
+		assert.equal(tar.status, 0, tar.stderr);
+		const gen = spawnSync(process.execPath, [
+			GEN, "--apk", f.apk, "--version", "3.2.0+44", "--plugin-tgz", f.tgz,
+			"--plugin-root", f.plugin, "--changelog", join(f.base, "CHANGELOG.md"), "--out", f.manifest,
+		], { encoding: "utf8" });
+		assert.equal(gen.status, 0, gen.stderr);
+		const r = verify(f.dist);
+		assert.notEqual(r.status, 0);
+		assert.match(r.stdout, /qrcode:加载失败/);
 	} finally {
 		await rm(f.base, { recursive: true, force: true });
 	}
@@ -257,7 +310,7 @@ test("tgz 已内联运行时依赖 → 该项通过（与真实发布产物一�
 		assert.equal(gen.status, 0, gen.stderr);
 		const r = verify(f.dist);
 		assert.equal(r.status, 0, r.stdout);
-		assert.match(r.stdout, /tgz 自包含运行时依赖（解包后可解析） \(dependencies=qrcode\)/);
+		assert.match(r.stdout, /tgz 自包含运行时依赖（解包内可解析且可加载） \(dependencies=qrcode\)/);
 	} finally {
 		await rm(f.base, { recursive: true, force: true });
 	}

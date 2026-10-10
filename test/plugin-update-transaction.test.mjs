@@ -3,7 +3,8 @@
 //   - profile 目录靠**验证式查找**（声明了本插件依赖），不靠模块层级推断；
 //   - 同一 profile 同时只允许一个事务，重复请求幂等。
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -21,6 +22,7 @@ import {
 	releaseLock,
 	snapshotDir,
 	snapshotInstalled,
+	snapshotReady,
 	snapshotRoot,
 	transactionFile,
 	updateLockFile,
@@ -94,14 +96,16 @@ test("acquireLock：同 opId 幂等；不同 opId 且持有者存活 → busy；
 		// 持有者已死 → 抢占
 		assert.equal(acquireLock(file, { opId: op2, pid: 222, now: 1003, isPidAlive: () => false }).ok, true);
 		assert.equal(readLock(file).opId, op2);
-		// 过期锁也可抢占（持有者仍存活，但锁已超过 staleMs）
+		// 持有者**仍存活**时，不因"时间久"被抢占（长安装不该被并发覆盖，F6）
 		assert.equal(
 			acquireLock(file, { opId: op1, pid: 111, now: 1003 + DEFAULT_LOCK_STALE_MS + 1, isPidAlive: () => true }).ok,
-			true,
+			false,
 		);
-		// 只有持有者能释放
-		assert.equal(releaseLock(file, op2), false);
-		assert.equal(releaseLock(file, op1), true);
+		assert.equal(readLock(file).opId, op2);
+		// 只有持有者能释放（此时持有者是 op2）
+		assert.equal(releaseLock(file, op1), false);
+		assert.equal(readLock(file).opId, op2);
+		assert.equal(releaseLock(file, op2), true);
 		assert.equal(readLock(file), null);
 	} finally {
 		await rm(base, { recursive: true, force: true });
@@ -121,6 +125,8 @@ test("snapshotInstalled：把当前内容复制成不可变快照（原目录不
 		assert.equal(await readFile(join(dest, "lib", "index.js"), "utf8"), "export const a = 1;\n");
 		// 原目录仍在（运行中的插件不能被搬走）
 		assert.equal(dirReady(installed), true);
+		// 只有**带完成标记**的快照才算可用（半复制不会被当成回滚目标，F4）
+		assert.equal(snapshotReady(dest), true);
 		assert.equal(dirReady(dest), true);
 	} finally {
 		await rm(base, { recursive: true, force: true });
@@ -133,6 +139,49 @@ test("snapshotInstalled：源不存在时明确失败（不制造空快照当回
 		const r = snapshotInstalled({ installedRoot: join(base, "missing"), destDir: join(base, "d") });
 		assert.equal(r.ok, false);
 		assert.equal(r.error, "installed-root-missing");
+	} finally {
+		await rm(base, { recursive: true, force: true });
+	}
+});
+
+test("snapshotInstalled：解引用 symlink，得到自包含快照（F4）", async () => {
+	const base = await tmp("snap3-");
+	try {
+		// 模拟 pnpm：副本里的依赖是指向树外 store 的符号链接
+		const store = join(base, "store", "qrcode");
+		await mkdir(store, { recursive: true });
+		await writeFile(join(store, "index.js"), "module.exports = 'qrcode';\n");
+		const installed = join(base, "installed");
+		await mkdir(join(installed, "lib"), { recursive: true });
+		await mkdir(join(installed, "node_modules"), { recursive: true });
+		await writeFile(join(installed, "package.json"), "{}\n");
+		await symlink(store, join(installed, "node_modules", "qrcode"), "dir");
+
+		const dest = snapshotDir(join(base, "snaps"), "c".repeat(64));
+		const r = snapshotInstalled({ installedRoot: installed, destDir: dest });
+		assert.equal(r.ok, true, r.error);
+		assert.equal(snapshotReady(dest), true);
+		// 快照里是**真实文件**，不是指向树外的链接
+		assert.equal(await readFile(join(dest, "node_modules", "qrcode", "index.js"), "utf8"), "module.exports = 'qrcode';\n");
+		const st = await lstat(join(dest, "node_modules", "qrcode"));
+		assert.equal(st.isSymbolicLink(), false);
+	} finally {
+		await rm(base, { recursive: true, force: true });
+	}
+});
+
+test("snapshotInstalled：复制中途失败不留「可用」快照（原子发布，F4）", async () => {
+	const base = await tmp("snap4-");
+	try {
+		const installed = join(base, "installed");
+		await mkdir(installed, { recursive: true });
+		await writeFile(join(installed, "package.json"), "{}\n");
+		const dest = snapshotDir(join(base, "snaps"), "d".repeat(64));
+		const r = snapshotInstalled({ installedRoot: installed, destDir: dest, copyDir: () => ({ ok: false, error: "ENOSPC" }) });
+		assert.equal(r.ok, false);
+		assert.match(r.error, /snapshot-failed/);
+		assert.equal(snapshotReady(dest), false, "半成品不能被当成回滚目标");
+		assert.equal(existsSync(dest), false);
 	} finally {
 		await rm(base, { recursive: true, force: true });
 	}

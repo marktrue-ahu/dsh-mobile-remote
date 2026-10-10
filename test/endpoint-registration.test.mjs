@@ -32,10 +32,40 @@ test("登记的方法必须与源码分派一致", () => {
 	assert.deepEqual(methodMismatch, [], `方法不符：${JSON.stringify(methodMismatch)}`);
 });
 
-test("每条登记项都显式写出 capability；写了键就必须真的声明过", () => {
-	const { missingCapabilityField, undeclaredCapabilities } = diffRegisteredEndpoints(source);
+test("每条登记项要么关联真实能力键，要么给出显式豁免理由（G2）", () => {
+	const { missingCapabilityField, missingExemption, undeclaredCapabilities } = diffRegisteredEndpoints(source);
 	assert.deepEqual(missingCapabilityField, [], `缺少 capability 字段：${missingCapabilityField.join(", ")}`);
+	assert.deepEqual(missingExemption, [], `既没能力键也没豁免理由：${missingExemption.join(", ")}`);
 	assert.deepEqual(undeclaredCapabilities, [], `登记了未声明的能力键：${undeclaredCapabilities.join(", ")}`);
+});
+
+test("负向变异（真实源码）：删掉 bootstrap 的 eventTimeline 声明 → 必须报错（G2）", () => {
+	// 在**真实源码副本**上变异，且必须打在 bootstrap 那处——SSE hello 里有一模一样的
+	// `capabilities: { eventTimeline: ... }`，打错地方等于没测（这正是 G2 指出的问题）。
+	const bootAt = source.search(/rest\s*===\s*["']\/bootstrap["']/);
+	assert.ok(bootAt > 0, "找不到 bootstrap 分派");
+	const mutated = source.slice(0, bootAt) + source.slice(bootAt).replace(/capabilities:\s*\{\s*eventTimeline:/, "capabilities: {");
+	assert.notEqual(mutated, source, "变异没生效：bootstrap 的能力声明结构变了");
+	assert.deepEqual(diffRegisteredEndpoints(mutated).undeclaredCapabilities, ["eventTimeline"]);
+
+	// 只改 SSE hello 那处：抽取必须**不受影响**，否则说明抽错了块
+	const helloMutated = source.replace(/capabilities:\s*\{\s*eventTimeline:/, "capabilities: {");
+	assert.notEqual(helloMutated, source);
+	assert.deepEqual(diffRegisteredEndpoints(helloMutated).undeclaredCapabilities, []);
+});
+
+test("能力抽取只认 bootstrap 块，不会被 SSE hello 的 capabilities 骗到（G2）", () => {
+	// 源码里 hello 的 capabilities 出现在 bootstrap 之前时，抽取仍必须取 bootstrap 的
+	const fake = `
+		const hello = { capabilities: { sseOnly: true } };
+		if (rest === "/bootstrap") {
+			sendJson(res, 200, { ok: true, capabilities: { eventTimeline: X, turnOutline: Y } });
+		}
+	`;
+	const declared = extractDeclaredCapabilities(fake);
+	assert.equal(declared.has("sseOnly"), false, "不该抽到 hello 的能力");
+	assert.ok(declared.has("eventTimeline"));
+	assert.ok(declared.has("turnOutline"));
 });
 
 test("登记表无重复", () => {

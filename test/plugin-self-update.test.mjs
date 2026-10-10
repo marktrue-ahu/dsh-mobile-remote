@@ -8,8 +8,9 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdirSync as mkdirSyncSync, readFileSync as readFileSyncSync, writeFileSync as writeFileSyncSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname as dirnamePath, join } from "node:path";
 import { once } from "node:events";
 import { test } from "node:test";
 import { spawnSync } from "node:child_process";
@@ -30,8 +31,26 @@ import {
 	runSelfUpdate,
 	switchDependencySpecifier,
 	transactionFile,
+	updateLockPath,
 } from "../lib/plugin-self-update.js";
-import { artifactDir, artifactRoot, snapshotDir, snapshotRoot } from "../lib/plugin-update-transaction.js";
+import { acquireLock, artifactDir, artifactRoot, releaseLock, snapshotDir, snapshotRoot } from "../lib/plugin-update-transaction.js";
+
+
+/** 测试替身：冻结 + 逃逸 + 就绪握手都不真跑子进程（那部分由监督器测试覆盖）。 */
+function stubSupervisorHandshake() {
+	return {
+		freezeImpl: () => ({ ok: true, entry: "/dev/null" }),
+		spawnArmedImpl: ({ readyFile }) => {
+			mkdirSyncSync(dirnamePath(readyFile), { recursive: true });
+			writeFileSyncSync(readyFile, JSON.stringify({ pid: 4242, cgroup: "/test" }) + "\n");
+			return { ok: true, mode: "test" };
+		},
+		awaitReadyImpl: async ({ readyFile }) => {
+			const doc = JSON.parse(readFileSyncSync(readyFile, "utf8"));
+			return { ok: true, ready: doc };
+		},
+	};
+}
 
 const PLUGIN_FILES_A = { "package.json": '{"name":"dsh-mobile-remote","version":"3.2.0"}\n', "lib/index.js": "export const v = 'A';\n" };
 const PLUGIN_FILES_B = { "package.json": '{"name":"dsh-mobile-remote","version":"3.2.0"}\n', "lib/index.js": "export const v = 'B';\n" };
@@ -223,6 +242,7 @@ test("runSelfUpdate：成功路径——不可变产物 + 快照 + 事务停在 
 			manifestUrl: "https://example.com/manifest.json",
 			profileDir: env.profileDir,
 			installedRoot: env.installedRoot,
+			...stubSupervisorHandshake(),
 			restartForm: "web-systemd",
 			runInstall: async () => ({ ok: true }),
 			onStep: (s) => steps.push(s),
@@ -259,6 +279,7 @@ test("runSelfUpdate：同版本不同内容的第二次更新不会毁掉旧回�
 			manifestUrl: "https://example.com/m.json",
 			profileDir: env.profileDir,
 			installedRoot: env.installedRoot,
+			...stubSupervisorHandshake(),
 			runInstall: async () => ({ ok: true }),
 		});
 		assert.equal(r1.ok, true, r1.error);
@@ -269,6 +290,7 @@ test("runSelfUpdate：同版本不同内容的第二次更新不会毁掉旧回�
 		const settled = await superviseUpdate({
 			stateFile: transactionFile(env.home),
 			waitForHost: async () => ({ ok: true, matched: "content" }),
+			restart: () => ({ ok: true }),
 			log: () => {},
 		});
 		assert.equal(settled.phase, TRANSACTION_PHASE.SETTLED);
@@ -318,6 +340,7 @@ test("runSelfUpdate：下载校验失败 → FAILED 且 profile 完全未动", a
 			manifestUrl: "https://example.com/m.json",
 			profileDir: env.profileDir,
 			installedRoot: env.installedRoot,
+			...stubSupervisorHandshake(),
 			runInstall: async () => ({ ok: true }),
 		});
 		assert.equal(r.ok, false);
@@ -343,6 +366,7 @@ test("runSelfUpdate：内容标识不符 → 拒绝安装，profile 未动", asy
 			manifestUrl: "https://example.com/m.json",
 			profileDir: env.profileDir,
 			installedRoot: env.installedRoot,
+			...stubSupervisorHandshake(),
 			runInstall: async () => ({ ok: true }),
 		});
 		assert.equal(r.ok, false);
@@ -367,6 +391,7 @@ test("runSelfUpdate：安装失败 → 依赖声明还原（失败但可用）",
 			manifestUrl: "https://example.com/m.json",
 			profileDir: env.profileDir,
 			installedRoot: env.installedRoot,
+			...stubSupervisorHandshake(),
 			runInstall: async () => ({ ok: false, error: "pnpm-exit-1" }),
 		});
 		assert.equal(r.ok, false);
@@ -409,6 +434,7 @@ test("runSelfUpdate：并发第二个事务被锁拒绝（R10）", async () => {
 			manifestUrl: "https://example.com/m.json",
 			profileDir: env.profileDir,
 			installedRoot: env.installedRoot,
+			...stubSupervisorHandshake(),
 			runInstall: async () => { await gate; return { ok: true }; },
 		});
 		// 等第一个事务真正拿到锁
@@ -419,6 +445,7 @@ test("runSelfUpdate：并发第二个事务被锁拒绝（R10）", async () => {
 			manifestUrl: "https://example.com/m.json",
 			profileDir: env.profileDir,
 			installedRoot: env.installedRoot,
+			...stubSupervisorHandshake(),
 			runInstall: async () => ({ ok: true }),
 		});
 		assert.equal(second.ok, false);
@@ -433,13 +460,13 @@ test("runSelfUpdate：并发第二个事务被锁拒绝（R10）", async () => {
 
 // ── 插件侧只读报告（回滚归监督器）──────────────────────────────
 
-test("reportPendingUpdate：只读报告——匹配/等待/超时收敛，绝不由插件自己回滚（R1）", async () => {
+test("reportPendingUpdate：任意非终态都会在持有者消失后收敛，绝不由插件自己回滚（F6）", async () => {
 	const base = await mkdtemp(join(tmpdir(), "rep-"));
 	try {
 		const file = transactionFile(base);
+		const lockPath = updateLockPath(base);
 		assert.equal(reportPendingUpdate({ stateFile: file }).action, "none");
 
-		await writeFile(join(base, "x"), "");
 		await mkdir(join(base, ".dsh", "mobile-remote"), { recursive: true });
 		await writeFile(file, JSON.stringify({
 			opId: "op",
@@ -448,18 +475,39 @@ test("reportPendingUpdate：只读报告——匹配/等待/超时收敛，绝�
 			targetContentSha256: "a".repeat(64),
 		}));
 
-		assert.equal(reportPendingUpdate({ stateFile: file, localContentSha256: "a".repeat(64) }).action, "matched");
-		assert.equal(reportPendingUpdate({ stateFile: file, localContentSha256: "b".repeat(64), supervisorAlive: true }).action, "waiting");
-		// 监督器消失且超时 → 收敛为失败，避免手机永久等待
+		// 新实例已生效 → matched（插件只报告，不自行回滚）
+		assert.equal(
+			reportPendingUpdate({ stateFile: file, lockPath, localContentSha256: "a".repeat(64) }).action,
+			"matched",
+		);
+		// 持有者存活 → 继续等
+		acquireLock(lockPath, { opId: "op", pid: process.pid });
+		assert.equal(
+			reportPendingUpdate({ stateFile: file, lockPath, localContentSha256: "b".repeat(64) }).action,
+			"waiting",
+		);
+		// 持有者已死（释放锁）且超时 → 收敛为失败（否则后续更新永久 busy）
+		releaseLock(lockPath, "op");
 		const expired = reportPendingUpdate({
 			stateFile: file,
+			lockPath,
 			localContentSha256: "b".repeat(64),
-			supervisorAlive: false,
 			timeoutMs: 0,
 			now: () => Date.now() + 60_000,
 		});
 		assert.equal(expired.action, "expired");
 		assert.equal(expired.transaction.phase, TRANSACTION_PHASE.FAILED);
+		assert.equal(readUpdateState(file).phase, TRANSACTION_PHASE.FAILED);
+
+		// 非 restart-pending 的非终态（staging）同样会被收敛（F6 的关键一条）
+		await writeFile(file, JSON.stringify({
+			opId: "op2",
+			phase: TRANSACTION_PHASE.STAGING,
+			startedAt: new Date(Date.now() - 3600_000).toISOString(),
+		}));
+		const staged = reportPendingUpdate({ stateFile: file, lockPath });
+		assert.equal(staged.action, "expired");
+		assert.equal(staged.transaction.result.reason, "holder-gone");
 	} finally {
 		await rm(base, { recursive: true, force: true });
 	}
