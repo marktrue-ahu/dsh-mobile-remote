@@ -16,12 +16,14 @@ import { pluginContentDigest } from "../lib/plugin-content-digest.js";
 import {
 	MAX_ROLLBACK_ATTEMPTS,
 	UPDATE_PHASE,
+	buildRestartScript,
 	decideRollback,
 	detectRestartForm,
 	downloadVerified,
 	extractVerified,
 	readUpdateState,
 	restartPlan,
+	runRestart,
 	runSelfUpdate,
 	settlePendingUpdate,
 	switchDependencySpecifier,
@@ -258,6 +260,39 @@ test("detectRestartForm：Windows / macOS 不自动重启", () => {
 	assert.equal(detectRestartForm({ platform: "linux", hasSystemdUnit: () => true }), "web-systemd");
 	assert.equal(detectRestartForm({ platform: "linux", env: { DSH_WEB_FOREGROUND: "1" } }), "web-foreground");
 	assert.equal(detectRestartForm({ platform: "linux" }), "unsupported");
+});
+
+test("buildRestartScript：脚本必须先等待再终止，且从宿主进程树脱离执行", () => {
+	const supervised = buildRestartScript({ plan: restartPlan({ form: "web-systemd", pid: 4242 }), pid: 4242, delayMs: 3000 });
+	assert.match(supervised, /^sleep 3; kill -TERM 4242$/);
+
+	const respawn = buildRestartScript({ plan: restartPlan({ form: "web-foreground", pid: 4242, profile: "web" }), pid: 4242, delayMs: 1000 });
+	assert.match(respawn, /^sleep 1; kill -TERM 4242; sleep 2; nohup dsh web --profile web/);
+
+	// 不支持自动重启的形态不产出脚本（调用方须转为降级指引）
+	assert.equal(buildRestartScript({ plan: restartPlan({ form: "unsupported" }), pid: 1 }), "");
+	// 监督形态但没有 pid 时不乱猜目标
+	assert.equal(buildRestartScript({ plan: restartPlan({ form: "web-systemd" }), pid: null }), "");
+});
+
+test("runRestart：以分离进程执行脚本；不支持的形态拒绝且不 spawn", () => {
+	const calls = [];
+	const fakeSpawn = (cmd, args, opts) => {
+		calls.push({ cmd, args, opts });
+		return { pid: 999, unref() {} };
+	};
+	const ok = runRestart({ plan: restartPlan({ form: "web-systemd", pid: 42 }), pid: 42, spawnImpl: fakeSpawn });
+	assert.equal(ok.ok, true);
+	assert.equal(calls.length, 1);
+	assert.equal(calls[0].cmd, "bash");
+	assert.equal(calls[0].opts.detached, true);
+	assert.deepEqual(calls[0].opts.stdio, "ignore");
+	assert.match(calls[0].args[1], /kill -TERM 42/);
+
+	const rejected = runRestart({ plan: restartPlan({ form: "unsupported" }), pid: 42, spawnImpl: fakeSpawn });
+	assert.equal(rejected.ok, false);
+	assert.equal(rejected.error, "restart-unsupported");
+	assert.equal(calls.length, 1);
 });
 
 // ── 端到端（临时目录，注入安装器，不碰真实宿主）────────────────

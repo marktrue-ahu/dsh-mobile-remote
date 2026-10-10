@@ -36,7 +36,7 @@ class MockResponse extends Writable {
 	}
 }
 
-function config() {
+function config(over = {}) {
 	return {
 		path: "/m",
 		// 关闭口令：对齐状态与鉴权无关，这里只测响应契约
@@ -46,6 +46,8 @@ function config() {
 		sessionTtlMs: 60_000,
 		rechargeUrl: "",
 		updateDir: "",
+		// 默认关掉更新检查：这些用例只关心契约，不应产生任何出网行为
+		pluginUpdateManifest: "off",
 		maxConnections: 16,
 		pushUrls: [],
 		pushCooldownMs: 60_000,
@@ -53,6 +55,7 @@ function config() {
 		pushContent: "minimal",
 		rateLimit: { maxFailures: 10, windowMs: 60_000, blockMs: 60_000 },
 		lanBridge: { enabled: false, host: "127.0.0.1", port: 3080 },
+		...over,
 	};
 }
 
@@ -103,9 +106,9 @@ function apiRouteOf(routes) {
 	return routes.find((route) => route.kind === "prefix" && route.path === "/m/api");
 }
 
-function request(route, { url, headers = {} }) {
+function request(route, { url, headers = {}, method = "GET" }) {
 	const req = {
-		method: "GET",
+		method,
 		url,
 		headers: { host: "127.0.0.1:3080", ...headers },
 		socket: { remoteAddress: "127.0.0.1" },
@@ -122,9 +125,9 @@ function request(route, { url, headers = {} }) {
 	}));
 }
 
-async function withHarness(callback) {
+async function withHarness(callback, over = {}) {
 	const harness = createContext();
-	apply(harness.ctx, config());
+	apply(harness.ctx, config(over));
 	try {
 		return await callback({ ...harness, api: apiRouteOf(harness.routes) });
 	} finally {
@@ -223,4 +226,63 @@ test("diagnostics：checks.appAlignment 是 PC 端的失配提示入口", async 
 		).json();
 		assert.equal(aligned.checks.appAlignment.state, "ok");
 	});
+});
+
+test("bootstrap：下发插件自更新状态（初始为未检查），并在 diagnostics 可见", async () => {
+	await withHarness(async ({ api }) => {
+		const boot = (await request(api, { url: "/m/api/bootstrap" })).json();
+		assert.equal(typeof boot.pluginUpdate, "object");
+		assert.equal(boot.pluginUpdate.state, "unknown");
+		assert.equal(boot.pluginUpdate.reason, "not-checked");
+
+		const diag = (await request(api, { url: "/m/api/diagnostics" })).json();
+		assert.equal(diag.checks.pluginUpdate.state, "unknown");
+	});
+});
+
+test("POST /plugin-update：GET 不接受（只允许明确触发）", async () => {
+	await withHarness(async ({ api }) => {
+		const r = await request(api, { url: "/m/api/plugin-update" });
+		assert.equal(r.status, 405);
+	});
+});
+
+test("POST /plugin-update：来源关闭 → 503；来源非法 → 400（fail-closed，不动本机）", async () => {
+	await withHarness(async ({ api }) => {
+		const off = await request(api, { url: "/m/api/plugin-update", method: "POST" });
+		assert.equal(off.status, 503);
+		assert.equal(off.json().error, "update-source-off");
+	}, { pluginUpdateManifest: "off" });
+
+	await withHarness(async ({ api }) => {
+		const invalid = await request(api, { url: "/m/api/plugin-update", method: "POST" });
+		assert.equal(invalid.status, 400);
+		assert.equal(invalid.json().error, "update-source-invalid");
+	}, { pluginUpdateManifest: "http://insecure.host/m.json" });
+});
+
+test("POST /plugin-update：本机形态不支持自重启 → 409（在做任何改动之前就拒绝）", async () => {
+	// 形态判定读进程环境（本仓库的测试就跑在 systemd 服务里），所以这里显式清掉相关变量，
+	// 让它稳定落到 unsupported。这一条钉住"先判形态、再动手"的顺序：
+	// 不支持就在进入下载/安装路径之前拒绝。
+	const saved = {
+		INVOCATION_ID: process.env.INVOCATION_ID,
+		DSH_PROFILE: process.env.DSH_PROFILE,
+		DSH_WEB_FOREGROUND: process.env.DSH_WEB_FOREGROUND,
+	};
+	delete process.env.INVOCATION_ID;
+	delete process.env.DSH_PROFILE;
+	delete process.env.DSH_WEB_FOREGROUND;
+	try {
+		await withHarness(async ({ api }) => {
+			const r = await request(api, { url: "/m/api/plugin-update", method: "POST" });
+			assert.equal(r.status, 409);
+			assert.equal(r.json().error, "restart-unsupported");
+		}, { pluginUpdateManifest: "https://my.host/update/manifest.json" });
+	} finally {
+		for (const [k, v] of Object.entries(saved)) {
+			if (v === undefined) delete process.env[k];
+			else process.env[k] = v;
+		}
+	}
 });
