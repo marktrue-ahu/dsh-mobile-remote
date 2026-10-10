@@ -202,10 +202,13 @@ double estimateTurnOffset({
 /// 死循环，只是给收敛留够余量。
 const int kTurnLocateMaxAttempts = 24;
 
-/// 跳转进行中允许的最大时长（毫秒），超时按「未能定位」明说。
+/// 定位的**绝对**时间安全网（毫秒）。
 ///
-/// 它是**硬截止**：超时后不再产生任何滚动 / 精调副作用（见 [TurnLocator.locate]）。
-const int kTurnLocateTimeoutMs = 4000;
+/// 上界本来是"尝试次数"（[kTurnLocateMaxAttempts]，每次尝试真的落点一帧）；
+/// 这个墙钟只兜住每帧都极慢的病态情形。历史和教训：这里原先是一个 4 秒的收敛预算，
+/// 但大量 prepend 之后单帧布局就可能 >1 秒，4 秒会在**正在收敛途中**误报
+/// 「多次尝试后仍未进入视图」（issue #31 复审实测：落点已前进到 -215908 仍被判停滞）。
+const int kTurnLocateHardCapMs = 20000;
 
 /// 判定"落点重复 / 振荡"的偏移容差（像素）。
 ///
@@ -365,6 +368,46 @@ double? _secantSlope(
   return slope > 0 ? slope : null;
 }
 
+/// 内容索引 → 该行的**已缓存高度**；未缓存返回 null。
+typedef CachedRowHeight = double? Function(int index);
+
+/// 按**内容顺序**估算目标顶部相对列表 `center` 的**有符号偏移**（issue #31 复审修订）。
+///
+/// 本体虚拟化列表用 `itemSizeCache + estimateSize` 做 `getOffsetForIndex`；这里用同样的
+/// 两段式算前缀高度（已缓存实测高度优先、未缓存用均值兜底），再**减去 center 处的前缀**——
+/// 这一步是必需的：`CustomScrollView.center` 之前（older 侧）的条目在**负坐标**，
+/// center 之后才是正坐标；直接返回"从最早条目起累加的非负前缀"根本不在定位器的坐标系里
+/// （复审给的核对例：older 只有一条高 100 的消息时，live 首条实际 top=0、older 首条实际
+/// top=-100，而非负前缀会给出 100 与 0）。
+///
+/// @param targetIndex 目标的内容索引。
+/// @param centerIndex center 处的内容索引（live 侧第一条消息）。
+/// @param childCount 内容顺序下的子项总数（含按钮/加载条等非消息行）。
+/// @param cachedHeight 该内容索引的已缓存高度（未缓存传 null）。
+/// @param averageHeight 未缓存行的回退高度（缓存实测均值，或 `extent / childCount`）。
+/// @returns 有符号的内容偏移；参数不可用时返回 null。
+double? estimateSignedContentOffset({
+  required int targetIndex,
+  required int centerIndex,
+  required int childCount,
+  required CachedRowHeight cachedHeight,
+  required double averageHeight,
+}) {
+  if (childCount <= 0 || !averageHeight.isFinite || averageHeight <= 0) {
+    return null;
+  }
+  double prefix(int index) {
+    var sum = 0.0;
+    for (var i = 0; i < index; i++) {
+      final height = cachedHeight(i);
+      sum += (height != null && height > 0) ? height : averageHeight;
+    }
+    return sum;
+  }
+
+  return prefix(targetIndex) - prefix(centerIndex);
+}
+
 /// 有界迭代定位的执行器。
 ///
 /// 把「估算 → 落点 → 检查目标是否真的进入视口」这条控制流从页面里抽出来：它是最
@@ -398,7 +441,7 @@ class TurnLocator {
     this.currentOffset = _zeroExtent,
     this.viewportExtent = _zeroExtent,
     this.maxAttempts = kTurnLocateMaxAttempts,
-    this.timeout = const Duration(milliseconds: kTurnLocateTimeoutMs),
+    this.timeout = const Duration(milliseconds: kTurnLocateHardCapMs),
     DateTime Function()? clock,
   }) : _clock = clock ?? DateTime.now;
 
@@ -442,6 +485,11 @@ class TurnLocator {
   /// 就能估出目标的偏移。冷缓存时它退化为 `extent / childCount` 的比例估算（仍远优于
   /// 盲二分：目标在 20% 处就估 20%，而不是先跳 50%）。
   ///
+  /// **坐标系**：必须是 `CustomScrollView.center` 的相对偏移（older 侧为负、live 侧为正），
+  /// 与 [measureBuilt] 给出的内容偏移同一坐标系；页面侧用
+  /// [estimateSignedContentOffset] 保证这一点（复审 P2：非负前缀会让估算整体平移、
+  /// 永远通不过 `(lo, hi)` 判据）。
+  ///
   /// 返回值只在"可信"时才被采用：必须严格落在当前搜索区间 `(lo, hi)` 内；否则退回
   /// 区间二分等既有策略。落点之后仍以实测几何校正，估算错了也不会跑偏。
   final double? Function(int index)? estimateOffsetForIndex;
@@ -451,7 +499,12 @@ class TurnLocator {
 
   final int maxAttempts;
 
-  /// 硬截止时间：超时后不再滚动 / 精调。
+  /// **绝对**时间安全网（默认 [kTurnLocateHardCapMs]）。
+  ///
+  /// 定位的真正上界是 [maxAttempts]（每次尝试都真的落点并等一帧）；这个墙钟只兜住
+  /// "每帧都极慢"的病态情形。**不要**把它当成收敛预算：issue #31 复审实测证明，
+  /// 用"多久没进展"或固定 4 秒当上界，会在真机/CI 负载下把慢帧误判成停滞、
+  /// 在明明还在靠近目标时误报「多次尝试后仍未进入视图」。
   final Duration timeout;
 
   final DateTime Function() _clock;
@@ -470,12 +523,21 @@ class TurnLocator {
     }
     if (isTargetInView()) return const TurnLocateOutcome.ok();
     final start = _clock();
+    // 上界是**尝试次数**（每次尝试都真的落点并等一帧），墙钟只作绝对安全网：
+    // 用"多久没进展"当上界在真机/CI 负载下会把慢帧误判成停滞、在收敛途中放弃
+    // （issue #31 复审实测：落点已从 -121471 前进到 -215908 仍被判停滞）。
     bool timedOut() => _clock().difference(start) >= timeout;
 
-    // 搜索区间：lo 是"目标一定在其下方"的实测内容偏移（实测索引 < 目标），
-    // hi 是"目标一定在其上方"的（实测索引 > 目标）。两者在一次定位内只收不放。
-    double lo = minScrollExtent();
-    double? hi;
+    // 搜索界（issue #31 复审 P1 修订）：
+    // **只持久化实测约束**——来自真实已构建子项的界（索引更小者的底部 = 下界；索引更大
+    // 者的顶部 = 上界）。prepend 更早历史会把 older 侧所有偏移**整体**推得更负，内容顺序
+    // 关系不变，因此这两个不等式不会被打破，跨轮保留还能持续收窄（丢了它搜索会在两个区域
+    // 之间振荡：复审前那版"每轮重算"就退化成这样）。
+    // **布局估计不持久化**：`minScrollExtent()` 只是懒布局的动态估计，把它当成"永久实测
+    // 下界"正是复审 P1 的病灶（目标约 -215000，冻结下界却停在 -10 附近）。因此只在还没有
+    // 实测下界时，用**当前这一轮**的布局下界兜底。
+    double? measuredLower;
+    double? measuredUpper;
     final visited = <double>[];
 
     for (var attempt = 0; attempt < maxAttempts; attempt++) {
@@ -502,18 +564,20 @@ class TurnLocator {
             beforeIndex = b.index;
             beforeOffset = b.offset;
           }
-          // 目标在该子项之后 → 目标偏移 ≥ 它的底部。
-          if (b.bottom > lo) lo = b.bottom;
+          // 目标在该子项之后 → 目标偏移 ≥ 它的底部（持久化，只收不放）。
+          if (measuredLower == null || b.bottom > measuredLower) measuredLower = b.bottom;
         } else {
           if (afterIndex == null || b.index < afterIndex) {
             afterIndex = b.index;
             afterOffset = b.offset;
           }
-          // 目标在该子项之前 → 目标偏移 ≤ 它的顶部。
-          if (hi == null || b.offset < hi) hi = b.offset;
+          // 目标在该子项之前 → 目标偏移 ≤ 它的顶部（持久化，只收不放）。
+          if (measuredUpper == null || b.offset < measuredUpper) measuredUpper = b.offset;
         }
       }
 
+      // 进展判定在**选完探针之后**做（见下）；这里不要提前更新 previous*，
+      // 否则判据会拿本轮的值和本轮比，永远不认为有进展。
       if (targetOffset != null) {
         // 目标已构建：它的真实内容偏移已知，直接把阅读线对准它——精确一跳，
         // 不受 `ensureVisible` 动画与后续 `jumpTo` 互相打断的影响。
@@ -523,24 +587,25 @@ class TurnLocator {
         if (!_isRepeat(exact, visited)) {
           scrollTo(exact);
           visited.add(exact);
-          await settle();
         }
-        if (isTargetInView()) return const TurnLocateOutcome.ok();
+        if (await _settleUntilInView()) return const TurnLocateOutcome.ok();
         if (timedOut()) {
           return const TurnLocateOutcome.failed(TurnLocateFailure.exhausted);
         }
       } else if (isTargetBuilt()) {
         // 已构建但量不到几何（渲染对象尚未布局完）：退回 ensureVisible 精调。
         await reveal();
-        await settle();
-        if (isTargetInView()) return const TurnLocateOutcome.ok();
+        if (await _settleUntilInView()) return const TurnLocateOutcome.ok();
         if (timedOut()) {
           return const TurnLocateOutcome.failed(TurnLocateFailure.exhausted);
         }
       }
 
-      final lower = math.max(lo, min);
-      final upper = math.max(math.min(hi ?? max, max), lower);
+      // 有效界：实测优先；尚无实测下界时才用**当前**布局下界（每轮重读，允许向负扩展）。
+      final lowerBound = measuredLower ?? min;
+      final upperBound = measuredUpper;
+      final lower = math.max(lowerBound, min);
+      final upper = math.max(math.min(upperBound ?? max, max), lower);
       var probe = _selectProbe(
         targetTurn: targetTurn,
         targetIndex: targetIndex,
@@ -549,8 +614,8 @@ class TurnLocator {
         beforeOffset: beforeOffset,
         afterIndex: afterIndex,
         afterOffset: afterOffset,
-        lo: lo,
-        hi: hi,
+        lo: lowerBound,
+        hi: upperBound,
         min: min,
         max: max,
         boundaries: boundaries,
@@ -568,21 +633,32 @@ class TurnLocator {
           viewport: viewport,
         ).clamp(min, max).toDouble();
       }
+
       scrollTo(probe);
       visited.add(probe);
-      await settle();
-      if (isTargetInView()) return const TurnLocateOutcome.ok();
+      if (await _settleUntilInView()) return const TurnLocateOutcome.ok();
     }
-    if (timedOut()) {
-      return const TurnLocateOutcome.failed(TurnLocateFailure.exhausted);
-    }
+    // 次数用尽前再给布局一点时间：大列表 prepend 之后"落点对了但目标还没布局完"
+    // 是常见情形，只等一帧就报失败会给出假的「未能定位」（issue #31 复审）。
     if (isTargetBuilt()) {
       await reveal();
+    }
+    if (await _settleUntilInView(frames: 4)) {
+      return const TurnLocateOutcome.ok();
+    }
+    return const TurnLocateOutcome.failed(TurnLocateFailure.exhausted);
+  }
+
+  /// 有界地等布局稳定并复查目标是否进入视口。
+  ///
+  /// 懒构建 + 大列表下，"滚动到位"与"目标真的被布局进视口"之间可能差好几帧；
+  /// 固定只等一帧会在负载下误报失败。这里最多等 [frames] 帧，且每帧先复查一次。
+  Future<bool> _settleUntilInView({int frames = 3}) async {
+    for (var i = 0; i < frames; i++) {
+      if (isTargetInView()) return true;
       await settle();
     }
-    return isTargetInView()
-        ? const TurnLocateOutcome.ok()
-        : const TurnLocateOutcome.failed(TurnLocateFailure.exhausted);
+    return isTargetInView();
   }
 
   /// 选下一个落点（未做区间夹紧与重复检测）。
