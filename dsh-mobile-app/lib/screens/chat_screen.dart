@@ -806,22 +806,11 @@ class _ChatScreenState extends State<ChatScreen> {
   /// （目标在 20% 处就估 20%，而不是先跳 50%）。返回 null 表示无法估算，定位器会退回
   /// 区间二分/割线估算。
   double? _estimateOffsetForIndex(int targetIndex) {
-    if (targetIndex <= 0) return 0;
     if (!_scrollCtrl.hasClients) return null;
     final childCount = _contentChildCount;
     if (childCount <= 0) return null;
 
-    var cachedBeforeSum = 0.0;
-    var cachedBeforeCount = 0;
-    for (var index = 0; index < targetIndex; index++) {
-      final key = _itemKeyAtIndex(index);
-      final height = key == null ? null : _itemHeights[key];
-      if (height != null && height > 0) {
-        cachedBeforeSum += height;
-        cachedBeforeCount += 1;
-      }
-    }
-
+    // 回退均值：优先用缓存实测均值，冷缓存退化为 extent / childCount 的比例估算。
     var average = 0.0;
     if (_itemHeights.isNotEmpty) {
       var total = 0.0;
@@ -841,7 +830,21 @@ class _ChatScreenState extends State<ChatScreen> {
       average = extent / childCount;
     }
     if (!average.isFinite || average <= 0) return null;
-    return cachedBeforeSum + average * (targetIndex - cachedBeforeCount);
+
+    // **有符号**：相对 `CustomScrollView.center` 的坐标（older 侧为负、live 侧为正），
+    // 与定位器实测的 measureBuilt 偏移同一坐标系（复审 P2：非负前缀会整体平移，
+    // 估算永远通不过 (lo, hi) 判据）。center 处的内容索引 = 内容子项数 − live 条数。
+    return estimateSignedContentOffset(
+      targetIndex: targetIndex,
+      centerIndex: childCount - _items.length,
+      childCount: childCount,
+      cachedHeight: (index) {
+        final key = _itemKeyAtIndex(index);
+        final height = key == null ? null : _itemHeights[key];
+        return (height != null && height > 0) ? height : null;
+      },
+      averageHeight: average,
+    );
   }
 
   /// 跳转到某一轮：**按实测几何校正的有界迭代定位**。
@@ -849,7 +852,7 @@ class _ChatScreenState extends State<ChatScreen> {
   /// `Scrollable.ensureVisible` 只能作用于已构建的渲染对象，而消息流是懒构建的
   /// `SliverList`——屏幕外的轮次根本没有 element。所以先按目标真实子项序号做比例
   /// 兜底，再用已构建边界的**实测内容偏移**插值/割线外推逐帧校正；重试有界且受
-  /// `kTurnLocateTimeoutMs` 硬截止，最终必须让目标**与视口相交**才算成功。
+  /// `kTurnLocateHardCapMs` 绝对安全网，最终必须让目标**与视口相交**才算成功。
   Future<void> _jumpToTurn(TurnAnchor anchor) async {
     if (!_scrollCtrl.hasClients) return;
     // 统一走有界迭代定位：即使边界已构建也由定位器按实测几何落点，并以

@@ -461,17 +461,29 @@ void main() {
       expect(tester.takeException(), isNull);
     });
 
-    testWidgets('同一会话第二次跳转更快（尺寸缓存已热）', (tester) async {
+    testWidgets('同一会话第二次跳转更快（尺寸缓存已热；先离开再重跳同一目标）', (tester) async {
       final backend = _Backend(initialEvents: _turnEvents(1, 1000, replyRepeat: 2));
       await _pumpChat(tester, backend: backend);
       await _leaveBottom(tester);
 
-      await _navigateTo(tester, 2);
-      final second = await _navigateTo(tester, 3);
+      final cold = await _navigateTo(tester, 2);
+      expect(_textInViewport(tester, '问题 2'), isTrue);
 
-      expect(_textInViewport(tester, '问题 3'), isTrue);
-      expect(second.length, lessThanOrEqualTo(3),
-          reason: '热缓存下第二次长跳应在 1–3 步内到位');
+      // 复审指出上一版直接跳**相邻**的第 3 轮、且目标已可见 → 0 次滚动也能绿，证明不了
+      // 缓存起作用。改成：先回到列表另一端并断言目标已离开视口，再重跳**同一**目标。
+      final position = _position(tester);
+      position.jumpTo(position.maxScrollExtent);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(_textInViewport(tester, '问题 2'), isFalse,
+          reason: '重跳前目标必须不在视口，否则测不到热缓存');
+      await _leaveBottom(tester);
+
+      final hot = await _navigateTo(tester, 2);
+
+      expect(_textInViewport(tester, '问题 2'), isTrue, reason: '热跳同样必须落到目标');
+      expect(hot.length, lessThanOrEqualTo(cold.length),
+          reason: '热缓存不应比冷跳更慢（冷 ${cold.length} 步 / 热 ${hot.length} 步）');
       expect(tester.takeException(), isNull);
     });
 

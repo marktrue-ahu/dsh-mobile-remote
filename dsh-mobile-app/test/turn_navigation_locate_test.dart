@@ -9,7 +9,7 @@
 //      钉死——它是 ADR 0018 实现期修订的直接依据；
 //   2. 验证有界迭代定位（`TurnLocator`）在这套真实结构上**能收敛**，且成功判据
 //      是"目标与视口相交"（不是"已构建"）；
-//   3. 钉死失败原因（notInWindow / exhausted）、硬截止（kTurnLocateTimeoutMs）
+//   3. 钉死失败原因（notInWindow / exhausted）、绝对时间安全网（kTurnLocateHardCapMs）
 //      与基于实测几何的校正（不等高条目也能收敛）。
 //
 // 与 `chat_scroll_regression_test.dart` 同一条风险线（负偏移、prepend 保位）。
@@ -37,7 +37,7 @@ TurnLocator _locator({
   double Function()? currentOffset,
   double Function()? viewportExtent,
   Future<void> Function()? settle,
-  Duration timeout = const Duration(milliseconds: kTurnLocateTimeoutMs),
+  Duration timeout = const Duration(milliseconds: kTurnLocateHardCapMs),
   DateTime Function()? clock,
 }) {
   return TurnLocator(
@@ -162,19 +162,21 @@ void main() {
       expect(scrolls, 0);
     });
 
-    test('截止时间用尽后不再产生副作用，返回 exhausted', () async {
+    test('绝对时间安全网到时后不再产生副作用，返回 exhausted', () async {
+      // 上界是**尝试次数**，墙钟只是绝对安全网（kTurnLocateHardCapMs）。这里让每帧
+      // 前进 25 秒，跨过安全网：只允许发生第一次落点，随后立即 exhausted。
       var now = DateTime(2026, 1, 1);
       var scrolls = 0;
       final locator = _locator(
         scrollTo: (_) => scrolls++,
-        settle: () async => now = now.add(const Duration(seconds: 5)),
+        settle: () async => now = now.add(const Duration(seconds: 25)),
         clock: () => now,
       );
       final outcome =
           await locator.locate(targetTurn: 5, targetIndex: 5, childCount: 10);
       expect(outcome.ok, isFalse);
       expect(outcome.failure, TurnLocateFailure.exhausted);
-      expect(scrolls, 1, reason: '超时后不得再滚动（硬截止）');
+      expect(scrolls, 1, reason: '安全网到时后不得再滚动');
     });
 
     test('落点被夹在可滚动范围内（center 锚点下的负最小偏移）', () async {
@@ -538,6 +540,137 @@ void main() {
           reason: '估算值低于实测下界 60000，已被证伪，不得采用');
       expect(probes.every((p) => p >= 60000), isTrue,
           reason: '落点必须尊重实测区间下界');
+    });
+  });
+
+  // issue #31 复审 P2/P3：把尺寸缓存的前缀算法抽成纯 seam 直接验证——生产用的是
+  // **有符号**的 center 相对坐标，而不是"从最早条目起累加的非负前缀"。
+  group('estimateSignedContentOffset：center 相对的有符号前缀', () {
+    test('复审给的核对例：older 一条 100 高 → live 首条 0、older 首条 -100', () {
+      final heights = <int, double>{0: 100};
+      double? heightOf(int index) => heights[index];
+      expect(
+        estimateSignedContentOffset(
+          targetIndex: 1,
+          centerIndex: 1,
+          childCount: 2,
+          cachedHeight: heightOf,
+          averageHeight: 50,
+        ),
+        0,
+        reason: 'live 首条就在 center 处，偏移必须是 0',
+      );
+      expect(
+        estimateSignedContentOffset(
+          targetIndex: 0,
+          centerIndex: 1,
+          childCount: 2,
+          cachedHeight: heightOf,
+          averageHeight: 50,
+        ),
+        -100,
+        reason: 'older 首条在 center 之前，偏移必须是负的',
+      );
+    });
+
+    test('缓存完整时等于实测前缀差（live 侧为正）', () {
+      final heights = <int, double>{0: 100, 1: 50, 2: 200, 3: 60, 4: 70};
+      double? heightOf(int index) => heights[index];
+      double? at(int target) => estimateSignedContentOffset(
+            targetIndex: target,
+            centerIndex: 2,
+            childCount: 5,
+            cachedHeight: heightOf,
+            averageHeight: 10,
+          );
+      expect(at(2), 0);
+      expect(at(0), -150);
+      expect(at(1), -50);
+      expect(at(4), 260);
+    });
+
+    test('空缓存退化为平均高度 × 索引差（冷缓存的比例估算）', () {
+      double? none(int index) => null;
+      double? at(int target) => estimateSignedContentOffset(
+            targetIndex: target,
+            centerIndex: 4,
+            childCount: 10,
+            cachedHeight: none,
+            averageHeight: 30,
+          );
+      expect(at(4), 0);
+      expect(at(0), -120, reason: '4 项 × 30');
+      expect(at(9), 150, reason: '5 项 × 30');
+    });
+
+    test('部分缓存：已缓存用实测、未缓存用均值', () {
+      final heights = <int, double>{1: 500};
+      double? heightOf(int index) => heights[index];
+      // centerIndex=3、target=0：经过 index 0/1/2 → 均值 + 500 + 均值
+      expect(
+        estimateSignedContentOffset(
+          targetIndex: 0,
+          centerIndex: 3,
+          childCount: 6,
+          cachedHeight: heightOf,
+          averageHeight: 100,
+        ),
+        -700,
+      );
+    });
+
+    test('估算只取决于目标与 center 的索引差（prepend 后仍同号同值）', () {
+      double? none(int index) => null;
+      final shallow = estimateSignedContentOffset(
+        targetIndex: 0,
+        centerIndex: 5,
+        childCount: 10,
+        cachedHeight: none,
+        averageHeight: 40,
+      );
+      final deep = estimateSignedContentOffset(
+        targetIndex: 0,
+        centerIndex: 5,
+        childCount: 30,
+        cachedHeight: none,
+        averageHeight: 40,
+      );
+      expect(shallow, -200);
+      expect(deep, -200);
+    });
+
+    test('参数不可用时返回 null（childCount / 均值非法）', () {
+      double? none(int index) => null;
+      expect(
+        estimateSignedContentOffset(
+          targetIndex: 1,
+          centerIndex: 0,
+          childCount: 0,
+          cachedHeight: none,
+          averageHeight: 10,
+        ),
+        isNull,
+      );
+      expect(
+        estimateSignedContentOffset(
+          targetIndex: 1,
+          centerIndex: 0,
+          childCount: 4,
+          cachedHeight: none,
+          averageHeight: 0,
+        ),
+        isNull,
+      );
+      expect(
+        estimateSignedContentOffset(
+          targetIndex: 1,
+          centerIndex: 0,
+          childCount: 4,
+          cachedHeight: none,
+          averageHeight: double.nan,
+        ),
+        isNull,
+      );
     });
   });
 }
