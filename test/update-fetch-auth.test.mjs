@@ -51,3 +51,43 @@ test('W1: the real resolver accepts the loopback host source, so the authenticat
   assert.equal(resolveManifestSource('off').kind, 'off');
   assert.equal(resolveManifestSource('upstream').kind, 'upstream');
 });
+
+test('W4: credentials follow the exact mounted update paths only', async () => {
+  const seen = [];
+  const fetchImpl = async (url, opts) => { seen.push({ url, token: opts.headers['x-mobile-token'] }); return new Response('{}'); };
+  const auth = { fetchImpl, token: 'fixture-only-secret', trustedOrigin: 'http://127.0.0.1:39403', basePath: '/m' };
+  await fetchUpdateResource('http://127.0.0.1:39403/m/api/update/manifest', auth);
+  await fetchUpdateResource('http://127.0.0.1:39403/m/api/update/plugin', auth);
+  await fetchUpdateResource('http://127.0.0.1:39403/other-plugin/api/update/manifest', auth);
+  await fetchUpdateResource('http://127.0.0.1:39403/m/api/update/manifest/../other', auth);
+  assert.equal(seen[0].token, 'fixture-only-secret');
+  assert.equal(seen[1].token, 'fixture-only-secret');
+  assert.equal(seen[2].token, undefined, '同 origin 的其它处理器不得拿到口令');
+  assert.equal(seen[3].token, undefined, '归一化后不在允许集合内');
+});
+
+test('D5: Config accepts exactly what the resolver accepts (loopback http in, external http out)', async () => {
+  const { Config } = await import('../lib/index.js');
+  const { resolveManifestSource } = await import('../lib/plugin-self-update.js');
+  const allowed = [
+    'upstream',
+    'off',
+    'https://release.test/manifest.json',
+    'http://127.0.0.1:39403/m/api/update/manifest',
+    'http://localhost:39403/m/api/update/manifest',
+  ];
+  const rejected = ['http://external.test/m.json', 'ftp://x/m.json', 'not-a-url'];
+  for (const value of allowed) {
+    assert.doesNotThrow(() => Config({ pluginUpdateManifest: value }), value);
+    assert.notEqual(resolveManifestSource(value).kind, 'invalid', value);
+  }
+  for (const value of rejected) {
+    assert.throws(() => Config({ pluginUpdateManifest: value }), value);
+    assert.equal(resolveManifestSource(value).kind, 'invalid', value);
+  }
+  // 畸形 https 两者都接受（真正的失败在 fetch 时 fail-closed）：要求的是**集合一致**，不是各自为政。
+  for (const value of ['https://[bad']) {
+    const configAccepts = (() => { try { Config({ pluginUpdateManifest: value }); return true; } catch { return false; } })();
+    assert.equal(configAccepts, resolveManifestSource(value).kind !== 'invalid', value);
+  }
+});

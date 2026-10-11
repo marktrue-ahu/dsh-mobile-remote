@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { createHash as hashOf } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable, Writable } from 'node:stream';
@@ -88,6 +89,30 @@ test('C2: malformed client IDs are rejected before any filesystem/download side 
       assert.equal(r.status, 400, opId); assert.equal(r.body.error, 'invalid-operation-id');
       assert.equal(existsSync(sentinel), true); assert.equal(readFileSync(sentinel, 'utf8'), 'keep');
     }
+  } finally { h.dispose(); }
+});
+
+test('D3: host manifest projects phone-reachable routes for BOTH artifacts (never loopback, never a fake file path)', async () => {
+  const dir = join(home, 'd3-artifacts'); mkdirSync(dir);
+  const apk = Buffer.from('apk'), tgz = Buffer.from('tgz');
+  const digest = bytes => hashOf('sha256').update(bytes).digest('hex');
+  writeFileSync(join(dir, 'app.apk'), apk); writeFileSync(join(dir, 'plugin.tgz'), tgz);
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ schema: 1, version: '3.3.0+70', apk: 'app.apk', size: apk.length, sha256: digest(apk),
+    app: { version: '3.3.0+70', file: 'app.apk', size: apk.length, sha256: digest(apk) },
+    plugin: { version: '3.3.0', file: 'plugin.tgz', size: tgz.length, sha256: digest(tgz), contentSha256: 'c'.repeat(64) } }));
+  const h = harness({ config: { updateDir: dir, pluginUpdateManifest: 'off', trustedHosts: ['192.168.1.9'] } });  // 信任集合按 hostname（端口被剥离）
+  try {
+    const r = await request(h.route, undefined, '/m/api/update/manifest', { host: '192.168.1.9:3080' });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.manifest.app.url, 'http://192.168.1.9:3080/m/api/update/apk');
+    assert.equal(r.body.manifest.plugin.url, 'http://192.168.1.9:3080/m/api/update/plugin');
+    assert.equal(/\/api\/update\/[^/]*\.apk$/.test(r.body.manifest.app.url), false, '不得虚构文件路由');
+    assert.equal(r.body.manifest.app.url.includes('127.0.0.1'), false, '手机上的 127.0.0.1 是手机自己');
+    // 固定快照必须与主机检查产出的候选一致（同一份产物、同一地址）
+    const { fixedReleaseSnapshot } = await import('../lib/plugin-self-update.js');
+    const snapshot = fixedReleaseSnapshot(r.body.manifest, 'http://192.168.1.9:3080/m/api/update/manifest');
+    assert.equal(snapshot.app.url, r.body.manifest.app.url);
+    assert.equal(snapshot.app.sha256, r.body.manifest.app.sha256);
   } finally { h.dispose(); }
 });
 

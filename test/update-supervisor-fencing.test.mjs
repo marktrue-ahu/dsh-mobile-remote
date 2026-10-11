@@ -73,3 +73,39 @@ test('C3-B: unfinished recovery blocks new admission even after the lock was rel
   const after=acquireLock(lockPath,{opId:'op-new',stateFile:currentFile});
   assert.equal(after.ok,true,after.error); releaseLock(lockPath,after.lease,{stateFile:currentFile});
 });
+
+test('D4: phase CAS is enforced through the real wrapper (previously dropped)', () => {
+  const home=mkdtempSync(join(tmpdir(),'cas-')),lockPath=updateLockPath(home),currentFile=transactionFile(home);
+  const grant=acquireLock(lockPath,{opId:'op-cas',stateFile:currentFile});
+  const stateFile=serverOperationPath(home,grant.lease.generation);
+  writeOwnedTransaction(stateFile,{opId:'op-cas',lease:grant.lease,phase:'rolling-back',lockPath,currentFile},{lockPath,lease:grant.lease,currentFile});
+  assert.throws(
+    ()=>writeOwnedTransaction(stateFile,{opId:'op-cas',lease:grant.lease,phase:'restart-pending',lockPath,currentFile},{lockPath,lease:grant.lease,currentFile,expectedPhases:['installing','restart-pending']}),
+    /phase-cas-failed/,
+  );
+  // 合法推进（阶段确实匹配）仍然成功
+  const advanced=writeOwnedTransaction(stateFile,{opId:'op-cas',lease:grant.lease,phase:'rolling-back',attempts:1,lockPath,currentFile},{lockPath,lease:grant.lease,currentFile,expectedPhases:['rolling-back']});
+  assert.equal(advanced.attempts,1);
+  releaseLock(lockPath,grant.lease,{stateFile:currentFile});
+});
+
+test('D4: duplicate same-generation supervisors — only one performs restore and restart', async () => {
+  const home=mkdtempSync(join(tmpdir(),'claim-')),lockPath=updateLockPath(home),currentFile=transactionFile(home);
+  const profile=join(home,'profile');mkdirSync(profile,{recursive:true});
+  writeFileSync(join(profile,'package.json'),JSON.stringify({dependencies:{'dsh-mobile-remote':'file:/snap'}}));
+  const grant=acquireLock(lockPath,{opId:'op-recover',stateFile:currentFile});
+  const stateFile=serverOperationPath(home,grant.lease.generation);
+  const snapshot=join(home,'snap');mkdirSync(snapshot,{recursive:true});writeFileSync(join(snapshot,'package.json'),'{}');
+  writeOwnedTransaction(stateFile,{opId:'op-recover',lease:grant.lease,phase:'rolling-back',attempts:1,rolledBack:true,
+    profileDir:profile,previousSnapshotDir:snapshot,previousContentSha256:'b'.repeat(64),targetContentSha256:'a'.repeat(64),
+    lockPath,currentFile},{lockPath,lease:grant.lease,currentFile});
+  let restores=0,restarts=0;
+  const base={stateFile,opId:'op-recover',generation:grant.lease.generation,lockPath,lease:grant.lease,currentFile,
+    restore:async()=>{restores++;await new Promise(r=>setTimeout(r,30));return {ok:true};},
+    restart:()=>{restarts++;return {ok:true};},
+    waitForHost:async()=>({ok:true,matched:'content'})};
+  const [first,second]=await Promise.all([superviseUpdate(base),superviseUpdate(base)]);
+  assert.equal(restores,1,`恢复只能执行一次：${JSON.stringify([first?.phase,second?.phase])}`);
+  assert.equal(restarts,1,'重启只能执行一次');
+  assert.ok([first,second].some(r=>r?.error==='recovery-claimed'||r?.phase==='rolled-back'));
+});

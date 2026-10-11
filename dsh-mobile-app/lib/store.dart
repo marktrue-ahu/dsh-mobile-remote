@@ -59,7 +59,8 @@ class AppStore extends ChangeNotifier {
       pluginUpdateJournal = PluginUpdateJournal(opId: api.pluginUpdate.transaction?.opId ?? genRequestId(),
         targetVersion: release.plugin.version, targetContentSha256: release.plugin.contentSha256,
         startedAt: DateTime.now().toUtc(), phase: UpdatePhase.appPending, release: release,
-        manifestUrl: release.manifestUrl, appVersion: candidate.version);
+        manifestUrl: release.manifestUrl, appVersion: candidate.version,
+        pluginVerified: _pluginProofFor(release));
       await _persistPrefs(_kPluginUpdateJournal, jsonEncode(pluginUpdateJournal!.toJson()));
     }
     _installingApp = true;
@@ -176,7 +177,8 @@ class AppStore extends ChangeNotifier {
     if (journal != null) {
       if (journal.phase == UpdatePhase.pluginRetry) return const UpdateGate(false, 'plugin-update-failed');
       if (journal.phase == UpdatePhase.appPending && journal.release != null &&
-          _pluginTargetHealthy(journal.release!) &&
+          journal.pluginVerified &&
+          api.pluginContentSha256 == journal.release!.plugin.contentSha256 &&
           (candidate == null || journal.release!.containsCandidate(candidate))) {
         return const UpdateGate(true, '');
       }
@@ -308,10 +310,36 @@ class AppStore extends ChangeNotifier {
       await _continueAppUpdateAfterPlugin();
       return;
     }
+    // D2：**先恢复固定快照再判定**。POST 已被接受、响应丢失/手机被杀时，本地 journal 是空的，
+    // 而服务端同 opId 的已 settled 事务里带着完整 release；不先回填就永远走不到 completed 分支。
+    var current = journal;
+    final serverTx = connected ? api.pluginUpdate.transaction : null;
+    if (serverTx != null && serverTx.opId == journal.opId &&
+        (journal.release == null || journal.targetContentSha256.isEmpty)) {
+      final release = serverTx.release;
+      if (release != null) {
+        // 只回填**空**快照，绝不覆盖已经固定的完整快照。
+        current = journal.copyWith(
+          release: release,
+          manifestUrl: release.manifestUrl,
+          targetVersion: release.plugin.version,
+          targetContentSha256: release.plugin.contentSha256,
+        );
+        pluginUpdateJournal = current;
+        await _persistPrefs(_kPluginUpdateJournal, jsonEncode(current.toJson()));
+      } else if (serverTx.targetContentSha256.isNotEmpty) {
+        current = journal.copyWith(
+          targetVersion: serverTx.targetVersion.isEmpty ? journal.targetVersion : serverTx.targetVersion,
+          targetContentSha256: serverTx.targetContentSha256,
+        );
+        pluginUpdateJournal = current;
+        await _persistPrefs(_kPluginUpdateJournal, jsonEncode(current.toJson()));
+      }
+    }
     final decision = decidePluginUpdateResume(
-      journal: journal,
+      journal: current,
       loadedContentSha256: connected ? api.pluginContentSha256 : '',
-      transaction: connected ? api.pluginUpdate.transaction : null,
+      transaction: serverTx,
       now: DateTime.now().toUtc(),
     );
     switch (decision.action) {
@@ -321,12 +349,13 @@ class AppStore extends ChangeNotifier {
         return;
       case ResumeAction.completed:
         final tx = api.pluginUpdate.transaction;
-        final target = tx?.targetVersion ?? journal.targetVersion;
-        pluginUpdateJournal = journal.copyWith(
+        final target = tx?.targetVersion ?? current.targetVersion;
+        pluginUpdateJournal = current.copyWith(
           phase: UpdatePhase.pluginConfirmed,
           targetVersion: target,
           targetContentSha256: tx?.targetContentSha256 ?? journal.targetContentSha256,
-          release: journal.release ?? tx?.release,
+          release: current.release ?? tx?.release,
+          pluginVerified: true,
         );
         await _persistPrefs(_kPluginUpdateJournal, jsonEncode(pluginUpdateJournal!.toJson()));
         pluginUpdateNotice = '电脑端插件已更新到 v$target';
@@ -348,12 +377,23 @@ class AppStore extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 插件目标是否**确实健康**。
+  ///
+  /// 两种正当情形（D1）：①本次确实提交过插件更新，事务已 settled 且内容匹配；
+  /// ②插件**本来就已预装成目标内容**（手工安装/首次部署），没有历史事务——
+  /// 这时不能要求一条不存在的 op，否则"只需装 App"的用户会被自己的门禁锁死。
+  /// 真正的在飞/矛盾事务仍由 [appUpdateGate] 的其它分支拒绝。
   bool _pluginTargetHealthy(ReleaseSnapshot release) {
+    if (api.pluginContentSha256 != release.plugin.contentSha256) return false;
     final tx = api.pluginUpdate.transaction;
-    return api.pluginContentSha256 == release.plugin.contentSha256 &&
-        tx != null && tx.phase == 'settled' && !tx.rolledBack &&
-        tx.targetContentSha256 == release.plugin.contentSha256;
+    if (tx == null) return true; // 预装且已加载目标内容：无历史操作也算健康
+    if (tx.rolledBack) return false;
+    if (tx.phase == 'settled') return tx.targetContentSha256 == release.plugin.contentSha256;
+    return false; // 非终态：交给门禁的在飞分支处理
   }
+
+  /// 记录"进入 appPending 时插件目标已被确认健康"的持久证明（D1）。
+  bool _pluginProofFor(ReleaseSnapshot release) => _pluginTargetHealthy(release);
 
   /// 插件已健康对齐后，再推进 App 自己那半边的更新（**同一份清单**，F9）。
   Future<void> _continueAppUpdateAfterPlugin() async {
@@ -379,7 +419,8 @@ class AppStore extends ChangeNotifier {
       await _clearPluginUpdateJournal();
     } else if (outcome.verdict == UpdateVerdict.updateAvailable) {
       pluginUpdateJournal = journal.copyWith(phase: UpdatePhase.appPending,
-        appVersion: candidate.version, manifestUrl: release.manifestUrl);
+        appVersion: candidate.version, manifestUrl: release.manifestUrl,
+        pluginVerified: _pluginProofFor(release));
       await _persistPrefs(_kPluginUpdateJournal, jsonEncode(pluginUpdateJournal!.toJson()));
       updateCandidate = candidate;
     } else {

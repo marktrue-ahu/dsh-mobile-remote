@@ -100,6 +100,7 @@ class PluginUpdateJournal {
     this.manifestUrl = '',
     this.appVersion = '',
     this.release,
+    this.pluginVerified = false,
   });
 
   /// 固定下来的清单身份（F9）：两端必须用**同一份**清单，不能在 App 阶段
@@ -109,6 +110,10 @@ class PluginUpdateJournal {
 
   /// App 自身的目标版本（插件确认后填）。
   final String appVersion;
+
+  /// 进入 appPending 时**插件目标已被确认健康**的持久证明（D1）。
+  /// 让"插件本来就已预装、只需装 App"的用户不被自己的门禁锁死；真正的在飞/矛盾事务仍会拒绝。
+  final bool pluginVerified;
 
   final String phase;
 
@@ -131,6 +136,7 @@ class PluginUpdateJournal {
     String? manifestUrl,
     String? appVersion,
     ReleaseSnapshot? release,
+    bool? pluginVerified,
   }) =>
       PluginUpdateJournal(
         opId: opId,
@@ -142,6 +148,7 @@ class PluginUpdateJournal {
         manifestUrl: manifestUrl ?? this.manifestUrl,
         appVersion: appVersion ?? this.appVersion,
         release: release ?? this.release,
+        pluginVerified: pluginVerified ?? this.pluginVerified,
       );
 
   Map<String, dynamic> toJson() => {
@@ -153,6 +160,7 @@ class PluginUpdateJournal {
         'phase': phase,
         'manifestUrl': manifestUrl,
         'appVersion': appVersion,
+        'pluginVerified': pluginVerified,
         if (release != null) 'release': release!.toJson(),
       };
 
@@ -172,6 +180,7 @@ class PluginUpdateJournal {
       phase: (json['phase'] as String?) ?? UpdatePhase.pluginPending,
       manifestUrl: (json['manifestUrl'] as String?) ?? '',
       appVersion: (json['appVersion'] as String?) ?? '',
+      pluginVerified: json['pluginVerified'] == true,
       release: ReleaseSnapshot.fromJson(json['release']),
     );
   }
