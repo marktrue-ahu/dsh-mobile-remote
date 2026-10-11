@@ -91,6 +91,85 @@ UpdateVerdict verdictFor({required AppVersion local, required AppVersion remote}
   return UpdateVerdict.upToDate;
 }
 
+/// Immutable identities from one normalized publishing manifest, not a source/latest pointer.
+@immutable
+class ReleaseArtifact {
+  const ReleaseArtifact({required this.version, required this.file, required this.size,
+    required this.sha256, required this.url, this.contentSha256 = ''});
+  final String version;
+  final String file;
+  final int size;
+  final String sha256;
+  final String url;
+  final String contentSha256;
+
+  static ReleaseArtifact? fromJson(Object? value, {bool plugin = false}) {
+    if (value is! Map) return null;
+    final version = value['version'];
+    final file = value['file'];
+    final size = value['size'];
+    final hash = value['sha256'];
+    final url = value['url'];
+    final content = value['contentSha256'];
+    if (version is! String || parseAppVersion(version) == null ||
+        file is! String || file.isEmpty || size is! int || size <= 0 ||
+        hash is! String || !_digest.hasMatch(hash) || url is! String || !_absoluteHttp(url) ||
+        (plugin && (content is! String || !_digest.hasMatch(content)))) {
+      return null;
+    }
+    return ReleaseArtifact(version: version, file: file, size: size, sha256: hash.toLowerCase(),
+      url: url, contentSha256: plugin ? (content as String).toLowerCase() : '');
+  }
+  Map<String, dynamic> toJson() => {'version': version, 'file': file, 'size': size,
+    'sha256': sha256, 'url': url, if (contentSha256.isNotEmpty) 'contentSha256': contentSha256};
+}
+final _digest = RegExp(r'^[0-9a-fA-F]{64}$');
+bool _absoluteHttp(String value) {
+  final uri = Uri.tryParse(value);
+  return uri != null && const {'http', 'https'}.contains(uri.scheme) && uri.host.isNotEmpty && uri.userInfo.isEmpty;
+}
+
+@immutable
+class ReleaseSnapshot {
+  const ReleaseSnapshot({required this.manifestUrl, required this.app, required this.plugin});
+  final String manifestUrl;
+  final ReleaseArtifact app;
+  final ReleaseArtifact plugin;
+  static ReleaseSnapshot? fromJson(Object? value) {
+    if (value is! Map || value['schema'] != 1) return null;
+    final manifest = value['manifestUrl'];
+    final app = ReleaseArtifact.fromJson(value['app']);
+    final plugin = ReleaseArtifact.fromJson(value['plugin'], plugin: true);
+    if (manifest is! String || !_absoluteHttp(manifest) || app == null || plugin == null) return null;
+    return ReleaseSnapshot(manifestUrl: manifest, app: app, plugin: plugin);
+  }
+  Map<String, dynamic> toJson() => {'schema': 1, 'manifestUrl': manifestUrl,
+    'app': app.toJson(), 'plugin': plugin.toJson()};
+  UpdateCandidate get candidate => UpdateCandidate(version: app.version, downloadUrl: app.url,
+    sizeBytes: app.size, sha256: app.sha256, source: Uri.parse(manifestUrl).host, release: this);
+  bool containsCandidate(UpdateCandidate candidate) => candidate.version == app.version &&
+    candidate.downloadUrl == app.url && candidate.sizeBytes == app.size && candidate.sha256?.toLowerCase() == app.sha256;
+}
+
+/// Resolve a publishing manifest once; callers then persist the normalized snapshot.
+ReleaseSnapshot? normalizedReleaseFromManifest(Map<String, dynamic> manifest, {
+  required String manifestUrl, String? appUrl, String? pluginUrl,
+}) {
+  final base = Uri.tryParse(manifestUrl);
+  if (base == null || !_absoluteHttp(manifestUrl) || manifest['schema'] != 1) return null;
+  Map<String, dynamic>? artifact(Object? value, String? fallback) {
+    if (value is! Map) return null;
+    final map = Map<String, dynamic>.from(value);
+    final explicit = map['url'];
+    final location = explicit is String && explicit.isNotEmpty ? explicit : fallback ?? map['file'];
+    if (location is! String) return null;
+    map['url'] = base.resolve(location).toString();
+    return map;
+  }
+  return ReleaseSnapshot.fromJson({'schema': 1, 'manifestUrl': manifestUrl,
+    'app': artifact(manifest['app'], appUrl), 'plugin': artifact(manifest['plugin'], pluginUrl)});
+}
+
 /// 更新候选：App 展示与下载所需的最小集合。
 @immutable
 class UpdateCandidate {
@@ -100,6 +179,7 @@ class UpdateCandidate {
   final String? sha256;
   final String? notes;
   final String source; // 展示用来源名：GitHub / 主机
+  final ReleaseSnapshot? release;
   const UpdateCandidate({
     required this.version,
     required this.downloadUrl,
@@ -107,6 +187,7 @@ class UpdateCandidate {
     this.sha256,
     this.notes,
     required this.source,
+    this.release,
   });
 }
 

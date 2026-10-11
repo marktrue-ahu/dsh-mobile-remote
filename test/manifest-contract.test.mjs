@@ -9,6 +9,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { pluginContentDigest } from "../lib/plugin-content-digest.js";
+import { freezePackage } from "../lib/runtime-dependency-snapshot.js";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const GEN = join(ROOT, "dsh-mobile-app", "tools", "gen-manifest.js");
@@ -61,9 +62,40 @@ async function makeFixture({ pluginUrl = "", pluginPkg = null } = {}) {
 	return { base, dist, tgz, apk, manifest, plugin };
 }
 
-function verify(dist) {
-	return spawnSync(process.execPath, [VERIFY, dist], { encoding: "utf8" });
+function verify(dist, env = process.env) {
+	return spawnSync(process.execPath, [VERIFY, dist], { encoding: "utf8", env });
 }
+
+async function repack(f) {
+	const tar = spawnSync("tar", ["-czf", f.tgz, "-C", join(f.base, "stage"), "package"], { encoding: "utf8" });
+	assert.equal(tar.status, 0, tar.stderr);
+	const gen = spawnSync(process.execPath, [
+		GEN, "--apk", f.apk, "--version", "3.2.0+44", "--plugin-tgz", f.tgz,
+		"--plugin-root", f.plugin, "--changelog", join(f.base, "CHANGELOG.md"), "--out", f.manifest,
+	], { encoding: "utf8" });
+	assert.equal(gen.status, 0, gen.stderr);
+}
+
+test("直属 qrcode 入口在包内，但传递依赖 symlink 指向外部 store → 拒绝假绿（W2）", async () => {
+	const f = await makeFixture({ pluginPkg: { name: "dsh-mobile-remote", version: "3.2.0", dependencies: { qrcode: "1" } } });
+	try {
+		const qr = join(f.base, "stage/package/node_modules/qrcode");
+		const external = join(f.base, "external-store/pngjs");
+		await mkdir(join(qr, "node_modules"), { recursive: true });
+		await mkdir(external, { recursive: true });
+		await writeFile(join(qr, "package.json"), JSON.stringify({ name: "qrcode", main: "index.js", dependencies: { pngjs: "1" } }));
+		await writeFile(join(qr, "index.js"), "const png = require('pngjs').png; exports.toBuffer = async () => png;\n");
+		await writeFile(join(external, "package.json"), JSON.stringify({ name: "pngjs", main: "index.js" }));
+		await writeFile(join(external, "index.js"), "exports.png = Buffer.from([137,80,78,71,13,10,26,10]);\n");
+		await symlink(external, join(qr, "node_modules/pngjs"), "dir");
+		await repack(f);
+		const r = verify(f.dist, { PATH: process.env.PATH, HOME: f.base });
+		assert.notEqual(r.status, 0, r.stdout);
+		assert.match(r.stdout, /tgz 自包含运行时依赖/);
+	} finally {
+		await rm(f.base, { recursive: true, force: true });
+	}
+});
 
 test("清单描述两端产物：schema/app/plugin 齐全，且镜像与 app 段同源", async () => {
 	const f = await makeFixture({ pluginUrl: "https://example.com/dsh-mobile-remote-v3.2.0.tgz" });
@@ -255,7 +287,7 @@ test("依赖是指向解包目录之外的 symlink → 校验器失败（F10 的
 		assert.equal(gen.status, 0, gen.stderr);
 		const r = verify(f.dist);
 		assert.notEqual(r.status, 0);
-		assert.match(r.stdout, /qrcode:解析到解包目录之外/);
+		assert.match(r.stdout, /symlink-outside-package: node_modules\/qrcode/);
 	} finally {
 		await rm(f.base, { recursive: true, force: true });
 	}
@@ -294,7 +326,7 @@ test("tgz 已内联运行时依赖 → 该项通过（与真实发布产物一�
 		const bundled = join(f.base, "stage", "package", "node_modules", "qrcode");
 		await mkdir(bundled, { recursive: true });
 		await writeFile(join(bundled, "package.json"), '{"name":"qrcode","version":"1.5.4","main":"index.js"}\n');
-		await writeFile(join(bundled, "index.js"), "module.exports = {};\n");
+		await writeFile(join(bundled, "index.js"), "exports.toBuffer = async () => Buffer.from([137,80,78,71,13,10,26,10]);\n");
 		const tar = spawnSync("tar", ["-czf", f.tgz, "-C", join(f.base, "stage"), "package"], { encoding: "utf8" });
 		assert.equal(tar.status, 0, tar.stderr);
 		// 内容变了 → 重新生成清单再校验
@@ -311,6 +343,102 @@ test("tgz 已内联运行时依赖 → 该项通过（与真实发布产物一�
 		const r = verify(f.dist);
 		assert.equal(r.status, 0, r.stdout);
 		assert.match(r.stdout, /tgz 自包含运行时依赖（解包内可解析且可加载） \(dependencies=qrcode\)/);
+	} finally {
+		await rm(f.base, { recursive: true, force: true });
+	}
+});
+
+test("真实 qrcode 完整冻结图打 tgz，搬迁解包后发行校验通过（含实际 PNG lazy API）", async () => {
+	const f = await makeFixture({ pluginPkg: { name: "dsh-mobile-remote", version: "3.2.0", dependencies: { qrcode: "^1.5.4" } } });
+	try {
+		await mkdir(join(f.plugin, "node_modules"), { recursive: true });
+		await symlink(join(ROOT, "node_modules/qrcode"), join(f.plugin, "node_modules/qrcode"), "dir");
+		const frozen = freezePackage({ sourceRoot: f.plugin, destination: join(f.base, "frozen") });
+		assert.equal(frozen.ok, true, frozen.error);
+		await cp(frozen.dir, join(f.base, "stage/package"), { recursive: true, dereference: false, verbatimSymlinks: true });
+		await repack(f);
+		assert.equal(dirname(f.plugin), f.base);
+		assert.equal(dirname(frozen.dir), f.base);
+		await rm(f.plugin, { recursive: true, force: true });
+		await rm(frozen.dir, { recursive: true, force: true });
+		const r = verify(f.dist, { PATH: process.env.PATH, HOME: f.base });
+		assert.equal(r.status, 0, r.stdout + r.stderr);
+		assert.match(r.stdout, /RESULT: PASS/);
+	} finally {
+		await rm(f.base, { recursive: true, force: true });
+	}
+});
+
+async function bundledQrcode(f, { code, dependencies = {} }) {
+	const qr = join(f.base, "stage/package/node_modules/qrcode");
+	await mkdir(qr, { recursive: true });
+	await writeFile(join(qr, "package.json"), JSON.stringify({ name: "qrcode", main: "index.js", dependencies }));
+	await writeFile(join(qr, "index.js"), code);
+	return qr;
+}
+
+test("qrcode lazy PNG API 的未声明绝对 require 外链也必须拒绝（非 symlink / 非声明依赖）", async () => {
+	const f = await makeFixture({ pluginPkg: { name: "dsh-mobile-remote", version: "3.2.0", dependencies: { qrcode: "1" } } });
+	try {
+		const outside = join(f.base, "external.js");
+		await writeFile(outside, "exports.png = Buffer.from([137,80,78,71,13,10,26,10]);\n");
+		await bundledQrcode(f, { code: `exports.toBuffer = async () => require(${JSON.stringify(outside)}).png;\n` });
+		await repack(f);
+		const r = verify(f.dist);
+		assert.notEqual(r.status, 0, r.stdout);
+		assert.match(r.stdout, /runtime-load-outside-package/);
+	} finally {
+		await rm(f.base, { recursive: true, force: true });
+	}
+});
+
+test("上层 node_modules 与 NODE_PATH 外部污染都不能补齐缺失的传递依赖", async () => {
+	const f = await makeFixture({ pluginPkg: { name: "dsh-mobile-remote", version: "3.2.0", dependencies: { qrcode: "1" } } });
+	try {
+		const external = join(f.base, "node_modules", "pngjs");
+		await mkdir(external, { recursive: true });
+		await writeFile(join(external, "package.json"), '{"name":"pngjs","main":"index.js"}');
+		await writeFile(join(external, "index.js"), "exports.png = Buffer.from([137,80,78,71,13,10,26,10]);\n");
+		await bundledQrcode(f, { dependencies: { pngjs: "1" }, code: "exports.toBuffer = async () => require('pngjs').png;\n" });
+		await repack(f);
+		for (const pollution of [
+			{ NODE_PATH: join(f.base, "node_modules") },
+			{ TMPDIR: f.base }, // 解包到污染 node_modules 的下层；不是仅 cwd 污染。
+		]) {
+			const r = verify(f.dist, { PATH: process.env.PATH, HOME: f.base, ...pollution });
+			assert.notEqual(r.status, 0, r.stdout);
+			assert.match(r.stdout, /pngjs:无法解析|pngjs:解析到解包目录之外/);
+		}
+	} finally {
+		await rm(f.base, { recursive: true, force: true });
+	}
+});
+
+test("只声明而入口未 require 的传递依赖仍须能加载，不能靠入口假绿", async () => {
+	const f = await makeFixture({ pluginPkg: { name: "dsh-mobile-remote", version: "3.2.0", dependencies: { qrcode: "1" } } });
+	try {
+		const qr = await bundledQrcode(f, { dependencies: { unused: "1" }, code: "exports.toBuffer = async () => Buffer.from([137,80,78,71,13,10,26,10]);\n" });
+		const unused = join(qr, "node_modules/unused");
+		await mkdir(unused, { recursive: true });
+		await writeFile(join(unused, "package.json"), '{"name":"unused","main":"index.js"}');
+		await writeFile(join(unused, "index.js"), "throw new Error('transitive-require-boom');\n");
+		await repack(f);
+		const r = verify(f.dist);
+		assert.notEqual(r.status, 0, r.stdout);
+		assert.match(r.stdout, /unused:加载失败\(transitive-require-boom\)/);
+	} finally {
+		await rm(f.base, { recursive: true, force: true });
+	}
+});
+
+test("qrcode 入口可 require，但必要 lazy PNG API 抛错 → 校验失败", async () => {
+	const f = await makeFixture({ pluginPkg: { name: "dsh-mobile-remote", version: "3.2.0", dependencies: { qrcode: "1" } } });
+	try {
+		await bundledQrcode(f, { code: "exports.toBuffer = async () => { throw new Error('lazy-png-boom'); };\n" });
+		await repack(f);
+		const r = verify(f.dist);
+		assert.notEqual(r.status, 0, r.stdout);
+		assert.match(r.stdout, /qrcode:加载失败\(lazy-png-boom\)/);
 	} finally {
 		await rm(f.base, { recursive: true, force: true });
 	}

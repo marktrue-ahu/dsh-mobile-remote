@@ -83,9 +83,19 @@ void main() {
       expect(store.appUpdateGate().reason, 'plugin-transaction-pending');
     });
 
-    test('插件已对齐且无在飞事务 → 允许', () {
+    test('插件已对齐且无在飞事务 → 允许（需固定 release + 已加载内容一致）', () {
       final store = AppStore();
-      api.pluginUpdate = status();
+      const hash = 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc';
+      api.pluginUpdate = PluginUpdateStatus.fromJson({
+        'state': 'up-to-date',
+        'transaction': {'opId': 'op-1', 'phase': 'settled', 'targetContentSha256': hash},
+        'release': {
+          'schema': 1, 'manifestUrl': 'https://release.test/manifest.json',
+          'plugin': {'version': '3.3.0', 'file': 'p.tgz', 'size': 3, 'sha256': 'b' * 0 + 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'contentSha256': hash, 'url': 'https://release.test/p.tgz'},
+          'app': {'version': '3.3.0+70', 'file': 'a.apk', 'size': 3, 'sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'url': 'https://release.test/a.apk'},
+        },
+      });
+      api.pluginContentSha256 = hash;
       expect(store.appUpdateGate().allowed, isTrue);
     });
   });
@@ -118,11 +128,11 @@ void main() {
       expect(next.manifestUrl, j.manifestUrl);
     });
 
-    test('markAppUpdateConfirmed 清掉记录（App 阶段已确认）', () async {
+    test('markAppUpdateConfirmed：本机版本未达固定目标时保留记录（C6）', () async {
       final store = AppStore();
       store.pluginUpdateJournal = journal(phase: UpdatePhase.appPending);
       await store.markAppUpdateConfirmed();
-      expect(store.pluginUpdateJournal, isNull);
+      expect(store.pluginUpdateJournal, isNotNull, reason: '没有 release/版本核验不得清记录');
     });
   });
 }

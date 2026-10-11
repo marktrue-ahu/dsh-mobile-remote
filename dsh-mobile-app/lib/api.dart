@@ -23,7 +23,8 @@ class ApiException implements Exception {
   /// 命令通路要靠它区分 `commands-execute-failed` 的两种含义：504 = 服务端 AbortSignal 中止
   /// （结果未知，不能断言失败）vs 400 = 命令自己抛错（确定失败）。
   final int? status;
-  ApiException(this.message, {this.code, this.status});
+  final Map<String, dynamic>? body;
+  ApiException(this.message, {this.code, this.status, this.body});
   @override
   String toString() => message;
 }
@@ -445,6 +446,7 @@ class Api implements GitReadApi {
             'HTTP ${res.statusCode}',
         code: body?['error'] is String ? (body?['error'] as String) : null,
         status: res.statusCode,
+        body: body,
       );
     }
     if (body == null) {
@@ -476,6 +478,39 @@ class Api implements GitReadApi {
   Future<Map<String, dynamic>> updateManifest() async {
     final d = await getJson('/api/update/manifest');
     return (d['manifest'] as Map<String, dynamic>?) ?? const {};
+  }
+
+  /// Only the trusted host artifact routes may receive the host token, never external URLs.
+  Map<String, String> artifactHeaders(Uri uri) {
+    final mount = path == '/' || path.isEmpty ? '/m' : path.replaceFirst(RegExp(r'/$'), '');
+    // baseUrl 可能为空（绝对 URL 候选）：这时没有"本机 origin"可言，绝不带口令。
+    final origin = baseUrl.isEmpty ? null : Uri.tryParse(baseUrl);
+    final sameOrigin = origin != null && origin.hasScheme && uri.origin == origin.origin;
+    return {'User-Agent': 'dsh-mobile-remote-app',
+      if (sameOrigin && uri.path.startsWith('$mount/api/update/') && token.isNotEmpty) 'x-mobile-token': token};
+  }
+
+  Future<Map<String, dynamic>> getAbsoluteJson(String url) async {
+    var uri = Uri.parse(url);
+    for (var redirects = 0; redirects <= 5; redirects++) {
+      final localOrigin = baseUrl.isEmpty ? null : Uri.tryParse(baseUrl);
+      final isLocalHttp = localOrigin != null && localOrigin.hasScheme && uri.scheme == 'http' && uri.origin == localOrigin.origin;
+      if (uri.host.isEmpty || uri.userInfo.isNotEmpty || (uri.scheme != 'https' && !isLocalHttp)) {
+        throw ApiException('不安全的清单 URL');
+      }
+      final request = http.Request('GET', uri)..followRedirects = false;
+      request.headers.addAll(artifactHeaders(uri));
+      final response = await _client.send(request).timeout(const Duration(seconds: 15));
+      if (const {301, 302, 303, 307, 308}.contains(response.statusCode)) {
+        final next = response.headers['location'];
+        await response.stream.drain<void>();
+        if (next == null) throw ApiException('清单重定向缺少地址');
+        uri = uri.resolve(next);
+        continue;
+      }
+      return _decode(await http.Response.fromStream(response));
+    }
+    throw ApiException('清单重定向次数过多');
   }
 
   /// 触发**电脑端插件自更新**（ADR 0019：手机可独立触发，不需要坐到电脑前）。

@@ -7,6 +7,7 @@
 library;
 
 import 'plugin_update_resume.dart';
+import 'update_core.dart';
 
 /// 不能自更新时给电脑端操作指引（只含**与实际安装方式对应**的那一条）。
 class PluginUpdateGuidance {
@@ -41,6 +42,7 @@ class PluginUpdateStatus {
     required this.transaction,
     required this.remoteVersion,
     required this.remoteContentSha256,
+    this.release,
   });
 
   const PluginUpdateStatus.unknown()
@@ -52,7 +54,8 @@ class PluginUpdateStatus {
         guidance = null,
         transaction = null,
         remoteVersion = '',
-        remoteContentSha256 = '';
+        remoteContentSha256 = '',
+        release = null;
 
   /// 检查结论：`up-to-date` / `update-available` / `local-ahead` / `unavailable` / `disabled` / `unknown`。
   final String state;
@@ -64,12 +67,15 @@ class PluginUpdateStatus {
   final PluginTransaction? transaction;
   final String remoteVersion;
   final String remoteContentSha256;
+  final ReleaseSnapshot? release;
+  bool get retryableFailure => state == 'update-failed' ||
+      const {'failed', 'rolled-back'}.contains(transaction?.phase);
 
   /// 内容状态说"有新版"——这是更新动作的唯一依据（不是版本号对齐）。
   bool get contentUpdateAvailable => state == 'update-available';
 
   /// 检查本身没做成（离线/HTTP 错误/解析失败/关闭）——**不能**显示成"无需更新"（W3）。
-  bool get checkUnavailable => state == 'unavailable' || state == 'unknown' || state == 'disabled';
+  bool get checkUnavailable => !upToDate && !contentUpdateAvailable;
 
   /// 明确的"没有新版"。
   bool get upToDate => state == 'up-to-date' || state == 'local-ahead';
@@ -87,6 +93,7 @@ class PluginUpdateStatus {
       transaction: PluginTransaction.fromJson(json['transaction'] is Map ? Map<String, dynamic>.from(json['transaction'] as Map) : null),
       remoteVersion: remote is Map ? ((remote['version'] as String?) ?? '') : '',
       remoteContentSha256: remote is Map ? ((remote['contentSha256'] as String?) ?? '') : '',
+      release: ReleaseSnapshot.fromJson(json['release']),
     );
   }
 }

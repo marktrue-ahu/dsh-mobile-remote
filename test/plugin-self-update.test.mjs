@@ -379,7 +379,7 @@ test("runSelfUpdate：内容标识不符 → 拒绝安装，profile 未动", asy
 	}
 });
 
-test("runSelfUpdate：安装失败 → 依赖声明还原（失败但可用）", async () => {
+test("runSelfUpdate：安装失败 → 保持恢复事务与快照，不伪称失败但可用", async () => {
 	const env = await makeEnv();
 	const built = await makeTgz(env.base, PLUGIN_FILES_B);
 	const body = await readFile(built.tgz);
@@ -397,7 +397,9 @@ test("runSelfUpdate：安装失败 → 依赖声明还原（失败但可用）",
 		assert.equal(r.ok, false);
 		assert.equal(r.step, "install");
 		const doc = JSON.parse(await readFile(join(env.profileDir, "package.json"), "utf8"));
-		assert.equal(doc.dependencies["dsh-mobile-remote"], "file:/old/plugin");
+		assert.equal(r.transaction.phase, "rolling-back");
+		assert.equal(r.transaction.rolledBack, true);
+		assert.ok(doc.dependencies["dsh-mobile-remote"].includes("plugin-artifacts"));
 	} finally {
 		await srv.close();
 		await rm(env.base, { recursive: true, force: true });
@@ -481,13 +483,13 @@ test("reportPendingUpdate：任意非终态都会在持有者消失后收敛，�
 			"matched",
 		);
 		// 持有者存活 → 继续等
-		acquireLock(lockPath, { opId: "op", pid: process.pid });
+		const holder = acquireLock(lockPath, { opId: "op", pid: process.pid });
 		assert.equal(
 			reportPendingUpdate({ stateFile: file, lockPath, localContentSha256: "b".repeat(64) }).action,
 			"waiting",
 		);
 		// 持有者已死（释放锁）且超时 → 收敛为失败（否则后续更新永久 busy）
-		releaseLock(lockPath, "op");
+		releaseLock(lockPath, holder.lease);
 		const expired = reportPendingUpdate({
 			stateFile: file,
 			lockPath,
@@ -495,9 +497,8 @@ test("reportPendingUpdate：任意非终态都会在持有者消失后收敛，�
 			timeoutMs: 0,
 			now: () => Date.now() + 60_000,
 		});
-		assert.equal(expired.action, "expired");
-		assert.equal(expired.transaction.phase, TRANSACTION_PHASE.FAILED);
-		assert.equal(readUpdateState(file).phase, TRANSACTION_PHASE.FAILED);
+		assert.equal(expired.action, "waiting", "可能已损坏安装时不能无恢复标普通FAILED");
+		assert.equal(expired.transaction.phase, TRANSACTION_PHASE.RESTART_PENDING);
 
 		// 非 restart-pending 的非终态（staging）同样会被收敛（F6 的关键一条）
 		await writeFile(file, JSON.stringify({

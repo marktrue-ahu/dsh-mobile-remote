@@ -8,9 +8,11 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { randomUUID } from "node:crypto";
 import {
 	TRANSACTION_PHASE,
 	acquireLock,
+	writeOwnedTransaction,
 	readLock,
 	readTransaction,
 	transactionFile,
@@ -18,24 +20,21 @@ import {
 } from "../lib/plugin-update-transaction.js";
 import { findPortOwnerPid, portKillSnippet, superviseUpdate, waitForHost } from "../lib/update-supervisor.js";
 
+let txSeq = 0;
 async function writeTx(base, over = {}) {
-	const file = transactionFile(base);
-	await mkdir(join(base, ".dsh", "mobile-remote"), { recursive: true });
-	await writeFile(file, `${JSON.stringify({
-		opId: "op-1",
-		phase: TRANSACTION_PHASE.RESTART_PENDING,
-		startedAt: new Date().toISOString(),
-		profileDir: join(base, "profile"),
-		previousSnapshotDir: join(base, "snapshots", "b".repeat(64)),
-		previousContentSha256: "b".repeat(64),
-		targetContentSha256: "a".repeat(64),
-		targetVersion: "3.3.0",
-		port: 3080,
-		restartForm: "web-systemd",
-		attempts: 0,
-		...over,
-	}, null, 2)}\n`);
-	return file;
+  // 生产里每个操作有自己的状态文件（服务端 UUID）；这里照做，避免把新操作写进旧终态文件。
+  const opId = `op-${++txSeq}`;
+  const lockPath = updateLockPath(base), currentFile = transactionFile(base);
+  const file = join(base, '.dsh', 'mobile-remote', 'transactions', `${randomUUID()}.json`);
+  await mkdir(join(base, '.dsh', 'mobile-remote', 'transactions'), { recursive: true });
+  const grant = acquireLock(lockPath, { opId, stateFile: currentFile });
+  assert.equal(grant.ok, true, grant.error);
+  const tx = { opId, lease: grant.lease, phase: TRANSACTION_PHASE.RESTART_PENDING, startedAt: new Date().toISOString(),
+    profileDir: join(base, 'profile'), previousSnapshotDir: join(base, 'snapshots', 'b'.repeat(64)),
+    previousContentSha256: 'b'.repeat(64), targetContentSha256: 'a'.repeat(64), targetVersion: '3.3.0',
+    port: 3080, restartForm: 'web-systemd', attempts: 0, lockPath, currentFile, ...over };
+  writeOwnedTransaction(file, tx, { lockPath, lease: grant.lease, currentFile });
+  return file;
 }
 
 test("waitForHost：按正在运行的内容标识确认健康，超时如实失败", async () => {
@@ -101,7 +100,7 @@ test("新版本健康 → SETTLED 并释放锁", async () => {
 	const base = await mkdtemp(join(tmpdir(), "sup-ok-"));
 	try {
 		const file = await writeTx(base);
-		acquireLock(updateLockPath(base), { opId: "op-1", pid: process.pid });
+		assert.equal(readLock(updateLockPath(base)).opId, readTransaction(file).opId);
 		const r = await superviseUpdate({
 			stateFile: file,
 			waitForHost: async () => ({ ok: true, matched: "content" }),
@@ -156,7 +155,7 @@ test("F3/F7：重启目标由端口占用者决定；回滚走快照且中间态
 	}
 });
 
-test("重启失败不再被忽略 → FAILED（restart-failed）", async () => {
+test("首次重启失败触发一次恢复，不能把损坏安装当普通终态", async () => {
 	const base = await mkdtemp(join(tmpdir(), "sup-rf-"));
 	try {
 		const file = await writeTx(base);
@@ -167,13 +166,13 @@ test("重启失败不再被忽略 → FAILED（restart-failed）", async () => {
 				waited++;
 				return { ok: true, matched: "content" };
 			},
-			restart: () => ({ ok: false, error: "restart-script-exit-1" }),
+			restart: (() => { let n=0; return () => ++n === 1 ? { ok: false, error: "restart-script-exit-1" } : { ok: true }; })(),
 			restore: () => ({ ok: true }),
 			log: () => {},
 		});
-		assert.equal(r.phase, TRANSACTION_PHASE.FAILED);
-		assert.equal(r.result.reason, "restart-failed");
-		assert.equal(waited, 0, "重启失败就不该继续等");
+		assert.equal(r.phase, TRANSACTION_PHASE.ROLLED_BACK);
+		assert.equal(r.result.reason, "rolled-back");
+		assert.equal(waited, 1, "只等待恢复后的旧实例");
 	} finally {
 		await rm(base, { recursive: true, force: true });
 	}

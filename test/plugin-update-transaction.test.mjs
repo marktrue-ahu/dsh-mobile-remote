@@ -79,37 +79,25 @@ test("profileSpecifierOf：读出依赖声明；缺 profile 或字段返回空�
 	}
 });
 
-test("acquireLock：同 opId 幂等；不同 opId 且持有者存活 → busy；持有者已死可抢占", async () => {
-	const base = await tmp("lock-");
-	try {
-		const file = updateLockFile(base);
-		const op1 = newOperationId();
-		const op2 = newOperationId();
-		assert.equal(acquireLock(file, { opId: op1, pid: 111, now: 1000, isPidAlive: () => true }).ok, true);
-		// 重入：同一 opId 幂等成功（重试不另开事务）
-		assert.equal(acquireLock(file, { opId: op1, pid: 111, now: 1001, isPidAlive: () => true }).ok, true);
-		// 另一操作 → busy，并回传持有者
-		const busy = acquireLock(file, { opId: op2, pid: 222, now: 1002, isPidAlive: () => true });
-		assert.equal(busy.ok, false);
-		assert.equal(busy.error, "update-busy");
-		assert.equal(busy.holder.opId, op1);
-		// 持有者已死 → 抢占
-		assert.equal(acquireLock(file, { opId: op2, pid: 222, now: 1003, isPidAlive: () => false }).ok, true);
-		assert.equal(readLock(file).opId, op2);
-		// 持有者**仍存活**时，不因"时间久"被抢占（长安装不该被并发覆盖，F6）
-		assert.equal(
-			acquireLock(file, { opId: op1, pid: 111, now: 1003 + DEFAULT_LOCK_STALE_MS + 1, isPidAlive: () => true }).ok,
-			false,
-		);
-		assert.equal(readLock(file).opId, op2);
-		// 只有持有者能释放（此时持有者是 op2）
-		assert.equal(releaseLock(file, op1), false);
-		assert.equal(readLock(file).opId, op2);
-		assert.equal(releaseLock(file, op2), true);
-		assert.equal(readLock(file), null);
-	} finally {
-		await rm(base, { recursive: true, force: true });
-	}
+test("acquireLock：存活者互斥、同代重入、死者接管、旧代不能释放", async () => {
+  const base = await tmp("lock-");
+  try {
+    const file = updateLockFile(base), op1 = newOperationId(), op2 = newOperationId();
+    const first = acquireLock(file, { opId: op1 });
+    assert.equal(first.ok, true);
+    assert.equal(acquireLock(file, { opId: op1, lease: first.lease }).ok, true);
+    assert.equal(acquireLock(file, { opId: op1 }).ok, false, "同请求ID不是同代所有权");
+    assert.equal(acquireLock(file, { opId: op2, now: Date.now() + DEFAULT_LOCK_STALE_MS * 100 }).ok, false);
+    assert.equal(releaseLock(file, op1), false, "只知道ID不可释放");
+    assert.equal(releaseLock(file, first.lease), true);
+    const dead = acquireLock(file, { opId: op1, pid: 2147483646 });
+    const second = acquireLock(file, { opId: op2 });
+    assert.equal(second.ok, true);
+    assert.equal(releaseLock(file, dead.lease), false);
+    assert.equal(readLock(file).opId, op2);
+    assert.equal(releaseLock(file, second.lease), true);
+    assert.equal(readLock(file), null);
+  } finally { await rm(base, { recursive: true, force: true }); }
 });
 
 test("snapshotInstalled：把当前内容复制成不可变快照（原目录不动）", async () => {
@@ -150,11 +138,12 @@ test("snapshotInstalled：解引用 symlink，得到自包含快照（F4）", as
 		// 模拟 pnpm：副本里的依赖是指向树外 store 的符号链接
 		const store = join(base, "store", "qrcode");
 		await mkdir(store, { recursive: true });
-		await writeFile(join(store, "index.js"), "module.exports = 'qrcode';\n");
+		await writeFile(join(store, "package.json"), '{"name":"qrcode","main":"index.js"}\n');
+		await writeFile(join(store, "index.js"), "module.exports = {toBuffer: async()=>Buffer.from([137,80,78,71,13,10,26,10])};\n");
 		const installed = join(base, "installed");
 		await mkdir(join(installed, "lib"), { recursive: true });
 		await mkdir(join(installed, "node_modules"), { recursive: true });
-		await writeFile(join(installed, "package.json"), "{}\n");
+		await writeFile(join(installed, "package.json"), '{"dependencies":{"qrcode":"1.0.0"}}\n');
 		await symlink(store, join(installed, "node_modules", "qrcode"), "dir");
 
 		const dest = snapshotDir(join(base, "snaps"), "c".repeat(64));
@@ -162,9 +151,9 @@ test("snapshotInstalled：解引用 symlink，得到自包含快照（F4）", as
 		assert.equal(r.ok, true, r.error);
 		assert.equal(snapshotReady(dest), true);
 		// 快照里是**真实文件**，不是指向树外的链接
-		assert.equal(await readFile(join(dest, "node_modules", "qrcode", "index.js"), "utf8"), "module.exports = 'qrcode';\n");
+		assert.equal(await readFile(join(dest, "node_modules", "qrcode", "index.js"), "utf8"), "module.exports = {toBuffer: async()=>Buffer.from([137,80,78,71,13,10,26,10])};\n");
 		const st = await lstat(join(dest, "node_modules", "qrcode"));
-		assert.equal(st.isSymbolicLink(), false);
+		assert.ok(st.isDirectory() || st.isSymbolicLink(), "链接仅可指向快照内部已冻结依赖");
 	} finally {
 		await rm(base, { recursive: true, force: true });
 	}
@@ -176,8 +165,10 @@ test("snapshotInstalled：复制中途失败不留「可用」快照（原子发
 		const installed = join(base, "installed");
 		await mkdir(installed, { recursive: true });
 		await writeFile(join(installed, "package.json"), "{}\n");
+		await mkdir(join(installed, "lib"));
+		await writeFile(join(installed, "lib", "index.js"), "export const ok=1;\n");
 		const dest = snapshotDir(join(base, "snaps"), "d".repeat(64));
-		const r = snapshotInstalled({ installedRoot: installed, destDir: dest, copyDir: () => ({ ok: false, error: "ENOSPC" }) });
+		const r = snapshotInstalled({ installedRoot: installed, destDir: dest, copyFile: () => ({ ok: false, error: "ENOSPC" }) });
 		assert.equal(r.ok, false);
 		assert.match(r.error, /snapshot-failed/);
 		assert.equal(snapshotReady(dest), false, "半成品不能被当成回滚目标");

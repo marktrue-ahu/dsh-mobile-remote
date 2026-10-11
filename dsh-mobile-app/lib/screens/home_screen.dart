@@ -117,7 +117,7 @@ class _HomeScreenState extends State<HomeScreen>
               final c = store.updateCandidate;
               if (c != null) {
                 // 取消/失败保留横幅（US22：直到更新或版本变更才消失）
-                unawaited(runUpdateFlow(context, store, c, onInstalled: store.clearUpdateCandidate));
+                unawaited(runUpdateFlow(context, store, c));
               }
             },
             onDismiss: () => store.clearUpdateCandidate(),
@@ -132,7 +132,7 @@ class _HomeScreenState extends State<HomeScreen>
                 : () {
                     final c = store.updateCandidate;
                     if (c != null) {
-                      unawaited(runUpdateFlow(context, store, c, onInstalled: store.clearUpdateCandidate));
+                      unawaited(runUpdateFlow(context, store, c));
                     }
                   },
             onDismiss: () => store.dismissAlignment(),

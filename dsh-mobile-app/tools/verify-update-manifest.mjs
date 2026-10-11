@@ -18,8 +18,8 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { createRequire } from "node:module";
 import { pluginContentDigest } from "../../lib/plugin-content-digest.js";
+import { verifyRuntimeClosure } from "../../lib/runtime-dependency-snapshot.js";
 
 const dir = process.argv[2]
 	? path.resolve(process.argv[2])
@@ -90,42 +90,15 @@ if (tgz && fs.existsSync(tgz)) {
 				plugin.contentSha256 === digest,
 				`manifest=${plugin.contentSha256} 实际=${digest}`,
 			);
-			// R13 / F10：tgz 必须**自包含运行时依赖**——离线 / vendored 安装解包后要能直接 require。
-			// 只核哈希会放过"哈希正确但装不起来"的包；只 require.resolve 又会放过
-			// "解析到解包目录之外（上层 node_modules / 全局包兜底）"与"解析得到但加载即抛"。
-			try {
-				const pkg = JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8"));
-				const deps = Object.keys(pkg.dependencies ?? {});
-				const req = createRequire(path.join(pkgDir, "package.json"));
-				const pkgReal = fs.realpathSync(pkgDir) + path.sep;
-				const problems = [];
-				for (const dep of deps) {
-					let resolved;
-					try {
-						resolved = req.resolve(dep);
-					} catch (e) {
-						problems.push(`${dep}:无法解析(${e.code ?? e.message})`);
-						continue;
-					}
-					const real = fs.realpathSync(resolved);
-					if (!real.startsWith(pkgReal)) {
-						problems.push(`${dep}:解析到解包目录之外(${real})`);
-						continue;
-					}
-					try {
-						req(dep);
-					} catch (e) {
-						problems.push(`${dep}:加载失败(${e.message})`);
-					}
-				}
-				check(
-					"tgz 自包含运行时依赖（解包内可解析且可加载）",
-					problems.length === 0,
-					problems.length === 0 ? `dependencies=${deps.join(",") || "无"}` : `问题：${problems.join("；")}`,
-				);
-			} catch (e) {
-				check("tgz 自包含运行时依赖（解包内可解析且可加载）", false, `读取 package.json 失败：${e.message}`);
-			}
+			// F10/W2：验证所有直接/传递声明依赖与实际 CJS/ESM 加载图，而不只是 qrcode 入口。
+			// 独立 Node 进程禁用全局搜索和 NODE_PATH/loader 污染；每个文件按 realpath 核闭包。
+			// qrcode.toBuffer(PNG) smoke 同时覆盖 lazy renderer / pngjs。
+			const runtime = verifyRuntimeClosure(pkgDir);
+			check(
+				"tgz 自包含运行时依赖（解包内可解析且可加载）",
+				runtime.ok,
+				runtime.ok ? `dependencies=${runtime.dependencies.join(",") || "无"}` : `问题：${runtime.error}`,
+			);
 		}
 	}
 	fs.rmSync(tmp, { recursive: true, force: true });

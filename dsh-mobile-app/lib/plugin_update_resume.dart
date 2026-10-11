@@ -10,6 +10,8 @@
 /// 明确回滚/失败结果或超时才失败。版本号继续只管对齐文案。
 library;
 
+import 'update_core.dart';
+
 /// 接续判定结果。
 enum ResumeAction {
   /// 没有进行中的更新。
@@ -40,6 +42,7 @@ class PluginTransaction {
     required this.targetContentSha256,
     required this.rolledBack,
     required this.reason,
+    this.release,
   });
 
   final String opId;
@@ -48,6 +51,7 @@ class PluginTransaction {
   final String targetContentSha256;
   final bool rolledBack;
   final String? reason;
+  final ReleaseSnapshot? release;
 
   static PluginTransaction? fromJson(Map<String, dynamic>? json) {
     if (json == null) return null;
@@ -61,6 +65,7 @@ class PluginTransaction {
       targetContentSha256: ((json['targetContentSha256'] as String?) ?? '').toLowerCase(),
       rolledBack: json['rolledBack'] == true,
       reason: result is Map ? (result['reason'] as String?) : null,
+      release: ReleaseSnapshot.fromJson(json['release']),
     );
   }
 }
@@ -72,6 +77,9 @@ class UpdatePhase {
 
   /// 插件已确认健康，尚未开始 App 自身更新。
   static const pluginConfirmed = 'plugin-confirmed';
+
+  /// Failure/timeout has not established target health. An explicit retry rechecks the release.
+  static const pluginRetry = 'plugin-retry';
 
   /// 正在装 App 自身的新版本。
   static const appPending = 'app-pending';
@@ -91,11 +99,13 @@ class PluginUpdateJournal {
     this.phase = UpdatePhase.pluginPending,
     this.manifestUrl = '',
     this.appVersion = '',
+    this.release,
   });
 
   /// 固定下来的清单身份（F9）：两端必须用**同一份**清单，不能在 App 阶段
   /// 因为用户改了更新源或上游发了新 Release 而"跨版本拼接"。
   final String manifestUrl;
+  final ReleaseSnapshot? release;
 
   /// App 自身的目标版本（插件确认后填）。
   final String appVersion;
@@ -120,6 +130,7 @@ class PluginUpdateJournal {
     String? phase,
     String? manifestUrl,
     String? appVersion,
+    ReleaseSnapshot? release,
   }) =>
       PluginUpdateJournal(
         opId: opId,
@@ -130,6 +141,7 @@ class PluginUpdateJournal {
         phase: phase ?? this.phase,
         manifestUrl: manifestUrl ?? this.manifestUrl,
         appVersion: appVersion ?? this.appVersion,
+        release: release ?? this.release,
       );
 
   Map<String, dynamic> toJson() => {
@@ -141,6 +153,7 @@ class PluginUpdateJournal {
         'phase': phase,
         'manifestUrl': manifestUrl,
         'appVersion': appVersion,
+        if (release != null) 'release': release!.toJson(),
       };
 
   static PluginUpdateJournal? fromJson(Map<String, dynamic>? json) {
@@ -159,6 +172,7 @@ class PluginUpdateJournal {
       phase: (json['phase'] as String?) ?? UpdatePhase.pluginPending,
       manifestUrl: (json['manifestUrl'] as String?) ?? '',
       appVersion: (json['appVersion'] as String?) ?? '',
+      release: ReleaseSnapshot.fromJson(json['release']),
     );
   }
 }
@@ -200,14 +214,18 @@ ResumeDecision decidePluginUpdateResume({
   }
 
   // 有事务且身份一致：以事务为准（这才是"结果待确认"的权威来源）
-  if (transaction != null && (journal.opId.isEmpty || transaction.opId.isEmpty || transaction.opId == journal.opId)) {
+  if (transaction != null && journal.opId.isNotEmpty && transaction.opId == journal.opId) {
     // F7：**正在回滚**时绝不能判成功——即使此刻跑着的内容恰好等于原目标（那是矛盾的中间态）
     if (transaction.rolledBack || transaction.phase == 'rolling-back') {
       return const ResumeDecision(ResumeAction.rolledBack, 'transaction-rolling-back');
     }
     switch (transaction.phase) {
       case 'settled':
-        return const ResumeDecision(ResumeAction.completed, 'transaction-settled');
+        final target = journal.release?.plugin.contentSha256 ?? journal.targetContentSha256;
+        if (target.isNotEmpty && loaded == target && transaction.targetContentSha256 == target) {
+          return const ResumeDecision(ResumeAction.completed, 'transaction-settled');
+        }
+        return waitOrTimeout('settled-content-unconfirmed');
       case 'rolled-back':
         return const ResumeDecision(ResumeAction.rolledBack, 'transaction-rolled-back');
       case 'failed':
@@ -215,20 +233,13 @@ ResumeDecision decidePluginUpdateResume({
       case 'restart-pending':
       case 'installing':
       case 'staging':
-        // 关键：**新实例健康且内容匹配**才算完成；否则旧实例仍在服务 → 继续等
-        if (loaded.isNotEmpty && loaded == transaction.targetContentSha256) {
-          return const ResumeDecision(ResumeAction.completed, 'loaded-target-content');
-        }
+        // Loaded bytes alone are not health confirmation; the supervisor must settle first.
         return waitOrTimeout('restart-in-progress');
       default:
         return waitOrTimeout('transaction-phase-${transaction.phase}');
     }
   }
 
-  // 没有事务信息（旧插件/状态丢失）：退化为"已加载内容 == 目标内容"的兜底判定
-  final target = journal.targetContentSha256;
-  if (target.isNotEmpty && loaded == target) {
-    return const ResumeDecision(ResumeAction.completed, 'loaded-target-content');
-  }
+  // Unknown/other operations cannot attest to this submitted operation's health.
   return waitOrTimeout('awaiting-transaction');
 }

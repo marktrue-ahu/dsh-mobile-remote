@@ -90,10 +90,10 @@ void main() {
       expect(d.reason, 'restart-in-progress');
     });
 
-    test('同版本、新内容已生效（重启后新实例响应）→ completed', () {
+    test('同版本、已加载新内容但事务未 settled → 仍 wait（字节本身不算健康确认）', () {
       final d = decide(j: journal(), loaded: hashNew, transaction: tx());
-      expect(d.action, ResumeAction.completed);
-      expect(d.reason, 'loaded-target-content');
+      expect(d.action, ResumeAction.wait);
+      expect(d.reason, 'restart-in-progress');
     });
 
     test('事务已 settled → completed（即使 App 还没看到新内容标识）', () {
@@ -119,8 +119,8 @@ void main() {
       expect(d.reason, 'awaiting-transaction');
     });
 
-    test('没有事务信息（旧插件）→ 用已加载内容标识兜底', () {
-      expect(decide(j: journal(), loaded: hashNew).action, ResumeAction.completed);
+    test('没有事务信息（旧插件）→ 一律等待，不据已加载字节判成功', () {
+      expect(decide(j: journal(), loaded: hashNew).action, ResumeAction.wait);
       expect(decide(j: journal(), loaded: hashOld).action, ResumeAction.wait);
     });
 
@@ -151,7 +151,7 @@ void main() {
     });
 
     test('终态集合：completed / rolledBack / failed / timedOut', () {
-      expect(decide(j: journal(), loaded: hashNew, transaction: tx()).isTerminal, isTrue);
+      expect(decide(j: journal(), loaded: hashNew, transaction: tx(phase: 'settled')).isTerminal, isTrue);
       expect(decide(j: journal(), loaded: hashOld, transaction: tx()).isTerminal, isFalse);
       expect(decide(j: journal(), loaded: hashOld, transaction: tx(phase: 'rolled-back')).isTerminal, isTrue);
       expect(decide().isTerminal, isFalse);

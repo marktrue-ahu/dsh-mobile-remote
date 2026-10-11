@@ -1116,8 +1116,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 : () {
                     final candidate = store.updateCandidate;
                     if (candidate != null) {
-                      unawaited(runUpdateFlow(context, store, candidate,
-                          onInstalled: store.clearUpdateCandidate));
+                      unawaited(runUpdateFlow(context, store, candidate));
                     }
                   },
             trailing: store.updateCandidate != null
@@ -1518,7 +1517,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _checkUpdate() async {
     final store = widget.store;
     // 两端编排（F8）：**唯一判据在 store.appUpdateGate()**，这里只是同一个门禁的入口
-    if (!await ensurePluginAlignedFirst(context, store)) return;
     store.updateChecking = true;
     if (mounted) setState(() {});
     final outcome = await Updater.check(store);
@@ -1532,8 +1530,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         store.setUpdateCandidate(candidate);
         _updateFlowBusy = true;
         setState(() {});
-        await runUpdateFlow(context, store, candidate,
-            onInstalled: store.clearUpdateCandidate);
+        await runUpdateFlow(context, store, candidate);
         _updateFlowBusy = false;
         if (mounted) setState(() {});
         break;
