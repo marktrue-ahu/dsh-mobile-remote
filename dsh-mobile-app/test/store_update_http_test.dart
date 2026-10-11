@@ -2,7 +2,6 @@ import 'dart:convert';
 
 import 'package:dsh_mobile_app/api.dart';
 import 'package:dsh_mobile_app/plugin_update_resume.dart';
-import 'package:dsh_mobile_app/plugin_update_status.dart';
 import 'package:dsh_mobile_app/store.dart';
 import 'package:dsh_mobile_app/update_core.dart';
 import 'package:dsh_mobile_app/updater.dart';
@@ -286,29 +285,56 @@ void main() {
     expect(store.pluginUpdateNotice, isNot(contains('两端已更新')));
   });
 
-  test('D1: pre-installed healthy plugin with no historical transaction still allows the app-only update', () async {
+  test('D1/W5: injected client reports NO transaction; app-only update still installs and stays retryable', () async {
     var installs = 0;
-    final client = Api(client: MockClient((request) async =>
-        http.Response(jsonEncode(bootstrap()), 200)))..baseUrl = 'https://desktop.example';
+    // W5：必须由**受测 store 的 client** 返回 transaction=null 的 bootstrap，而不是改全局 api。
+    final client = Api(client: MockClient((request) async => http.Response(jsonEncode({
+      'plugin': {'version': '3.3.0', 'contentSha256': pluginHash},
+      'pluginUpdate': {'state': 'up-to-date', 'canSelfUpdate': true, 'release': release(), 'transaction': null},
+    }), 200)))..baseUrl = 'https://desktop.example';
     final store = AppStore(apiClient: client, localVersion: () async => parseAppVersion('3.2.0+44'),
       installer: (candidate, {onProgress, onStage, cancel}) async { installs++; return null; });
     addTearDown(store.dispose);
     await store.loadPrefs();
     client.absorbBootstrap(await client.getJson('/api/bootstrap'));
-    // 预装且已加载目标内容：没有 settled 事务也必须放行
-    api.pluginUpdate = PluginUpdateStatus.fromJson({
-      'state': 'up-to-date',
-      'release': release(),
-      'transaction': {'opId': 'op-none', 'phase': 'staging', 'targetContentSha256': pluginHash},
-    });
-    api.pluginContentSha256 = pluginHash;
+    expect(client.pluginUpdate.transaction, isNull, reason: '受测对象确实没有历史事务');
+    expect(client.pluginContentSha256, pluginHash);
     final candidate = ReleaseSnapshot.fromJson(release())!.candidate;
     expect(store.appUpdateGate(candidate).allowed, isTrue);
     expect(await store.installAppUpdate(candidate), isNull);
     expect(installs, 1, reason: '预装插件不该阻塞 App 安装');
-    // 取消后仍可重试：记录保留，门禁仍允许
     expect(store.pluginUpdateJournal, isNotNull);
-    expect(store.appUpdateGate(candidate).allowed, isTrue);
+    expect(store.appUpdateGate(candidate).allowed, isTrue, reason: '取消/未确认安装后仍可重试');
+  });
+
+  test('E1: an in-flight, rolled-back or contradictory server transaction blocks the app install (Native calls = 0)', () async {
+    for (final state in [
+      {'opId': 'op-new', 'phase': 'staging', 'targetContentSha256': pluginHash, 'rolledBack': false},
+      {'opId': 'op-new', 'phase': 'rolling-back', 'targetContentSha256': pluginHash, 'rolledBack': true},
+      {'opId': 'op-new', 'phase': 'settled', 'targetContentSha256': oldHash, 'rolledBack': false},
+      {'opId': 'op-new', 'phase': 'settled', 'targetContentSha256': pluginHash, 'rolledBack': true},
+    ]) {
+      var installs = 0;
+      final client = Api(client: MockClient((request) async => http.Response(jsonEncode({
+        'plugin': {'version': '3.3.0', 'contentSha256': pluginHash},
+        'pluginUpdate': {'state': 'up-to-date', 'canSelfUpdate': true, 'release': release(), 'transaction': state},
+      }), 200)))..baseUrl = 'https://desktop.example';
+      final store = AppStore(apiClient: client, localVersion: () async => parseAppVersion('3.2.0+44'),
+        installer: (candidate, {onProgress, onStage, cancel}) async { installs++; return null; });
+      addTearDown(store.dispose);
+      await store.loadPrefs();
+      client.absorbBootstrap(await client.getJson('/api/bootstrap'));
+      // 下载开始前插件是健康的（预装目标内容）→ 先建立 appPending + 持久证明
+      final candidate = ReleaseSnapshot.fromJson(release())!.candidate;
+      store.pluginUpdateJournal = PluginUpdateJournal(
+        opId: 'op-local', targetVersion: '3.3.0', targetContentSha256: pluginHash,
+        startedAt: DateTime.now().toUtc(), phase: UpdatePhase.appPending, release: ReleaseSnapshot.fromJson(release()),
+        manifestUrl: release()['manifestUrl'] as String, appVersion: '3.3.0+55', pluginVerified: true);
+      expect(store.appUpdateGate(candidate).allowed, isFalse, reason: '在飞/回滚/矛盾事务必须挡住：$state');
+      final result = await store.installAppUpdate(candidate);
+      expect(result, isNotNull, reason: '拒绝时必须给出可读原因：$state');
+      expect(installs, 0, reason: 'Native 安装调用必须为零：$state');
+    }
   });
 
   test('D2: accepted-but-response-lost recovers the fixed snapshot from the server before deciding', () async {

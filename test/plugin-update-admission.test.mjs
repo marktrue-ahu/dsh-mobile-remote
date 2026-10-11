@@ -10,7 +10,7 @@ import { test } from 'node:test';
 const home = mkdtempSync(join(tmpdir(), 'update-admission-'));
 process.env.HOME = home;
 const { apply } = await import('../lib/index.js');
-const { readTransaction, transactionFile, readLock, updateLockPath, releaseLock } = await import('../lib/plugin-update-transaction.js');
+const { readTransaction, transactionFile, readLock, updateLockPath, releaseLock, finishOwnedTerminal } = await import('../lib/plugin-update-transaction.js');
 const manifest = {
   schema: 1,
   app: { version: '3.3.0+70', file: 'app.apk', size: 3, sha256: 'a'.repeat(64), url: 'https://release.test/app-70.apk' },
@@ -36,9 +36,11 @@ function harness(options = {}) {
     maxConnections: 16, pushUrls: [], pushCooldownMs: 60000, doneGraceMs: 1000, pushContent: 'minimal',
     rateLimit: { maxFailures: 10, windowMs: 60000, blockMs: 60000 }, lanBridge: { enabled: false, host: '127.0.0.1', port: 39401 }, ...options.config,
   };
-  apply(ctx, config, { pluginUpdates: { fetchImpl, restartForm: () => 'web-foreground',
-    schedule: fn => jobs.push(fn), runSelfUpdate: async () => { installed++; return { ok: true }; }, ...options } });
-  return { route: routes.find(r => r.kind === 'prefix' && r.path === '/m/api'), logs, dispose: () => cleanup?.(), profile };
+  const { pluginUpdates: pluginOverrides = {}, ...restOptions } = options;
+  apply(ctx, config, { ...restOptions, pluginUpdates: { fetchImpl, restartForm: () => 'web-foreground',
+    schedule: fn => jobs.push(fn), runSelfUpdate: async () => { installed++; return { ok: true }; },
+    ...(restOptions.persist ? { persist: restOptions.persist } : {}), ...pluginOverrides } });
+  return { route: routes.find(r => r.kind === 'prefix' && /\/api$/.test(r.path)), mount: config.path, logs, dispose: () => cleanup?.(), profile };
 }
 async function request(route, body, path = '/m/api/plugin-update', headers = {}) {
   const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);
@@ -138,5 +140,72 @@ test('W1: actual protected host producer feeds manifest and tgz consumers', asyn
     const destPath = join(home, 'downloaded.tgz');
     const result = await downloadVerified({ url: release.manifest.plugin.url, destPath, sha256: digest(tgz), size: tgz.length, auth, fetchImpl: fakeNetwork });
     assert.equal(result.ok, true, result.error); assert.deepEqual(readFileSync(destPath), tgz);
+  } finally { h.dispose(); }
+});
+
+test('E2: phone POST accepted returns a phone-reachable fixed APK route, not the host loopback locator', async () => {
+  const dir = join(home, 'e2-artifacts'); mkdirSync(dir);
+  const apk = Buffer.from('apk'), tgz = Buffer.from('tgz');
+  const digest = b => hashOf('sha256').update(b).digest('hex');
+  writeFileSync(join(dir, 'app.apk'), apk); writeFileSync(join(dir, 'plugin.tgz'), tgz);
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ schema: 1, version: '3.3.0+70', apk: 'app.apk', size: apk.length, sha256: digest(apk),
+    app: { version: '3.3.0+70', file: 'app.apk', size: apk.length, sha256: digest(apk) },
+    plugin: { version: '3.3.0', file: 'plugin.tgz', size: tgz.length, sha256: digest(tgz), contentSha256: 'c'.repeat(64) } }));
+  const token = 'fixture-only-token';
+  const manifestPath = '/m/api/update/manifest';
+  const h = harness({
+    config: { updateDir: dir, authToken: token, trustedHosts: ['192.0.2.9'], pluginUpdateManifest: `http://127.0.0.1:39401${manifestPath}` },
+    pluginUpdates: {
+      // 宿主的清单请求者是自己（回环），不是发 POST 的手机
+      fetchImpl: async (url, opts) => {
+        const reply = await request(h.route, undefined, new URL(url).pathname, { host: '127.0.0.1:39401', ...opts.headers });
+        return new Response(reply.bytes, { status: reply.status });
+      },
+      schedule: () => {},
+    },
+  });
+  try {
+    const r = await request(h.route, { opId: 'phone-request' }, '/m/api/plugin-update', { host: '192.0.2.9:39401', 'x-mobile-token': token });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    const release = r.body.check.release;
+    assert.equal(release.app.url, 'http://192.0.2.9:39401/m/api/update/apk', '返回给手机的必须是手机可达地址');
+    assert.equal(release.plugin.url, 'http://192.0.2.9:39401/m/api/update/plugin');
+    assert.equal(release.app.url.includes('127.0.0.1'), false);
+    assert.equal(release.app.sha256, digest(apk), '固定发布身份不得改写');
+    assert.equal(release.app.size, apk.length);
+    // 收敛本用例的在飞事务，避免影响同一 HOME 下的后续用例
+    const holder = readLock(updateLockPath(home));
+    if (holder) {
+      finishOwnedTerminal(transactionFile(home), { phase: 'failed', result: { ok: false, reason: 'fixture-done' }, expectedPhases: ['staging'] },
+        { lockPath: updateLockPath(home), lease: holder, currentFile: transactionFile(home) });
+    }
+  } finally { h.dispose(); }
+});
+
+test('E3: non-default mount path keeps credentials on the host loopback fetch', async () => {
+  const dir = join(home, 'e3-artifacts'); mkdirSync(dir);
+  const apk = Buffer.from('apk'), tgz = Buffer.from('tgz');
+  const digest = b => hashOf('sha256').update(b).digest('hex');
+  writeFileSync(join(dir, 'app.apk'), apk); writeFileSync(join(dir, 'plugin.tgz'), tgz);
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ schema: 1, version: '3.3.0+70', apk: 'app.apk', size: apk.length, sha256: digest(apk),
+    app: { version: '3.3.0+70', file: 'app.apk', size: apk.length, sha256: digest(apk) },
+    plugin: { version: '3.3.0', file: 'plugin.tgz', size: tgz.length, sha256: digest(tgz), contentSha256: 'c'.repeat(64) } }));
+  const token = 'fixture-only-token';
+  const h = harness({
+    config: { path: '/phone', updateDir: dir, authToken: token, trustedHosts: ['192.0.2.9'],
+      pluginUpdateManifest: 'http://127.0.0.1:39401/phone/api/update/manifest' },
+    pluginUpdates: {
+      fetchImpl: async (url, opts) => {
+        const reply = await request(h.route, undefined, new URL(url).pathname, { host: '127.0.0.1:39401', ...opts.headers });
+        return new Response(reply.bytes, { status: reply.status });
+      },
+      schedule: () => {},
+    },
+  });
+  try {
+    const r = await request(h.route, { opId: 'phone-path' }, `${h.mount}/api/plugin-update`, { host: '192.0.2.9:39401', 'x-mobile-token': token });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.equal(r.body.action, 'accepted', `非默认挂载路径不得因缺 basePath 被剥凭据：${JSON.stringify(r.body.check)}`);
+    assert.equal(r.body.check.release.app.url, 'http://192.0.2.9:39401/phone/api/update/apk');
   } finally { h.dispose(); }
 });

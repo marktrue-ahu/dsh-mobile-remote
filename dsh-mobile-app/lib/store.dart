@@ -178,7 +178,9 @@ class AppStore extends ChangeNotifier {
       if (journal.phase == UpdatePhase.pluginRetry) return const UpdateGate(false, 'plugin-update-failed');
       if (journal.phase == UpdatePhase.appPending && journal.release != null &&
           journal.pluginVerified &&
-          api.pluginContentSha256 == journal.release!.plugin.contentSha256 &&
+          // E1：证明是**下载开始前**记下的；放行前必须重新核对当前事务——
+          // 期间可能出现新的在飞/回滚/矛盾事务，纯哈希比较会漏掉它们。
+          _pluginTargetHealthy(journal.release!) &&
           (candidate == null || journal.release!.containsCandidate(candidate))) {
         return const UpdateGate(true, '');
       }
