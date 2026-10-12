@@ -16,7 +16,8 @@
     "FAQ.md",
     "CHANGELOG.md",
     "CONTRIBUTING.md",
-    "LICENSE"
+    "LICENSE",
+    "cordis.patch.yml"
   ],
   "dsh": {
     "client": {
@@ -25,6 +26,9 @@
         "@deepseek-ai/dsh-client-runtime",
         "@deepseek-ai/dsh-client-ui-settings"
       ]
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
     }
   },
   "keywords": [

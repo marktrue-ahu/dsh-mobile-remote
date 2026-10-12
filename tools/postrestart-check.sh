@@ -29,6 +29,13 @@ log() { echo "$*" >>"$LOG"; }
 check() { # check <ok:0|1> <message>
   if [ "$1" -eq 0 ]; then log "PASS $2"; else log "FAIL $2"; FAILED=1; fi
 }
+# 解析型抽查：响应为空/非 JSON/断言异常都必须计入失败——
+# 否则日志里出现 traceback 而 failed 仍为 0，等于抽查在说谎（2026-10-12 踩过）。
+pycheck() { # pycheck <名称> <python 片段>（从 stdin 读响应）
+  local name="$1" out rc
+  out="$($PY -c "$2" 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ]; then log "$out"; else log "FAIL $name 抽查异常：$(printf '%s' "$out" | tail -1)"; FAILED=1; fi
+}
 api() { $CURL -s -m 20 -H "X-Mobile-Token: $TOKEN" "$BASE$1"; }
 
 TOKEN="$(grep -oP 'authToken:\s*\K.*' "$PATCH_YML" 2>/dev/null | tr -d '"')"
@@ -83,20 +90,22 @@ d=json.load(sys.stdin); ss=d.get("sessions") or []
 print(ss[0].get("id") if ss else "")
 ')"
 if [ -n "$SID" ]; then
-  api "/m/api/session-config?sessionId=$SID" | $PY -c '
+  api "/m/api/session-config?sessionId=$SID" | pycheck session-config '
 import json,sys
 d=json.load(sys.stdin); c=d.get("config") or {}
-print(("PASS" if d.get("ok") else "FAIL"),"session-config ok=",d.get("ok"),
+assert d.get("ok"), d
+print("PASS","session-config ok=",d.get("ok"),
       "model=",c.get("model"),"provider=",c.get("provider"),"reasoningEffort=",c.get("reasoningEffort"))
 ' >>"$LOG" 2>&1
 else
   check 1 "无法取到真实 sessionId，session-config 未抽查"
 fi
-api '/m/api/catalog?refresh=1' | $PY -c '
+api '/m/api/catalog?refresh=1' | pycheck catalog '
 import json,sys
 d=json.load(sys.stdin); c=d.get("catalog") or {}
 models=c.get("models") or d.get("models") or []
-print(("PASS" if d.get("ok") else "FAIL"),"catalog?refresh=1 ok=",d.get("ok"),"models=",len(models))
+assert d.get("ok"), d
+print("PASS","catalog?refresh=1 ok=",d.get("ok"),"models=",len(models))
 ' >>"$LOG" 2>&1
 
 log "=== postrestart check end $(date '+%F %T') (failed=${FAILED}) ==="
