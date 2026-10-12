@@ -21,7 +21,10 @@ let jobs = [];
 const fetchImpl = async () => new Response(JSON.stringify(manifest), { headers: { 'content-type': 'application/json' } });
 
 function harness(options = {}) {
-  const profile = join(home, `profile-${Math.random().toString(36).slice(2)}`);
+  // 每个用例独立 HOME：事务/锁不跨用例残留（否则后面的 POST 会莫名 update-busy）。
+  const testHome = options.homeDir ?? home;
+  process.env.HOME = testHome;
+  const profile = join(testHome, `profile-${Math.random().toString(36).slice(2)}`);
   mkdirSync(profile); writeFileSync(join(profile, 'package.json'), JSON.stringify({ dependencies: { 'dsh-mobile-remote': 'file:/fixture-old' } }));
   const routes = []; const logs = []; let cleanup;
   const ctx = {
@@ -40,7 +43,7 @@ function harness(options = {}) {
   apply(ctx, config, { ...restOptions, pluginUpdates: { fetchImpl, restartForm: () => 'web-foreground',
     schedule: fn => jobs.push(fn), runSelfUpdate: async () => { installed++; return { ok: true }; },
     ...(restOptions.persist ? { persist: restOptions.persist } : {}), ...pluginOverrides } });
-  return { route: routes.find(r => r.kind === 'prefix' && /\/api$/.test(r.path)), mount: config.path, logs, dispose: () => cleanup?.(), profile };
+  return { route: routes.find(r => r.kind === 'prefix' && /\/api$/.test(r.path)), mount: config.path, home: testHome, logs, dispose: () => cleanup?.(), profile };
 }
 async function request(route, body, path = '/m/api/plugin-update', headers = {}) {
   const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);
@@ -68,7 +71,8 @@ test('C1: actual update-available handler persists release before accepted; retr
     const busy = await request(h.route, { opId: 'different-request' });
     assert.equal(busy.status, 409); assert.equal(busy.body.transaction.opId, tx.opId);
     // Reads remain responsive while the scheduled install has not even run.
-    assert.equal((await request(h.route, undefined, '/m/api/bootstrap')).status, 200);
+    const boot = await request(h.route, undefined, '/m/api/bootstrap');
+    assert.equal(boot.status, 200, JSON.stringify({ body: boot.body, logs: h.logs.slice(-4) }));
   } finally { global.fetch = savedFetch; const holder = readLock(updateLockPath(home)); if (holder) { const tx = readTransaction(transactionFile(home)); const { writeOwnedTransaction } = await import('../lib/plugin-update-transaction.js'); writeOwnedTransaction(transactionFile(home), { ...tx, phase: 'failed' }, { lockPath: updateLockPath(home), lease: holder }); releaseLock(updateLockPath(home), holder); } h.dispose(); }
 });
 
@@ -153,7 +157,9 @@ test('E2: phone POST accepted returns a phone-reachable fixed APK route, not the
     plugin: { version: '3.3.0', file: 'plugin.tgz', size: tgz.length, sha256: digest(tgz), contentSha256: 'c'.repeat(64) } }));
   const token = 'fixture-only-token';
   const manifestPath = '/m/api/update/manifest';
+  const testHome = mkdtempSync(join(tmpdir(), 'e2-home-'));
   const h = harness({
+    homeDir: testHome,
     config: { updateDir: dir, authToken: token, trustedHosts: ['192.0.2.9'], pluginUpdateManifest: `http://127.0.0.1:39401${manifestPath}` },
     pluginUpdates: {
       // 宿主的清单请求者是自己（回环），不是发 POST 的手机
@@ -173,11 +179,11 @@ test('E2: phone POST accepted returns a phone-reachable fixed APK route, not the
     assert.equal(release.app.url.includes('127.0.0.1'), false);
     assert.equal(release.app.sha256, digest(apk), '固定发布身份不得改写');
     assert.equal(release.app.size, apk.length);
-    // 收敛本用例的在飞事务，避免影响同一 HOME 下的后续用例
-    const holder = readLock(updateLockPath(home));
+    // 独立 HOME：无需清理别人的状态，但收敛自己的在飞事务更干净
+    const holder = readLock(updateLockPath(testHome));
     if (holder) {
-      finishOwnedTerminal(transactionFile(home), { phase: 'failed', result: { ok: false, reason: 'fixture-done' }, expectedPhases: ['staging'] },
-        { lockPath: updateLockPath(home), lease: holder, currentFile: transactionFile(home) });
+      finishOwnedTerminal(transactionFile(testHome), { phase: 'failed', result: { ok: false, reason: 'fixture-done' }, expectedPhases: ['staging'] },
+        { lockPath: updateLockPath(testHome), lease: holder, currentFile: transactionFile(testHome) });
     }
   } finally { h.dispose(); }
 });
@@ -192,6 +198,7 @@ test('E3: non-default mount path keeps credentials on the host loopback fetch', 
     plugin: { version: '3.3.0', file: 'plugin.tgz', size: tgz.length, sha256: digest(tgz), contentSha256: 'c'.repeat(64) } }));
   const token = 'fixture-only-token';
   const h = harness({
+    homeDir: mkdtempSync(join(tmpdir(), 'e3-home-')),
     config: { path: '/phone', updateDir: dir, authToken: token, trustedHosts: ['192.0.2.9'],
       pluginUpdateManifest: 'http://127.0.0.1:39401/phone/api/update/manifest' },
     pluginUpdates: {
@@ -207,5 +214,85 @@ test('E3: non-default mount path keeps credentials on the host loopback fetch', 
     assert.equal(r.status, 200, JSON.stringify(r.body));
     assert.equal(r.body.action, 'accepted', `非默认挂载路径不得因缺 basePath 被剥凭据：${JSON.stringify(r.body.check)}`);
     assert.equal(r.body.check.release.app.url, 'http://192.0.2.9:39401/phone/api/update/apk');
+  } finally { h.dispose(); }
+});
+
+test('F1: queued worker keeps the internal loopback locator while public views stay phone-reachable', async () => {
+  const { pluginContentDigest } = await import('../lib/plugin-content-digest.js');
+  const { writeFileSync: writeSync } = await import('node:fs');
+  const dir = join(home, 'f1-artifacts'); mkdirSync(dir);
+  const apk = Buffer.from('apk'), tgz = Buffer.from('tgz-bytes');
+  const digest = b => hashOf('sha256').update(b).digest('hex');
+  // 真实 worker 会复算解包内容标识：夹具的 contentSha256 必须与 stub runTar 产出的内容一致
+  const staged = join(home, 'f1-staged'); mkdirSync(join(staged, 'lib'), { recursive: true });
+  writeSync(join(staged, 'package.json'), JSON.stringify({ name: 'dsh-mobile-remote', version: '3.3.0' }));
+  writeSync(join(staged, 'lib', 'index.js'), "export const v = 'new';\n");
+  const contentSha256 = pluginContentDigest(staged);
+  const installedRoot = join(home, 'f1-installed'); mkdirSync(join(installedRoot, 'lib'), { recursive: true });
+  writeSync(join(installedRoot, 'package.json'), JSON.stringify({ name: 'dsh-mobile-remote', version: '3.2.0' }));
+  writeSync(join(installedRoot, 'lib', 'index.js'), "export const v = 'old';\n");
+  writeFileSync(join(dir, 'app.apk'), apk); writeFileSync(join(dir, 'plugin.tgz'), tgz);
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ schema: 1, version: '3.3.0+70', apk: 'app.apk', size: apk.length, sha256: digest(apk),
+    app: { version: '3.3.0+70', file: 'app.apk', size: apk.length, sha256: digest(apk) },
+    plugin: { version: '3.3.0', file: 'plugin.tgz', size: tgz.length, sha256: digest(tgz), contentSha256 } }));
+  const token = 'fixture-only-token';
+  const seen = [];
+  let h;
+  const f1Home = mkdtempSync(join(tmpdir(), 'f1-home-'));
+  h = harness({
+    homeDir: f1Home,
+    config: { updateDir: dir, authToken: token, trustedHosts: ['192.0.2.9'],
+      pluginUpdateManifest: 'http://127.0.0.1:39401/m/api/update/manifest' },
+    pluginUpdates: {
+      // 真的排队执行 worker（默认 harness 只收集不执行）
+      schedule: fn => setImmediate(fn),
+      // 用**真实** runSelfUpdate（harness 默认 stub 只返回 ok、不推进事务，测不到下载与凭据）
+      runSelfUpdate: (opts) => import('../lib/plugin-self-update.js').then(m => m.runSelfUpdate(opts)),
+      // 真实 worker 走这里取清单与包；记录是否带了回环凭据
+      fetchImpl: async (url, opts) => {
+        seen.push({ url, token: opts?.headers?.['x-mobile-token'] });
+        const reply = await request(h.route, undefined, new URL(url).pathname, { host: '127.0.0.1:39401', ...(opts?.headers ?? {}) });
+        return new Response(reply.bytes, { status: reply.status });
+      },
+      workerOptions: {
+        installedRoot, pluginRoot: installedRoot,
+        freezeImpl: () => ({ ok: true, entry: '/fixture' }),
+        spawnArmedImpl: () => ({ ok: true, mode: 'fixture' }),
+        awaitReadyImpl: async () => ({ ok: true, ready: { pid: process.pid } }),
+        runInstall: async () => ({ ok: true }),
+        runTar: async (_tgz, dest) => {
+          mkdirSync(join(dest, 'package', 'lib'), { recursive: true });
+          writeSync(join(dest, 'package', 'package.json'), JSON.stringify({ name: 'dsh-mobile-remote', version: '3.3.0' }));
+          writeSync(join(dest, 'package', 'lib', 'index.js'), "export const v = 'new';\n");
+          return { ok: true };
+        },
+      },
+    },
+  });
+  try {
+    const headers = { host: '192.0.2.9:39401', 'x-mobile-token': token };
+    const accepted = await request(h.route, { opId: 'f1-phone' }, '/m/api/plugin-update', headers);
+    assert.equal(accepted.status, 200, JSON.stringify(accepted.body));
+    assert.equal(accepted.body.check.release.app.url, 'http://192.0.2.9:39401/m/api/update/apk');
+    // 让排队 worker 真的跑完（轮询而非固定等待）
+    let persisted = readTransaction(transactionFile(f1Home));
+    for (let i = 0; i < 60 && persisted?.phase === 'staging'; i++) {
+      await new Promise(r => setTimeout(r, 50));
+      persisted = readTransaction(transactionFile(f1Home));
+    }
+    assert.equal(persisted.phase, 'restart-pending', `worker 必须成功落位：${JSON.stringify({ result: persisted.result, logs: h.logs.slice(-5) })}`);
+    assert.equal(persisted.release.plugin.url, 'http://127.0.0.1:39401/m/api/update/plugin', '内部事务必须保留回环 locator');
+    assert.equal(persisted.release.app.url, 'http://127.0.0.1:39401/m/api/update/apk');
+    assert.ok(seen.some(s => s.url.includes('127.0.0.1') && s.token === token), 'worker 必须带回环凭据读受保护产物');
+    // 公开出口（bootstrap）仍必须是手机可达视图，且身份固定
+    const boot = await request(h.route, undefined, '/m/api/bootstrap', headers);
+    const pub = boot.body.pluginUpdate.transaction.release;
+    assert.equal(pub.app.url, 'http://192.0.2.9:39401/m/api/update/apk');
+    assert.equal(pub.plugin.url, 'http://192.0.2.9:39401/m/api/update/plugin');
+    assert.equal(pub.app.sha256, digest(apk));
+    assert.equal(pub.plugin.contentSha256, contentSha256);
+    const holder = readLock(updateLockPath(f1Home));
+    if (holder) finishOwnedTerminal(transactionFile(f1Home), { phase: 'failed', result: { ok: false, reason: 'fixture-done' }, expectedPhases: ['restart-pending'] },
+      { lockPath: updateLockPath(f1Home), lease: holder, currentFile: transactionFile(f1Home) });
   } finally { h.dispose(); }
 });
