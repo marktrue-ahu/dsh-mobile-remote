@@ -19,7 +19,7 @@ import {
 } from "../lib/plugin-update-transaction.js";
 import { switchDependencySpecifier } from "../lib/plugin-self-update.js";
 
-const SCOPED = "@marktrue-ahu/dsh-mobile-remote";
+const SCOPED = "@marktrue/dsh-mobile-remote";
 
 async function makePlugin(root, name) {
 	await mkdir(join(root, "lib"), { recursive: true });
