@@ -1,0 +1,254 @@
+/// 插件自更新的**接续**（CONTEXT「更新接续」；评审 #32 note 1286 的 R7）。
+///
+/// 插件更新必然包含一次宿主重启，而重启会**断开手机与电脑的连接**——那是正常环节。
+/// 但只比 `X.Y.Z` 会两头误判：
+///   - 同版本不同内容时，旧进程还没重启就判"完成"；
+///   - 服务端重启延迟内刷新到旧实例，就立刻判"版本不符"并清掉记录。
+///
+/// 所以判定必须依据**事务**（电脑端下发的 `pluginUpdate.transaction`）与
+/// **正在运行的内容标识**（`plugin.contentSha256`）：只有新实例健康、且目标内容匹配才算成功；
+/// 明确回滚/失败结果或超时才失败。版本号继续只管对齐文案。
+library;
+
+import 'update_core.dart';
+
+/// 接续判定结果。
+enum ResumeAction {
+  /// 没有进行中的更新。
+  none,
+
+  /// 还在等（宿主重启中，或旧实例仍在服务）——**不是失败**。
+  wait,
+
+  /// 新实例健康且目标内容已生效。
+  completed,
+
+  /// 电脑端明确回滚到旧版本。
+  rolledBack,
+
+  /// 电脑端明确失败。
+  failed,
+
+  /// 等太久仍无法确认。
+  timedOut,
+}
+
+/// 电脑端下发的事务摘要（bootstrap 的 `pluginUpdate.transaction`）。
+class PluginTransaction {
+  const PluginTransaction({
+    required this.opId,
+    required this.phase,
+    required this.targetVersion,
+    required this.targetContentSha256,
+    required this.rolledBack,
+    required this.reason,
+    this.release,
+  });
+
+  final String opId;
+  final String phase;
+  final String targetVersion;
+  final String targetContentSha256;
+  final bool rolledBack;
+  final String? reason;
+  final ReleaseSnapshot? release;
+
+  static PluginTransaction? fromJson(Map<String, dynamic>? json) {
+    if (json == null) return null;
+    final phase = json['phase'];
+    if (phase is! String || phase.isEmpty) return null;
+    final result = json['result'];
+    return PluginTransaction(
+      opId: (json['opId'] as String?) ?? '',
+      phase: phase,
+      targetVersion: (json['targetVersion'] as String?) ?? '',
+      targetContentSha256: ((json['targetContentSha256'] as String?) ?? '').toLowerCase(),
+      rolledBack: json['rolledBack'] == true,
+      reason: result is Map ? (result['reason'] as String?) : null,
+      release: ReleaseSnapshot.fromJson(json['release']),
+    );
+  }
+}
+
+/// 两端更新的阶段（F9：**必须持久化**，否则 App 被系统杀掉后不知道走到哪一步）。
+class UpdatePhase {
+  /// 已提交插件更新，等电脑端重启生效。
+  static const pluginPending = 'plugin-pending';
+
+  /// 插件已确认健康，尚未开始 App 自身更新。
+  static const pluginConfirmed = 'plugin-confirmed';
+
+  /// Failure/timeout has not established target health. An explicit retry rechecks the release.
+  static const pluginRetry = 'plugin-retry';
+
+  /// 正在装 App 自身的新版本。
+  static const appPending = 'app-pending';
+
+  /// 两端都已确认。
+  static const done = 'done';
+}
+
+/// 一次两端更新的记录（持久化在手机上，跨断线、跨进程、跨 App 重启）。
+class PluginUpdateJournal {
+  const PluginUpdateJournal({
+    required this.opId,
+    required this.targetVersion,
+    required this.targetContentSha256,
+    required this.startedAt,
+    this.attempts = 0,
+    this.phase = UpdatePhase.pluginPending,
+    this.manifestUrl = '',
+    this.appVersion = '',
+    this.release,
+    this.pluginVerified = false,
+  });
+
+  /// 固定下来的清单身份（F9）：两端必须用**同一份**清单，不能在 App 阶段
+  /// 因为用户改了更新源或上游发了新 Release 而"跨版本拼接"。
+  final String manifestUrl;
+  final ReleaseSnapshot? release;
+
+  /// App 自身的目标版本（插件确认后填）。
+  final String appVersion;
+
+  /// 进入 appPending 时**插件目标已被确认健康**的持久证明（D1）。
+  /// 让"插件本来就已预装、只需装 App"的用户不被自己的门禁锁死；真正的在飞/矛盾事务仍会拒绝。
+  final bool pluginVerified;
+
+  final String phase;
+
+  /// 提交意图时就生成的 operation id：重连后据此查询**同一个**事务（评审 R6/R7）。
+  final String opId;
+
+  /// 期望的插件版本（提交时未知则为空串，随后由事务补齐）。
+  final String targetVersion;
+
+  /// 期望的内容标识（同上）。
+  final String targetContentSha256;
+
+  final DateTime startedAt;
+  final int attempts;
+
+  PluginUpdateJournal copyWith({
+    String? targetVersion,
+    String? targetContentSha256,
+    String? phase,
+    String? manifestUrl,
+    String? appVersion,
+    ReleaseSnapshot? release,
+    bool? pluginVerified,
+  }) =>
+      PluginUpdateJournal(
+        opId: opId,
+        targetVersion: targetVersion ?? this.targetVersion,
+        targetContentSha256: targetContentSha256 ?? this.targetContentSha256,
+        startedAt: startedAt,
+        attempts: attempts,
+        phase: phase ?? this.phase,
+        manifestUrl: manifestUrl ?? this.manifestUrl,
+        appVersion: appVersion ?? this.appVersion,
+        release: release ?? this.release,
+        pluginVerified: pluginVerified ?? this.pluginVerified,
+      );
+
+  Map<String, dynamic> toJson() => {
+        'opId': opId,
+        'targetVersion': targetVersion,
+        'targetContentSha256': targetContentSha256,
+        'startedAt': startedAt.toUtc().toIso8601String(),
+        'attempts': attempts,
+        'phase': phase,
+        'manifestUrl': manifestUrl,
+        'appVersion': appVersion,
+        'pluginVerified': pluginVerified,
+        if (release != null) 'release': release!.toJson(),
+      };
+
+  static PluginUpdateJournal? fromJson(Map<String, dynamic>? json) {
+    if (json == null) return null;
+    final started = json['startedAt'];
+    if (started is! String) return null;
+    final at = DateTime.tryParse(started);
+    if (at == null) return null;
+    final attempts = json['attempts'];
+    return PluginUpdateJournal(
+      opId: (json['opId'] as String?) ?? '',
+      targetVersion: (json['targetVersion'] as String?) ?? '',
+      targetContentSha256: ((json['targetContentSha256'] as String?) ?? '').toLowerCase(),
+      startedAt: at,
+      attempts: attempts is int ? attempts : 0,
+      phase: (json['phase'] as String?) ?? UpdatePhase.pluginPending,
+      manifestUrl: (json['manifestUrl'] as String?) ?? '',
+      appVersion: (json['appVersion'] as String?) ?? '',
+      pluginVerified: json['pluginVerified'] == true,
+      release: ReleaseSnapshot.fromJson(json['release']),
+    );
+  }
+}
+
+/// 判定结果。
+class ResumeDecision {
+  const ResumeDecision(this.action, this.reason);
+  final ResumeAction action;
+  final String reason;
+
+  bool get isTerminal =>
+      action == ResumeAction.completed ||
+      action == ResumeAction.rolledBack ||
+      action == ResumeAction.failed ||
+      action == ResumeAction.timedOut;
+
+  @override
+  String toString() => 'ResumeDecision(${action.name}, $reason)';
+}
+
+/// 判定"现在该做什么"。
+///
+/// - [loadedContentSha256]：电脑端正在运行的插件内容标识（bootstrap 的 `plugin.contentSha256`）；
+/// - [transaction]：电脑端当前事务摘要（可能为 null：旧插件或状态丢失）。
+ResumeDecision decidePluginUpdateResume({
+  required PluginUpdateJournal? journal,
+  required String loadedContentSha256,
+  PluginTransaction? transaction,
+  required DateTime now,
+  Duration timeout = const Duration(minutes: 5),
+}) {
+  if (journal == null) return const ResumeDecision(ResumeAction.none, 'no-journal');
+
+  final loaded = loadedContentSha256.toLowerCase();
+  ResumeDecision waitOrTimeout(String reason) {
+    final elapsed = now.difference(journal.startedAt.toUtc());
+    if (elapsed > timeout) return const ResumeDecision(ResumeAction.timedOut, 'reconnect-timeout');
+    return ResumeDecision(ResumeAction.wait, reason);
+  }
+
+  // 有事务且身份一致：以事务为准（这才是"结果待确认"的权威来源）
+  if (transaction != null && journal.opId.isNotEmpty && transaction.opId == journal.opId) {
+    // F7：**正在回滚**时绝不能判成功——即使此刻跑着的内容恰好等于原目标（那是矛盾的中间态）
+    if (transaction.rolledBack || transaction.phase == 'rolling-back') {
+      return const ResumeDecision(ResumeAction.rolledBack, 'transaction-rolling-back');
+    }
+    switch (transaction.phase) {
+      case 'settled':
+        final target = journal.release?.plugin.contentSha256 ?? journal.targetContentSha256;
+        if (target.isNotEmpty && loaded == target && transaction.targetContentSha256 == target) {
+          return const ResumeDecision(ResumeAction.completed, 'transaction-settled');
+        }
+        return waitOrTimeout('settled-content-unconfirmed');
+      case 'rolled-back':
+        return const ResumeDecision(ResumeAction.rolledBack, 'transaction-rolled-back');
+      case 'failed':
+        return ResumeDecision(ResumeAction.failed, transaction.reason ?? 'transaction-failed');
+      case 'restart-pending':
+      case 'installing':
+      case 'staging':
+        // Loaded bytes alone are not health confirmation; the supervisor must settle first.
+        return waitOrTimeout('restart-in-progress');
+      default:
+        return waitOrTimeout('transaction-phase-${transaction.phase}');
+    }
+  }
+
+  // Unknown/other operations cannot attest to this submitted operation's health.
+  return waitOrTimeout('awaiting-transaction');
+}

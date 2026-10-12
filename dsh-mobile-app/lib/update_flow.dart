@@ -9,28 +9,71 @@ import '../update_core.dart';
 import '../updater.dart';
 
 /// 对给定候选执行完整更新流（spec：确认 → 下载 → 校验 → 签名预检 → 安装）。
-/// [onInstalled]：安装器拉起成功后回调（用于清掉「有新版本」常驻提示——
-/// 取消/失败时保留提示，符合 US22「直到更新或版本变更」）。
+/// Installer launch never clears the fixed candidate/journal; a restarted App verifies version/build.
+/// 所有 App 更新入口的**唯一门禁**（F8）：无论从首页横幅、设置页版本行还是「检查更新」
+/// 进来，都先经过这里——避免某一条路径绕开"插件先行"，把 App 升到需要新端点插件的版本。
+/// 两端编排的前置检查（F8/R9）：插件未对齐就先处理插件，返回是否允许继续装 App。
+Future<bool> ensurePluginAlignedFirst(BuildContext context, AppStore store, [UpdateCandidate? candidate]) async {
+  final gate = store.appUpdateGate(candidate);
+  if (gate.allowed) return true;
+  switch (gate.reason) {
+    case 'plugin-update-in-progress':
+      showToast(context, L10n.t('电脑端插件正在更新，完成后会自动继续', 'Desktop plugin is updating — this continues automatically'));
+      return false;
+    case 'plugin-update-failed':
+    case 'plugin-update-available':
+      final go = await _confirmPluginFirst(context);
+      if (go == true) await store.beginPluginUpdate();
+      return false;
+    case 'plugin-update-guidance':
+      showToast(context, L10n.t('电脑端插件需按指引更新（设置页可见）', 'Desktop plugin needs a manual update — see Settings'));
+      return false;
+    case 'plugin-transaction-pending':
+      showToast(context, L10n.t('电脑端插件更新尚未确认，请稍后再试', 'Desktop plugin update is not confirmed yet — try again shortly'));
+      return false;
+    case 'plugin-check-unavailable':
+    default:
+      // W3：检查没做成时**不**说成"无需更新"，也不放行 App 更新
+      showToast(context, L10n.t('无法确认该发布的插件目标；请在设置页重试或按电脑端插件指引升级。旧组合仍可正常使用', 'Cannot confirm this release’s plugin target. Retry or follow the desktop plugin guide in Settings; existing features remain usable'));
+      return false;
+  }
+}
+
+Future<bool?> _confirmPluginFirst(BuildContext context) => showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(L10n.t('先更新电脑端插件', 'Update the desktop plugin first')),
+        content: Text(L10n.t(
+          '电脑端插件有新版本。先把插件更新好，再更新 App，否则新 App 需要的新端点会缺失。',
+          'A newer desktop plugin is available. Update it before the app, otherwise endpoints the new app needs will be missing.',
+        )),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text(L10n.t('稍后', 'Later'))),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: Text(L10n.t('先更新插件', 'Update plugin'))),
+        ],
+      ),
+    );
+
 Future<void> runUpdateFlow(
   BuildContext context,
   AppStore store,
-  UpdateCandidate candidate, {
-  VoidCallback? onInstalled,
-}) async {
+  UpdateCandidate candidate,
+) async {
+  if (!await ensurePluginAlignedFirst(context, store, candidate)) return;
+  if (!context.mounted) return;
   final ok = await _confirmDialog(context, candidate);
   if (ok != true || !context.mounted) return;
 
   final result = await showDialog<String>(
     context: context,
     barrierDismissible: false,
-    builder: (_) => _DownloadDialog(candidate: candidate),
+    builder: (_) => _DownloadDialog(store: store, candidate: candidate),
   );
 
   if (!context.mounted) return;
   if (result == 'cancelled') {
     showToast(context, L10n.t('已取消更新', 'Update cancelled'));
   } else if (result == null || result.isEmpty) {
-    onInstalled?.call();
     showToast(context, L10n.t('已拉起安装器，请按系统提示完成安装', 'Installer opened — follow the system prompt'));
   } else {
     showToast(context, result);
@@ -85,8 +128,9 @@ Widget _kv(String k, String v) => Padding(
 
 /// 下载/校验/安装进度弹窗；返回 null=成功，'cancelled'=用户取消，其他=错误信息。
 class _DownloadDialog extends StatefulWidget {
+  final AppStore store;
   final UpdateCandidate candidate;
-  const _DownloadDialog({required this.candidate});
+  const _DownloadDialog({required this.store, required this.candidate});
 
   @override
   State<_DownloadDialog> createState() => _DownloadDialogState();
@@ -103,7 +147,7 @@ class _DownloadDialogState extends State<_DownloadDialog> {
   final _cancelToken = UpdateCancelToken();
 
   Future<void> _start() async {
-    final err = await Updater.downloadAndInstall(
+    final err = await widget.store.installAppUpdate(
       widget.candidate,
       onProgress: (r, t) {
         if (mounted) {

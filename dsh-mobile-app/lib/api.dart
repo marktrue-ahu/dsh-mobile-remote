@@ -12,6 +12,8 @@ import 'logger.dart';
 import 'models.dart';
 import 'git_models.dart';
 import 'turn_outline.dart';
+import 'plugin_update_status.dart';
+import 'version_alignment.dart';
 
 class ApiException implements Exception {
   final String message;
@@ -23,7 +25,8 @@ class ApiException implements Exception {
   /// 命令通路要靠它区分 `commands-execute-failed` 的两种含义：504 = 服务端 AbortSignal 中止
   /// （结果未知，不能断言失败）vs 400 = 命令自己抛错（确定失败）。
   final int? status;
-  ApiException(this.message, {this.code, this.status});
+  final Map<String, dynamic>? body;
+  ApiException(this.message, {this.code, this.status, this.body});
   @override
   String toString() => message;
 }
@@ -89,6 +92,36 @@ class Api implements GitReadApi {
 
   /// 电脑端插件版本（bootstrap 返回，设置页「版本」展示用）。
   String pluginVersion = '';
+
+  /// 电脑端**正在运行**的插件内容标识（bootstrap 返回）。
+  /// 更新接续据此确认"新实例已健康生效"，而不是只看版本号（评审 R7）。
+  String pluginContentSha256 = '';
+
+  /// 电脑端下发的插件自更新状态（含安装形态、能否自更新、降级指引、事务摘要）。
+  PluginUpdateStatus pluginUpdate = const PluginUpdateStatus.unknown();
+
+  /// 每次成功吸收 bootstrap 后的回调——**统一的接续入口**（评审 R8）：
+  /// 首次连接、SSE 自动重连、下拉刷新、存活探测都走 `absorbBootstrap`，
+  /// 因此把"接续推进"挂在这里，就不会漏掉"用户什么都没做、只是自动重连"的路径。
+  void Function()? onBootstrapAbsorbed;
+
+  /// 手机端自身版本（`X.Y.Z+build`，启动时由 package_info_plus 填入）。
+  /// 随每个请求以 `x-mobile-app-version` 上报：电脑端据此判定两端对齐，
+  /// 并在**缺失**时把"旧 App"作为可靠信号（旧版 App 不上报）。
+  String appVersion = '';
+
+  /// 两端对齐状态（电脑端下发优先；旧插件不下发时本地自行判定）。
+  AppAlignment alignment = const AppAlignment.unknown();
+
+  /// 记录手机端自身版本，并立即重算对齐状态。
+  void setAppVersion(String value) {
+    appVersion = value;
+    alignment = computeAlignment(
+      pluginVersion: pluginVersion,
+      appVersion: appVersion,
+      server: null,
+    );
+  }
 
   /// 对话时间线能力由服务端显式声明，不能只按 package version 猜测。
   TimelineCapabilities timelineCapabilities = const TimelineCapabilities();
@@ -245,6 +278,12 @@ class Api implements GitReadApi {
         } catch (_) {}
       }());
     }
+    final align = d['alignment'];
+    alignment = computeAlignment(
+      pluginVersion: pluginVersion,
+      appVersion: appVersion,
+      server: align is Map ? Map<String, dynamic>.from(align) : null,
+    );
     final capabilities = d['capabilities'];
     timelineCapabilities = capabilities is Map
         ? TimelineCapabilities.fromJson(
@@ -264,6 +303,13 @@ class Api implements GitReadApi {
                 : null,
           )
         : const TurnOutlineCapabilities();
+    // 正在运行的内容标识 + 插件自更新状态（含事务摘要）：接续判定与"能不能一键"的依据
+    if (p is Map && p['contentSha256'] is String) {
+      pluginContentSha256 = (p['contentSha256'] as String).toLowerCase();
+    }
+    pluginUpdate = PluginUpdateStatus.fromJson(d['pluginUpdate']);
+    // 统一接续入口：所有吸收 bootstrap 的路径（首连/自动重连/刷新/探测）都走到这里
+    onBootstrapAbsorbed?.call();
   }
 
   /// 连接成功后收集电脑全部地址（/api/bootstrap 的 server.urls 含 Tailscale/ZeroTier 等虚拟网段 IP）。
@@ -314,6 +360,8 @@ class Api implements GitReadApi {
   Map<String, String> get _headers => {
     'content-type': 'application/json',
     if (token.isNotEmpty) 'x-mobile-token': token,
+    // 电脑端据此判定两端对齐；旧 App 不带这个头，那本身就是"旧 App"的信号
+    if (appVersion.isNotEmpty) 'x-mobile-app-version': appVersion,
   };
 
   Future<Map<String, dynamic>> getJson(
@@ -413,6 +461,7 @@ class Api implements GitReadApi {
             'HTTP ${res.statusCode}',
         code: body?['error'] is String ? (body?['error'] as String) : null,
         status: res.statusCode,
+        body: body,
       );
     }
     if (body == null) {
@@ -445,6 +494,49 @@ class Api implements GitReadApi {
     final d = await getJson('/api/update/manifest');
     return (d['manifest'] as Map<String, dynamic>?) ?? const {};
   }
+
+  /// Only the trusted host artifact routes may receive the host token, never external URLs.
+  Map<String, String> artifactHeaders(Uri uri) {
+    final mount = path == '/' || path.isEmpty ? '/m' : path.replaceFirst(RegExp(r'/$'), '');
+    // baseUrl 可能为空（绝对 URL 候选）：这时没有"本机 origin"可言，绝不带口令。
+    final origin = baseUrl.isEmpty ? null : Uri.tryParse(baseUrl);
+    final sameOrigin = origin != null && origin.hasScheme && uri.origin == origin.origin;
+    return {'User-Agent': 'dsh-mobile-remote-app',
+      if (sameOrigin && uri.path.startsWith('$mount/api/update/') && token.isNotEmpty) 'x-mobile-token': token};
+  }
+
+  Future<Map<String, dynamic>> getAbsoluteJson(String url) async {
+    var uri = Uri.parse(url);
+    for (var redirects = 0; redirects <= 5; redirects++) {
+      final localOrigin = baseUrl.isEmpty ? null : Uri.tryParse(baseUrl);
+      final isLocalHttp = localOrigin != null && localOrigin.hasScheme && uri.scheme == 'http' && uri.origin == localOrigin.origin;
+      if (uri.host.isEmpty || uri.userInfo.isNotEmpty || (uri.scheme != 'https' && !isLocalHttp)) {
+        throw ApiException('不安全的清单 URL');
+      }
+      final request = http.Request('GET', uri)..followRedirects = false;
+      request.headers.addAll(artifactHeaders(uri));
+      final response = await _client.send(request).timeout(const Duration(seconds: 15));
+      if (const {301, 302, 303, 307, 308}.contains(response.statusCode)) {
+        final next = response.headers['location'];
+        await response.stream.drain<void>();
+        if (next == null) throw ApiException('清单重定向缺少地址');
+        uri = uri.resolve(next);
+        continue;
+      }
+      return _decode(await http.Response.fromStream(response));
+    }
+    throw ApiException('清单重定向次数过多');
+  }
+
+  /// 触发**电脑端插件自更新**（ADR 0019：手机可独立触发，不需要坐到电脑前）。
+  /// 返回 `{action, opId?, check?}`；服务端**先应答、再后台推进**，因此超时不代表没开始
+  /// ——带同一个 [opId] 重试是幂等的，重连后凭它查询同一事务（评审 R6/R10）。
+  Future<Map<String, dynamic>> triggerPluginUpdate({String opId = ''}) =>
+      postJson(
+        '/api/plugin-update',
+        <String, dynamic>{if (opId.isNotEmpty) 'opId': opId},
+        timeout: const Duration(seconds: 15),
+      );
 
   // ── v2.6：模型提供商（与 PC 端 设置→模型 同一配置通道） ──
   /// 提供商列表（含 dormant 未激活项、baseURL、密钥状态）。

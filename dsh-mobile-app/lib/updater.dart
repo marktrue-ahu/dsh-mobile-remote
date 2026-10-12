@@ -1,6 +1,5 @@
 // 自动更新编排：检查（按更新源取候选 + 版本判定）→ 下载（进度）→ sha256 校验（主机源）→
 // 签名预检（自身 vs 下载 APK）→ 拉起系统安装器。均有副作用，按 spec 由 UI 层驱动。
-import 'dart:convert';
 import 'dart:io';
 import 'package:convert/convert.dart';
 import 'package:crypto/crypto.dart';
@@ -52,11 +51,17 @@ String hostCheckErrorMessage(ApiException e) {
   }
 }
 
+typedef UpdateInstaller = Future<String?> Function(UpdateCandidate candidate, {
+  void Function(int received, int? total)? onProgress,
+  void Function(String stage)? onStage,
+  UpdateCancelToken? cancel,
+});
+
 class Updater {
   static const _githubRepo = 'https://api.github.com/repos/201222-L/dsh-mobile-remote/releases/latest';
 
   /// 读取本机 App 版本（package_info_plus）。失败返回 null。
-  static Future<AppVersion?> _localVersion() async {
+  static Future<AppVersion?> localVersion() async {
     try {
       final info = await PackageInfo.fromPlatform();
       return parseAppVersion('${info.version}+${info.buildNumber}');
@@ -68,16 +73,19 @@ class Updater {
 
   /// 检查更新：按 store.updateSource 取候选并判定。不抛（失败收敛为 error 结果）。
   static Future<UpdateCheckOutcome> check(AppStore store) async {
-    final local = await _localVersion();
-    if (local == null) {
-      return const UpdateCheckOutcome(verdict: UpdateVerdict.upToDate, error: '无法读取本地版本');
+    final journal = store.pluginUpdateJournal;
+    if (journal != null) {
+      if (journal.phase == 'plugin-pending') {
+        return const UpdateCheckOutcome(verdict: UpdateVerdict.upToDate, error: '电脑端插件更新尚未健康确认');
+      }
+      return store.checkFixedAppUpdate(journal.release);
     }
     UpdateCandidate? candidate;
     try {
       if (store.updateSource == 'host') {
-        candidate = await _candidateFromHost();
+        candidate = await _candidateFromHost(store.api);
       } else {
-        candidate = await _candidateFromGithub();
+        candidate = await _candidateFromGithub(store.api);
       }
     } catch (e) {
       AppLog.instance.log('Update: 检查失败 $e');
@@ -90,14 +98,7 @@ class Updater {
           : 'GitHub 最新 release 中没有 APK 资产';
       return UpdateCheckOutcome(verdict: UpdateVerdict.upToDate, error: msg);
     }
-    final remote = parseAppVersion(candidate.version);
-    if (remote == null) {
-      return UpdateCheckOutcome(verdict: UpdateVerdict.upToDate, error: '更新源版本号格式异常：${candidate.version}');
-    }
-    return UpdateCheckOutcome(
-      verdict: verdictFor(local: local, remote: remote),
-      candidate: candidate,
-    );
+    return store.checkFixedAppUpdate(candidate.release);
   }
 
   /// 检查失败的提示：主机源按错误码映射；GitHub 失败给「可切主机源」引导（spec）。
@@ -109,22 +110,35 @@ class Updater {
     return 'GitHub 源检查失败：$e（网络不可达？可在「更新源」切换为主机源）';
   }
 
-  static Future<UpdateCandidate?> _candidateFromHost() async {
-    final d = await api.updateManifest();
-    // 检查与下载同 base：挂载路径来自 bootstrap 权威校正，不可硬编码 /m
-    return candidateFromHostManifest(d, baseUrl: hostApiBase(baseUrl: api.baseUrl, mountPath: api.path));
+  static Future<UpdateCandidate?> _candidateFromHost(Api client) async {
+    final d = await client.updateManifest();
+    final base = hostApiBase(baseUrl: client.baseUrl, mountPath: client.path);
+    final snapshot = normalizedReleaseFromManifest(d, manifestUrl: '$base/api/update/manifest',
+      appUrl: '$base/api/update/apk', pluginUrl: '$base/api/update/plugin');
+    return snapshot?.candidate;
   }
 
-  static Future<UpdateCandidate?> _candidateFromGithub() async {
-    // GitHub API 强制要求 User-Agent
-    final resp = await http
-        .get(Uri.parse(_githubRepo), headers: {'User-Agent': 'dsh-mobile-remote-app'})
-        .timeout(const Duration(seconds: 15));
-    if (resp.statusCode != 200) {
-      throw HttpException('GitHub API HTTP ${resp.statusCode}');
+  static Future<UpdateCandidate?> _candidateFromGithub(Api client) async {
+    final release = await client.getAbsoluteJson(_githubRepo);
+    final assets = (release['assets'] as List?)?.whereType<Map>().toList() ?? const <Map>[];
+    Map? asset(String file) {
+      for (final value in assets) {
+        if (value['name'] == file) return value;
+      }
+      return null;
     }
-    final release = jsonDecode(utf8.decode(resp.bodyBytes)) as Map<String, dynamic>;
-    return candidateFromGithubRelease(release);
+    final manifestUrl = asset('manifest.json')?['browser_download_url'];
+    if (manifestUrl is! String || !manifestUrl.startsWith('https://')) {
+      throw const FormatException('此发布缺少两端 manifest.json；请更新电脑端插件或使用配置完整的主机源，旧组合仍可继续使用');
+    }
+    final manifest = await client.getAbsoluteJson(manifestUrl);
+    String? artifactUrl(Object? value) {
+      if (value is! Map || value['file'] is! String) return null;
+      final url = asset(value['file'] as String)?['browser_download_url'];
+      return url is String ? url : null;
+    }
+    return normalizedReleaseFromManifest(manifest, manifestUrl: manifestUrl,
+      appUrl: artifactUrl(manifest['app']), pluginUrl: artifactUrl(manifest['plugin']))?.candidate;
   }
 
   /// 启动静默自动检查（spec：默认开）：仅把命中的候选写入 store（不弹窗），
@@ -147,9 +161,14 @@ class Updater {
     void Function(int received, int? total)? onProgress,
     void Function(String stage)? onStage,
     UpdateCancelToken? cancel,
+    Api? apiClient,
+    bool Function()? mayInstall,
+    http.Client? downloadClient,
+    Directory? temporaryDirectory,
   }) async {
+    final connection = apiClient ?? api;
     // ── 下载 ──
-    final dir = await getTemporaryDirectory();
+    final dir = temporaryDirectory ?? await getTemporaryDirectory();
     final updateDir = Directory('${dir.path}/dsh-update');
     await updateDir.create(recursive: true);
     final target = File('${updateDir.path}/dsh-update-${DateTime.now().millisecondsSinceEpoch}.apk');
@@ -167,10 +186,8 @@ class Updater {
     try {
       onStage?.call('download');
       final req = http.Request('GET', Uri.parse(candidate.downloadUrl));
-      if (candidate.source == '主机' && api.token.isNotEmpty) {
-        req.headers['x-mobile-token'] = api.token;
-      }
-      client = http.Client();
+      req.headers.addAll(connection.artifactHeaders(req.url));
+      client = downloadClient ?? http.Client();
       if (cancel != null) cancel._client = client;
       final resp = await client.send(req).timeout(const Duration(seconds: 30));
       if (resp.statusCode != 200) {
@@ -193,6 +210,16 @@ class Updater {
         return '下载失败：文件为空';
       }
       bool wasCancelled() => cancel?.cancelled == true;
+
+      // ── 字节数校验：以**发布清单声明的 size** 为准，不看响应的 Content-Length ──
+      // （同 URL 被替换成另一份产物时，Content-Length 会跟着变，只信它就等于没校验。）
+      if (candidate.sizeBytes != null && candidate.sizeBytes! > 0) {
+        final actual = await target.length();
+        if (actual != candidate.sizeBytes) {
+          await target.delete();
+          return '校验失败：文件大小与发布清单不一致（$actual ≠ ${candidate.sizeBytes}），已取消';
+        }
+      }
 
       // ── sha256 校验（主机源 manifest 提供；GitHub 无 -> 跳过） ──
       if (candidate.sha256 != null && candidate.sha256!.isNotEmpty) {
@@ -226,6 +253,10 @@ class Updater {
       }
 
       // ── 安装（拉起系统安装器；最终核对交给系统） ──
+      if (mayInstall != null && !mayInstall()) {
+        await target.delete();
+        return '插件状态已变化，已取消 App 安装；请重试确认';
+      }
       onStage?.call('install');
       await NativeUpdate.installApk(target.path);
       return null;
