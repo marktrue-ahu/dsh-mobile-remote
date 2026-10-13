@@ -1,0 +1,12 @@
+# dsh.bundle 激活补丁（DSH 桌面/CLI 安装本包时作为 profile 层应用）。
+#
+# 有了它，用户 `dsh plugin add @marktrue/dsh-mobile-remote` 之后无需手工编辑
+# profile 的 cordis.patch.yml——本文件就是那一段 insert。
+#
+# ⚠️ authToken 必须由用户在自己的 profile 配置里设置：留空等于关闭访问口令，
+#    同一网络内任何设备都能连接并控制 agent（插件启动时会打印告警）。
+- insert:
+    - id: mobile-remote
+      name: "@marktrue/dsh-mobile-remote"
+      config:
+        path: /m

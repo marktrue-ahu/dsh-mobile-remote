@@ -54,8 +54,14 @@ try {
 } finally {
     Pop-Location
 }
+# 产物名由包名决定：带 scope 时是 `scope-name-ver.tgz`（斜杠换连字符），不能按固定名找。
 $packed = Join-Path $dist "dsh-mobile-remote-$ver.tgz"
 $tgzOut = Join-Path $dist "dsh-mobile-remote-v$ver.tgz"
+if (-not (Test-Path $packed)) {
+    $candidate = Get-ChildItem -Path $dist -Filter "*-$ver.tgz" -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($candidate) { $packed = $candidate.FullName }
+}
 if (Test-Path $packed) {
     # 命名对齐历史发布惯例：dsh-mobile-remote-vX.Y.Z.tgz（npm pack 原生输出不含 v）
     Move-Item $packed $tgzOut -Force

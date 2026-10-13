@@ -48,12 +48,16 @@ cp "$apk" "$apk_out"
 echo "Archived: $apk_out ($(du -h "$apk_out" | cut -f1))"
 
 # 2) 插件 tarball（npm pack，本地无网络；输出名与 PowerShell 脚本统一）
-npm_tgz="$dist/dsh-mobile-remote-$ver.tgz"
 tgz_out="$dist/dsh-mobile-remote-v$ver.tgz"
-(cd "$repo_dir" && npm pack --pack-destination "$dist" >/dev/null)
-if [ -f "$npm_tgz" ]; then
-    mv -f "$npm_tgz" "$tgz_out"
+# 产物名由包名决定：带 scope 时 npm pack 输出 `scope-name-ver.tgz`（斜杠换成连字符），
+# 不能再按固定名找文件——否则会误用上一次遗留的旧 tgz，生成内容对不上的清单。
+pack_json="$(cd "$repo_dir" && npm pack --pack-destination "$dist" --json)"
+npm_tgz="$dist/$(printf '%s' "$pack_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["filename"])')"
+if [ ! -f "$npm_tgz" ]; then
+    echo "npm pack 未产出预期文件：$npm_tgz" >&2
+    exit 1
 fi
+mv -f "$npm_tgz" "$tgz_out"
 if [ ! -f "$tgz_out" ]; then
     echo "Plugin tarball not found at $tgz_out" >&2
     exit 1
