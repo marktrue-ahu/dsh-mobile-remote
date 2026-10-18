@@ -12,7 +12,7 @@
 
 | 组件 | 要求 |
 |---|---|
-| 桌面端 DSH（Harness） | 插件不按宿主版本号硬拦截；可用性取决于宿主提供的 Remote RPC、事件桥等接口。诊断提供 `services` / `checks`，**并自 v3.1.6 起提供宿主能力三态报告**（`checks.hostCapabilities` 的 `ok`/`drift`/`missing` 与 `checks.hostGeneration`）；仍**不返回宿主版本号**，因此不要把插件版本推断为宿主能力。见 §2.6 |
+| 桌面端 DSH（Harness） | 插件不按宿主版本号硬拦截；可用性取决于宿主提供的 Remote RPC、事件桥等接口。诊断提供 `services` / `checks`，**并自 v3.1.6 起提供宿主能力三态报告**（`checks.hostCapabilities` 的 `ok`/`drift`/`missing` 与 `checks.hostGeneration`）；仍**不返回宿主版本号**，因此不要把插件版本推断为宿主能力。见 §2.6；**`0.2.1` 起进程内网关调用强制显式 Peer，由 §2.7 适配（issue #34）** |
 | dsh-mobile-remote 插件 | **v3.1.5**；`/m/api/diagnostics` 提供 `services` / `checks`，并提供 `/m/api/account-usage` |
 | 手机 App（Android） | v3.1.5（与插件同版本便于配对；不同版本按 API 增量兼容）；Android 7.0+、64 位机型 |
 | 字段级兼容（v3.1.0） | `reasoning`/`title` 为纯增量字段：新插件+旧 App 无影响（忽略新字段）；新 App+旧插件自动回退（不渲染折叠块 / 悬浮球标题兜底短码）——任意组合均可使用 |
@@ -28,9 +28,9 @@
 
 **v3.1.6+ 新增宿主能力自检**（ADR 0017；issue #30 起补原因码）：
 
-- `checks.hostCapabilities`：逐项给出三态——`ok` / `drift` / `missing`。`drift` 是**能力语义漂移**（服务在、调用不报错，但成员形状不是插件认识的样子），这正是 0.2.0 四处变更的形态，旧的两分法看不见它们。
+- `checks.hostCapabilities`：逐项给出三态——`ok` / `drift` / `missing`。`drift` 是**能力语义漂移**（服务在、调用不报错，但成员形状不是插件认识的样子），这正是 0.2.0 四处变更与 0.2.1 peer 收紧的形态，旧的两分法看不见它们。**`gateway.eventsPeer`（issue #34）** 专门覆盖"网关入口都在、但进程内 Peer 来源缺失"这一种漂移，原因码为 `gateway-peer-source-missing`。
 - `checks.hostCapabilityReasons`（issue #30 审查修复）：**只对 `drift` 项**给出 allow-list 原因码，避免"只报状态值查不出哪一步坏了"。`settings.read` 的取值：`settings-get-threw` / `settings-describe-threw` / `settings-describe-shape-invalid` / `settings-descriptor-without-value` / `settings-has-no-read-method`。该探针与真实读取**共享严格读取器**——对插件真正读取的命名空间逐个探测，"命名空间不存在"仍算 ok，读不到才报 `drift`。
-- `checks.hostGeneration`：插件**实际走了哪条代际路径**（`jobsCaller` / `settingsRead` / `wireStreamArgs`），排查"为什么同一功能在两台机器上表现不同"时先看这里。
+- `checks.hostGeneration`：插件**实际走了哪条代际路径**（`jobsCaller` / `settingsRead` / `wireStreamArgs` / `eventsPeer`），排查"为什么同一功能在两台机器上表现不同"时先看这里。`eventsPeer` 取值：`createPeer`（0.2.1+）/ `operatorPeer`（0.2.0 网关兜底）/ `legacy`（旧代 3 参开流不需要 peer）/ `none`（必失败）/ `unknown`（网关服务缺失，无法判定）。
 
 `services.apiProxy` / `checks.respondBridge` / `checks.frameBridge` **已随 v3.1.6 删除**：该服务自 `0.1.2-rc.1` 起就不存在，保留它们只会让人以为有一条可用的旧代降级通道。同样地，`/m/api/respond` 在待办不在本地清单时返回 `404 respond-not-pending`（此前返回 `503` 并归咎于"内核过旧"，属误导——真实原因通常是"另一端已先答"或"已超时"）。
 
@@ -52,8 +52,8 @@
 | `approval` | 权限策略读取（`setPolicy` 仅当存在时调用） | 可选 | 跳过策略写入 |
 | `credentials` | DeepSeek 余额查询 | 可选 | 回退环境变量 `DEEPSEEK_API_KEY`；都没有则余额不可用 |
 | `approval/request`·`user-questions/request` 瀑布 | Agent 作用域 Cordis 瀑布，插件 answerer 应答（当前代际的交互入口） | 软依赖 | 无瀑布宿主时问询/审批**无手机弹卡**（旧代 `apiProxy` 帧桥已于 v3.1.6 删除，不存在该降级出口；见 §2.6） |
-| `typertGateway` — Remote 调用入口（`invokeRpc`） | 模型目录、会话配置、发送、队列操作、归档、分支、目标等 RPC | 硬依赖 | 调用失败时对应 API 返回错误；当前诊断不会输出独立的 `host.capabilities` 状态，请结合宿主版本和运行日志排查 |
-| `typertGateway` — `$events` 远程事件桥（`openWireStream`） | 插件进程内 `$events` 客户端：与桌面 GUI 同收事件副本、先答生效 | 可选（v3.1.3） | 桥不可用时 `approvalMode: both` 按 `mobile` 语义降级；`checks.remoteEvents` 和运行日志可辅助诊断 |
+| `typertGateway` — Remote 调用入口（`invokeRpc` / `stream`） | 模型目录、会话配置、发送、队列操作、归档、分支、目标等 RPC | 硬依赖 | 调用失败时对应 API 返回错误；**`0.2.1` 起必须显式传活 Peer（§2.7）**，否则恒返回 `gateway/internal: …reading 'signal'` |
+| `typertGateway` — `$events` 远程事件桥（`openWireStream` / 结算 `dispatchRpc`） | 插件进程内 `$events` 客户端：与桌面 GUI 同收事件副本、先答生效 | 可选（v3.1.3） | 桥不可用时 `approvalMode: both` 按 `mobile` 语义降级；`checks.remoteEvents` 和运行日志可辅助诊断。**`0.2.1` 起开流与 `$events/result` 结算都必须带同一个活 Peer（§2.7）** |
 | `sessionController`（`prompt`） | 冷会话恢复：不在 live agent 注册表里的持久会话发送 | 冷会话路径依赖 | 宿主若不支持该调用则发送失败；当前诊断不提供该能力的独立布尔字段 |
 | `apiProxy`（旧代，0.1.1-rc.2 及更早） | 问询/审批帧桥 + 应答回写 | **弃用通道**（ADR 0001） | **两代宿主（0.1.5 / 0.2.0）内核树内均 0 命中**，插件侧的探测与帧桥代码**已于 v3.1.6 整块删除**（issue #19）：保留它的唯一效果是让读者以为存在一条可用的旧代降级通道 |
 
@@ -67,6 +67,7 @@
 | `ctx.on("agent/inbox/spliced")`（经 `session/event` 送达） | 队列即时同步：内核任何生效的 inbox 变更都会 append 该会话事件，据此重推 `mobile/queue` 快照 | 事件名与载荷在当前代际与上一代一致；缺失时手机队列退回 REST 轮询兜底（不报错，仅不实时） |
 | `sessionQuery.readEvent`（可选） | Tool activity 与未知 Visible event 的按需无损详情 | 不存在时回退快照；旧历史详情明确显示不可用，不猜测重建 |
 | `ctx.on("agent/status")` | 状态点（绿/橙） | 同上 |
+| `typertGateway`（`invokeRpc` / `stream` / `openWireStream` / `dispatchRpc`） | 全部内核 RPC 与 `$events` 双端审批通道 | **`0.2.1` 起必须显式传活 Peer（§2.7）**；漏传/传错返回 `gateway/internal: …reading 'signal'`，由错误映射转成业务错误码（不再静默） |
 | `session/modelCatalog` RPC | 模型目录（App 模型选择器） | 失败 → 目录为空，App 隐藏模型胶囊 |
 | `settings.update`（`agent-presets` / `permission` 命名空间） | 默认预设修改 | 与 PC 端同一写入通道；命名空间变更会导致设置失败（App 报错提示） |
 | `session/prompt` | 发消息（`mode: queue \| steer`，`requestId` **必填**） | `requestId` 由插件无条件铸造；缺失会被网关以 `gateway/input-invalid` 拒绝投递 |
@@ -109,7 +110,7 @@
 | 任务查询/终止的 caller | **Agent 对象**（实现内部取其 `.id`） | **SessionId 字符串** | `jobs.events.subscribe` 是否存在（两处差异同版发生） | 列表恒返回空（像"确实没有任务"）；终止报"任务属于另一个会话" |
 | 任务事件订阅 | `onJobsChanged` + `onJobDone` 两个回调 | 统一的 `events.subscribe(filter, listener)` | 同上 | 实时推送静默退化为轮询 |
 | 设置读取 | `get(ns)` 返回配置节 | `describe()` 返回描述符数组（取 `value`） | `typeof settings.get === "function"` | 抛出的类型错误被 `try/catch` 吞掉，提供商配置页字段凭空消失 |
-| 事件流打开的参数位次 | `(端点, 载荷, 取消信号)` | `(端点, 载荷, uplink, peer, 取消信号, 控制)` | 形参个数（3 vs 6） | 信号落进 `uplink`、真 signal 为 `undefined`，宿主在 `AbortSignal.any` 处抛错并被重试吞掉 → `approvalMode: both` 的双端呈现**永远不就绪** |
+| 事件流打开的参数位次 | `(端点, 载荷, 取消信号)` | `(端点, 载荷, uplink, peer, 取消信号, 控制)`；**`0.2.1` 末尾又加 `uplinkWindow`（7 参）** | 形参个数（3 vs ≥5 判 control 位次） | 信号落进 `uplink`、真 signal 为 `undefined`，宿主在 `AbortSignal.any` 处抛错并被重试吞掉 → `approvalMode: both` 的双端呈现**永远不就绪**。peer 从 `0.2.1` 起必填，见 §2.7 |
 
 **另有一类风险单独处理**：插件依赖的若干宿主成员是 **TS-private**（无契约保证）——权限预设的 `names`/`presets`/`apply`，以及工作区注册表的 `enqueueOperation`/`requireState`/`setState`（后者此前**完全无守卫**）。v3.1.6 起这些成员缺失时**显式报错**（503）或显式降级，不再让 `TypeError` 在深处被吞成"按了没反应"。**不迁移**到公开 API——那是行为改变，与本次兼容修复分开评估。
 
@@ -129,6 +130,27 @@
 **子代理列表的完整性**：不能拿会话注册表当子代理目录——`sessions.list()` 只有 **live/驻留**会话，continuable 子代理结束并释放 handle 后会从中移除，而持久目录仍保留其身份。只用注册表会在父会话还活着时"成功却显示暂无子代理"。目录读不到时退回注册表并标注 `catalogDegraded`，**不让不完整列表冒充完整目录**。
 
 **验证范围（如实标注）**：只对 **`0.2.x` 做真实宿主端到端验证**（本机宿主即 0.2.x）。`0.1.x` 那条路径的真实宿主验不到，**靠两代假宿主夹具保护**（`test/host-compat-020.test.mjs`：按真实签名复刻两代差异，让两条分支都被实际执行到）。因此 0.1.x 一侧属于"夹具已验证、真实宿主未验证"。
+
+---
+
+### 2.7 `0.2.1`：进程内网关调用强制 Peer（issue #34）
+
+宿主 `0.2.1-rc.2` 把 `0.2.0` 的"peer 可省"收紧为"**每个进程内网关调用都必须显式传一个活着的 Peer**"。与 §2.6 同类：**服务在、成员在、调用不报参数错，但宿主内部先解引用 `peer.signal`**——漏传只会得到 `gateway/internal: Cannot read properties of undefined (reading 'signal')`，或在插件的重试循环里被吞成"通道不可用"。插件按能力探测（不按版本号）选择 peer 来源：
+
+| 差异 | `0.2.0` | `0.2.1-rc.2` | 插件如何判别 | 传错的后果 |
+|---|---|---|---|---|
+| 进程内 Peer 来源 | 网关自带 `operatorPeer()` 兜底（`connection.operator` 单例） | **兜底删除**；改由 `ctx.connection.createPeer({ principal, interactions })` 现造 | `typeof connection.createPeer === "function"` → `createPeer`；否则看 `gateway.operatorPeer` → `operatorPeer`；都没有 → `none` | unary RPC 恒返回 `gateway/internal`；`$events` 永不就绪、`approvalMode: both` 静默降级 mobile |
+| 网关四入口的 peer 实参 | 可省 | `invokeRpc(e,p,s,**peer**)` / `stream({…,**peer**})` / `openWireStream(e,p,uplink,**peer**,s,…)` / `dispatchRpc(e,p,s,**peer**)` 均必填 | 同上一行（`hostPeerSource`） | 同上 |
+| `$events/result` 结算身份 | peer 不参与 | `assertPeerLive` + `requireInteractions` + owner + **`client.peer !== peer` 拒绝** | 插件把**开流用的同一个 Peer 实例**用于结算 | 结算被 `gateway/interactions-forbidden` 拒绝，手机答了却"没生效" |
+
+**插件做法（issue #34 实现）**：
+
+- 插件级**单例** Peer：首次真正调用网关时惰性创建（`owner` + `interactions: "answer"`），跨 RPC 与 `$events` 开流共用；**开流与结算同一个实例**（宿主按 Peer 身份匹配），插件卸载时 `dispose()`。
+- `connection` 服务可能晚于插件挂载（`0.2.1` 实测首次 `ctx.get("connection")` 为 `undefined`）——首次取不到就不缓存，交给既有 `$events` 有界重试/下次调用再建；缓存的 Peer 若 `signal` 已 abort（作用域销毁）则自动重建。
+- `0.2.0`/`0.1.x` 不改变行为：没有 `createPeer` 时继续传 `undefined`，由网关兜底 / 旧代 3 参开流不需要 peer。
+- 诊断显式化：`checks.hostCapabilities["gateway.eventsPeer"]`（`ok`/`drift`，按**真实创建结果**判定而非只看工厂存在）+ `checks.hostGeneration.eventsPeer`（`createPeer`/`operatorPeer`/`legacy`/`none`/`unknown`），`drift` 时附原因码 `gateway-peer-source-missing`；创建失败写一次性告警日志；`approvalMode: both` 的降级文案不再归咎"宿主版本过低"。
+
+**验证范围（如实标注）**：`0.2.1-rc.2` 路径已在**隔离宿主**（`HOME`/`DSH_HOME` 独立、独立 profile、3099 端口）完成端到端验证：`hostCapabilities` 8/8 `ok`（含 `gateway.eventsPeer: ok`）、`hostGeneration.eventsPeer: createPeer`、`checks.remoteEvents: true`、`POST /m/api/defaults {"permissionPreset":"workspace-write"}` 返回 `200 {"ok":true}`。三代实参位次、peer 同源（含 `$events/result` 结算）、单例复用与释放、drift 上报由 `test/host-compat-021.test.mjs` 夹具钉住（变异验证：去掉结算 peer 或改为每次新建都会红）；`0.2.0`/`0.1.x` 回归由 `test/host-compat-020.test.mjs` 保护。**生产宿主部署与真机验收不在本分支自动化范围内**，需按发布流程人工执行。
 
 ---
 
@@ -175,7 +197,8 @@ App 为 Flutter 原生 APK（`com.dsh.remote`），渲染后端为 **Impeller（
 | 11 | 与 dsh-web 移动端远程（`@linxin666/dsh-remote-web-ui`）同装冲突 | 两者抢 `/m` 路由前缀（对方写死不可配），可能异常/崩溃 | 本插件 `path` 改 `/mr` 等非 `/m` 单段即可共存（App 自动适配，无需重装）；详见 FAQ |
 | 12 | 手机在线时桌面端不弹审批/问询框（v3.1.2，issue #9） | 桌面用户无法在 PC 审批/应答（只能手机答或 120s fail-close） | **v3.1.3 修复**：默认 `approvalMode: both` 双端同卡、先答生效（0.1.2-rc.1+）；旧宿主/历史版本可用 `approvalMode: mobile \| desktop` 明确策略 |
 | 13 | `approvalMode: both` 依赖内核 `$events` 通道 | 旧宿主（0.1.1-rc.2 及更早）无法双端同卡 | 自动降级 mobile 并写日志；诊断 `notes` 可查 |
-| 14 | 宿主 API 存在**静默语义漂移**（服务在、调用不报错、行为却已变） | 升级宿主后功能"看起来正常但没有内容"，且旧的两分法探测（存在/缺失）看不见它们 | 能力三态报告（`checks.hostCapabilities` 的 `drift` + `checks.hostGeneration`）+ 两代假宿主夹具；见 §2.6、ADR 0017 |
+| 14 | 宿主 API 存在**静默语义漂移**（服务在、调用不报错、行为却已变） | 升级宿主后功能"看起来正常但没有内容"，且旧的两分法探测（存在/缺失）看不见它们 | 能力三态报告（`checks.hostCapabilities` 的 `drift` + `checks.hostGeneration`）+ 两代假宿主夹具；见 §2.6、§2.7、ADR 0017 |
+| 15 | `0.2.1-rc.2` 起进程内网关调用强制显式 Peer（§2.7） | 未适配的插件版本上：RPC 功能报 `gateway/internal`，`$events` 双端审批静默降级 | 已按能力探测适配（`connection.createPeer`，开流与结算同源）；诊断 `gateway.eventsPeer` 可归因；旧代行为不变 |
 
 ## 6. 内置常量与"写死"数据速查
 
