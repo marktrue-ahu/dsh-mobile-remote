@@ -2,6 +2,7 @@
 // 手动「检查更新」与首页「有新版本」横幅共用此流程。
 import 'package:flutter/material.dart';
 import '../l10n.dart';
+import '../plugin_update_resume.dart';
 import '../store.dart';
 import '../theme.dart';
 import '../toast.dart';
@@ -18,7 +19,16 @@ Future<bool> ensurePluginAlignedFirst(BuildContext context, AppStore store, [Upd
   if (gate.allowed) return true;
   switch (gate.reason) {
     case 'plugin-update-in-progress':
-      showToast(context, L10n.t('电脑端插件正在更新，完成后会自动继续', 'Desktop plugin is updating — this continues automatically'));
+      if (store.pluginUpdateJournal?.phase == UpdatePhase.appPending) {
+        // F13：App 半边长期停在"更新进行中"时，必须给取消/重查出口，不能死锁。
+        final exited = await _stuckUpdateExit(context, store);
+        if (exited && context.mounted) {
+          final notice = store.pluginUpdateNotice;
+          if (notice != null && notice.isNotEmpty) showToast(context, notice);
+        }
+      } else {
+        showToast(context, L10n.t('电脑端插件正在更新，完成后会自动继续', 'Desktop plugin is updating — this continues automatically'));
+      }
       return false;
     case 'plugin-update-failed':
     case 'plugin-update-available':
@@ -37,6 +47,29 @@ Future<bool> ensurePluginAlignedFirst(BuildContext context, AppStore store, [Upd
       showToast(context, L10n.t('无法确认该发布的插件目标；请在设置页重试或按电脑端插件指引升级。旧组合仍可正常使用', 'Cannot confirm this release’s plugin target. Retry or follow the desktop plugin guide in Settings; existing features remain usable'));
       return false;
   }
+}
+
+/// 接续失败出口（F13）：目标改变、过期、失败或另一事务回滚导致长期停在
+/// "更新进行中"时，允许取消旧目标并按电脑端**当前状态**重新检查。
+Future<bool> _stuckUpdateExit(BuildContext context, AppStore store) async {
+  final choice = await showDialog<String>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: Text(L10n.t('更新仍在进行中', 'Update still pending')),
+      content: Text(L10n.t(
+        '这条更新记录还没有成功证明。可以继续等待，或者取消旧目标并按电脑端当前状态重新检查（不会自动降级 App）。',
+        'This update record has no success proof yet. Keep waiting, or cancel the old target and re-check against the current desktop state '
+            '(the app is never downgraded automatically).',
+      )),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx, 'wait'), child: Text(L10n.t('继续等待', 'Keep waiting'))),
+        TextButton(onPressed: () => Navigator.pop(ctx, 'cancel'), child: Text(L10n.t('取消并重新检查', 'Cancel and re-check'))),
+      ],
+    ),
+  );
+  if (choice != 'cancel') return false;
+  await store.cancelUpdateAndRecheck();
+  return true;
 }
 
 Future<bool?> _confirmPluginFirst(BuildContext context) => showDialog<bool>(

@@ -170,6 +170,128 @@ ReleaseSnapshot? normalizedReleaseFromManifest(Map<String, dynamic> manifest, {
     'app': artifact(manifest['app'], appUrl), 'plugin': artifact(manifest['plugin'], pluginUrl)});
 }
 
+/// 宿主下发的**发布定位**（bootstrap 的 `currentRelease` / `updateTarget`，§5.3）。
+///
+/// App 只消费宿主给出的完整快照与固定地址：`release.app.url` / `release.plugin.url`
+/// 都必须是手机可达的宿主地址；固定目标的下载 query 由宿主拼好，App 不自行构造。
+@immutable
+class ReleasePointer {
+  const ReleasePointer({required this.releaseId, required this.release});
+
+  /// 不依赖外部地址的发布标识（宿主计算，用于存储与传输定位）。
+  final String releaseId;
+
+  /// 完整 schema 1 快照（两端身份 + 宿主投影后的下载地址）。
+  final ReleaseSnapshot release;
+
+  static ReleasePointer? fromJson(Object? value) {
+    if (value is! Map) return null;
+    final id = value['releaseId'];
+    final release = ReleaseSnapshot.fromJson(value['release']);
+    if (id is! String || id.isEmpty || release == null) return null;
+    return ReleasePointer(releaseId: id, release: release);
+  }
+
+  Map<String, dynamic> toJson() => {'releaseId': releaseId, 'release': release.toJson()};
+}
+
+/// **当前发布**的健康确认（bootstrap 的 `currentReleaseHealth`，§5.3）。
+///
+/// “健康”不是文件指针或哈希相同的别名：既不可是在飞/回滚事务，也要以本实例实际
+/// 运行内容为准。缺失（旧宿主）时 App 按“运行内容 + 无矛盾事务”兜底判定。
+@immutable
+class ReleaseHealth {
+  const ReleaseHealth({
+    required this.state,
+    this.runningContentSha256 = '',
+    this.instanceId = '',
+    this.transactionOpId = '',
+    this.transactionGeneration = 0,
+  });
+
+  /// `confirmed` / `waiting` / `failed`；空串表示宿主未给出该字段。
+  final String state;
+
+  /// 本实例**实际运行**的插件内容标识（不是磁盘字节）。
+  final String runningContentSha256;
+
+  /// 服务实例身份：换实例后旧健康结论不能冒充新的。
+  final String instanceId;
+
+  /// 关联事务身份与代际（在飞/回滚矛盾判据）。
+  final String transactionOpId;
+  final int transactionGeneration;
+
+  bool get confirmed => state == 'confirmed';
+  bool get waiting => state == 'waiting';
+  bool get failed => state == 'failed' || state == 'error';
+
+  static ReleaseHealth? fromJson(Object? value) {
+    if (value is! Map) return null;
+    final state = ((value['state'] as String?) ?? '').toLowerCase();
+    if (state.isEmpty && value['runningContentSha256'] is! String) return null;
+    final tx = value['transaction'];
+    var opId = '';
+    var generation = 0;
+    if (tx is Map) {
+      opId = (tx['opId'] as String?) ?? '';
+      final g = tx['generation'];
+      if (g is int) {
+        generation = g;
+      } else if (g is num) {
+        generation = g.toInt();
+      } else if (g is String) {
+        generation = int.tryParse(g) ?? 0;
+      }
+    }
+    return ReleaseHealth(
+      state: state,
+      runningContentSha256: (((value['runningContentSha256'] as String?) ?? '')).toLowerCase(),
+      instanceId: (value['instanceId'] as String?) ?? '',
+      transactionOpId: opId,
+      transactionGeneration: generation,
+    );
+  }
+}
+
+/// APK 分发就绪诊断（`appArtifact`：`ok` / `missing` / `mismatch` + 稳定 reason）。
+///
+/// 插件健康与 APK 就绪是两件事（§5.10）：缺失/镜像滞后只降级 APK 分发，不影响控制面。
+@immutable
+class AppArtifactDiagnostic {
+  const AppArtifactDiagnostic({required this.state, this.reason = ''});
+
+  final String state;
+  final String reason;
+
+  bool get ok => state == 'ok';
+  bool get missing => state == 'missing';
+  bool get mismatch => state == 'mismatch';
+
+  static AppArtifactDiagnostic? fromJson(Object? value) {
+    if (value is! Map) return null;
+    final state = ((value['state'] as String?) ?? '').toLowerCase();
+    if (state.isEmpty) return null;
+    return AppArtifactDiagnostic(state: state, reason: (value['reason'] as String?) ?? '');
+  }
+}
+
+/// 旧版 App/旧宿主可能留下**外部 Release 资产地址**（GitHub 直连）。
+///
+/// 新流程只允许宿主投影的固定目标地址（§5.6/§5.9、F19）：遇到外部资产地址时
+/// 明确拒绝并提示重新检查，绝不把它再拼成可用下载地址。
+String? fixedArtifactUrlIssue(ReleaseSnapshot release) {
+  final uri = Uri.tryParse(release.app.url);
+  if (uri == null || uri.host.isEmpty || !const {'http', 'https'}.contains(uri.scheme) || uri.userInfo.isNotEmpty) {
+    return '固定发布缺少可下载的绝对地址；请重新检查两端版本或升级电脑端插件';
+  }
+  final host = uri.host.toLowerCase();
+  if (host == 'github.com' || host.endsWith('.github.com') || host == 'githubusercontent.com' || host.endsWith('.githubusercontent.com')) {
+    return '该固定快照仍指向外部 Release 资产地址（旧流程）；新版 App 只从电脑端固定目标下载，请重新检查两端版本或升级电脑端插件';
+  }
+  return null;
+}
+
 /// 更新候选：App 展示与下载所需的最小集合。
 @immutable
 class UpdateCandidate {
@@ -191,9 +313,6 @@ class UpdateCandidate {
   });
 }
 
-/// GitHub APK 资产名前缀（spec：取 assets 中第一个名形如 `DSH-Remote-*.apk` 的条目）。
-const String githubApkPrefix = 'DSH-Remote-';
-
 /// 主机源 API base：baseUrl + 插件挂载路径（与 api._uri 同规则：空/`/` 回退 `/m`，去尾斜杠）。
 /// 检查与下载必须用同一 base——挂载路径非默认 `/m` 时硬编码会 404。
 String hostApiBase({required String baseUrl, required String mountPath}) {
@@ -207,37 +326,6 @@ String hostApiBase({required String baseUrl, required String mountPath}) {
     m = m.substring(0, m.length - 1);
   }
   return '$base$m';
-}
-
-/// GitHub release 资产里挑 APK：形如 `DSH-Remote-*.apk`。返回 null = 无 APK 资产。
-Map<String, dynamic>? pickGithubApkAsset(List<dynamic>? assets) {
-  if (assets == null) return null;
-  for (final a in assets) {
-    if (a is! Map) continue;
-    final name = a['name'] as String? ?? '';
-    if (name.startsWith(githubApkPrefix) && name.endsWith('.apk')) {
-      return Map<String, dynamic>.from(a);
-    }
-  }
-  return null;
-}
-
-/// 从 GitHub `releases/latest` 响应构建候选（tag 版本无 build；asset 无 sha256/notes）。
-UpdateCandidate? candidateFromGithubRelease(Map<String, dynamic> release) {
-  final tag = release['tag_name'] as String? ?? '';
-  final version = parseAppVersion(tag);
-  if (version == null) return null;
-  final asset = pickGithubApkAsset(release['assets'] as List?);
-  if (asset == null) return null;
-  final url = asset['browser_download_url'] as String? ?? '';
-  final parsedUrl = Uri.tryParse(url);
-  if (parsedUrl == null || parsedUrl.scheme != 'https' || parsedUrl.host.isEmpty) return null;
-  return UpdateCandidate(
-    version: version.toString(),
-    downloadUrl: url,
-    sizeBytes: (asset['size'] as num?)?.toInt(),
-    source: 'GitHub',
-  );
 }
 
 /// 从主机源 manifest 构建候选（baseUrl 如 `http://<host>:3080/m`；下载走插件 /api/update/apk）。

@@ -11,6 +11,8 @@ import { test } from "node:test";
 
 let apply;
 let testHome;
+// #35 起口令必须显式配置或由宿主自动生成；契约用例用固定口令并默认带上 token。
+const AUTH_TOKEN = "fixture-alignment-token";
 
 class MockResponse extends Writable {
 	constructor() {
@@ -39,8 +41,9 @@ class MockResponse extends Writable {
 function config(over = {}) {
 	return {
 		path: "/m",
-		// 关闭口令：对齐状态与鉴权无关，这里只测响应契约
-		authToken: "",
+		// #35 起"空口令 ≠ 关闭认证"：宿主会自动生成口令并 fail-closed。
+		// 对齐状态与鉴权无关，这里用固定口令 + request() 默认带上 token，只测响应契约。
+		authToken: AUTH_TOKEN,
 		cookieName: "dsh_mobile_token",
 		trustedHosts: [],
 		sessionTtlMs: 60_000,
@@ -110,7 +113,7 @@ function request(route, { url, headers = {}, method = "GET" }) {
 	const req = {
 		method,
 		url,
-		headers: { host: "127.0.0.1:3080", ...headers },
+		headers: { host: "127.0.0.1:3080", "x-mobile-token": AUTH_TOKEN, ...headers },
 		socket: { remoteAddress: "127.0.0.1" },
 		on() {
 			return this;

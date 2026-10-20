@@ -307,11 +307,52 @@ void main() {
     expect(store.appUpdateGate(candidate).allowed, isTrue, reason: '取消/未确认安装后仍可重试');
   });
 
-  test('E1: an in-flight, rolled-back or contradictory server transaction blocks the app install (Native calls = 0)', () async {
+  test('D3: a settled historical target does not block a matching current plugin', () async {
+    final data = bootstrap();
+    data['pluginUpdate']['transaction']['targetContentSha256'] = oldHash;
+    final client = Api(
+      client: MockClient((_) async => http.Response(jsonEncode(data), 200)),
+    )..baseUrl = 'https://desktop.example';
+    final store = AppStore(
+      apiClient: client,
+      localVersion: () async => parseAppVersion('3.2.0+48'),
+    );
+    addTearDown(store.dispose);
+    await store.loadPrefs();
+    client.absorbBootstrap(await client.getJson('/api/bootstrap'));
+
+    expect(client.pluginUpdate.transaction?.phase, 'settled');
+    expect(client.pluginUpdate.transaction?.targetContentSha256, oldHash);
+    expect(client.pluginContentSha256, pluginHash);
+    final candidate = ReleaseSnapshot.fromJson(release())!.candidate;
+    expect(
+      store.appUpdateGate(candidate).allowed,
+      isTrue,
+      reason: '当前运行插件与固定发布清单一致，旧 settled 事务不应阻断 App 更新',
+    );
+
+    store.pluginUpdateJournal = PluginUpdateJournal(
+      opId: 'op-local',
+      targetVersion: '3.3.0',
+      targetContentSha256: pluginHash,
+      startedAt: DateTime.now().toUtc(),
+      phase: UpdatePhase.appPending,
+      release: ReleaseSnapshot.fromJson(release()),
+      manifestUrl: release()['manifestUrl'] as String,
+      appVersion: '3.3.0+55',
+      pluginVerified: true,
+    );
+    expect(
+      store.appUpdateGate(candidate).allowed,
+      isTrue,
+      reason: 'appPending 接续也应以当前插件内容确认，而非旧事务目标',
+    );
+  });
+
+  test('E1: an in-flight or rolled-back server transaction blocks the app install (Native calls = 0)', () async {
     for (final state in [
       {'opId': 'op-new', 'phase': 'staging', 'targetContentSha256': pluginHash, 'rolledBack': false},
       {'opId': 'op-new', 'phase': 'rolling-back', 'targetContentSha256': pluginHash, 'rolledBack': true},
-      {'opId': 'op-new', 'phase': 'settled', 'targetContentSha256': oldHash, 'rolledBack': false},
       {'opId': 'op-new', 'phase': 'settled', 'targetContentSha256': pluginHash, 'rolledBack': true},
     ]) {
       var installs = 0;

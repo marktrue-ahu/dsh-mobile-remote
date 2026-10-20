@@ -11,6 +11,7 @@ import '../floating.dart';
 import '../l10n.dart';
 import '../logger.dart';
 import '../models.dart';
+import '../plugin_update_resume.dart';
 import '../store.dart';
 import '../theme.dart';
 import '../toast.dart';
@@ -1130,32 +1131,34 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
           // 插件更新入口由**内容状态**驱动（评审 R11）：同版本不同内容时也必须能操作，
           // 而不是只看版本号对齐。不能自更新的形态给出**对应那一条**可复制指引。
+          // 有进行中的记录时可点开「处理」：取消旧目标并按电脑端当前状态重新检查（F13）。
           if (api.pluginUpdate.contentUpdateAvailable || store.pluginUpdateJournal != null)
             _row(
               leading: const Icon(Icons.desktop_windows_outlined),
               title: L10n.t('更新电脑端插件', 'Update desktop plugin'),
               sub: store.pluginUpdateJournal != null
-                  ? L10n.t('等待电脑端完成更新并重启…', 'Waiting for the desktop plugin to restart…')
+                  ? _journalSub(store)
                   : api.pluginUpdate.canSelfUpdate
                       ? L10n.t('电脑端插件有新版本：可在这里直接触发更新',
                           'A newer desktop plugin is available — trigger the update here')
                       : L10n.t('电脑端插件有新版本：本机形态需按指引更新',
                           'A newer desktop plugin is available — follow the guide for your install'),
               onTap: store.pluginUpdateJournal != null
-                  ? null
+                  ? () => unawaited(_updateJournalActions(store))
                   : (api.pluginUpdate.canSelfUpdate ? _triggerPluginUpdate : _showPluginUpdateGuidance),
               trailing: store.pluginUpdateJournal == null
                   ? Text(
                       api.pluginUpdate.canSelfUpdate ? L10n.t('更新 ▸', 'Update ▸') : L10n.t('指引 ▸', 'Guide ▸'),
                       style: TextStyle(fontSize: 12, color: brand))
-                  : null,
+                  : Text(L10n.t('处理 ▸', 'Manage ▸'), style: TextStyle(fontSize: 12, color: brand)),
             ),
           _row(
             leading: const Icon(Icons.sync_outlined),
             title: L10n.t('检查更新', 'Check for updates'),
             sub: store.updateChecking
                 ? L10n.t('检查中…', 'Checking…')
-                : L10n.t('检查 GitHub / 主机源是否有新版本', 'Check GitHub / host source for updates'),
+                : L10n.t('检查电脑端固定发布 / 主机目录是否有新版本',
+                    'Check the desktop fixed release / host directory for updates'),
             trailing: TextButton(
               onPressed: store.updateChecking || _updateFlowBusy ? null : _checkUpdate,
               child: Text(store.updateChecking ? L10n.t('检查中…', 'Checking…') : L10n.t('检查 ▸', 'Check ▸'),
@@ -1165,8 +1168,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _row(
             leading: const Icon(Icons.storage_outlined),
             title: L10n.t('更新源', 'Update source'),
-            sub: store.updateSource == 'host' ? L10n.t('dsh 运行主机', 'dsh host') : L10n.t('GitHub Releases', 'GitHub Releases'),
-            trailing: Text(store.updateSource == 'host' ? L10n.t('主机 ▸', 'Host ▸') : L10n.t('GitHub ▸', 'GitHub ▸'),
+            // 来源接线（F04/F19）：App 不再直连 GitHub；两种来源都由电脑端投影固定下载地址。
+            sub: store.updateSource == 'host'
+                ? L10n.t('主机 updateDir 人工目录', 'host updateDir (manual)')
+                : L10n.t('自动（电脑端检查结果）', 'Automatic (desktop check)'),
+            trailing: Text(store.updateSource == 'host' ? L10n.t('主机目录 ▸', 'Host dir ▸') : L10n.t('自动 ▸', 'Auto ▸'),
                 style: TextStyle(fontSize: 12, color: brand)),
             onTap: _pickUpdateSource,
           ),
@@ -1343,6 +1349,53 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await widget.store.beginPluginUpdate();
     if (!mounted) return;
     final notice = widget.store.pluginUpdateNotice;
+    if (notice != null) showToast(context, notice);
+  }
+
+  /// 进行中记录的状态说明（不同阶段该做什么不同）。
+  String _journalSub(AppStore store) {
+    return switch (store.pluginUpdateJournal?.phase) {
+      UpdatePhase.appPending => L10n.t('电脑端插件已确认；App 更新待安装/待核验',
+          'Desktop plugin confirmed; the app update is pending install/verification'),
+      UpdatePhase.pluginConfirmed => L10n.t('电脑端插件已更新；正在确定 App 目标…',
+          'Desktop plugin updated; resolving the app target…'),
+      UpdatePhase.pluginRetry => L10n.t('上次更新未确认；可重试，或取消并重新检查',
+          'Last update was not confirmed; retry, or cancel and re-check'),
+      _ => L10n.t('等待电脑端完成更新并重启…', 'Waiting for the desktop plugin to restart…'),
+    };
+  }
+
+  /// 接续记录的出口（F13）：长时间没有成功证明时，允许取消旧目标并按当前状态重查。
+  Future<void> _updateJournalActions(AppStore store) async {
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 14, 20, 6),
+            child: Text(L10n.t('处理进行中的更新', 'Manage pending update'),
+                style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700)),
+          ),
+          ListTile(
+            title: Text(L10n.t('继续等待', 'Keep waiting')),
+            subtitle: Text(L10n.t('重连后会自动确认；不会先装 App',
+                'It continues automatically after reconnecting and never installs the app first')),
+            onTap: () => Navigator.of(ctx).pop('wait'),
+          ),
+          ListTile(
+            title: Text(L10n.t('取消并重新检查', 'Cancel and re-check')),
+            subtitle: Text(L10n.t('清除本地旧目标，按电脑端当前状态重新检查；不会自动降级 App',
+                'Clears the local old target and re-checks the current desktop state; the app is never downgraded')),
+            onTap: () => Navigator.of(ctx).pop('recheck'),
+          ),
+          const SizedBox(height: 8),
+        ]),
+      ),
+    );
+    if (choice != 'recheck' || !mounted) return;
+    await store.cancelUpdateAndRecheck();
+    if (!mounted) return;
+    final notice = store.pluginUpdateNotice;
     if (notice != null) showToast(context, notice);
   }
 
@@ -1557,8 +1610,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700)),
           ),
           for (final item in [
-            ('github', 'GitHub Releases', L10n.t('公开分发渠道；需能访问 GitHub', 'Public releases; requires GitHub access')),
-            ('host', L10n.t('dsh 运行主机', 'dsh host'), L10n.t('主机 updateDir 里的版本', 'Version in host updateDir')),
+            // 来源接线（F04/F19）：App 不再直连 GitHub；两种来源都只下载电脑端投影的固定地址。
+            ('github', L10n.t('自动（电脑端检查结果）', 'Automatic (desktop check)'),
+                L10n.t('由电脑端插件的更新检查来源决定；App 统一从电脑端固定目标下载',
+                    'Decided by the desktop plugin update source; the app always downloads the desktop fixed target')),
+            ('host', L10n.t('主机 updateDir 人工目录', 'Host updateDir (manual)'),
+                L10n.t('电脑端 updateDir 里人工放置的完整清单', 'A complete manifest placed manually in the host updateDir')),
           ])
             ListTile(
               title: Text(item.$2),

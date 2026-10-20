@@ -7,6 +7,8 @@ import { Readable, Writable } from 'node:stream';
 import { once } from 'node:events';
 import { test } from 'node:test';
 
+// #35 起口令必须显式配置或由宿主自动生成；admission 用例与鉴权无关，用固定口令 + 默认 token 头。
+const AUTH_TOKEN = 'fixture-admission-token';
 const home = mkdtempSync(join(tmpdir(), 'update-admission-'));
 process.env.HOME = home;
 const { apply } = await import('../lib/index.js');
@@ -34,7 +36,7 @@ function harness(options = {}) {
     provide() {}, inject() {}, on: () => () => {}, effect(fn) { cleanup = fn(); return cleanup; },
   };
   const config = {
-    path: '/m', authToken: '', cookieName: 'token', trustedHosts: [], sessionTtlMs: 60000,
+    path: '/m', authToken: AUTH_TOKEN, cookieName: 'token', trustedHosts: [], sessionTtlMs: 60000,
     rechargeUrl: '', updateDir: '', pluginUpdateManifest: 'https://release.test/manifest.json', updateProfileDir: profile,
     maxConnections: 16, pushUrls: [], pushCooldownMs: 60000, doneGraceMs: 1000, pushContent: 'minimal',
     rateLimit: { maxFailures: 10, windowMs: 60000, blockMs: 60000 }, lanBridge: { enabled: false, host: '127.0.0.1', port: 39401 }, ...options.config,
@@ -47,7 +49,7 @@ function harness(options = {}) {
 }
 async function request(route, body, path = '/m/api/plugin-update', headers = {}) {
   const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);
-  Object.assign(req, { method: path.endsWith('bootstrap') || path.includes('/update/') ? 'GET' : 'POST', url: path, headers: { host: '127.0.0.1:39401', ...headers }, socket: { remoteAddress: '127.0.0.1' } });
+  Object.assign(req, { method: path.endsWith('bootstrap') || path.includes('/update/') ? 'GET' : 'POST', url: path, headers: { host: '127.0.0.1:39401', 'x-mobile-token': AUTH_TOKEN, ...headers }, socket: { remoteAddress: '127.0.0.1' } });
   const chunks = [];
   const res = new Writable({ write(chunk, _, cb) { chunks.push(Buffer.from(chunk)); cb(); } });
   res.writeHead = (status) => { res.statusCode = status; return res; };
@@ -135,7 +137,7 @@ test('W1: actual protected host producer feeds manifest and tgz consumers', asyn
   const token = 'fixture-only-protected-token', origin = 'http://127.0.0.1:39401';
   const h = harness({ config: { authToken: token, updateDir: dir, pluginUpdateManifest: 'off' } });
   try {
-    assert.equal((await request(h.route, undefined, '/m/api/update/manifest')).status, 401);
+    assert.equal((await request(h.route, undefined, '/m/api/update/manifest', { 'x-mobile-token': '' })).status, 401);
     const fakeNetwork = async (url, opts) => { const reply = await request(h.route, undefined, new URL(url).pathname, opts.headers); return new Response(reply.bytes, { status: reply.status }); };
     const auth = { token, trustedOrigin: origin };
     const release = await fetchReleaseManifest({ source: { kind: UPDATE_SOURCE_KIND.CUSTOM, url: `${origin}/m/api/update/manifest` }, fetchImpl: fakeNetwork, auth });

@@ -72,18 +72,31 @@ if (Test-Path $packed) {
     Write-Warning "Plugin tarball not found - check npm pack output"
 }
 
-# 3) Release manifest: describes both artifacts (app + plugin) and their digests.
+# 3) Paired release triple (design §5.1/§5.2): from the **already-packed plugin tgz** plus the
+#    APK, generate the full schema-1 paired manifest, assemble the App carrier
+#    (same package name @X.Y.Z-app, dsh.appCarrier=true, no entry/platform fields/install hooks)
+#    and `npm pack` it. Build order is not interchangeable: the tgz is a hard input, and the tool
+#    also asserts the tgz content digest equals the current source tree, then runs the release
+#    verifier in --require-carrier mode. Local `npm pack` only - never publishes to a registry.
 #    PLUGIN_URL writes the tarball's download URL; without it only the file name is emitted
 #    and consumers resolve it relative to the manifest location.
 $manifest = Join-Path $dist 'manifest.json'
 $pluginUrlArgs = @()
 if ($env:PLUGIN_URL) { $pluginUrlArgs = @('--plugin-url', $env:PLUGIN_URL) }
-node (Join-Path $PSScriptRoot 'gen-manifest.js') --apk $apkOut --version $fullVersion --plugin-tgz $tgzOut --plugin-root $repoDir --changelog (Join-Path $repoDir 'CHANGELOG.md') --out $manifest @pluginUrlArgs
-if ($LASTEXITCODE -ne 0) { Write-Error "gen-manifest.js failed with exit code $LASTEXITCODE"; exit 1 }
-
-# 4) Verify the manifest against the artifacts (fail-closed).
-node (Join-Path $PSScriptRoot 'verify-update-manifest.mjs') $dist
-if ($LASTEXITCODE -ne 0) { Write-Error "manifest verification failed"; exit 1 }
+if ($env:MANIFEST_VERSION) {
+    # Test-only path (requires ALLOW_TEST_MANIFEST_VERSION=1): the manifest carries a hand-filled
+    # build number higher than the real APK, to exercise the App's "update available" detection.
+    # This is not a release: no carrier is built and the pairing gate is skipped; F17/R9
+    # (app.version read from the APK) is enforced only on the real release path.
+    node (Join-Path $PSScriptRoot 'gen-manifest.js') --apk $apkOut --version $fullVersion --plugin-tgz $tgzOut --plugin-root $repoDir --changelog (Join-Path $repoDir 'CHANGELOG.md') --out $manifest @pluginUrlArgs
+    if ($LASTEXITCODE -ne 0) { Write-Error "gen-manifest.js failed with exit code $LASTEXITCODE"; exit 1 }
+    node (Join-Path $PSScriptRoot 'verify-update-manifest.mjs') $dist
+    if ($LASTEXITCODE -ne 0) { Write-Error "test manifest verification failed"; exit 1 }
+    Write-Warning "MANIFEST_VERSION=$fullVersion is test-only / hand-filled; app carrier is NOT built for this path"
+} else {
+    node (Join-Path $PSScriptRoot 'build-app-carrier.mjs') --apk $apkOut --plugin-tgz $tgzOut --plugin-root $repoDir --changelog (Join-Path $repoDir 'CHANGELOG.md') --app-version $fullVersion --out-dir $dist @pluginUrlArgs
+    if ($LASTEXITCODE -ne 0) { Write-Error "app carrier build / release-pairing verification failed"; exit 1 }
+}
 
 if ($env:UPDATE_DIR) {
     New-Item -ItemType Directory -Force -Path $env:UPDATE_DIR | Out-Null

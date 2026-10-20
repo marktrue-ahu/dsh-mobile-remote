@@ -65,54 +65,77 @@ void main() {
     });
   });
 
-  group('candidateFromGithubRelease', () {
-    test('挑 DSH-Remote-*.apk 资产并映射字段', () {
-      final release = {
-        'tag_name': 'v3.0.0',
-        'assets': [
-          {'name': 'dsh-mobile-remote-v3.0.0.tgz', 'size': 3081701},
-          {'name': 'DSH-Remote-v3.0.0.apk', 'size': 72026882, 'browser_download_url': 'https://x/DSH-Remote-v3.0.0.apk'},
-        ],
-      };
-      final c = candidateFromGithubRelease(release);
-      expect(c, isNotNull);
-      expect(c!.version, '3.0.0');
-      expect(c.downloadUrl, 'https://x/DSH-Remote-v3.0.0.apk');
-      expect(c.sizeBytes, 72026882);
-      expect(c.sha256, isNull);
-      expect(c.source, 'GitHub');
+  group('ReleasePointer / ReleaseHealth（§5.3 三角色与健康确认）', () {
+    const hash = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    Map<String, dynamic> releaseJson({String appUrl = 'https://desktop.example/m/api/update/apk?release=r1'}) => {
+          'schema': 1,
+          'manifestUrl': 'https://desktop.example/m/api/update/manifest',
+          'app': {'version': '3.3.0+55', 'file': 'a.apk', 'size': 4, 'sha256': hash, 'url': appUrl},
+          'plugin': {'version': '3.3.0', 'file': 'p.tgz', 'size': 8, 'sha256': hash, 'contentSha256': hash,
+            'url': 'https://desktop.example/m/api/update/plugin?release=r1'},
+        };
+
+    test('releaseId + 完整快照往返；缺 releaseId 或快照不合法 → null', () {
+      final p = ReleasePointer.fromJson({'releaseId': 'r1', 'release': releaseJson()});
+      expect(p, isNotNull);
+      expect(p!.releaseId, 'r1');
+      expect(ReleasePointer.fromJson(p.toJson())!.releaseId, 'r1');
+      expect(ReleasePointer.fromJson({'releaseId': '', 'release': releaseJson()}), isNull);
+      expect(ReleasePointer.fromJson({'release': releaseJson()}), isNull);
+      expect(ReleasePointer.fromJson({'releaseId': 'r1', 'release': {'schema': 1}}), isNull);
+      expect(ReleasePointer.fromJson(null), isNull);
     });
 
-    test('非 HTTPS 下载地址 → null', () {
+    test('当前发布健康：state/runningContentSha256/实例/事务代际解析', () {
+      final h = ReleaseHealth.fromJson({
+        'state': 'confirmed',
+        'runningContentSha256': hash.toUpperCase(),
+        'instanceId': 'inst-1',
+        'transaction': {'opId': 'op-1', 'generation': 7},
+      })!;
+      expect(h.confirmed, isTrue);
+      expect(h.runningContentSha256, hash, reason: '统一小写');
+      expect(h.instanceId, 'inst-1');
+      expect(h.transactionOpId, 'op-1');
+      expect(h.transactionGeneration, 7);
+      expect(ReleaseHealth.fromJson({'state': 'waiting'})!.waiting, isTrue);
+      expect(ReleaseHealth.fromJson({'state': 'failed'})!.failed, isTrue);
+      expect(ReleaseHealth.fromJson(null), isNull);
+      expect(ReleaseHealth.fromJson({}), isNull);
+    });
+
+    test('appArtifact 三态诊断解析', () {
+      expect(AppArtifactDiagnostic.fromJson({'state': 'ok'})!.ok, isTrue);
+      final missing = AppArtifactDiagnostic.fromJson({'state': 'missing', 'reason': 'app-artifact-not-ready'})!;
+      expect(missing.missing, isTrue);
+      expect(missing.reason, 'app-artifact-not-ready');
+      expect(AppArtifactDiagnostic.fromJson({'state': 'mismatch'})!.mismatch, isTrue);
+      expect(AppArtifactDiagnostic.fromJson({'state': ''}), isNull);
+      expect(AppArtifactDiagnostic.fromJson(null), isNull);
+    });
+
+    test('来源接线守卫：外部 GitHub 资产地址不再可用，宿主固定地址通过', () {
+      final hostFixed = ReleaseSnapshot.fromJson(releaseJson())!;
+      expect(fixedArtifactUrlIssue(hostFixed), isNull);
       expect(
-        candidateFromGithubRelease({
-          'tag_name': 'v3.0.0',
-          'assets': [
-            {'name': 'DSH-Remote-v3.0.0.apk', 'browser_download_url': 'http://x/app.apk'},
-          ],
-        }),
-        isNull,
+        fixedArtifactUrlIssue(ReleaseSnapshot.fromJson(releaseJson(
+          appUrl: 'https://github.com/201222-L/dsh-mobile-remote/releases/download/v3.3.0/DSH-Remote-v3.3.0.apk',
+        ))!),
+        contains('固定目标'),
       );
-    });
-
-    test('无 APK 资产 → null', () {
-      final release = {
-        'tag_name': 'v3.0.0',
-        'assets': [
-          {'name': 'dsh-mobile-remote-v3.0.0.tgz', 'size': 1},
-        ],
-      };
-      expect(candidateFromGithubRelease(release), isNull);
-    });
-
-    test('非法 tag → null', () {
-      final release = {
-        'tag_name': 'not-a-version',
-        'assets': [
-          {'name': 'DSH-Remote-x.apk', 'browser_download_url': 'https://x/a.apk'},
-        ],
-      };
-      expect(candidateFromGithubRelease(release), isNull);
+      expect(
+        fixedArtifactUrlIssue(ReleaseSnapshot.fromJson(releaseJson(
+          appUrl: 'https://objects.githubusercontent.com/abc/app.apk',
+        ))!),
+        contains('固定目标'),
+      );
+      expect(
+        fixedArtifactUrlIssue(ReleaseSnapshot.fromJson(releaseJson(
+          appUrl: 'http://192.168.1.5:3080/m/api/update/apk',
+        ))!),
+        isNull,
+        reason: '局域网宿主固定地址是合法来源',
+      );
     });
   });
 
