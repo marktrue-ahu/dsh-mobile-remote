@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { pluginContentDigest } from "../lib/plugin-content-digest.js";
 import { freezePackage, frozenPackageReady, verifyFrozenPackage, verifyRuntimeClosure } from "../lib/runtime-dependency-snapshot.js";
 
 function put(file, content) {
@@ -34,6 +36,79 @@ function fixture(t) {
 	symlinkSync(pngjs, join(dirname(qrcode), "pngjs"), "dir");
 	return { base, source, installed, qrcode, pngjs, destination: join(base, "snapshot") };
 }
+
+// ── App 载体（同包名 X.Y.Z-app 数据依赖）夹具：验证 §5.5 的闭包排除 ──────────────
+const CARRIER_NAME = "@marktrue/dsh-mobile-remote";
+const CARRIER_VERSION = "3.2.0";
+const CARRIER_ALIAS = `${CARRIER_NAME}-app`;
+const CARRIER_APK_FILE = "DSH-Remote-v3.2.0.apk";
+// 6MB 假 APK：超过 F15 的 5MB 增量阈值，若被复制进快照，大小断言会失败。
+const CARRIER_APK = Buffer.alloc(6 * 1024 * 1024, 0x41);
+const CARRIER_ALIAS_SPEC = `npm:${CARRIER_NAME}@${CARRIER_VERSION}-app`;
+
+function sha256(bytes) {
+	return createHash("sha256").update(bytes).digest("hex");
+}
+
+function carrierManifest(pluginRoot, apkBytes = CARRIER_APK) {
+	const app = { version: `${CARRIER_VERSION}+44`, file: CARRIER_APK_FILE, size: apkBytes.length, sha256: sha256(apkBytes) };
+	return {
+		schema: 1,
+		app,
+		plugin: {
+			version: CARRIER_VERSION,
+			file: "dsh-mobile-remote-v3.2.0.tgz",
+			size: 24,
+			sha256: sha256(Buffer.from("fake-plugin-tarball")),
+			contentSha256: pluginContentDigest(pluginRoot),
+		},
+		version: app.version,
+		apk: app.file,
+		size: app.size,
+		sha256: app.sha256,
+		notes: "carrier fixture",
+	};
+}
+
+/** 在现有 pnpm sibling 夹具上叠加"主包精确别名声明 + 随包载体"，模拟真实安装布局。 */
+function carrierFixture(t, { declaration = "npm-alias" } = {}) {
+	const f = fixture(t);
+	const pkg = { name: CARRIER_NAME, version: CARRIER_VERSION, type: "module", dependencies: { qrcode: "1" } };
+	if (declaration === "npm-alias") pkg.optionalDependencies = { [CARRIER_ALIAS]: CARRIER_ALIAS_SPEC };
+	put(join(f.installed, "package.json"), JSON.stringify(pkg, null, 2));
+	const carrierRoot = join(f.source, "node_modules/.pnpm/carrier@1/node_modules", CARRIER_ALIAS);
+	put(join(carrierRoot, "package.json"), JSON.stringify({ name: CARRIER_NAME, version: `${CARRIER_VERSION}-app`, dsh: { appCarrier: true } }));
+	put(join(carrierRoot, "manifest.json"), JSON.stringify(carrierManifest(f.installed)));
+	put(join(carrierRoot, CARRIER_APK_FILE), CARRIER_APK);
+	// pnpm sibling 布局：载体挂在与插件同级的 node_modules 作用域里。
+	mkdirSync(join(dirname(f.installed), "@marktrue"), { recursive: true });
+	symlinkSync(carrierRoot, join(dirname(f.installed), CARRIER_ALIAS), "dir");
+	return { ...f, carrierRoot };
+}
+
+/** 递归列出相对路径（不跟随 symlink，避免把外部 store 算进快照）。 */
+function walkEntries(dir, base = dir, out = []) {
+	for (const name of readdirSync(dir).sort()) {
+		const full = join(dir, name);
+		const rel = relative(base, full);
+		out.push(rel);
+		if (lstatSync(full).isDirectory()) walkEntries(full, base, out);
+	}
+	return out;
+}
+
+/** 快照实际字节数（F15 的"≤ 5MB 增量"口径近似）。 */
+function totalBytes(dir) {
+	let total = 0;
+	for (const name of readdirSync(dir)) {
+		const full = join(dir, name);
+		const st = lstatSync(full);
+		if (st.isDirectory()) total += totalBytes(full);
+		else if (st.isFile()) total += st.size;
+	}
+	return total;
+}
+
 function loadPng(root) {
 	return spawnSync(process.execPath, ["--no-global-search-paths", "-e", `
 		const { createRequire } = require('node:module');
@@ -283,4 +358,82 @@ test("真实 qrcode 的标准 pnpm sibling store 移除后，全部 dependencies
 	assert.equal(existsSync(store), false);
 	assert.equal(loadPng(f.destination).status, 0);
 	assert.equal(verifyFrozenPackage(f.destination).ok, true);
+});
+
+// ── 载体排除：建图 → 冻结复制 → 冻结后完整闭包校验 → 复用/恢复路径 ──────────────
+
+test("随包载体从运行时闭包排除：建图/冻结/复用都不复制 APK，qrcode 仍完整可加载", (t) => {
+	const f = carrierFixture(t);
+	// 建图阶段：数据包没有可执行入口，必须在要求入口之前被排除，否则 freeze 直接失败。
+	const sourcePackageJson = readFileSync(join(f.installed, "package.json"), "utf8");
+	const frozen = freezePackage({ sourceRoot: f.installed, destination: f.destination });
+	assert.equal(frozen.ok, true, frozen.error);
+	assert.equal(frozen.carrierExcluded, true);
+	// 冻结复制：载体字节（APK/清单/包元数据）不进入快照，运行依赖 qrcode/pngjs 完整保留。
+	const entries = walkEntries(f.destination);
+	assert.equal(entries.some((entry) => entry.includes(CARRIER_ALIAS)), false);
+	assert.equal(entries.some((entry) => entry.endsWith(".apk") || entry.endsWith("manifest.json")), false);
+	assert.ok(entries.some((entry) => entry.endsWith(join("node_modules/.runtime-deps/1/package.json"))));
+	assert.ok(totalBytes(f.destination) < 5 * 1024 * 1024, "快照不应包含 6MB 载体");
+	// 根包元数据原样保留：排除不靠删改依赖声明，内容标识不变。
+	assert.equal(readFileSync(join(f.destination, "package.json"), "utf8"), sourcePackageJson);
+	assert.equal(pluginContentDigest(f.destination), pluginContentDigest(f.installed));
+	// 冻结后完整闭包校验 / 快照复用：源（含载体 store 与 qrcode store）移除后仍通过。
+	assert.equal(frozenPackageReady(f.destination), true);
+	removeFixture(f.source, f.base);
+	assert.equal(frozenPackageReady(f.destination), true);
+	const checked = verifyFrozenPackage(f.destination);
+	assert.equal(checked.ok, true, checked.error);
+	assert.ok(checked.loadedFiles.every((file) => file.startsWith(f.destination + "/")));
+	// 恢复/搬迁路径使用同一规则：复制到新目录后闭包与 PNG lazy API 仍可用。
+	const restored = join(f.base, "restored/installed-package");
+	cpSync(f.destination, restored, { recursive: true, dereference: false, verbatimSymlinks: true });
+	assert.equal(frozenPackageReady(restored), true);
+	assert.equal(loadPng(restored).status, 0);
+	assert.equal(verifyRuntimeClosure(restored).ok, true);
+});
+
+test("普通依赖自报 dsh.appCarrier 不能豁免：照常进入闭包并被复制", (t) => {
+	const f = fixture(t);
+	const sneaky = join(f.source, "node_modules/.pnpm/sneaky@1/node_modules/sneaky-carrier");
+	put(join(sneaky, "package.json"), JSON.stringify({ name: "sneaky-carrier", version: "1.0.0", main: "index.js", dsh: { appCarrier: true } }));
+	put(join(sneaky, "index.js"), "module.exports = 'sneaky-carrier';\n");
+	symlinkSync(sneaky, join(dirname(f.installed), "sneaky-carrier"), "dir");
+	put(join(f.installed, "package.json"), JSON.stringify({
+		name: "dsh-mobile-remote", type: "module", dependencies: { qrcode: "1", "sneaky-carrier": "1" },
+	}));
+	const frozen = freezePackage({ sourceRoot: f.installed, destination: f.destination });
+	assert.equal(frozen.ok, true, frozen.error);
+	assert.equal(frozen.carrierExcluded, false);
+	const entries = walkEntries(f.destination);
+	assert.ok(entries.some((entry) => entry.includes("sneaky-carrier")), "自报标记的普通依赖必须照常复制");
+	assert.equal(verifyFrozenPackage(f.destination).ok, true);
+});
+
+test("声明了载体但身份校验失败 → 冻结/校验 fail-closed，不把数据包当运行依赖", (t) => {
+	const f = carrierFixture(t);
+	// 大小不变、字节被换 → 必须由 sha256 判据拒绝（不是"碰巧能加载"）。
+	const tampered = Buffer.from(CARRIER_APK);
+	tampered[0] ^= 0xff;
+	writeFileSync(join(f.carrierRoot, CARRIER_APK_FILE), tampered);
+	const frozen = freezePackage({ sourceRoot: f.installed, destination: f.destination });
+	assert.equal(frozen.ok, false);
+	assert.match(frozen.error, /app-carrier-invalid: carrier-apk-sha256-mismatch/);
+	assert.equal(existsSync(f.destination), false);
+	const checked = verifyRuntimeClosure(f.installed);
+	assert.equal(checked.ok, false);
+	assert.match(checked.error, /app-carrier-invalid: carrier-apk-sha256-mismatch/);
+});
+
+test("未声明载体（可选依赖未安装）不阻塞冻结：闭包与快照照常自包含", (t) => {
+	const f = fixture(t);
+	put(join(f.installed, "package.json"), JSON.stringify({
+		name: CARRIER_NAME, version: CARRIER_VERSION, type: "module",
+		dependencies: { qrcode: "1" },
+		optionalDependencies: { [CARRIER_ALIAS]: CARRIER_ALIAS_SPEC },
+	}));
+	const frozen = freezePackage({ sourceRoot: f.installed, destination: f.destination });
+	assert.equal(frozen.ok, true, frozen.error);
+	assert.equal(frozen.carrierExcluded, false);
+	assert.equal(frozenPackageReady(f.destination), true);
 });
