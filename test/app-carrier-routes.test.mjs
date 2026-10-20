@@ -1093,3 +1093,25 @@ test("qr-config：产物未就绪时 appDownloadUrl=null，只给稳定状态（
 		assert.equal(denied.json().error, "loopback-only");
 	});
 });
+
+test("F01b: 纯人工区部署（无载体、托管区未初始化）→ 匿名 APK 回退人工区，appArtifact 报 ok/manual-legacy", async () => {
+	const base = await mkdtemp(join(tmpdir(), "dsh-manual-only-"));
+	const dir = join(base, "update");
+	await mkdir(dir, { recursive: true });
+	const manifest = manifestFor({ appVersion: "3.2.0+57", tgzBytes: Buffer.from("tgz-bytes") });
+	await writeFile(join(dir, "mobile.apk"), APK_BYTES);
+	await writeFile(join(dir, "manifest.json"), JSON.stringify(manifest));
+	const profileDir = join(base, "profile-web");
+	await mkdir(profileDir, { recursive: true });
+	await writeFile(join(profileDir, "package.json"), JSON.stringify({ name: "web-profile", dependencies: {} }));
+	await withHarness({ config: { updateDir: dir, updateProfileDir: profileDir } }, async ({ api }) => {
+		// 真机验收发现：托管区 not-ready 时曾直接 503，人工区清单被"挡住"。
+		const dl = await request(api, { url: "/m/api/update/apk" });
+		assert.equal(dl.status, 200, "人工区存在时必须可匿名下载");
+		assert.deepEqual(dl.body, APK_BYTES);
+		const boot = await request(api, { url: "/m/api/bootstrap", headers: { "x-mobile-token": TOKEN } });
+		const artifact = boot.json().appArtifact;
+		assert.equal(artifact.state, "ok");
+		assert.equal(artifact.source, "manual-legacy");
+	});
+});
