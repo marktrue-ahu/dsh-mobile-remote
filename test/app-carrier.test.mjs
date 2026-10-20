@@ -221,24 +221,36 @@ test("同一作用域多个不同候选 → ambiguous，不替调用方挑第一
 	assert.equal(result.carrier, undefined);
 });
 
-test("自身作用域没有时按 profile 逐个回退：唯一候选才可用，来源可诊断", (t) => {
+test("不跨 profile 猜载体：未显式给出当前 profile 时即使别的 profile 有载体也不采用（§5.5）", (t) => {
 	const f = fixture(t, { withCarrier: false });
 	makeProfileCarrier(t, f, "web", secondCarrier(t, f));
 	const result = discoverAppCarrier({ pluginRoot: f.pluginRoot, dshHome: f.dshHome });
+	assert.equal(result.ok, false);
+	assert.equal(result.status, APP_CARRIER_STATUS.MISSING);
+	assert.equal(result.reason, "carrier-not-installed");
+});
+
+test("显式给出当前 profile 才回退，且只认该 profile（来源可诊断）", (t) => {
+	const f = fixture(t, { withCarrier: false });
+	const profileDir = makeProfileCarrier(t, f, "web", secondCarrier(t, f));
+	const result = discoverAppCarrier({ pluginRoot: f.pluginRoot, dshHome: f.dshHome, profileDir });
 	assert.equal(result.ok, true, result.reason);
 	assert.equal(result.status, APP_CARRIER_STATUS.FOUND);
 	assert.equal(result.discoveredVia, "profile:web");
 	assert.equal(describeAppCarrier(result).locatedVia, "profile:web");
 });
 
-test("多个 profile 各有一个载体 → ambiguous（不要找到第一个就用）", (t) => {
+test("多 profile 各有一个载体：未指定时不采用（防串 profile），指定后只认指定那个、不构成 ambiguous", (t) => {
 	const f = fixture(t, { withCarrier: false });
 	makeProfileCarrier(t, f, "web", secondCarrier(t, f, { slot: "web", apkBytes: Buffer.from("web-profile-apk") }));
-	makeProfileCarrier(t, f, "desktop", secondCarrier(t, f, { slot: "desktop", apkBytes: Buffer.from("desktop-profile-apk") }));
-	const result = discoverAppCarrier({ pluginRoot: f.pluginRoot, dshHome: f.dshHome });
-	assert.equal(result.status, APP_CARRIER_STATUS.AMBIGUOUS);
-	assert.equal(result.reason, "carrier-multiple-candidates");
-	assert.equal(result.candidates.length, 2);
+	const desktopDir = makeProfileCarrier(t, f, "desktop", secondCarrier(t, f, { slot: "desktop", apkBytes: Buffer.from("desktop-profile-apk") }));
+	const withoutProfile = discoverAppCarrier({ pluginRoot: f.pluginRoot, dshHome: f.dshHome });
+	assert.equal(withoutProfile.ok, false);
+	assert.equal(withoutProfile.status, APP_CARRIER_STATUS.MISSING);
+	const withDesktop = discoverAppCarrier({ pluginRoot: f.pluginRoot, dshHome: f.dshHome, profileDir: desktopDir });
+	assert.equal(withDesktop.ok, true, withDesktop.reason);
+	assert.equal(withDesktop.discoveredVia, "profile:desktop");
+	assert.equal(withDesktop.apk.sha256, sha256(Buffer.from("desktop-profile-apk")));
 });
 
 test("声明缺失不影响发现（声明状态交给闭包排除判定）", (t) => {
