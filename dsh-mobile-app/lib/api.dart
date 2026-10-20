@@ -11,6 +11,7 @@ import 'logger.dart';
 import 'models.dart';
 import 'git_models.dart';
 import 'plugin_update_status.dart';
+import 'update_core.dart';
 import 'version_alignment.dart';
 
 class ApiException implements Exception {
@@ -27,6 +28,41 @@ class ApiException implements Exception {
   ApiException(this.message, {this.code, this.status, this.body});
   @override
   String toString() => message;
+}
+
+/// 电脑端**口令生成/落盘失败**（罕见：状态目录不可写等；契约 §5.7 / F21）。
+/// 与普通 `auth-required`（口令缺失/错误，重扫一次即可）分开处理。
+bool isAuthNotConfigured(ApiException error) {
+  if (error.code == 'auth-not-configured') return true;
+  final detail = error.message;
+  return detail.contains('认证未配置') || detail.contains('auth not configured');
+}
+
+/// 口令缺失/错误（`401 auth-required`，或任何 401）：迁移期空口令也走这里，重扫即可。
+bool isAuthRequired(Object error) {
+  if (error is! ApiException) return false;
+  return error.status == 401 ||
+      error.code == 'auth-required' ||
+      error.code == 'unauthorized';
+}
+
+/// 认证类错误 → 专门、可执行的提示；非认证错误返回 null（不能显示成通用网络错误）。
+///
+/// 契约（§5.7 / F21，2026-10-20 定稿）：
+/// - `401 auth-required` 是**普通情况**：口令缺失或错误（迁移期 App 存的是空口令也走这里）
+///   → 重新扫电脑连接页的二维码即可；
+/// - `401 auth-not-configured` 是**罕见情况**：口令生成/状态落盘失败（状态目录不可写等）
+///   → 重扫也拿不到口令，应检查插件状态目录权限，而不是让用户反复重扫。
+String? authFixHint(Object error) {
+  if (error is! ApiException) return null;
+  if (isAuthNotConfigured(error)) {
+    return '电脑端访问口令生成或保存失败（认证未配置，控制接口已拒绝访问）。'
+        '请检查电脑端插件状态目录的写权限/磁盘空间后重启宿主；此时重扫二维码无效';
+  }
+  if (isAuthRequired(error)) {
+    return '访问口令缺失或未通过验证。请在电脑上打开连接页，用二维码重新扫码连接一次即可继续（插件升级后可能只需重扫一次）';
+  }
+  return null;
 }
 
 /// v3.0.0(热修 05)：客户端 requestId（UUID v4，Random.secure，不引第三方依赖）。
@@ -97,6 +133,23 @@ class Api implements GitReadApi {
 
   /// 电脑端下发的插件自更新状态（含安装形态、能否自更新、降级指引、事务摘要）。
   PluginUpdateStatus pluginUpdate = const PluginUpdateStatus.unknown();
+
+  /// 电脑端**当前发布**（bootstrap 的 `currentRelease`）：releaseId + 完整快照。
+  /// 新流程的权威来源：与"正在运行且健康确认"的插件内容配对，用于 App-only 首装/更新。
+  ReleasePointer? currentRelease;
+
+  /// 电脑端**更新目标**（bootstrap 的 `updateTarget`）：受信来源解析出的候选发布。
+  /// 它可以早于实际安装进入候选状态，但不能提前把当前首装入口指向未生效的插件配对。
+  ReleasePointer? updateTarget;
+
+  /// 当前发布的健康确认（`currentReleaseHealth`）。缺失 = 旧宿主，按运行内容兜底。
+  ReleaseHealth? currentReleaseHealth;
+
+  /// APK 分发就绪诊断（`appArtifact`；bootstrap 优先，诊断路由兜底）。
+  AppArtifactDiagnostic? appArtifact;
+
+  /// 电脑端服务实例身份（`plugin.instanceId`/pid）：核对"服务实例"与旧健康结论。
+  String pluginInstanceId = '';
 
   /// 每次成功吸收 bootstrap 后的回调——**统一的接续入口**（评审 R8）：
   /// 首次连接、SSE 自动重连、下拉刷新、存活探测都走 `absorbBootstrap`，
@@ -288,13 +341,53 @@ class Api implements GitReadApi {
                 : null,
           )
         : const TimelineCapabilities();
-    // 正在运行的内容标识 + 插件自更新状态（含事务摘要）：接续判定与"能不能一键"的依据
-    if (p is Map && p['contentSha256'] is String) {
-      pluginContentSha256 = (p['contentSha256'] as String).toLowerCase();
-    }
-    pluginUpdate = PluginUpdateStatus.fromJson(d['pluginUpdate']);
+    // 正在运行的内容标识 + 插件自更新状态 + 三角色发布快照：接续/门禁/App 安装的依据
+    _absorbUpdateFields(d);
     // 统一接续入口：所有吸收 bootstrap 的路径（首连/自动重连/刷新/探测）都走到这里
     onBootstrapAbsorbed?.call();
+  }
+
+  /// 只吸收与**两端更新**有关的字段（bootstrap / 诊断响应同构）。
+  ///
+  /// 与 [absorbBootstrap] 分开是为了让"下载前/拉起安装器前重新读取当前状态"（§5.9）
+  /// 不触发接续回调（否则会在安装中途递归推进 journal）。
+  void absorbUpdateState(Map<String, dynamic> d) => _absorbUpdateFields(d);
+
+  void _absorbUpdateFields(Map<String, dynamic> d) {
+    final p = d['plugin'];
+    if (p is Map) {
+      if (p['contentSha256'] is String) {
+        pluginContentSha256 = (p['contentSha256'] as String).toLowerCase();
+      }
+      final instance = p['instanceId'] ?? p['pid'];
+      if (instance != null) pluginInstanceId = '$instance';
+    }
+    pluginUpdate = PluginUpdateStatus.fromJson(d['pluginUpdate']);
+    // 三角色发布（§5.3）：当前发布 / 更新目标 / 固定快照分开，旧字段只作兜底。
+    currentRelease = ReleasePointer.fromJson(d['currentRelease']);
+    updateTarget = ReleasePointer.fromJson(d['updateTarget']);
+    currentReleaseHealth = ReleaseHealth.fromJson(d['currentReleaseHealth']);
+    // appArtifact 也可能只出现在诊断路由；bootstrap 的值优先。
+    appArtifact = _findAppArtifact(d) ?? appArtifact;
+  }
+
+  /// `appArtifact` 可能在 bootstrap 顶层、诊断顶层或诊断的 `checks` 段（§5.10）。
+  AppArtifactDiagnostic? _findAppArtifact(Map<String, dynamic> d) {
+    final direct = AppArtifactDiagnostic.fromJson(d['appArtifact']);
+    if (direct != null) return direct;
+    final checks = d['checks'];
+    if (checks is Map) {
+      return AppArtifactDiagnostic.fromJson(checks['appArtifact']);
+    }
+    return null;
+  }
+
+  /// 重新读取电脑端当前状态（下载前 / 拉起安装器前的复核，§5.9）。
+  ///
+  /// 失败会抛 [ApiException]：调用方必须据此**拒绝继续**，不能靠旧缓存证明启动安装。
+  Future<void> refreshUpdateState({Duration timeout = const Duration(seconds: 8)}) async {
+    final d = await getJson('/api/bootstrap', timeout: timeout);
+    absorbUpdateState(d);
   }
 
   /// 连接成功后收集电脑全部地址（/api/bootstrap 的 server.urls 含 Tailscale/ZeroTier 等虚拟网段 IP）。
@@ -1186,7 +1279,11 @@ class Api implements GitReadApi {
 
   Future<Map<String, dynamic>?> diagnostics() async {
     try {
-      return await getJson('/api/diagnostics');
+      final d = await getJson('/api/diagnostics');
+      // appArtifact 也可能只出现在诊断路由（bootstrap 优先，这里只补缺）。
+      final artifact = _findAppArtifact(d);
+      if (artifact != null) appArtifact = artifact;
+      return d;
     } catch (_) {
       return null;
     }
