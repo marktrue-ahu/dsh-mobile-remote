@@ -1,6 +1,6 @@
 # 0020 App 安装包随插件分发：同包名的载体版本
 
-状态：已接受。背景与验收见 GitLab `ahedu/dsh-mobile-remote#35`。
+状态：已接受。背景与验收见 GitLab `ahedu/dsh-mobile-remote#35` 完整设计与工程契约见 [`docs/design/app-carrier.md`](../design/app-carrier.md)。
 
 ## 问题
 

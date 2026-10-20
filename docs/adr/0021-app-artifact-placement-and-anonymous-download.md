@@ -1,6 +1,6 @@
 # 0021 App 安装包的落位、分发与匿名边界
 
-状态：已接受。背景与验收见 GitLab `ahedu/dsh-mobile-remote#35`。与 ADR 0020（载体分发形态）、ADR 0019（三条判据）配套。
+状态：已接受。背景与验收见 GitLab `ahedu/dsh-mobile-remote#35` 完整设计与工程契约见 [`docs/design/app-carrier.md`](../design/app-carrier.md)。与 ADR 0020（载体分发形态）、ADR 0019（三条判据）配套。
 
 ## 问题
 
