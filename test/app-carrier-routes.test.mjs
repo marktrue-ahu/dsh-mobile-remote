@@ -9,7 +9,7 @@
 // 与 test/update-routes.test.mjs 同款 harness：apply + 假 ctx + MockResponse；store 用真实
 // 托管区 module 建夹具（publishRelease + selectRelease），断言的是 HTTP 契约而不是实现细节。
 import assert from "node:assert/strict";
-import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -793,5 +793,303 @@ test("LAN 桥投影：不把 127.0.0.1 发给手机（用桥的 LAN 侧网卡 + 
 			effectCleanup?.();
 			await new Promise((resolve) => upstream.close(resolve));
 		}
+	});
+});
+
+// ── #35 缺口 A：随包载体导入托管区（写侧接线）＋启动 GC ──────────────────────────
+// 真机验收发现的缺口：托管区 module 只被读取链引用，导入链路从未接线，匿名下载实际
+// 一直靠"载体直读回退"。以下用例钉住：apply 后异步导入落位、重复 apply 幂等、
+// 托管区成为读取权威（载体不可发现时仍可服务），以及启动 GC 只回收无引用残留。
+
+/** 轮询等待（导入/GC 在 apply 返回后的 0ms 定时器里跑，测试需要等它落定）。 */
+async function waitFor(check, label = "条件", { timeoutMs = 5000, intervalMs = 20 } = {}) {
+	const startedAt = Date.now();
+	for (;;) {
+		const value = await check();
+		if (value) return value;
+		if (Date.now() - startedAt > timeoutMs) throw new Error(`等待超时：${label}`);
+		await new Promise((resolve) => setTimeout(resolve, intervalMs));
+	}
+}
+
+/** 读 JSON 文件；不存在/损坏时返回 null（轮询用）。 */
+async function readJsonMaybe(file) {
+	try {
+		return JSON.parse(await readFile(file, "utf8"));
+	} catch {
+		return null;
+	}
+}
+
+async function pathExists(target) {
+	try {
+		await stat(target);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * "载体已安装 + 空托管区" 夹具：假插件根（package.json 声明精确载体别名）+
+ * node_modules 里的载体包（APK + 完整 schema 1 清单，plugin.contentSha256 = 运行内容）。
+ * updateDir 为空的独立目录，profileDir 是带 package.json 的真实 profile 目录。
+ */
+async function makeCarrierImportFixture() {
+	const base = await mkdtemp(join(tmpdir(), "dsh-carrier-import-"));
+	const pluginRoot = join(base, "plugin-root");
+	const carrierRoot = join(pluginRoot, "node_modules", "@marktrue", "dsh-mobile-remote-app");
+	const updateDir = join(base, "update");
+	const profileDir = join(base, "profile-web");
+	await mkdir(carrierRoot, { recursive: true });
+	await mkdir(updateDir, { recursive: true });
+	await mkdir(profileDir, { recursive: true });
+	await writeFile(join(profileDir, "package.json"), JSON.stringify({
+		name: "web-profile",
+		dependencies: { [PLUGIN_NAME]: "file:/fixture-plugin" },
+	}));
+	// 与 store 夹具字节区分（首字节不同），便于断言"服务的是载体字节"。
+	const appBytes = Buffer.from(APK_BYTES);
+	appBytes[0] = (appBytes[0] + 7) & 0xff;
+	const tgzBytes = Buffer.from("carrier-plugin-tgz-for-import\n");
+	const manifest = manifestFor({ appVersion: "3.2.0+9", appBytes, tgzBytes });
+	await writeFile(join(pluginRoot, "package.json"), JSON.stringify({
+		name: PLUGIN_NAME,
+		version: PLUGIN_VERSION,
+		optionalDependencies: { "@marktrue/dsh-mobile-remote-app": `npm:${PLUGIN_NAME}@${PLUGIN_VERSION}-app` },
+	}));
+	await writeFile(join(carrierRoot, "package.json"), JSON.stringify({
+		name: PLUGIN_NAME,
+		version: `${PLUGIN_VERSION}-app`,
+		dsh: { appCarrier: true },
+	}));
+	await writeFile(join(carrierRoot, "mobile.apk"), appBytes);
+	await writeFile(join(carrierRoot, "manifest.json"), JSON.stringify(manifest));
+	const identity = releaseIdentityFromManifest(manifest);
+	assert.equal(identity.ok, true, JSON.stringify(identity));
+	return {
+		base, pluginRoot, carrierRoot, updateDir, profileDir,
+		profileKey: basename(profileDir),
+		appBytes, manifest, releaseId: identity.releaseId,
+		pointerFile: join(updateDir, ".app-carrier", "profiles", basename(profileDir), "current.json"),
+		appObjectPath: join(updateDir, ".app-carrier", "objects", "apk", sha256(appBytes), "app.apk"),
+		releaseDir: join(updateDir, ".app-carrier", "releases", identity.releaseId),
+	};
+}
+
+function carrierHarnessOptions(fixture) {
+	return {
+		config: { updateDir: fixture.updateDir, updateProfileDir: fixture.profileDir },
+		runtime: { carrier: { pluginRoot: fixture.pluginRoot } },
+	};
+}
+
+test("载体导入托管区：apply 后异步落位为当前发布，读取链报告 carrier-store", async () => {
+	const fixture = await makeCarrierImportFixture();
+	try {
+		await withHarness(carrierHarnessOptions(fixture), async ({ api }) => {
+			const pointer = await waitFor(async () => {
+				const value = await readJsonMaybe(fixture.pointerFile);
+				return value?.current?.releaseId === fixture.releaseId ? value : null;
+			}, "载体导入落位（profile 当前指针）");
+			assert.equal(pointer.current.identity.plugin.contentSha256, RUNNING_CONTENT);
+			assert.equal(pointer.profileDir, fixture.profileDir, "指针必须记录真实 profile 目录（GC 存活性判定用）");
+
+			// 托管区出现 releases/<releaseId>/ 与不可变 APK 对象；暂存区不留残留。
+			assert.ok(await pathExists(join(fixture.releaseDir, "release.json")), "托管区应有发布记录");
+			assert.ok(await pathExists(join(fixture.releaseDir, "manifest.json")), "托管区应有发布清单");
+			assert.ok(await pathExists(fixture.appObjectPath), "托管区应有按内容寻址的 APK 对象");
+			assert.deepEqual(await readdir(join(fixture.updateDir, ".app-carrier", "staging")), [], "导入完成不应留下暂存");
+
+			// 读取链：托管区当前发布优先（source=carrier-store），匿名下载仍是载体字节。
+			const boot = (await request(api, { url: "/m/api/bootstrap", headers: { "x-mobile-token": TOKEN } })).json();
+			assert.equal(boot.appArtifact.state, "ok");
+			assert.equal(boot.appArtifact.source, "carrier-store");
+			assert.equal(boot.currentRelease.releaseId, fixture.releaseId);
+			assert.equal(boot.currentReleaseHealth.state, "confirmed");
+			const apk = await request(api, { url: "/m/api/update/apk" });
+			assert.equal(apk.status, 200);
+			assert.deepEqual(apk.body, fixture.appBytes);
+			const fixed = await request(api, {
+				url: `/m/api/update/apk?release=${fixture.releaseId}&sha256=${sha256(fixture.appBytes)}`,
+			});
+			assert.equal(fixed.status, 200);
+			assert.deepEqual(fixed.body, fixture.appBytes);
+
+			// 诊断可见导入结论（稳定代号；不得回显本机路径/凭据）。
+			const diag = (await request(api, { url: "/m/api/diagnostics", headers: { "x-mobile-token": TOKEN } })).json();
+			assert.equal(diag.carrier.import.state, "ready");
+			assert.equal(diag.carrier.import.releaseId, fixture.releaseId);
+			const carrierSerialized = JSON.stringify(diag.carrier);
+			assert.equal(carrierSerialized.includes(fixture.updateDir), false, "诊断不得回显本机绝对路径");
+			assert.equal(carrierSerialized.includes(TOKEN), false, "诊断不得回显访问口令");
+
+			// 载体原件未被移动/改写（导入只读载体，硬链接/复制语义由托管区 module 决定）。
+			assert.deepEqual(await readFile(join(fixture.carrierRoot, "mobile.apk")), fixture.appBytes);
+		});
+	} finally {
+		await rm(fixture.base, { recursive: true, force: true });
+	}
+});
+
+test("载体导入托管区：重复 apply 幂等（不重复导入、不重写指针）", async () => {
+	const fixture = await makeCarrierImportFixture();
+	try {
+		await withHarness(carrierHarnessOptions(fixture), async () => {
+			await waitFor(async () => (await readJsonMaybe(fixture.pointerFile))?.current?.releaseId === fixture.releaseId, "首次导入落位");
+		});
+		const releasesDir = join(fixture.updateDir, ".app-carrier", "releases");
+		const releasesBefore = (await readdir(releasesDir)).filter((name) => /^[a-f0-9]{64}$/.test(name)).sort();
+		const pointerBefore = await stat(fixture.pointerFile);
+		assert.equal(releasesBefore.length, 1);
+
+		await withHarness(carrierHarnessOptions(fixture), async ({ api }) => {
+			const importState = await waitFor(async () => {
+				const diag = (await request(api, { url: "/m/api/diagnostics", headers: { "x-mobile-token": TOKEN } })).json();
+				const state = diag.carrier?.import;
+				return state && state.state !== "pending" ? state : null;
+			}, "第二次导入任务完成");
+			assert.equal(importState.state, "ready");
+			assert.equal(importState.reason, "already-current", "同一 releaseId 应命中幂等跳过");
+			assert.equal(importState.releaseId, fixture.releaseId);
+		});
+
+		const releasesAfter = (await readdir(releasesDir)).filter((name) => /^[a-f0-9]{64}$/.test(name)).sort();
+		const pointerAfter = await stat(fixture.pointerFile);
+		assert.deepEqual(releasesAfter, releasesBefore, "重复 apply 不得产生重复发布记录");
+		assert.equal(pointerAfter.mtimeMs, pointerBefore.mtimeMs, "幂等路径不得重写当前指针（不重置保留时钟）");
+		assert.deepEqual(await readdir(join(fixture.updateDir, ".app-carrier", "staging")), []);
+	} finally {
+		await rm(fixture.base, { recursive: true, force: true });
+	}
+});
+
+test("读取链：载体不可发现后仍从托管区当前发布服务（托管区优先、载体回退）", async () => {
+	const fixture = await makeCarrierImportFixture();
+	try {
+		await withHarness(carrierHarnessOptions(fixture), async () => {
+			await waitFor(async () => (await readJsonMaybe(fixture.pointerFile))?.current?.releaseId === fixture.releaseId, "首次导入落位");
+		});
+		// 模拟载体直读回退不可用（载体被移除/装歪）：托管区必须独立服务当前发布。
+		await rm(join(fixture.carrierRoot, "mobile.apk"), { force: true });
+		await withHarness(carrierHarnessOptions(fixture), async ({ api }) => {
+			const boot = (await request(api, { url: "/m/api/bootstrap", headers: { "x-mobile-token": TOKEN } })).json();
+			assert.equal(boot.appArtifact.state, "ok");
+			assert.equal(boot.appArtifact.source, "carrier-store");
+			const apk = await request(api, { url: "/m/api/update/apk" });
+			assert.equal(apk.status, 200);
+			assert.deepEqual(apk.body, fixture.appBytes);
+		});
+	} finally {
+		await rm(fixture.base, { recursive: true, force: true });
+	}
+});
+
+test("启动 GC：回收无引用对象与过期暂存，不删当前发布与载体原件", async () => {
+	const fixture = await makeCarrierImportFixture();
+	try {
+		await withHarness(carrierHarnessOptions(fixture), async () => {
+			await waitFor(async () => (await readJsonMaybe(fixture.pointerFile))?.current?.releaseId === fixture.releaseId, "首次导入落位");
+		});
+		const carrierBytes = await readFile(join(fixture.carrierRoot, "mobile.apk"));
+
+		// 构造"过期残留"：无引用的旧对象 + 超出 staging TTL 的未提交暂存（都不参与服务）。
+		const staleSha = "b".repeat(64);
+		const staleObjectDir = join(fixture.updateDir, ".app-carrier", "objects", "apk", staleSha);
+		await mkdir(staleObjectDir, { recursive: true });
+		await writeFile(join(staleObjectDir, "app.apk"), Buffer.from("stale-object\n"));
+		const staleStagingId = "11111111-2222-3333-4444-555555555555";
+		const staleStagingDir = join(fixture.updateDir, ".app-carrier", "staging", staleStagingId);
+		await mkdir(staleStagingDir, { recursive: true });
+		await writeFile(join(staleStagingDir, "staged.json"), JSON.stringify({
+			schema: 1, stagingId: staleStagingId, createdAtMs: Date.now() - 2 * 60 * 60 * 1000,
+		}));
+		await writeFile(join(staleStagingDir, "app.apk"), Buffer.from("stale-staging\n"));
+
+		let gcState;
+		await withHarness(carrierHarnessOptions(fixture), async ({ api }) => {
+			gcState = await waitFor(async () => {
+				const diag = (await request(api, { url: "/m/api/diagnostics", headers: { "x-mobile-token": TOKEN } })).json();
+				const gc = diag.carrier?.garbageCollection;
+				if (!gc || gc.state === "pending") return null;
+				// 以"残留真的被删掉"为准，避免只看诊断状态与文件系统进度错位。
+				if (await pathExists(join(staleObjectDir, "app.apk"))) return null;
+				if (await pathExists(staleStagingDir)) return null;
+				return gc;
+			}, "启动 GC 回收过期残留");
+			assert.equal(gcState.state, "ok");
+			assert.ok(gcState.removedObjects >= 1, `应回收无引用对象：${JSON.stringify(gcState)}`);
+			assert.ok(gcState.removedStaging >= 1, `应回收过期暂存：${JSON.stringify(gcState)}`);
+		});
+
+		// 当前发布的对象/记录/指针与载体原件都不得被 GC 删除。
+		assert.ok(await pathExists(fixture.appObjectPath));
+		assert.deepEqual(await readFile(fixture.appObjectPath), fixture.appBytes);
+		assert.ok(await pathExists(join(fixture.releaseDir, "release.json")));
+		const pointer = await readJsonMaybe(fixture.pointerFile);
+		assert.equal(pointer.current.releaseId, fixture.releaseId);
+		assert.deepEqual(await readFile(join(fixture.carrierRoot, "mobile.apk")), carrierBytes);
+	} finally {
+		await rm(fixture.base, { recursive: true, force: true });
+	}
+});
+
+// ── #35 缺口 B：连接页下载码数据（/api/qr-config 新增字段）──────────────────────
+test("qr-config：下发手机可达的 appDownloadUrl 与 appArtifact 状态（不含口令/本机路径）", async () => {
+	await withStoreFixture({}, async (fixture) => {
+		// 显式 publicOrigin 让"手机可达绝对地址"在测试里可确定（与 bootstrap 投影一致）。
+		await withHarness({
+			config: {
+				updateDir: fixture.carrierDir,
+				updateProfileDir: fixture.profileDir,
+				publicOrigin: "https://remote.example.com",
+			},
+		}, async ({ api }) => {
+			const res = await request(api, { url: "/m/api/qr-config" });
+			assert.equal(res.status, 200);
+			const body = res.json();
+			assert.equal(body.appDownloadUrl, "https://remote.example.com/m/api/update/apk");
+			assert.equal(body.appArtifact.state, "ok");
+			assert.equal(body.appArtifact.releaseId, fixture.current.releaseId);
+			assert.deepEqual([...body.urls], ["https://remote.example.com/m"], "二维码地址与下载地址共用同一手机可达基址");
+			// 下载码数据不得携带口令，也不得回显本机绝对路径。
+			const serialized = JSON.stringify({ appDownloadUrl: body.appDownloadUrl, appArtifact: body.appArtifact });
+			assert.equal(serialized.includes(TOKEN), false, "下载码数据不得包含口令");
+			assert.equal(serialized.includes(fixture.carrierDir), false, "appArtifact 不得回显本机路径");
+		});
+
+		// 未显式配置基址时：有手机可达网卡 → 用它拼 /api/update/apk；只有回环 → null（绝不发回环地址）。
+		await withHarness({
+			config: { updateDir: fixture.carrierDir, updateProfileDir: fixture.profileDir },
+		}, async ({ api }) => {
+			const body = (await request(api, { url: "/m/api/qr-config" })).json();
+			const nonLoopback = body.urls.find((value) => !String(value).includes("127.0.0.1"));
+			if (nonLoopback) {
+				assert.equal(body.appDownloadUrl, new URL(nonLoopback).origin + "/m/api/update/apk");
+			} else {
+				assert.equal(body.appDownloadUrl, null, "没有手机可达地址时不得下发回环下载地址");
+			}
+			assert.equal(body.appArtifact.state, "ok");
+		});
+	});
+});
+
+test("qr-config：产物未就绪时 appDownloadUrl=null，只给稳定状态（不生成坏码）", async () => {
+	await withHarness({ config: {} }, async ({ api }) => {
+		const body = (await request(api, { url: "/m/api/qr-config" })).json();
+		assert.equal(body.appDownloadUrl, null);
+		assert.equal(body.appArtifact.state, "missing");
+		assert.match(body.appArtifact.reason, /^[a-z0-9][a-z0-9._-]{0,63}$/, "reason 必须是稳定代号");
+		assert.equal(typeof body.appArtifact.hint, "string");
+		assert.ok(body.appArtifact.hint.length > 0, "应给可执行的修复指引");
+		const serialized = JSON.stringify({ appDownloadUrl: body.appDownloadUrl, appArtifact: body.appArtifact });
+		assert.equal(serialized.includes(TOKEN), false);
+	});
+
+	// 非 loopback 来源仍 403（下载码数据同样受本机特权入口围栏保护）。
+	await withHarness({ config: {} }, async ({ api }) => {
+		const denied = await request(api, { url: "/m/api/qr-config", remoteAddress: "192.0.2.10" });
+		assert.equal(denied.status, 403);
+		assert.equal(denied.json().error, "loopback-only");
 	});
 });
