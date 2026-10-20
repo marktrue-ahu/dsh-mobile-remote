@@ -45,6 +45,9 @@
   "bundleDependencies": [
     "qrcode"
   ],
+  "optionalDependencies": {
+    "@marktrue/dsh-mobile-remote-app": "npm:@marktrue/dsh-mobile-remote@3.2.0-app"
+  },
   "peerDependencies": {
     "@deepseek-ai/dsh-credentials": ">=0.1.0-rc.6 <0.2.0",
     "@deepseek-ai/dsh-llm": ">=0.1.0-rc.6 <0.2.0",

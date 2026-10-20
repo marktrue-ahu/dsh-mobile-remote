@@ -64,29 +64,49 @@ if [ ! -f "$tgz_out" ]; then
 fi
 echo "Archived: $tgz_out ($(du -h "$tgz_out" | cut -f1))"
 
-# 3) 发布清单（共享生成器：合法 JSON / 无 BOM / notes=CHANGELOG 最新条目全文 /
-#    app 与 plugin 两段 + 各自 sha256 / plugin 的 contentSha256）
+# 3) 配对产物三件套（设计稿 §5.1/§5.2）：由**已打好的插件 tgz** + APK 生成完整 schema 1
+#    配对清单（app/plugin 两段 + 顶层兼容镜像 + contentSha256），再组装并打出 App 载体
+#    （同包名 @X.Y.Z-app、dsh.appCarrier=true、无运行入口/平台字段/安装钩子）。
+#    构建顺序不可交换：tgz 已存在是硬输入；工具还会断言 tgz 内容标识等于当前源码，
+#    并调用发布校验器（--require-carrier）复核清单/插件 tgz/APK/载体 tarball 全一致。
+#    本步骤只做本地 npm pack，不会向任何 registry 发布。
 #    PLUGIN_URL：把 tgz 的下载地址写进清单（GitHub Release 等托管场景）；不设则只写文件名，
 #    由消费方相对清单地址解析。
 manifest="$dist/manifest.json"
 plugin_url_args=()
 [ -n "${PLUGIN_URL:-}" ] && plugin_url_args=(--plugin-url "$PLUGIN_URL")
-node "$app_dir/tools/gen-manifest.js" \
-    --apk "$apk_out" \
-    --version "$full_ver" \
-    --plugin-tgz "$tgz_out" \
-    --plugin-root "$repo_dir" \
-    --changelog "$repo_dir/CHANGELOG.md" \
-    --out "$manifest" \
-    "${plugin_url_args[@]}"
+if [ -n "${MANIFEST_VERSION:-}" ]; then
+    # 测试专用（需 ALLOW_TEST_MANIFEST_VERSION=1）：清单故意写一个“比 APK 实际构建号更高”的
+    # 版本，用于验证 App 端“有新版本”的判定。这不是正式发布，因此不构建载体、不走载体配对
+    # 门禁；F17/R9（app.version 从 APK 实读）只在正式发布路径强制。
+    node "$app_dir/tools/gen-manifest.js" \
+        --apk "$apk_out" \
+        --version "$full_ver" \
+        --plugin-tgz "$tgz_out" \
+        --plugin-root "$repo_dir" \
+        --changelog "$repo_dir/CHANGELOG.md" \
+        --out "$manifest" \
+        "${plugin_url_args[@]}"
+    node "$app_dir/tools/verify-update-manifest.mjs" "$dist" || {
+        echo "test manifest verification failed" >&2
+        exit 1
+    }
+    echo "WARN: MANIFEST_VERSION=$full_ver is test-only / hand-filled; app carrier is NOT built for this path" >&2
+else
+    node "$app_dir/tools/build-app-carrier.mjs" \
+        --apk "$apk_out" \
+        --plugin-tgz "$tgz_out" \
+        --plugin-root "$repo_dir" \
+        --changelog "$repo_dir/CHANGELOG.md" \
+        --app-version "$full_ver" \
+        --out-dir "$dist" \
+        "${plugin_url_args[@]}" || {
+        echo "app carrier build / release-pairing verification failed" >&2
+        exit 1
+    }
+fi
 
-# 4) 校验清单与产物一致（fail-closed：不一致即中止发布）
-node "$app_dir/tools/verify-update-manifest.mjs" "$dist" || {
-    echo "manifest verification failed" >&2
-    exit 1
-}
-
-# 5) 可选：拷入插件 updateDir（应用「主机源」更新通道；tgz 一并落位，使该目录自包含）
+# 4) 可选：拷入插件 updateDir（应用「主机源」更新通道；tgz 一并落位，使该目录自包含）
 if [ -n "${UPDATE_DIR:-}" ]; then
     mkdir -p "$UPDATE_DIR"
     cp "$apk_out" "$tgz_out" "$manifest" "$UPDATE_DIR/"
