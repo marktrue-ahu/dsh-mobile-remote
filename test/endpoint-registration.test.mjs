@@ -124,6 +124,19 @@ test("比对器能揪出漏登记/陈旧/方法不符/未声明能力（机制�
 	assert.deepEqual(missingField.missingCapabilityField, ["/known", "/new-one"]);
 });
 
+test("#35 下载面鉴权属性：/update/apk 是唯一匿名例外，其余 update 路由必须鉴权", () => {
+	const byPath = new Map(REGISTERED_ENDPOINTS.map((entry) => [entry.path, entry]));
+	assert.equal(byPath.get("/update/apk").auth, "anonymous");
+	assert.equal(byPath.get("/update/apk").methods, "GET");
+	assert.equal(byPath.get("/update/manifest").auth, "required");
+	assert.equal(byPath.get("/update/plugin").auth, "required");
+	// 本机特权入口：无需移动口令，但只允许受信本机来源（不是远程控制豁免）。
+	assert.equal(byPath.get("/qr-config").auth, "local-privileged");
+	// 除这三条以外的移动端端点一律不得登记成匿名（防止有人扩大匿名范围）。
+	const anonymous = REGISTERED_ENDPOINTS.filter((entry) => entry.auth === "anonymous").map((entry) => entry.path);
+	assert.deepEqual(anonymous, ["/update/apk"]);
+});
+
 test("本次新增的自更新端点已登记（含主机源下发插件包）", () => {
 	const paths = REGISTERED_ENDPOINTS.map((e) => e.path);
 	for (const p of ["/plugin-update", "/update/manifest", "/update/apk", "/update/plugin"]) {
