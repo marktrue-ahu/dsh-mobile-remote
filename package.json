@@ -17,7 +17,10 @@
     "CHANGELOG.md",
     "CONTRIBUTING.md",
     "LICENSE",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "!docs/adr",
+    "!docs/agents",
+    "!docs/design"
   ],
   "dsh": {
     "client": {

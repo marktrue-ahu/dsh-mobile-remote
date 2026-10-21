@@ -3,8 +3,10 @@
 # 有了它，用户 `dsh plugin add @marktrue/dsh-mobile-remote` 之后无需手工编辑
 # profile 的 cordis.patch.yml——本文件就是那一段 insert。
 #
-# ⚠️ authToken 必须由用户在自己的 profile 配置里设置：留空等于关闭访问口令，
-#    同一网络内任何设备都能连接并控制 agent（插件启动时会打印告警）。
+# 口令：**不需要在这里写死**。未配置时插件会自动生成 43 字符强随机口令并存到
+#    <DSH_HOME>/mobile-remote/auth-token，连接二维码会携带它；移动接口一律 fail-closed。
+#    桌面版（webserver 只听回环）还需开启 lanBridge 才能让手机连上：
+#      config.lanBridge: { enabled: true, port: 3081 }
 - insert:
     - id: mobile-remote
       name: "@marktrue/dsh-mobile-remote"
