@@ -2,10 +2,19 @@
 # Archive a release (Linux/WSL，与 package-release.ps1 等价)，并生成自动更新主机源的 manifest.json（App 3.0.0+8 起）。
 # 用法：构建后执行 `bash dsh-mobile-app/tools/package-release.sh`；
 #       设置 UPDATE_DIR=<插件 updateDir> 可将 APK+manifest 一并拷入主机更新目录。
+#       `bash ... --check-only [dist目录]`：只跑 npm 载体发布前预检（不构建、不发布），
+#       用于已有 dist（如 dsh-mobile-app/dist/local-3.2.0+57）的发布前确认。
 set -euo pipefail
 
 app_dir="$(cd "$(dirname "$0")/.." && pwd)"
 repo_dir="$(cd "$app_dir/.." && pwd)"
+
+# --check-only：不构建 APK/载体，只对已有发布目录做「发布前预检」（离线、绝不 publish）。
+if [ "${1:-}" = "--check-only" ]; then
+    check_dir="${2:-$app_dir/dist}"
+    echo "Publish preflight only (no build, no npm publish): $check_dir" >&2
+    exec node "$app_dir/tools/publish-carrier-check.mjs" "$check_dir"
+fi
 
 apk="$app_dir/build/app/outputs/flutter-apk/app-release.apk"
 if [ ! -f "$apk" ]; then
@@ -102,6 +111,12 @@ else
         --out-dir "$dist" \
         "${plugin_url_args[@]}" || {
         echo "app carrier build / release-pairing verification failed" >&2
+        exit 1
+    }
+    # 载体 npm 发布前预检（离线 dry-run；不发布）。发布命令必须人工执行：
+    #   npm publish <dist>/<name>-X.Y.Z-app.tgz --tag app
+    node "$app_dir/tools/publish-carrier-check.mjs" "$dist" || {
+        echo "carrier publish preflight failed" >&2
         exit 1
     }
 fi

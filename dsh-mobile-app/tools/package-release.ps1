@@ -2,9 +2,23 @@
 # dsh-mobile-app/dist/ with versioned filenames. Version comes from pubspec.yaml;
 # plugin version is kept in sync (App version = plugin version = git tag).
 # Run after: flutter build apk --release
+#   -CheckOnly [-DistDir <dir>] : only run the offline carrier publish preflight
+#                                 (no build, never runs npm publish).
+param(
+    [switch]$CheckOnly,
+    [string]$DistDir = ''
+)
 $ErrorActionPreference = 'Stop'
 $appDir = Split-Path -Parent $PSScriptRoot   # dsh-mobile-app/
 $repoDir = Split-Path -Parent $appDir        # repo root
+
+if ($CheckOnly) {
+    $checkDir = if ($DistDir) { $DistDir } else { Join-Path $appDir 'dist' }
+    Write-Output ("Publish preflight only (no build, no npm publish): " + $checkDir)
+    node (Join-Path $PSScriptRoot 'publish-carrier-check.mjs') $checkDir
+    exit $LASTEXITCODE
+}
+
 $apk = Join-Path $appDir 'build\app\outputs\flutter-apk\app-release.apk'
 if (-not (Test-Path $apk)) {
     Write-Error "APK not found: $apk - run 'flutter build apk --release' first"
@@ -96,6 +110,10 @@ if ($env:MANIFEST_VERSION) {
 } else {
     node (Join-Path $PSScriptRoot 'build-app-carrier.mjs') --apk $apkOut --plugin-tgz $tgzOut --plugin-root $repoDir --changelog (Join-Path $repoDir 'CHANGELOG.md') --app-version $fullVersion --out-dir $dist @pluginUrlArgs
     if ($LASTEXITCODE -ne 0) { Write-Error "app carrier build / release-pairing verification failed"; exit 1 }
+    # Offline publish preflight (dry-run; never runs npm publish). Publishing is manual:
+    #   npm publish <dist>\<name>-X.Y.Z-app.tgz --tag app
+    node (Join-Path $PSScriptRoot 'publish-carrier-check.mjs') $dist
+    if ($LASTEXITCODE -ne 0) { Write-Error "carrier publish preflight failed"; exit 1 }
 }
 
 if ($env:UPDATE_DIR) {

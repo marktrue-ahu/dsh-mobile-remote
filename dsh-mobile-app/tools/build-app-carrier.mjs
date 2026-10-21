@@ -11,6 +11,10 @@
 //   同包名，version = `<插件版本>-app`；内容 = APK + 完整清单 + README + LICENSE；
 //   `dsh.appCarrier: true`；无 os/cpu/libc、无 bin/main/exports、无 dsh.bundle、无安装期脚本。
 //
+// ── npm 发布元数据（issue #36 P3-A：载体发布到 npm，dist-tag 固定 app）─────────────
+//   载体 package.json 同时写好 `private: false`、`publishConfig: { access: "public", tag: "app" }`，
+//   并继承主包的 license/description/repository；本工具只**生成元数据**，绝不发布。
+//
 // ── 硬约束 ─────────────────────────────────────────────────────────────────────
 //   本工具**不发布任何东西**：只调用 `npm pack`（本地打包、零网络），绝不调用 npm publish；
 //   不发 registry、不改版本号、不写 CHANGELOG。所有判定 fail-closed：任一条 FAIL 即非零退出。
@@ -40,6 +44,7 @@ import {
 	carrierContentsChecks,
 	carrierDependencySpec,
 	carrierPackageChecks,
+	carrierPublishMetadataChecks,
 	carrierRecordChecks,
 	carrierVersion,
 	exactCarrierAliasChecks,
@@ -84,6 +89,14 @@ const FLAG_MAP = {
 	"--readme": "readme",
 	"--license": "license",
 };
+
+/** 主包的 repository 可能是对象或字符串（npm 两种都接受）；统一成对象形态，缺失时返回 null（不伪造）。 */
+function repositoryMetaOf(pkg) {
+	const value = pkg?.repository;
+	if (typeof value === "string" && value.trim() !== "") return { type: "git", url: value.trim() };
+	if (value && typeof value === "object" && typeof value.url === "string" && value.url !== "") return value;
+	return null;
+}
 
 function parseArgs(argv) {
 	const args = {};
@@ -315,8 +328,14 @@ function main() {
 				description: `DSH Mobile Remote App 载体（与 ${pluginName}@${pluginVersion} 配对）：随插件分发 APK 与发布清单，仅作数据分发，无运行入口。`,
 				files,
 				dsh: { appCarrier: true },
+				// ── npm 发布元数据（P3-A）──
+				// 载体是 semver prerelease（X.Y.Z-app）：`^X.Y.Z` 不会匹配它，必须显式发布并打 `app`
+				// dist-tag；`latest` 永远留给主插件，绝不能用 latest 发布载体。
+				private: false,
 				license: typeof rootPkg.license === "string" && rootPkg.license !== "" ? rootPkg.license : "MIT",
-				publishConfig: { access: "public" },
+				publishConfig: { access: "public", tag: "app" },
+				// 发布来源可追溯：license/repository 继承主包（没有 repository 时省略，避免伪造）。
+				...(repositoryMetaOf(rootPkg) ? { repository: repositoryMetaOf(rootPkg) } : {}),
 			};
 			fs.writeFileSync(path.join(carrierStage, "package.json"), `${JSON.stringify(carrierPkg, null, 2)}\n`);
 			fs.copyFileSync(apkFile, path.join(carrierStage, apkBaseName));
@@ -333,6 +352,12 @@ function main() {
 			check("载体许可证文件存在（LICENSE）", fs.existsSync(licenseFile), licenseFile);
 			if (fs.existsSync(licenseFile)) fs.copyFileSync(licenseFile, path.join(carrierStage, "LICENSE"));
 			reportChecks(carrierPackageChecks(carrierPkg, {
+				expectedName: pluginName,
+				expectedVersion: appCarrierVersion,
+				expectedFiles: files,
+			}), check);
+			reportChecks(carrierPublishMetadataChecks(carrierPkg, {
+				mainPkg: rootPkg,
 				expectedName: pluginName,
 				expectedVersion: appCarrierVersion,
 				expectedFiles: files,
@@ -405,7 +430,9 @@ function main() {
 			console.log(`  carrier  : ${carrierFile} (${carrierStat.size} B, sha256 ${record.sha256})`);
 			console.log(`  record   : ${recordFile}`);
 			console.log(`  版本配对 : ${pluginName}@${pluginVersion} ↔ @${appCarrierVersion}`);
+			console.log(`  发布命令 : npm publish ${carrierFile} --tag app   # 本工具绝不执行；dist-tag 固定 app`);
 			info("未向任何 registry 发布（仅 npm pack 本地打包）；发布顺序由发布流程保证：先载体后主包");
+			info("发布前预检：node dsh-mobile-app/tools/publish-carrier-check.mjs <dist目录>（离线，不发布）");
 		} finally {
 			fs.rmSync(carrierStage, { recursive: true, force: true });
 		}

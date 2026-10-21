@@ -283,36 +283,43 @@ export function carrierPackageChecks(pkg, { expectedName, expectedVersion, expec
 	const checks = [];
 	checks.push({
 		name: "载体包名与主插件一致（同包名，仅版本 -app 区分）",
+		code: "carrier-name-mismatch",
 		pass: typeof expectedName === "string" && expectedName !== "" && pkg?.name === expectedName,
 		detail: `carrier=${pkg?.name ?? "<缺失>"} 主包=${expectedName || "<未知>"}`,
 	});
 	checks.push({
 		name: "载体包名不含平台 token",
+		code: "carrier-name-platform-token",
 		pass: typeof pkg?.name === "string" && pkg.name !== "" && !containsPlatformToken(pkg.name),
 		detail: `name=${pkg?.name ?? "<缺失>"}`,
 	});
 	checks.push({
 		name: "两条版本严格配对（主插件 X.Y.Z ↔ 载体 X.Y.Z-app）",
+		code: "carrier-version-pairing-mismatch",
 		pass: typeof expectedVersion === "string" && pkg?.version === expectedVersion,
 		detail: `carrier=${pkg?.version ?? "<缺失>"} 期望=${expectedVersion || "<未知>"}`,
 	});
 	checks.push({
 		name: "载体版本不含平台 token",
+		code: "carrier-version-platform-token",
 		pass: typeof pkg?.version === "string" && pkg.version !== "" && !containsPlatformToken(pkg.version),
 		detail: `version=${pkg?.version ?? "<缺失>"}`,
 	});
 	checks.push({
 		name: "载体声明数据角色 dsh.appCarrier === true",
+		code: "carrier-role-marker-missing",
 		pass: pkg?.dsh?.appCarrier === true,
 		detail: `dsh=${JSON.stringify(pkg?.dsh ?? null)}`,
 	});
 	checks.push({
 		name: "载体无 dsh.bundle（不承担插件 bundle 角色）",
+		code: "carrier-bundle-forbidden",
 		pass: !(pkg?.dsh && typeof pkg.dsh === "object" && Object.hasOwn(pkg.dsh, "bundle")),
 		detail: `dsh=${JSON.stringify(pkg?.dsh ?? null)}`,
 	});
 	checks.push({
 		name: "载体无平台字段（os/cpu/libc）",
+		code: "carrier-platform-field-forbidden",
 		pass: !CARRIER_FORBIDDEN_FIELDS.slice(0, 3).some((field) => Object.hasOwn(pkg ?? {}, field)),
 		detail: CARRIER_FORBIDDEN_FIELDS.slice(0, 3)
 			.filter((field) => Object.hasOwn(pkg ?? {}, field))
@@ -321,12 +328,14 @@ export function carrierPackageChecks(pkg, { expectedName, expectedVersion, expec
 	});
 	checks.push({
 		name: "载体无运行入口（bin/main/exports）",
+		code: "carrier-entry-field-forbidden",
 		pass: !["bin", "main", "exports"].some((field) => Object.hasOwn(pkg ?? {}, field)),
 		detail: ["bin", "main", "exports"].filter((field) => Object.hasOwn(pkg ?? {}, field)).join(",") || "无",
 	});
 	const scripts = pkg?.scripts && typeof pkg.scripts === "object" ? Object.keys(pkg.scripts) : [];
 	checks.push({
 		name: "载体无安装期执行钩子（scripts 必须为空）",
+		code: "carrier-scripts-forbidden",
 		pass: scripts.length === 0,
 		detail: scripts.length === 0 ? "无" : `scripts=${scripts.join(",")}`,
 	});
@@ -335,6 +344,7 @@ export function carrierPackageChecks(pkg, { expectedName, expectedVersion, expec
 		: [];
 	checks.push({
 		name: "载体 dsh 字段仅含 appCarrier 标记",
+		code: "carrier-dsh-extra-field",
 		pass: extraDsh.length === 0,
 		detail: extraDsh.length === 0 ? "ok" : `多余字段=${extraDsh.join(",")}`,
 	});
@@ -342,14 +352,142 @@ export function carrierPackageChecks(pkg, { expectedName, expectedVersion, expec
 	const wanted = [...expectedFiles].sort();
 	checks.push({
 		name: "载体 files 精确为 APK + manifest.json + README.md + LICENSE",
+		code: "carrier-files-mismatch",
 		pass: wanted.length > 0 && arraysEqual(files, wanted),
 		detail: `files=${files.join(",") || "<缺失>"} 期望=${wanted.join(",") || "<未知>"}`,
 	});
 	checks.push({
 		name: "载体不得把自身或主插件打进包（无 node_modules/lib 内容）",
+		code: "carrier-dependencies-forbidden",
 		pass: !Object.hasOwn(pkg ?? {}, "dependencies") || Object.keys(pkg.dependencies ?? {}).length === 0,
 		detail: pkg?.dependencies ? `dependencies=${Object.keys(pkg.dependencies).join(",")}` : "无",
 	});
+	return checks;
+}
+
+// ── 载体 npm 发布元数据（P3-A：载体发布到 npm，dist-tag 固定 app、绝不 latest）───────────
+//
+// 只用于「发布前预检」与「构建器自检」，不改变运行期数据角色判定（carrierPackageChecks）。
+// 依据 issue #36 P3-A：载体 X.Y.Z-app 是 semver prerelease，`^X.Y.Z` 不会匹配它，
+// 因此必须显式发布并打 `app` dist-tag；主包用精确别名 optionalDependencies 引入。
+// npm 拒绝发布 `private: true` 的包；scoped 包公开发布需要 publishConfig.access=public。
+
+function repositoryUrl(pkg) {
+	const repo = pkg?.repository;
+	if (typeof repo === "string") return repo;
+	if (repo && typeof repo === "object" && typeof repo.url === "string") return repo.url;
+	return "";
+}
+
+/**
+ * 载体 package.json 的 npm 发布元数据断言（stable reason code 供发布预检输出）。
+ * @param {object} pkg 载体 package.json
+ * @param {{mainPkg?: object|null, expectedName?: string, expectedVersion?: string, expectedFiles?: string[]}} [options]
+ */
+export function carrierPublishMetadataChecks(pkg, {
+	mainPkg = null,
+	expectedName = "",
+	expectedVersion = "",
+	expectedFiles = [],
+} = {}) {
+	const checks = [];
+	const name = typeof pkg?.name === "string" ? pkg.name : "";
+	const version = typeof pkg?.version === "string" ? pkg.version : "";
+	const publishConfig = pkg?.publishConfig && typeof pkg.publishConfig === "object" ? pkg.publishConfig : {};
+	const files = Array.isArray(pkg?.files) ? pkg.files.map(String) : [];
+	const apkFile = expectedFiles.find((file) => /\.apk$/i.test(String(file))) ?? "";
+	const license = typeof pkg?.license === "string" ? pkg.license : "";
+	const description = typeof pkg?.description === "string" ? pkg.description : "";
+	const repoUrl = repositoryUrl(pkg);
+
+	checks.push({
+		code: "carrier-publish-name-mismatch",
+		name: "发布包名与主包一致（同包名 + -app 版本区分）",
+		pass: expectedName === "" ? name !== "" : name === expectedName,
+		detail: `carrier=${name || "<缺失>"} 期望=${expectedName || "<未知>"}`,
+	});
+	checks.push({
+		code: "carrier-publish-version-not-app-suffix",
+		name: "发布版本是 semver 预发布 X.Y.Z-app（npm 范围依赖不会误匹配）",
+		pass: /^\d+\.\d+\.\d+-app$/.test(version),
+		detail: `version=${version || "<缺失>"}`,
+	});
+	checks.push({
+		code: "carrier-publish-version-mismatch",
+		name: "发布版本与主插件版本严格配对（主插件 X.Y.Z ↔ 载体 X.Y.Z-app）",
+		pass: expectedVersion !== "" && version === expectedVersion,
+		detail: `carrier=${version || "<缺失>"} 期望=${expectedVersion || "<未知>"}`,
+	});
+	checks.push({
+		code: "carrier-publish-private-not-false",
+		name: "private 必须显式为 false（npm 拒绝发布 private 包）",
+		pass: pkg?.private === false,
+		detail: `private=${JSON.stringify(pkg?.private ?? "<缺失>")}`,
+	});
+	checks.push({
+		code: "carrier-publish-access-not-public",
+		name: "publishConfig.access 必须是 public（scoped 包公开发布）",
+		pass: publishConfig.access === "public",
+		detail: `access=${publishConfig.access ?? "<缺失>"}`,
+	});
+	checks.push({
+		code: "carrier-publish-tag-not-app",
+		name: "publishConfig.tag 必须是 app（dist-tag 固定 app，绝不用 latest）",
+		pass: publishConfig.tag === "app",
+		detail: `tag=${publishConfig.tag ?? "<缺失>"}`,
+	});
+	checks.push({
+		code: "carrier-publish-tag-latest",
+		name: "publishConfig.tag 不得是 latest（载体不能成为默认安装版本）",
+		pass: publishConfig.tag !== "latest",
+		detail: `tag=${publishConfig.tag ?? "<缺失>"}`,
+	});
+	checks.push({
+		code: "carrier-publish-files-missing-apk",
+		name: "files 必须包含 APK 本体",
+		pass: apkFile !== "" && files.includes(apkFile),
+		detail: `files=${files.join(",") || "<缺失>"} apk=${apkFile || "<未知>"}`,
+	});
+	checks.push({
+		code: "carrier-publish-files-missing-manifest",
+		name: "files 必须包含 manifest.json（随包完整发布清单）",
+		pass: files.includes("manifest.json"),
+		detail: `files=${files.join(",") || "<缺失>"}`,
+	});
+	checks.push({
+		code: "carrier-publish-license-missing",
+		name: "license 非空（随包许可）",
+		pass: license.trim() !== "",
+		detail: `license=${license || "<缺失>"}`,
+	});
+	if (mainPkg && typeof mainPkg.license === "string" && mainPkg.license !== "") {
+		checks.push({
+			code: "carrier-publish-license-mismatch",
+			name: "license 继承主包（同一许可证）",
+			pass: license === mainPkg.license,
+			detail: `carrier=${license || "<缺失>"} 主包=${mainPkg.license}`,
+		});
+	}
+	checks.push({
+		code: "carrier-publish-description-missing",
+		name: "description 非空（npm 页面可读说明）",
+		pass: description.trim() !== "",
+		detail: `description=${description ? description.slice(0, 40) : "<缺失>"}`,
+	});
+	checks.push({
+		code: "carrier-publish-repository-missing",
+		name: "repository 非空（来源可追溯）",
+		pass: repoUrl !== "",
+		detail: `repository=${repoUrl || "<缺失>"}`,
+	});
+	if (mainPkg && repositoryUrl(mainPkg) !== "") {
+		checks.push({
+			code: "carrier-publish-repository-mismatch",
+			name: "repository 继承主包",
+			pass: repoUrl === repositoryUrl(mainPkg),
+			detail: `carrier=${repoUrl || "<缺失>"} 主包=${repositoryUrl(mainPkg)}`,
+		});
+	}
 	return checks;
 }
 
@@ -454,6 +592,7 @@ export function carrierContentsChecks({ carrierDir, entries, manifest, mainPkgNa
 	const expectedEntries = ["LICENSE", "README.md", "package.json", "manifest.json", apkName].filter(Boolean).sort();
 	checks.push({
 		name: "载体 tarball 仅含 APK + 清单 + README + LICENSE（无插件代码/依赖）",
+		code: "carrier-entries-mismatch",
 		pass: expectedEntries.length === 5 && arraysEqual([...entries].sort(), expectedEntries),
 		detail: `entries=${entries.join(",") || "<空>"}`,
 	});
@@ -462,6 +601,7 @@ export function carrierContentsChecks({ carrierDir, entries, manifest, mainPkgNa
 	const carrierPkg = readJsonFile(carrierPkgFile);
 	checks.push({
 		name: "载体包 package.json 可解析",
+		code: "carrier-package-json-missing",
 		pass: carrierPkg.ok,
 		detail: carrierPkg.ok ? carrierPkgFile : String(carrierPkg.error),
 	});
@@ -476,12 +616,14 @@ export function carrierContentsChecks({ carrierDir, entries, manifest, mainPkgNa
 	const embeddedManifest = readJsonFile(path.join(carrierDir, "manifest.json"));
 	checks.push({
 		name: "载体 tarball 内发布清单可解析",
+		code: "carrier-manifest-missing",
 		pass: embeddedManifest.ok,
 		detail: embeddedManifest.ok ? "manifest.json" : String(embeddedManifest.error),
 	});
 	if (embeddedManifest.ok) {
 		checks.push({
 			name: "载体 tarball 内清单与 dist/manifest.json 逐字段一致",
+			code: "carrier-manifest-mismatch",
 			pass: JSON.stringify(sortObject(embeddedManifest.value)) === JSON.stringify(sortObject(manifest)),
 			detail: "随包清单必须就是发布清单本身，不能重新拼装",
 		});
@@ -492,18 +634,20 @@ export function carrierContentsChecks({ carrierDir, entries, manifest, mainPkgNa
 		const buf = fs.readFileSync(embeddedApk);
 		checks.push({
 			name: "载体 tarball 内 APK 大小与清单 app.size 一致",
+			code: "carrier-apk-size-mismatch",
 			pass: app.size === buf.length,
 			detail: `清单=${app.size ?? "<缺失>"} 实际=${buf.length}`,
 		});
 		checks.push({
 			name: "载体 tarball 内 APK 哈希与清单 app.sha256 一致",
+			code: "carrier-apk-sha256-mismatch",
 			pass: app.sha256 === sha256Buffer(buf),
 			detail: `清单=${app.sha256 ?? "<缺失>"} 实际=${sha256Buffer(buf)}`,
 		});
 	} else {
-		checks.push({ name: "载体 tarball 内 APK 存在", pass: false, detail: `缺少 ${apkName || "<apk 名>"}` });
-		checks.push({ name: "载体 tarball 内 APK 大小与清单 app.size 一致", pass: false, detail: "APK 缺失" });
-		checks.push({ name: "载体 tarball 内 APK 哈希与清单 app.sha256 一致", pass: false, detail: "APK 缺失" });
+		checks.push({ code: "carrier-apk-missing", name: "载体 tarball 内 APK 存在", pass: false, detail: `缺少 ${apkName || "<apk 名>"}` });
+		checks.push({ code: "carrier-apk-size-mismatch", name: "载体 tarball 内 APK 大小与清单 app.size 一致", pass: false, detail: "APK 缺失" });
+		checks.push({ code: "carrier-apk-sha256-mismatch", name: "载体 tarball 内 APK 哈希与清单 app.sha256 一致", pass: false, detail: "APK 缺失" });
 	}
 
 	// 清单里插件段的哈希必须来自**本地实际 tgz**（构建顺序：先 tgz 后载体；无自指循环）。
@@ -511,11 +655,13 @@ export function carrierContentsChecks({ carrierDir, entries, manifest, mainPkgNa
 		const tgzBuf = fs.readFileSync(pluginTgzFile);
 		checks.push({
 			name: "载体清单的 plugin.size 来自本地实际插件 tgz",
+			code: "carrier-plugin-size-mismatch",
 			pass: plugin.size === tgzBuf.length,
 			detail: `清单=${plugin.size ?? "<缺失>"} 实际=${tgzBuf.length}`,
 		});
 		checks.push({
 			name: "载体清单的 plugin.sha256 来自本地实际插件 tgz",
+			code: "carrier-plugin-sha256-mismatch",
 			pass: plugin.sha256 === sha256Buffer(tgzBuf),
 			detail: `清单=${plugin.sha256 ?? "<缺失>"} 实际=${sha256Buffer(tgzBuf)}`,
 		});
@@ -532,17 +678,19 @@ function expectedCarrierVersion(pluginVersion) {
 /** 构建记录（app-carrier.json）与清单/载体 tarball 的体积哈希一致性（§5.2 发布记录 / R10）。 */
 export function carrierRecordChecks(record, { carrierFile, manifest }) {
 	const checks = [];
-	checks.push({ name: "载体构建记录 app-carrier.json 可解析", pass: record !== null && typeof record === "object", detail: "schema 1" });
+	checks.push({ code: "carrier-record-missing", name: "载体构建记录 app-carrier.json 可解析", pass: record !== null && typeof record === "object", detail: "schema 1" });
 	if (record === null || typeof record !== "object") return checks;
-	checks.push({ name: "载体构建记录 schema = 1", pass: record.schema === 1, detail: `schema=${record.schema}` });
+	checks.push({ code: "carrier-record-schema-mismatch", name: "载体构建记录 schema = 1", pass: record.schema === 1, detail: `schema=${record.schema}` });
 	checks.push({
 		name: "载体构建记录 name/version 与载体包一致（X.Y.Z-app）",
+		code: "carrier-record-identity-mismatch",
 		pass: typeof record.name === "string" && record.name !== ""
 			&& record.version === carrierVersion(manifest?.plugin?.version ?? ""),
 		detail: `name=${record.name ?? "<缺失>"} version=${record.version ?? "<缺失>"}`,
 	});
 	checks.push({
 		name: "载体构建记录 file 与载体 tarball 文件名一致",
+		code: "carrier-record-file-mismatch",
 		pass: typeof record.file === "string" && record.file === path.basename(carrierFile),
 		detail: `记录=${record.file ?? "<缺失>"} 实际=${path.basename(carrierFile)}`,
 	});
@@ -555,18 +703,21 @@ export function carrierRecordChecks(record, { carrierFile, manifest }) {
 	const actualSha = stat ? sha256File(carrierFile) : "";
 	checks.push({
 		name: "载体 tarball 体积/哈希与构建记录一致（清单无法自指，故用构建记录）",
+		code: "carrier-record-carrier-mismatch",
 		pass: stat !== null && record.size === stat.size && record.sha256 === actualSha,
 		detail: `记录 size=${record.size ?? "<缺失>"} sha256=${record.sha256 ?? "<缺失>"}；实际 size=${stat?.size ?? "<缺失>"} sha256=${actualSha || "<缺失>"}`,
 	});
 	const recorded = record.manifest && typeof record.manifest === "object" ? record.manifest : {};
 	checks.push({
 		name: "构建记录 app 段身份与发布清单一致",
+		code: "carrier-record-manifest-app-mismatch",
 		pass: JSON.stringify(objectPick(recorded.app ?? {}, MANIFEST_APP_FIELDS))
 			=== JSON.stringify(objectPick(manifest?.app ?? {}, MANIFEST_APP_FIELDS)),
 		detail: "version/file/size/sha256",
 	});
 	checks.push({
 		name: "构建记录 plugin 段身份与发布清单一致",
+		code: "carrier-record-manifest-plugin-mismatch",
 		pass: JSON.stringify(objectPick(recorded.plugin ?? {}, MANIFEST_PLUGIN_FIELDS))
 			=== JSON.stringify(objectPick(manifest?.plugin ?? {}, MANIFEST_PLUGIN_FIELDS)),
 		detail: "version/file/size/sha256/contentSha256",
