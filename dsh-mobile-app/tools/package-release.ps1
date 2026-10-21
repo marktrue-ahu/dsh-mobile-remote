@@ -4,13 +4,26 @@
 # Run after: flutter build apk --release
 #   -CheckOnly [-DistDir <dir>] : only run the offline carrier publish preflight
 #                                 (no build, never runs npm publish).
+#   -DrillOnly [-DistDir <dir>] : only run the full release drill (local registry;
+#                                 no build, never publishes public npm).
+#   -Drill                      : after the normal build, run the full release drill;
+#                                 drill failure blocks the release (fail-closed).
 param(
     [switch]$CheckOnly,
+    [switch]$Drill,
+    [switch]$DrillOnly,
     [string]$DistDir = ''
 )
 $ErrorActionPreference = 'Stop'
 $appDir = Split-Path -Parent $PSScriptRoot   # dsh-mobile-app/
 $repoDir = Split-Path -Parent $appDir        # repo root
+
+if ($DrillOnly) {
+    $drillDir = if ($DistDir) { $DistDir } else { Join-Path $appDir 'dist' }
+    Write-Output ("Release drill only (no build, no npm publish): " + $drillDir)
+    node (Join-Path $PSScriptRoot 'npm-drill.mjs') --dist $drillDir --phases all
+    exit $LASTEXITCODE
+}
 
 if ($CheckOnly) {
     $checkDir = if ($DistDir) { $DistDir } else { Join-Path $appDir 'dist' }
@@ -114,6 +127,12 @@ if ($env:MANIFEST_VERSION) {
     #   npm publish <dist>\<name>-X.Y.Z-app.tgz --tag app
     node (Join-Path $PSScriptRoot 'publish-carrier-check.mjs') $dist
     if ($LASTEXITCODE -ne 0) { Write-Error "carrier publish preflight failed"; exit 1 }
+}
+
+if ($Drill) {
+    # Explicit -Drill: full release drill after build; failure blocks the release (fail-closed).
+    node (Join-Path $PSScriptRoot 'npm-drill.mjs') --dist $dist --phases all
+    if ($LASTEXITCODE -ne 0) { Write-Error "release drill failed - blocking publish"; exit 1 }
 }
 
 if ($env:UPDATE_DIR) {
