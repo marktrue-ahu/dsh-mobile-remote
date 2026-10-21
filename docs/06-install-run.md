@@ -295,7 +295,7 @@ flutter build apk --release
 > 首次构建需下载 Gradle 依赖（约 5-10 分钟）；若报 Kotlin 增量缓存损坏（`Could not close incremental caches`），`android/gradle.properties` 已设 `kotlin.incremental=false`，删除 `build` 与 `.dart_tool` 后重试。
 > 更换图标：把 1024×1024 PNG 覆盖到 `assets/icon-1024.png`，运行 `python tools/make_icon.py` 后重新构建。
 > 多品牌/兼容性注意事项见 docs/09-compatibility.md。
-> 完整构建命令、Google 下载代理配置、签名校验及 Gradle 常见问题见 [`10-android-build.md`](10-android-build.md)。
+> 完整构建命令、Google 下载代理配置、签名校验及 Gradle 常见问题见 [`11-android-build.md`](11-android-build.md)。
 
 ### 8.3 安装与使用
 1. 把 APK 传到手机（微信文件传输/网盘/USB），点击安装（需允许"安装未知来源应用"）。
