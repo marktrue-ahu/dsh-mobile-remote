@@ -21,7 +21,7 @@ $repoDir = Split-Path -Parent $appDir        # repo root
 if ($DrillOnly) {
     $drillDir = if ($DistDir) { $DistDir } else { Join-Path $appDir 'dist' }
     Write-Output ("Release drill only (no build, no npm publish): " + $drillDir)
-    node (Join-Path $PSScriptRoot 'npm-drill.mjs') --dist $drillDir --phases all
+    node (Join-Path $PSScriptRoot '../../tools/npm-drill.mjs') --dist $drillDir --phases all
     exit $LASTEXITCODE
 }
 
@@ -131,7 +131,7 @@ if ($env:MANIFEST_VERSION) {
 
 if ($Drill) {
     # Explicit -Drill: full release drill after build; failure blocks the release (fail-closed).
-    node (Join-Path $PSScriptRoot 'npm-drill.mjs') --dist $dist --phases all
+    node (Join-Path $PSScriptRoot '../../tools/npm-drill.mjs') --dist $dist --phases all
     if ($LASTEXITCODE -ne 0) { Write-Error "release drill failed - blocking publish"; exit 1 }
 }
 

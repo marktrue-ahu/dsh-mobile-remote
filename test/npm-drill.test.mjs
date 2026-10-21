@@ -1,6 +1,6 @@
 // 发版演练 CLI 的**离线**契约测试（issue #37 唯一 seam：命令行接口）。
 //
-// 只驱动 `dsh-mobile-app/tools/npm-drill.mjs` 的外部行为：退出码、`RESULT:`、逐条 PASS/FAIL、
+// 只驱动 `tools/npm-drill.mjs` 的外部行为：退出码、`RESULT:`、逐条 PASS/FAIL、
 // 稳定 reason、run.json 结构、证据目录与默认清理行为。全程不联网、不需要 Verdaccio。
 // 完整五阶段真实 registry 演练在 `test/npm-drill-e2e.test.mjs`（NPM_DRILL=1 才跑）。
 import assert from "node:assert/strict";
@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
-const CLI = join(ROOT, "dsh-mobile-app", "tools", "npm-drill.mjs");
+const CLI = join(ROOT, "tools", "npm-drill.mjs");
 const BUILDER = join(ROOT, "dsh-mobile-app", "tools", "build-app-carrier.mjs");
 // 确定性工具链：保留真实 PATH（需要 npm/pnpm/verdaccio），但剔除 Android SDK 目录，
 // 避免有 aapt 的开发机上把假 APK 当真实包实读。

@@ -12,13 +12,15 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { pluginContentDigest } from "../../../../lib/plugin-content-digest.js";
-import { sha256Buffer, sha256File, tarExtract } from "../release-checks.mjs";
+import { pluginContentDigest } from "../../../lib/plugin-content-digest.js";
+import { sha256Buffer, sha256File, tarExtract } from "../../../dsh-mobile-app/tools/lib/release-checks.mjs";
 import {
 	ensureDir, existsFile, linkOrCopyFile, readTextFile, runCommand, writeTextFile,
 } from "./process.mjs";
 
-const TOOLS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+// publish-carrier-check 属于 **App 发布链**（dsh-mobile-app/tools）：演练只读调用它。
+// 本模块位于仓库根 tools/lib/npm-drill/，故需跨到 dsh-mobile-app/tools。
+const TOOLS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../dsh-mobile-app/tools");
 
 /** 读取并校验发布目录的配对产物（清单 / 构建记录 / APK / 插件 tgz / 载体 tgz）。 */
 export function readDistAssets(distDir) {

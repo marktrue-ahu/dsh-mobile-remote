@@ -64,13 +64,14 @@ import { REGISTRY_PHASES, prepareProjection, PHASES } from "./lib/npm-drill/phas
 import { createDrillVersions, validateDrillVersions } from "./lib/npm-drill/versions.mjs";
 
 const TOOLS_DIR = path.dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = path.resolve(TOOLS_DIR, "../..");
+// 演练属于**插件发布**（tools/ 侧）：从仓库根 tools/npm-drill.mjs 运行，仓库根在上层。
+const REPO_ROOT = path.resolve(TOOLS_DIR, "..");
 const ALL_PHASES = ["preflight", ...REGISTRY_PHASES];
 
 const HELP_TEXT = `npm-drill — 发版演练（本地 registry，全程不接触公共 npm）
 
 用法:
-  node dsh-mobile-app/tools/npm-drill.mjs [选项]
+  node tools/npm-drill.mjs [选项]
 
 选项:
   --dist <目录>       发布产物目录（含 manifest.json / APK / 插件 tgz / carrier tgz / app-carrier.json）
@@ -97,9 +98,9 @@ const HELP_TEXT = `npm-drill — 发版演练（本地 registry，全程不接�
   失败时自动保留现场；成功默认清理临时现场，--keep 可保留。
 
 示例:
-  node dsh-mobile-app/tools/npm-drill.mjs --dist dsh-mobile-app/dist
-  node dsh-mobile-app/tools/npm-drill.mjs --dist dsh-mobile-app/dist --phases preflight
-  node dsh-mobile-app/tools/npm-drill.mjs --dist dsh-mobile-app/dist --phases publish,install --keep
+  node tools/npm-drill.mjs --dist dsh-mobile-app/dist
+  node tools/npm-drill.mjs --dist dsh-mobile-app/dist --phases preflight
+  node tools/npm-drill.mjs --dist dsh-mobile-app/dist --phases publish,install --keep
 `;
 
 class DrillSetupError extends Error {
@@ -412,7 +413,8 @@ async function main() {
 	if (options.build) {
 		const build = await runCommand({
 			command: "bash",
-			args: [path.join(TOOLS_DIR, "package-release.sh")],
+			// package-release.sh 属于 App 发布链（dsh-mobile-app/tools），本工具只调用不搬运。
+			args: [path.join(REPO_ROOT, "dsh-mobile-app", "tools", "package-release.sh")],
 			cwd: REPO_ROOT,
 			env: { ...process.env },
 			logFile: path.join(logsDir, "build.log"),
