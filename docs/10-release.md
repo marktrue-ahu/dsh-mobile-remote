@@ -194,6 +194,11 @@ node dsh-mobile-app/tools/verify-update-manifest.mjs dsh-mobile-app/dist \
 
 ## 6. 演练
 
+> 工具位置约定：**发布插件的工具在仓库根 `tools/`**（演练 `tools/npm-drill.mjs`）；
+> **发布 App 的工具在 `dsh-mobile-app/tools/`**（APK 构建、载体打包、发布预检、
+> `package-release.sh`）。演练属于插件发布，因此位于根 `tools/`。
+
+
 演练用临时本地 registry 完整预演发布与安装链路，**不接触公共 npm、不消耗任何公共版本号**。演练通过是正式发布的前置门禁。
 
 ### 6.1 前置
@@ -206,22 +211,22 @@ node dsh-mobile-app/tools/verify-update-manifest.mjs dsh-mobile-app/dist \
 
 ```bash
 # 完整演练（默认 --phases all；自动起本地 registry，退出销毁现场）
-node dsh-mobile-app/tools/npm-drill.mjs --dist dsh-mobile-app/dist
+node tools/npm-drill.mjs --dist dsh-mobile-app/dist
 
 # 只做离线预检阶段（不联网、不需要 Verdaccio）
-node dsh-mobile-app/tools/npm-drill.mjs --dist dsh-mobile-app/dist --phases preflight
+node tools/npm-drill.mjs --dist dsh-mobile-app/dist --phases preflight
 
 # 只跑某几段调试（更早的阶段作为静默前置自动执行；更晚的未选中阶段不执行）
-node dsh-mobile-app/tools/npm-drill.mjs --dist dsh-mobile-app/dist --phases publish,install
+node tools/npm-drill.mjs --dist dsh-mobile-app/dist --phases publish,install
 
 # 复用已有 registry（CI/调试；低上限实例仍由脚本本机启动）
-node dsh-mobile-app/tools/npm-drill.mjs --dist dsh-mobile-app/dist --registry http://127.0.0.1:4873
+node tools/npm-drill.mjs --dist dsh-mobile-app/dist --registry http://127.0.0.1:4873
 
 # 保留现场（工作目录、registry 存储、全部日志）
-node dsh-mobile-app/tools/npm-drill.mjs --dist dsh-mobile-app/dist --keep
+node tools/npm-drill.mjs --dist dsh-mobile-app/dist --keep
 
 # 演练前先构建（等价先跑 package-release.sh）
-node dsh-mobile-app/tools/npm-drill.mjs --dist dsh-mobile-app/dist --build
+node tools/npm-drill.mjs --dist dsh-mobile-app/dist --build
 
 # 与发布脚本集成（两步都要显式请求；默认构建流程不会自动跑演练）
 bash dsh-mobile-app/tools/package-release.sh --drill           # 正常构建后追加演练，失败即阻断

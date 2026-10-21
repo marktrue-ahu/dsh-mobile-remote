@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
-const CLI = join(ROOT, "dsh-mobile-app", "tools", "npm-drill.mjs");
+const CLI = join(ROOT, "tools", "npm-drill.mjs");
 const BUILDER = join(ROOT, "dsh-mobile-app", "tools", "build-app-carrier.mjs");
 const RELEASE_SH = join(ROOT, "dsh-mobile-app", "tools", "package-release.sh");
 // 确定性工具链：保留真实 PATH（需要 npm/pnpm/verdaccio），但剔除 Android SDK 目录，

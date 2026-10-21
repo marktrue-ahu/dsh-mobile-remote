@@ -5,9 +5,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { APP_CARRIER_STATUS, discoverAppCarrier } from "../../../../lib/app-carrier.js";
-import { pluginContentDigest } from "../../../../lib/plugin-content-digest.js";
-import { sha256Buffer, sha256File } from "../release-checks.mjs";
+import { APP_CARRIER_STATUS, discoverAppCarrier } from "../../../lib/app-carrier.js";
+import { pluginContentDigest } from "../../../lib/plugin-content-digest.js";
+import { sha256Buffer, sha256File } from "../../../dsh-mobile-app/tools/lib/release-checks.mjs";
 import {
 	ensureDir, existsDir, existsFile, isolatedEnv, readTextFile,
 } from "./process.mjs";
@@ -22,7 +22,6 @@ import {
 import { REASONS } from "./reasons.mjs";
 import { validateDrillVersions } from "./versions.mjs";
 
-const TOOLS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
 /** 断言包装：异常一律转成 FAIL（reason 兜底 drill-assertion-failed），并记录耗时。 */
 async function assertion(id, title, run) {

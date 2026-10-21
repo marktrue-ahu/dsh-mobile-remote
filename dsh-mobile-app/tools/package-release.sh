@@ -24,7 +24,7 @@ esac
 if [ "$mode" = "drill-only" ]; then
     drill_dist="${target_dir:-$app_dir/dist}"
     echo "Release drill only (no build, no npm publish): $drill_dist" >&2
-    exec node "$app_dir/tools/npm-drill.mjs" --dist "$drill_dist" --phases all
+    exec node "$repo_dir/tools/npm-drill.mjs" --dist "$drill_dist" --phases all
 fi
 
 # --check-only：不构建 APK/载体，只对已有发布目录做「发布前预检」（离线、绝不 publish）。
@@ -141,7 +141,7 @@ fi
 
 # 3.5) 显式 --drill：构建后跑完整发版演练；演练失败即阻断后续发布（fail-closed）。
 if [ "$mode" = "drill" ]; then
-    node "$app_dir/tools/npm-drill.mjs" --dist "$dist" --phases all || {
+    node "$repo_dir/tools/npm-drill.mjs" --dist "$dist" --phases all || {
         echo "release drill failed — blocking publish" >&2
         exit 1
     }
