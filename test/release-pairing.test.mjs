@@ -5,12 +5,14 @@
 //
 // 覆盖：正常顺序成功；逆序（缺插件 tgz / 先有载体再重打 tgz）失败；范围别名被拒；
 // 载体平台字段/入口/dsh.bundle/安装钩子被拒；两条版本不配对被拒；哈希不符被拒；
-// 发布顺序前置（缺载体 tarball 拒绝发布主包）；无 aapt 时显式降级并标注“未实读”。
+// 发布顺序前置（缺载体 tarball 拒绝发布主包）；无 aapt 时显式降级并标注“未实读”；
+// npm 载体发布前预检（publish-carrier-check）：发布元数据（tag=app/access/private/files）、
+// X.Y.Z ↔ X.Y.Z-app 版本配对、产物哈希与离线 `npm pack --dry-run` 的 PASS/FAIL 两条路径。
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import {
-	appendFile, chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile,
+	appendFile, chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -21,6 +23,7 @@ const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const BUILD = join(ROOT, "dsh-mobile-app", "tools", "build-app-carrier.mjs");
 const VERIFY = join(ROOT, "dsh-mobile-app", "tools", "verify-update-manifest.mjs");
 const GEN = join(ROOT, "dsh-mobile-app", "tools", "gen-manifest.js");
+const PUBLISH_CHECK = join(ROOT, "dsh-mobile-app", "tools", "publish-carrier-check.mjs");
 
 const PLUGIN_NAME = "@marktrue/dsh-mobile-remote";
 const PLUGIN_VERSION = "3.2.0";
@@ -96,6 +99,9 @@ async function makeFixture() {
 		version: PLUGIN_VERSION,
 		files: ["lib", "README.md", "LICENSE"],
 		optionalDependencies: { [CARRIER_ALIAS]: `npm:${PLUGIN_NAME}@${CARRIER_VERSION}` },
+		// 载体发布元数据继承来源（P3-A：license/repository 随载体发布）
+		license: "MIT",
+		repository: { type: "git", url: "git+https://example.com/fixture.git" },
 	};
 	await writeFile(join(pluginRoot, "package.json"), `${JSON.stringify(pluginPkg, null, 2)}\n`);
 	await writeFile(join(pluginRoot, "lib", "index.js"), "export const plugin = '3.2.0';\n");
@@ -159,6 +165,15 @@ function verifyPairing(fixture, extraArgs = [], { aapt = true } = {}) {
 	], { encoding: "utf8", env: toolEnv(fixture, { aapt }) });
 }
 
+/** 发布前预检 CLI（离线 dry-run，不发布）。 */
+function publishCheck(fixture, { aapt = true } = {}) {
+	return spawnSync(process.execPath, [
+		PUBLISH_CHECK,
+		fixture.dist,
+		"--package-json", fixture.mainPkgPath,
+	], { encoding: "utf8", env: toolEnv(fixture, { aapt }) });
+}
+
 function stdoutOf(resultOrStdout) {
 	return typeof resultOrStdout === "string" ? resultOrStdout : (resultOrStdout?.stdout ?? "");
 }
@@ -186,6 +201,14 @@ function assertFailLine(resultOrStdout, fragment) {
 	assert.ok(
 		matches.some((line) => line.includes(fragment)),
 		`期望出现含「${fragment}」的 FAIL 行，实际 FAIL 行：\n${matches.join("\n") || "<无>"}`,
+	);
+}
+
+function assertReasonLine(resultOrStdout, code) {
+	const matches = failLines(resultOrStdout);
+	assert.ok(
+		matches.some((line) => line.includes(`[reason:${code}]`)),
+		`期望出现带 [reason:${code}] 的 FAIL 行，实际 FAIL 行：\n${matches.join("\n") || "<无>"}`,
 	);
 }
 
@@ -263,6 +286,14 @@ test("正常顺序：先插件 tgz 后载体；清单/载体/APK/tgz 四者一�
 			"载体内的清单必须就是发布清单本身",
 		);
 		assert.deepEqual(await readFile(join(extracted.packageDir, APK_FILE)), APK_BYTES);
+
+		// npm 发布元数据（P3-A：载体发布到 npm，dist-tag 固定 app）
+		assert.equal(carrierPkg.private, false, "private 必须显式 false 才能 npm publish");
+		assert.deepEqual(carrierPkg.publishConfig, { access: "public", tag: "app" }, "dist-tag 固定 app，绝不用 latest");
+		assert.equal(carrierPkg.license, "MIT", "license 继承主包");
+		assert.equal(carrierPkg.repository?.url, "git+https://example.com/fixture.git", "repository 继承主包");
+		assert.ok(String(carrierPkg.description ?? "").trim() !== "", "description 非空");
+		assertPassLine(build, "publishConfig.tag 必须是 app");
 
 		// 严格发布门禁
 		const verify = verifyPairing(f);
@@ -558,4 +589,98 @@ test("主包 package.json：载体别名是当前版本的精确 npm 别名，�
 	assert.ok(!(pkg.bundleDependencies ?? []).includes(alias), "载体不得进 bundled 依赖");
 	assert.ok(!(pkg.bundledDependencies ?? []).includes(alias), "载体不得进 bundled 依赖");
 	assert.equal(pkg.dependencies?.[alias], undefined, "载体别名不得出现在普通 dependencies");
+});
+
+// ── 11. 发布前预检 PASS：发布元数据/版本配对/产物哈希/离线 dry-run 全通过，且不写盘、不发布 ──
+test("publish-carrier-check PASS：发布元数据/版本配对/产物哈希/离线 dry-run 全通过（不写盘、不发布）", async () => {
+	const f = await makeFixture();
+	try {
+		assertExitPass(buildCarrier(f), "基线载体应先构建成功");
+		const before = (await readdir(f.dist)).sort();
+
+		const check = publishCheck(f);
+		assertExitPass(check, "发布前预检应 PASS");
+		assert.match(check.stdout, /REASONS: none/);
+		assertPassLine(check, "publishConfig.tag 必须是 app");
+		assertPassLine(check, "发布版本与主插件版本严格配对");
+		assertPassLine(check, "npm pack --dry-run 成功（离线元数据检查，不发布、不落盘）");
+		assertPassLine(check, "dry-run 打包内容包含 APK 本体");
+		assertPassLine(check, "dry-run 打包内容恰为约定 5 个文件");
+		assertPassLine(check, "载体 tarball 体积/哈希与构建记录一致");
+		// 只打印发布方案（必须带 --tag app），绝不执行发布
+		assert.match(check.stdout, /--tag app/);
+		assert.match(check.stdout, /NOT executed by this check/);
+
+		// 预检必须零写盘：dry-run 不产出 tarball，不新增/删除 dist 文件
+		const after = (await readdir(f.dist)).sort();
+		assert.deepEqual(after, before, "发布前预检不得写盘");
+	} finally {
+		await rm(f.base, { recursive: true, force: true });
+	}
+});
+
+// ── 12. 发布前预检 FAIL：tag/private/access/版本不配对 → 稳定 reason ──────────────────
+test("publish-carrier-check FAIL：非法发布元数据（tag/private/access/版本）带稳定 reason 被拒", async () => {
+	const f = await makeFixture();
+	try {
+		assertExitPass(buildCarrier(f));
+		const variants = [
+			{ label: "tag-latest", reason: "carrier-publish-tag-not-app", mutate: (pkg) => { pkg.publishConfig.tag = "latest"; } },
+			{ label: "tag-missing", reason: "carrier-publish-tag-not-app", mutate: (pkg) => { delete pkg.publishConfig.tag; } },
+			{ label: "private-true", reason: "carrier-publish-private-not-false", mutate: (pkg) => { pkg.private = true; } },
+			{ label: "access-restricted", reason: "carrier-publish-access-not-public", mutate: (pkg) => { pkg.publishConfig.access = "restricted"; } },
+			{ label: "version-skew", reason: "carrier-version-pairing-mismatch", mutate: (pkg) => { pkg.version = "3.2.1-app"; } },
+		];
+		for (const variant of variants) {
+			const extracted = await extractCarrier(f, `publish-${variant.label}`);
+			try {
+				const pkgFile = join(extracted.packageDir, "package.json");
+				const pkg = JSON.parse(await readFile(pkgFile, "utf8"));
+				variant.mutate(pkg);
+				await writeFile(pkgFile, `${JSON.stringify(pkg, null, 2)}\n`);
+				await repackCarrier(extracted.root, f.carrierFile);
+				await refreshCarrierRecord(f);
+
+				const check = publishCheck(f);
+				assertExitFail(check, `发布前预检应拒绝：${variant.label}`);
+				assert.match(check.stdout, /REASONS: .+/);
+				assertReasonLine(check, variant.reason);
+			} finally {
+				await rm(extracted.root, { recursive: true, force: true });
+			}
+		}
+	} finally {
+		await rm(f.base, { recursive: true, force: true });
+	}
+});
+
+// ── 13. 发布前预检 FAIL：dist 产物不一致（APK / 构建记录）→ 稳定 reason ──────────────
+test("publish-carrier-check FAIL：APK 或构建记录被篡改/缺失 → 稳定 reason 被拒", async () => {
+	const f = await makeFixture();
+	try {
+		assertExitPass(buildCarrier(f));
+
+		// 13a) dist 内 APK 被追加字节 → 清单与 APK 哈希不符
+		await appendFile(f.apkPath, Buffer.from([0]));
+		const apkCheck = publishCheck(f);
+		assertExitFail(apkCheck, "APK 被篡改必须失败");
+		assertReasonLine(apkCheck, "apk-sha256-mismatch");
+		await writeFile(f.apkPath, APK_BYTES); // 恢复
+
+		// 13b) 构建记录里的载体 tarball 体积被改 → 与载体 tarball 实算不符
+		const record = JSON.parse(await readFile(f.recordPath, "utf8"));
+		record.size += 1;
+		await writeFile(f.recordPath, `${JSON.stringify(record, null, 2)}\n`);
+		const recordCheck = publishCheck(f);
+		assertExitFail(recordCheck, "构建记录被篡改必须失败");
+		assertReasonLine(recordCheck, "carrier-record-carrier-mismatch");
+
+		// 13c) 构建记录缺失 → 无法核对载体 tarball 体积/哈希
+		await rm(f.recordPath);
+		const missingCheck = publishCheck(f);
+		assertExitFail(missingCheck, "缺构建记录必须失败");
+		assertReasonLine(missingCheck, "carrier-record-missing");
+	} finally {
+		await rm(f.base, { recursive: true, force: true });
+	}
 });
