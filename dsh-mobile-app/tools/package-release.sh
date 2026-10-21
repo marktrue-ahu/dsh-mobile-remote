@@ -4,14 +4,32 @@
 #       设置 UPDATE_DIR=<插件 updateDir> 可将 APK+manifest 一并拷入主机更新目录。
 #       `bash ... --check-only [dist目录]`：只跑 npm 载体发布前预检（不构建、不发布），
 #       用于已有 dist（如 dsh-mobile-app/dist/local-3.2.0+57）的发布前确认。
+#       `bash ... --drill`：正常构建后**追加发版演练**（本地 registry）；演练失败即阻断后续发布。
+#       `bash ... --drill-only [dist目录]`：只演练、不构建；失败非零退出（用于预演/CI）。
+#       演练需要全局 Verdaccio（npm i -g verdaccio@6.10.6）；默认不跑（需显式请求）。
 set -euo pipefail
 
 app_dir="$(cd "$(dirname "$0")/.." && pwd)"
 repo_dir="$(cd "$app_dir/.." && pwd)"
 
+mode=""
+target_dir=""
+case "${1:-}" in
+    --check-only) mode="check-only"; target_dir="${2:-}" ;;
+    --drill-only) mode="drill-only"; target_dir="${2:-}" ;;
+    --drill) mode="drill" ;;
+esac
+
+# --drill-only：只对已有发布目录跑完整发版演练（不构建、不发布）。
+if [ "$mode" = "drill-only" ]; then
+    drill_dist="${target_dir:-$app_dir/dist}"
+    echo "Release drill only (no build, no npm publish): $drill_dist" >&2
+    exec node "$app_dir/tools/npm-drill.mjs" --dist "$drill_dist" --phases all
+fi
+
 # --check-only：不构建 APK/载体，只对已有发布目录做「发布前预检」（离线、绝不 publish）。
-if [ "${1:-}" = "--check-only" ]; then
-    check_dir="${2:-$app_dir/dist}"
+if [ "$mode" = "check-only" ]; then
+    check_dir="${target_dir:-$app_dir/dist}"
     echo "Publish preflight only (no build, no npm publish): $check_dir" >&2
     exec node "$app_dir/tools/publish-carrier-check.mjs" "$check_dir"
 fi
@@ -117,6 +135,14 @@ else
     #   npm publish <dist>/<name>-X.Y.Z-app.tgz --tag app
     node "$app_dir/tools/publish-carrier-check.mjs" "$dist" || {
         echo "carrier publish preflight failed" >&2
+        exit 1
+    }
+fi
+
+# 3.5) 显式 --drill：构建后跑完整发版演练；演练失败即阻断后续发布（fail-closed）。
+if [ "$mode" = "drill" ]; then
+    node "$app_dir/tools/npm-drill.mjs" --dist "$dist" --phases all || {
+        echo "release drill failed — blocking publish" >&2
         exit 1
     }
 fi

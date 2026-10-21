@@ -269,6 +269,9 @@ App = **原生 Flutter 应用**（非 WebView）：全部界面用 Flutter 原�
 ### 8.2 构建 APK
 
 前置：Flutter SDK（本项目用 3.47.0） + Android SDK。
+
+**构建、Release 签名、代理、Gradle/缓存排障与产物校验的完整步骤，统一见发布操作手册 [`docs/10-release.md`](10-release.md) §4（构建）与[附录 A（Android 构建与排障）](10-release.md#附录-aandroid-apk-构建与排障)。** 日常开发的最短路径：
+
 ```powershell
 cd dsh-mobile-app
 flutter analyze        # 应为 No issues found
@@ -276,23 +279,7 @@ flutter build apk --release
 # 产物：build\app\outputs\flutter-apk\app-release.apk
 ```
 
-**Release 签名（发布前必做）**：正式分发必须用你自己的 keystore（否则用的 debug 签名，且换签名=换应用、用户需卸载重装）：
-
-```powershell
-# ① 生成 keystore（记住密码；jks 与 key.properties 均已 gitignore，勿提交、勿丢失）
-keytool -genkeypair -v -keystore android/app/release.jks -keyalg RSA -keysize 2048 -validity 10950 -alias dsh
-
-# ② 写 android/key.properties
-# storePassword=<密码>
-# keyPassword=<密码>
-# keyAlias=dsh
-# storeFile=app/release.jks
-
-# ③ 构建（build.gradle.kts 自动读取 key.properties；不存在则回退 debug 签名）
-flutter build apk --release
-```
-
-> 首次构建需下载 Gradle 依赖（约 5-10 分钟）；若报 Kotlin 增量缓存损坏（`Could not close incremental caches`），`android/gradle.properties` 已设 `kotlin.incremental=false`，删除 `build` 与 `.dart_tool` 后重试。
+> 正式发布必须走 `docs/10-release.md`（含版本 bump、载体打包、预检、演练与发布顺序）；本文件不再重复签名/排障细节，避免两处维护。
 > 更换图标：把 1024×1024 PNG 覆盖到 `assets/icon-1024.png`，运行 `python tools/make_icon.py` 后重新构建。
 > 多品牌/兼容性注意事项见 docs/09-compatibility.md。
 ### 8.3 安装与使用

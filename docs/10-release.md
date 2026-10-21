@@ -1,0 +1,844 @@
+# 10 发布操作手册 — 从构建到正式发布
+
+> 版本：v1.0 · 适用仓库：`dsh-mobile-remote`（插件 + Flutter Android App）
+> 状态：本文件是**发布操作的唯一权威**。演练与预检由 `dsh-mobile-app/tools/` 下的工具实现；试发布与正式发布是**人工步骤**，须按仓库授权流程执行。
+> 本文件编号 10；Android 构建与排障全文并入[附录 A](#附录-aandroid-apk-构建与排障)，不再单独成篇。
+
+## 目录
+
+1. [适用范围与前置](#1-适用范围与前置)
+2. [发布前检查](#2-发布前检查)
+3. [版本 bump](#3-版本-bump)
+4. [构建](#4-构建)
+5. [预检](#5-预检)
+6. [演练](#6-演练)
+7. [试发布](#7-试发布)
+8. [正式发布](#8-正式发布)
+9. [发布后验证](#9-发布后验证)
+10. [失败处理与回滚](#10-失败处理与回滚)
+11. [记录与清理](#11-记录与清理)
+- [附录 A：Android APK 构建与排障](#附录-aandroid-apk-构建与排障)
+
+---
+
+## 1. 适用范围与前置
+
+### 1.1 三个术语（不得混用）
+
+| 术语 | 英文 | 做什么 | 是否接触公共 npm | 何时跑 |
+|---|---|---|---|---|
+| **预检** | preflight | 离线校验本地产物与元数据（清单/APK/载体 tarball/构建记录/发布字段/离线 `npm pack --dry-run`） | 否 | 构建后、发布前 |
+| **演练** | drill | 用**临时本地 registry** 真实跑一遍「发布 → 全新安装 → 载体发现 → 版本更新 → 失败路径」 | 否（只连 `127.0.0.1`） | 预检通过后、试发布/正式发布前 |
+| **试发布** | canary publish | 向**真实 npm** 发一次性包名或预发布版本，验证市场侧真实链路 | **是（需授权）** | 首次发版/大版本/链路变更时 |
+
+相关既有词汇：**发布清单**（`manifest.json`，配对权威）、**内容标识**（`plugin.contentSha256`）、**App 载体版本**（`X.Y.Z-app`，同包名预发布版本）。演练另有两个演练子域词汇：**演练 registry**（临时本地 Verdaccio 实例）、**演练版本**（`9.9.<随机补丁号>`，载体对应 `9.9.<补丁号>-app`；纯 X.Y.Z，不占正式版本线）。三词详细定义见 develop 的 `CONTEXT.md`（决策记录只落 develop，不在本分支重复）。
+
+### 1.2 发布产物
+
+一次正式发布形成以下产物（同一次发布、同一 HEAD）：
+
+| 产物 | 位置 | 说明 |
+|---|---|---|
+| App APK | `<dist>/DSH-Remote-v<X.Y.Z>.apk` | 正式签名；清单 `app` 段描述它 |
+| 主插件 tarball | `<dist>/dsh-mobile-remote-v<X.Y.Z>.tgz` | 由仓库根 `npm pack`；清单 `plugin` 段描述它 |
+| 发布清单 | `<dist>/manifest.json` | schema 1；`app` + `plugin` 两段 + 顶层兼容镜像 |
+| 载体 tarball | `<dist>/marktrue-dsh-mobile-remote-<X.Y.Z>-app.tgz` | 同包名 `X.Y.Z-app`；内含 APK + 清单 + 说明/许可；发布到 npm 的 `app` tag |
+| 构建记录 | `<dist>/app-carrier.json` | 载体 tarball 的体积/哈希与两段身份；本地证据，不上传 |
+| Release 三资产 | GitHub Release | 上面的清单 + APK + 主插件 tarball（逐字节一致） |
+
+### 1.3 环境前置
+
+| 依赖 | 要求 | 检查命令 |
+|---|---|---|
+| Node.js | ≥ 22.15（仓库开发基线 v24） | `node --version` |
+| npm | 11.x | `npm --version` |
+| pnpm | 11.x（演练安装用） | `pnpm --version` |
+| Verdaccio | **6.10.6**，全局安装（演练用，一次性） | `verdaccio --version` |
+| Flutter/Android SDK | 构建 App 时（见附录 A） | `flutter doctor -v` |
+| Git 工作区 | 发布 HEAD 干净；分支/版本经授权 | `git status --short` |
+
+安装演练依赖（只装一次，脚本不会自动安装）：
+
+```bash
+npm i -g verdaccio@6.10.6
+verdaccio --version   # 应输出 6.x
+```
+
+npm 全局前缀需可写（本机为 `~/.local`，已验证可用）；若 `EACCES`，先修 `npm config get prefix` 的权限，不要用 `sudo` 混装用户级工具。
+
+### 1.4 三条硬规则
+
+1. **公共版本号不可回收**：同一包名同一版本一旦发布，内容不可变、不可覆盖；发布失败/内容有误只能申请**新版本**重来。
+2. **先载体、后插件**：载体 `X.Y.Z-app` 必须先发布成功并可解析，再发布主插件 `X.Y.Z`（发布窗口内主插件 404 属预期 fail-closed）。
+3. **正式发布前必须演练通过**：`npm-drill` 演练失败一律阻断正式发布（本地工作流规则同步此门禁）。
+
+---
+
+## 2. 发布前检查
+
+按顺序执行；任一项不满足即停止，不放行发布。
+
+- [ ] 规划中的版本号 `<X.Y.Z>` 已在 npm 上确认**未占用**：`npm view @marktrue/dsh-mobile-remote versions --json`（只读网络操作）。
+- [ ] 当前分支与 HEAD 符合发布授权；`git status --short` 干净（或仅有不影响产物的明确变更）。
+- [ ] 版本三处一致（见 §3 校验命令）：根 `package.json` version、`dsh-mobile-app/pubspec.yaml` version、根 `package.json` 的载体别名。
+- [ ] `CHANGELOG.md` 已写本次发布条目（清单 `notes` 取最新 `##` 条目全文，缺条目构建会失败）。
+- [ ] 门禁测试通过：`node --test test/*.mjs`；App 侧 `cd dsh-mobile-app && flutter analyze && flutter test`。
+- [ ] 构建机环境就绪（附录 A）；签名 keystore 已备份、未丢失。
+- [ ] 演练环境就绪：`verdaccio --version`；且已在当前 HEAD 的发布目录上跑通 §6 演练（`RESULT: PASS`）。
+- [ ] 已取得本次**发布授权**（试发布与正式发布均需授权；本手册不代授权）。
+- [ ] 发布窗口内不再 rebase/改版本/重打产物；发布记录人、时间、版本已登记。
+
+---
+
+## 3. 版本 bump
+
+正式版本形如 `X.Y.Z`；App 内部构建号为递增的 `+N`（只增不减，防降级）。一次 bump 至少改四处：
+
+1. 根 `package.json`：`"version": "X.Y.Z"`。
+2. 根 `package.json` 载体别名（精确 npm 别名，禁 range）：
+
+   ```json
+   "optionalDependencies": {
+     "@marktrue/dsh-mobile-remote-app": "npm:@marktrue/dsh-mobile-remote@X.Y.Z-app"
+   }
+   ```
+
+3. `dsh-mobile-app/pubspec.yaml`：`version: X.Y.Z+N`（语义版本与插件一致，构建号递增）。
+4. `CHANGELOG.md`：新增 `## vX.Y.Z（build N，issues …）— 摘要` 条目（正文会进清单 `notes`）。
+
+校核（任一项不通过不得继续）：
+
+```bash
+node -e '
+const p=require("./package.json");
+const alias=p.optionalDependencies?.["@marktrue/dsh-mobile-remote-app"];
+const want=`npm:${p.name}@${p.version}-app`;
+if(alias!==want) throw new Error(`载体别名不精确: ${alias} != ${want}`);
+console.log("version:",p.version,"alias:",alias);
+'
+grep -nE '^version:' dsh-mobile-app/pubspec.yaml
+head -20 CHANGELOG.md
+```
+
+禁止：改已发布版本的任何字节；用 `latest`/范围写载体别名；只为让演练通过而改版本号。
+
+---
+
+## 4. 构建
+
+构建/签名/代理/Gradle/缓存/排障的完整细节在[附录 A](#附录-aandroid-apk-构建与排障)。本章只给发布流程需要的最短路径。
+
+### 4.1 一条命令产出全部发布产物
+
+```bash
+# 清场：确保 dist 内没有别的版本残留（只删本地产物目录，不影响仓库源码）
+rm -rf dsh-mobile-app/dist
+
+# 构建 APK（若已有正式签名 APK 可跳过，见附录 A.3）
+cd dsh-mobile-app
+flutter pub get && flutter analyze && flutter test
+flutter build apk --release
+cd ..
+
+# 打包：APK + 主插件 tgz + 完整配对清单 + App 载体 + 发布预检（fail-closed，含本地严格校验）
+bash dsh-mobile-app/tools/package-release.sh
+```
+
+产物在 `dsh-mobile-app/dist/`（见 §1.2）。脚本行为：先 `npm pack` 主插件，再由 tgz + APK 生成清单，最后打载体并跑**离线预检**；任何一步失败即非零退出，不产出可发布产物。
+
+> `UPDATE_DIR=<插件 updateDir>` 可把 APK + 清单 + 插件 tgz 拷入主机更新目录（人工区）。正式发布前确认目标目录，不要在宿主运行中重启验证时误清。
+
+### 4.2 测试 manifest（仅联调，不用于发布）
+
+反复验证 App 自动更新时可手工覆盖清单版本（APK 构建号保持不变，清单写更高 build）：
+
+```bash
+ALLOW_TEST_MANIFEST_VERSION=1 MANIFEST_VERSION="X.Y.Z+99" \
+  bash dsh-mobile-app/tools/package-release.sh
+```
+
+该通道**不构建载体、不走载体配对门禁**，脚本会打印 `WARN`；正式发布严禁设置这两个变量。
+
+> 分支侧文档只保留构建最短路径与排障附录；App 架构、安装、重建等日常说明仍看 `docs/06-install-run.md`。
+
+---
+
+## 5. 预检
+
+预检 = **离线**校验，不联网、不发布、不写盘（`npm pack --dry-run`）。两层：
+
+### 5.1 发布前预检（载体 npm 发布字段 + 产物一致性）
+
+```bash
+node dsh-mobile-app/tools/publish-carrier-check.mjs dsh-mobile-app/dist
+# 或：npm run release:carrier:check -- dsh-mobile-app/dist
+# 或：bash dsh-mobile-app/tools/package-release.sh --check-only dsh-mobile-app/dist
+```
+
+校验内容：载体发布元数据（`private=false`、`publishConfig.access=public`、`publishConfig.tag=app` 且非 latest、`files` 含 APK 与 `manifest.json`、version=`X.Y.Z-app` 且与主包版本配对、license/description/repository 齐备）；主包精确别名；清单 ↔ APK ↔ 构建记录 ↔ 载体 tarball 的 size/sha256；`npm pack --dry-run` 打包内容恰为 APK + 清单 + README + LICENSE + package.json。
+
+输出逐条 `PASS/FAIL`；失败行带稳定 reason（如 `carrier-publish-tag-not-app`），结尾 `RESULT: FAIL` 且退出码非 0。
+
+### 5.2 清单严格校验（发布目录内部一致性）
+
+```bash
+node dsh-mobile-app/tools/verify-update-manifest.mjs dsh-mobile-app/dist \
+  --require-carrier --package-json package.json
+```
+
+含发布顺序前置、APK 内部版本实读（环境有 `aapt`/`aapt2` 时）、载体字段红线、tgz 运行时闭包等。
+
+预检不通过 = 停止；修产物或版本后从头构建，**不要手工改 dist 内任何文件**。
+
+---
+
+## 6. 演练
+
+演练用临时本地 registry 完整预演发布与安装链路，**不接触公共 npm、不消耗任何公共版本号**。演练通过是正式发布的前置门禁。
+
+### 6.1 前置
+
+- 全局安装 Verdaccio（§1.3）；脚本只检查并提示，不自动安装。
+- 已构建好的发布目录（§4）；或加 `--build` 让演练先跑一次发布构建。
+- 演练本身不需要手机、不需要桌面版 GUI；预算 < 10 分钟。
+
+### 6.2 命令
+
+```bash
+# 完整演练（默认 --phases all；自动起本地 registry，退出销毁现场）
+node dsh-mobile-app/tools/npm-drill.mjs --dist dsh-mobile-app/dist
+
+# 只做离线预检阶段（不联网、不需要 Verdaccio）
+node dsh-mobile-app/tools/npm-drill.mjs --dist dsh-mobile-app/dist --phases preflight
+
+# 只跑某几段调试（更早的阶段作为静默前置自动执行；更晚的未选中阶段不执行）
+node dsh-mobile-app/tools/npm-drill.mjs --dist dsh-mobile-app/dist --phases publish,install
+
+# 复用已有 registry（CI/调试；低上限实例仍由脚本本机启动）
+node dsh-mobile-app/tools/npm-drill.mjs --dist dsh-mobile-app/dist --registry http://127.0.0.1:4873
+
+# 保留现场（工作目录、registry 存储、全部日志）
+node dsh-mobile-app/tools/npm-drill.mjs --dist dsh-mobile-app/dist --keep
+
+# 演练前先构建（等价先跑 package-release.sh）
+node dsh-mobile-app/tools/npm-drill.mjs --dist dsh-mobile-app/dist --build
+
+# 与发布脚本集成（两步都要显式请求；默认构建流程不会自动跑演练）
+bash dsh-mobile-app/tools/package-release.sh --drill           # 正常构建后追加演练，失败即阻断
+bash dsh-mobile-app/tools/package-release.sh --drill-only      # 只演练已有 dist（不构建、不发布）
+```
+
+> 维护者/CI：默认测试套件用 `--phases preflight` 覆盖离线 CLI 契约（不联网、不需要 Verdaccio）；
+> 完整五阶段演练用 opt-in 开关：`NPM_DRILL=1 node --test test/npm-drill-e2e.test.mjs`。
+
+CLI 契约：
+
+| 参数 | 含义 |
+|---|---|
+| `--dist <dir>` | 发布产物目录（默认 `dsh-mobile-app/dist`） |
+| `--phases <list>` | `preflight,publish,install,discover,update,failure` 或 `all`；默认 `all` |
+| `--registry <url>` | 复用已有 registry（跳过启动正常实例） |
+| `--keep` | 保留演练现场（默认成功后退毁临时现场） |
+| `--build` | 演练前先执行发布构建 |
+| `-h/--help` | 帮助 |
+
+### 6.3 五阶段与 20 条断言
+
+| 阶段 | 断言 | 验收内容 |
+|---|---|---|
+| **发布**（publish） | A1–A4 | A1 registry 存活；A2 插件发布成功且可查询；A3 载体发布成功，dist-tags 中 `app`→载体、`latest`→插件、载体不在 `latest`；A4 重复发布同版本被拒 |
+| **全新安装**（install） | A5–A10 | A5 全新隔离 HOME + 新 profile 安装主插件成功；A6 载体别名目录存在；A7 别名目录 `package.json` 的真实 name/version 正确且带 `dsh.appCarrier` 标记；A8 载体内 APK size+sha256 与清单一致；A9 lockfile 记录别名 mapping；A10 `.modules.yaml` 的 hoisted 位置映射包含载体 |
+| **真实布局发现**（discover） | A11–A13 | A11 实际安装布局下载体发现返回 found 且来源为插件自身作用域；A12 载体清单 App 版本的**构建号**与发布目录清单一致、APK 身份（file/size/sha256）一致（语义版本被投影为演练版本）；A13 插件内容标识与清单 `plugin.contentSha256` 一致 |
+| **版本更新**（update） | A14–A16 | A14 发布第二对新版本成功；A15 原安装更新成功，别名目录版本变为新载体版本；A16 旧载体被替换，再次发现得到新版本 |
+| **失败路径**（failure） | A17–A20 | A17 只发插件不发载体：安装不报错但别名目录缺失，发现结果为「载体未安装」；A18 载体发布元数据不合规时预检以稳定 reason 失败；A19 版本配对错误时预检以稳定 reason 失败；A20 低上限（10mb）registry 发布大体量载体失败（E413 类） |
+
+离线阶段 `preflight`（`--phases preflight`）另有辅助断言：发布目录完整且预检通过、演练版本命名合法。默认测试套件只跑该离线阶段，不联网。
+
+### 6.4 演练版本与隔离
+
+- 演练版本：`9.9.<随机补丁号>`，载体对应 `9.9.<补丁号>-app`；第二对版本用**不同补丁号**；跨次运行互不冲突，也不会被误认为正式版本。
+  > 为什么不是 issue 建议的 `9.9.9-drill.<随机后缀>`：运行时载体发现（`lib/app-carrier.js`）要求插件版本为**纯 X.Y.Z**、且载体清单 `app.version` 的语义部分等于插件版本；预发布版本会把这些「发现/更新」断言误判成版本不符。演练清单因此把 app 版本语义部分投影为演练版本、保留原构建号与 APK 字节身份（见断言 A12）。
+- 演练 registry：临时 Verdaccio，`127.0.0.1:<随机空闲端口>`，数据目录在仓库外；正常实例 `max_body_size: 200mb`；失败路径另起 10mb 上限实例复现 E413；无 uplink，不代理公共源。
+- 演练 HOME/安装目录：独立临时目录，不影响本机 `~/.dsh`、运行中 profile 与 pnpm store。
+- 演练退出：默认销毁临时 registry 与安装现场；失败时保留证据目录（便于贴 issue）。`--keep` 保留全部现场。
+
+### 6.5 输出、记录与 reason
+
+- 逐条 `PASS/FAIL`（失败行带 `[reason:drill-*]`）+ 阶段摘要 + `RESULT: PASS|FAIL` + `REASONS:` + `EVIDENCE:`（证据目录）+ 退出码非 0 即失败。
+- 运行记录：`<状态目录>/drill/<UTC时间>-<演练版本>/run.json`（阶段/断言/结果/reason/耗时）+ registry 与包管理器日志。状态目录默认 `~/.dsh/mobile-remote/drill`（可用 `DSH_DRILL_STATE_DIR` 覆盖）。
+- 常见 reason：`drill-registry-not-installed`（未装 Verdaccio）、`drill-registry-start-failed`、`drill-publish-failed`、`drill-dist-tag-mismatch`、`drill-install-failed`、`drill-carrier-alias-missing`、`drill-plugin-digest-mismatch`、`drill-e413-not-reproduced` 等；完整词表见脚本头部注释。
+
+### 6.6 失败时
+
+1. 看证据目录下日志：`verdaccio-*.log`、`npm-publish-*.log`、`pnpm-*.log`。
+2. 修代码/产物/环境后**重新构建**再跑；不要手工改 registry 数据或安装目录绕过断言。
+3. 演练失败不得进入正式发布；若失败原因属于工具缺陷，先在分支修复并补测试。
+
+---
+
+## 7. 试发布
+
+> **需授权**：试发布会向真实 npm 发布内容。未经明确授权不得执行。本手册不实现自动化。
+
+目的：验证公共 npm 的真实接收、镜像同步与 dist-tag 行为（本地演练无法覆盖这些）。两种形态二选一：
+
+### 7.1 形态一：预发布版本（推荐，常规试发布）
+
+在正式版本之前发一个预发布版本（同一包名，加 `canary` dist-tag），例如 `X.Y.(Z+1)-canary.1`：
+
+```bash
+# 授权后，仅人工执行；先载体后插件
+npm publish <dist>/<carrier-canary.tgz> --tag canary
+npm view @marktrue/dsh-mobile-remote dist-tags --json    # canary 指向载体，latest 不变
+npm publish <dist>/<plugin-canary.tgz> --tag canary
+npm view @marktrue/dsh-mobile-remote dist-tags --json    # canary 指向插件，latest 不变
+```
+
+风险：预发布版本同样**不可回收**；`latest` 必须保持不变；发布前用 §5 预检 + §6 演练确认产物。
+
+### 7.2 形态二：一次性包名（验证大包接收/镜像）
+
+用一个**一次性包名**（如 `@marktrue/dsh-mobile-remote-canary-<日期>`）发布载体同规模 tarball，验证公共 registry 的请求体/体积上限与镜像可取性。**不要**用正式包名做体积实验。
+
+风险与边界：
+
+- 版本号一旦发布**不可回收**；即使 72 小时内 `npm unpublish`，也可能已被镜像/缓存（见下）。
+- 公共 registry 对 `unpublish` 有严格限制：超过 72 小时的版本一般不可 unpublish；同包名下删除/重发策略受 npm 政策约束，且强力删包后同名可能长期不可复用。
+- 一次性包名会在公共 npm 长期可见（镜像站可能长期保留），命名需可识别为试验包并写清用途/回收说明。
+- 任何试发布前必须：授权 → 预检通过 → 演练通过 → 记录包名/版本/时间；试发布后立即核验 `npm view` 与镜像可取性。
+
+> 试发布只是**真源补充**，不能替代演练（演练覆盖安装/别名/更新；试发布覆盖公共接收与镜像）。
+
+---
+
+## 8. 正式发布
+
+前提：§5 预检通过、§6 演练通过（`RESULT: PASS`，或使用 `package-release.sh --drill` 由脚本阻断失败）、§7 试发布（如需要）通过、已取得发布授权。
+
+### 8.1 发布顺序（不可交换）
+
+1. **先发载体**（`app` tag，绝不 latest）：
+
+   ```bash
+   npm publish dsh-mobile-app/dist/marktrue-dsh-mobile-remote-X.Y.Z-app.tgz --tag app
+   ```
+
+2. **核验 registry 中的载体**（不能只看退出码）：
+
+   ```bash
+   npm view @marktrue/dsh-mobile-remote@X.Y.Z-app version dist.tarball --json
+   npm view @marktrue/dsh-mobile-remote dist-tags --json
+   # 期望：app = X.Y.Z-app；latest 仍指向上一个主插件版本
+   ```
+
+   若使用镜像/企业源，确认该版本已可取得（镜像同步可能需要时间）。
+
+3. **发布同一份主插件 tgz**（`latest`，禁止重打）：
+
+   ```bash
+   npm publish dsh-mobile-app/dist/dsh-mobile-remote-vX.Y.Z.tgz
+   npm view @marktrue/dsh-mobile-remote dist-tags --json    # latest = X.Y.Z
+   ```
+
+4. **发布 Release 三资产**（同一清单、同一 APK、同一主插件 tgz；文件名/大小/哈希逐字节一致）。
+5. **记录结果**：两次发布各自的耗时/结果/公开 URL；失败与部分成功按 §10 处理。
+
+### 8.2 发布窗口注意事项
+
+- 载体已发、主插件未发期间，`pnpm add @marktrue/dsh-mobile-remote` 会 404——这是**预期 fail-closed**（防止装到没有配对载体的插件），不是故障；尽快完成第 3 步。
+- 跨 npm/Release 无原子事务：任何一步成功都算部分完成；重试只能复用**已成功的同一内容**，已发布版本禁止覆盖。
+- 网关/镜像的企业环境要额外确认 npm 客户端配置（`npm config get registry`），不要误发到企业内部源。
+- 发布期间不要改分支、不要重跑构建；如需重来必须申请新版本。
+
+---
+
+## 9. 发布后验证
+
+依次核验（只读）：
+
+1. **registry 元数据**：`npm view @marktrue/dsh-mobile-remote dist-tags versions --json`；确认 `latest=X.Y.Z`、`app=X.Y.Z-app`、载体不在 `latest`。
+2. **字节一致**：`npm view @marktrue/dsh-mobile-remote@X.Y.Z dist.integrity` 与本地 `sha512` 一致；`npm view ... dist.tarball` 下载后 sha256 与本地 tgz 一致；载体同理。
+3. **镜像可取性**：在有代表性的镜像/网络环境重试上述查询与下载（记录耗时）。
+4. **全新安装冒烟**：在隔离 HOME/新目录 `pnpm add @marktrue/dsh-mobile-remote@X.Y.Z`，确认载体别名目录存在且版本为 `X.Y.Z-app`、APK 哈希与清单一致。
+5. **Release 三资产**：GitHub Release 的清单/APK/插件 tgz 与本地 dist 逐字节一致（sha256）。
+6. **宿主更新目录**：如使用 `UPDATE_DIR`，确认清单/APK/tgz 已落位且 `manifest.json` 可解析；宿主重启后更新入口可用。
+7. **真机**：按 `docs/06-install-run.md` 手工验证 App 更新/首装（本手册不自动化真机），记录机型、网络与结果。
+8. **回滚预案**：确认上一版本插件 tgz/载体/APK 仍可取得（本地 dist 与 Release 记录），并知道回滚操作（§10）。
+
+---
+
+## 10. 失败处理与回滚
+
+### 10.1 发布失败分类
+
+| 现象 | 判断 | 处理 |
+|---|---|---|
+| 预检失败（`RESULT: FAIL` + reason） | 本地产物/元数据问题 | 修产物后重新构建；禁止手改 dist |
+| 演练失败 | 安装/别名/dist-tag/更新链路问题 | 按 reason + 证据日志修复；重跑演练 |
+| `E403`/`EPUBLISHCONFLICT`（版本已存在） | 同版本已发布（不可覆盖） | 申请**新版本**；如属误发立即评估 unpublish 政策，不静默覆盖 |
+| `E413`（请求体过大） | registry 体积上限 | 换用支持大包的 registry 配置/方案；记录证据，回到方案选择 |
+| 载体已发、主插件失败 | 部分成功（预期 fail-closed 窗口） | 修因后用**同一 tgz** 重试；不得重打；记录部分成功 |
+| 宿主拉不到/装不上 | 镜像滞后或版本选择问题 | 核验镜像可取性；给出诊断与手工兜底路径（见 §9） |
+
+### 10.2 回滚
+
+- **未发布前**：直接放弃本次产物，回到构建前状态；已 bump 的版本号若未发布可复用，但需重新走完整门禁。
+- **已发布后**：公共版本不可撤销，所谓回滚是**运行时回退**：
+  1. 插件回滚：按既有自更新/监督器回滚机制恢复旧版本；恢复后按**已恢复实例的内容标识与健康结果**重新选择旧配对发布（不按版本号猜）。
+  2. 载体/APK：旧载体仍可从 npm 下载（版本不可变）；本机 dist 与 Release 记录需保留至少一个发布周期。
+  3. App：不自动降级已装 App；如需降级须人工卸载重装并重扫连接码。
+  4. 记录：在发布记录中写明回滚时间、原因、恢复版本与验证结果。
+
+> 应急手工兜底：从受信发布源/维护者取得**同一次发布**的 APK + 完整清单，放入人工区（宿主不自动改写人工区），经导入校验后服务；不要用其他版本的 APK 顶替。
+
+---
+
+## 11. 记录与清理
+
+### 11.1 每次发布必须记录
+
+- 版本号、App 构建号、发布 UTC 时间、操作者与授权依据。
+- 发布 HEAD（`git rev-parse HEAD`）、分支、工作区是否干净。
+- 产物身份：清单 `app.sha256`/`plugin.sha256`/`plugin.contentSha256`、载体 tarball sha256+size、插件 tgz sha256+size。
+- 演练结果：`run.json` 路径、`RESULT`、耗时、失败 reason（如有）。
+- 试发布（如有）：包名、版本、dist-tag、unpublish 窗口、镜像核验结果。
+- 正式发布：两次 `npm publish` 的结果与 registry 核验输出、Release URL、部分成功状态。
+- 回滚（如有）：原因、时间、恢复版本、验证结果。
+
+建议把本次 `dist/` 的 `app-carrier.json`、`manifest.json`、`publish-carrier-check`/`npm-drill` 输出一并归档到发布记录目录（仓库外）。
+
+### 11.2 清理
+
+- **演练现场**：默认成功后自动销毁临时 registry 与安装目录（只保留 `run.json` 与日志）；`--keep` 保留现场，确认无用后手动删除状态目录下对应 `<UTC>-<演练版本>`。
+- **本地产物**：`dsh-mobile-app/dist/` 为 gitignored 本地产物；发布完成后可保留最新一份用于回滚，其余旧版本按磁盘情况清理。
+- **临时目录**：确认没有遗留 Verdaccio 进程（`ss -ltn | grep <端口>`）或工作目录；异常退出时按证据目录手工清理。
+- **敏感物**：keystore（`android/app/release.jks`）、`android/key.properties`、npm token 绝不提交、不写入日志/清单/文档；发布记录里只记 token 来源，不记值。
+- **不可清理**：已发布到 npm 的版本与 Release 资产不可删除（除按 npm 政策在 72h 内 unpublish 的特例，且需授权与记录）。
+
+---
+
+## 附录 A：Android APK 构建与排障
+
+> 本附录由原「Android APK 构建与排障指南」全文并入发布手册（发布主流程见 §4）；内容未删减，标题层级与编号调整为 A.x 以适配附录。构建环境/代理/Gradle/签名等问题优先查本附录，再回 §4。
+
+本文记录 `dsh-mobile-app` 的 Android Release APK 构建流程，以及首次构建、网络代理、Gradle、缓存和签名相关的常见问题。每个 shell 代码块均假定从仓库根目录独立执行，代码块内另有 `cd` 时除外。
+
+
+### A.1 当前构建基线
+
+| 组件 | 当前项目使用版本 |
+|---|---|
+| Flutter | 3.47.1 stable（项目要求 3.47+） |
+| Dart | 3.13.1（`pubspec.yaml` 要求 `^3.13.0`） |
+| JDK | 17 |
+| Android Gradle Plugin | 9.1.0 |
+| Gradle Wrapper | 9.3.1 |
+| Kotlin | 2.4.0 |
+
+以仓库中的 `pubspec.yaml`、`android/settings.gradle.kts` 和 Gradle Wrapper 配置为准。升级 Flutter、AGP、Gradle 或 Kotlin 时应一起验证，避免只升级其中一项。
+
+### A.2 构建前检查
+
+确认 Flutter、Java 和 Android SDK 可用：
+
+```bash
+flutter --version
+java -version
+flutter doctor -v
+```
+
+如果工具安装在自定义目录，可在当前终端临时设置：
+
+```bash
+export JAVA_HOME=/path/to/jdk17
+export ANDROID_HOME=/path/to/android-sdk
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+export PATH="/path/to/flutter/bin:$JAVA_HOME/bin:$PATH"
+```
+
+`dsh-mobile-app/android/local.properties` 至少应包含本机 SDK 路径，例如：
+
+```properties
+sdk.dir=/path/to/android-sdk
+flutter.sdk=/path/to/flutter
+```
+
+`local.properties` 是本机文件，已被 Git 忽略，不应提交。
+
+### A.3 标准 Release 构建
+
+推荐通过 Flutter CLI 构建：
+
+```bash
+cd dsh-mobile-app
+flutter pub get
+flutter analyze
+flutter test
+flutter build apk --release
+```
+
+成功标志：命令退出码为 0，并出现 `Built ...app-release.apk`。标准产物位于：
+
+```text
+dsh-mobile-app/build/app/outputs/flutter-apk/app-release.apk
+```
+
+若只需直接调用 Android 构建链，也可使用：
+
+```bash
+cd dsh-mobile-app/android
+./gradlew :app:assembleRelease --no-daemon --console=plain --max-workers=2
+```
+
+直接调用 Gradle 时，产物通常位于：
+
+```text
+dsh-mobile-app/build/app/outputs/apk/release/app-release.apk
+```
+
+直接 Gradle 构建适合排查具体 Android 任务；日常发布仍建议使用 Flutter CLI。
+
+### A.3.1 测试构建：APK 版本不变，manifest 使用 `+99`
+
+需要反复验证主机源自动更新时，保持 `pubspec.yaml` 和 APK 内置版本不变，只覆盖 manifest 的版本号。例如当前 APK 为 `3.1.5+22`，测试 manifest 使用 `3.1.5+99`。
+
+```bash
+cd dsh-mobile-app
+flutter analyze
+flutter test
+flutter build apk --release
+
+# MANIFEST_VERSION 是显式测试覆盖，必须保持语义版本并提高 build 号
+ALLOW_TEST_MANIFEST_VERSION=1 \
+MANIFEST_VERSION="3.1.5+99" \
+UPDATE_DIR="$HOME/.dsh/mobile-remote/update" \
+bash tools/package-release.sh
+```
+
+Windows PowerShell：
+
+```powershell
+$env:ALLOW_TEST_MANIFEST_VERSION = '1'
+$env:MANIFEST_VERSION = '3.1.5+99'
+$env:UPDATE_DIR = "$HOME/.dsh/mobile-remote/update"
+.\tools\package-release.ps1
+Remove-Item Env:ALLOW_TEST_MANIFEST_VERSION, Env:MANIFEST_VERSION, Env:UPDATE_DIR
+```
+
+验收：检查 `updateDir/manifest.json` 的 `version` 为 `3.1.5+99`，并校验其中的 `sha256`、`size` 与 APK 一致；更新完成后可再次执行同一流程重复测试。只有显式设置 `ALLOW_TEST_MANIFEST_VERSION=1` 才允许覆盖；正式发布不得设置该变量，发布脚本还会要求测试 manifest 与 APK 语义版本一致且 build 更大。测试结束后清理测试 manifest 并恢复正式版本。
+
+### A.4 Google 下载必须走本地代理
+
+首次构建会从 Google Storage 下载 Flutter Android 引擎和其他依赖。当前环境使用 HTTP 代理：
+
+```text
+http://127.0.0.1:1080/
+```
+
+#### A.4.1 Linux / WSL
+
+先设置通用代理环境变量：
+
+```bash
+export HTTP_PROXY=http://127.0.0.1:1080
+export HTTPS_PROXY=http://127.0.0.1:1080
+export http_proxy="$HTTP_PROXY"
+export https_proxy="$HTTPS_PROXY"
+export NO_PROXY=localhost,127.0.0.1
+export no_proxy="$NO_PROXY"
+```
+
+Java/Gradle 不一定只读取 `HTTP_PROXY`，因此构建时同时传入 JVM 代理参数：
+
+```bash
+cd dsh-mobile-app/android
+./gradlew :app:assembleRelease \
+  --no-daemon \
+  --console=plain \
+  --max-workers=2 \
+  -Dhttp.proxyHost=127.0.0.1 \
+  -Dhttp.proxyPort=1080 \
+  -Dhttps.proxyHost=127.0.0.1 \
+  -Dhttps.proxyPort=1080
+```
+
+通过 Flutter CLI 构建时，可将 JVM 参数放入 `GRADLE_OPTS`：
+
+```bash
+export GRADLE_OPTS="-Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=1080 -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=1080"
+cd dsh-mobile-app
+flutter build apk --release
+```
+
+#### A.4.2 Windows PowerShell
+
+```powershell
+$env:HTTP_PROXY = "http://127.0.0.1:1080"
+$env:HTTPS_PROXY = "http://127.0.0.1:1080"
+$env:GRADLE_OPTS = "-Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=1080 -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=1080"
+
+cd dsh-mobile-app
+flutter build apk --release
+```
+
+#### A.4.3 持久化 Gradle 代理（可选）
+
+如果该机器始终需要代理，可写入用户级 `~/.gradle/gradle.properties`：
+
+```properties
+systemProp.http.proxyHost=127.0.0.1
+systemProp.http.proxyPort=1080
+systemProp.https.proxyHost=127.0.0.1
+systemProp.https.proxyPort=1080
+```
+
+这是机器级配置，不要将个人代理配置写入项目的 `android/gradle.properties` 后提交。
+
+#### A.4.4 验证代理
+
+先确认代理能访问 Flutter Storage：
+
+```bash
+curl -x http://127.0.0.1:1080 \
+  -I --max-time 15 \
+  https://storage.googleapis.com/download.flutter.io/
+```
+
+返回 `HTTP/2 200` 或其他有效 HTTP 响应，说明代理链路可用。构建期间可检查 Gradle 是否连接代理：
+
+```bash
+ss -tpn | rg '127\.0\.0\.1:1080'
+```
+
+### A.5 干净重建
+
+普通代码修改不需要每次清理。遇到缓存异常或需要确认可重复构建时执行：
+
+```bash
+cd dsh-mobile-app
+flutter clean
+flutter pub get
+flutter analyze
+flutter test
+flutter build apk --release
+```
+
+也可以只清理 Android 产物：
+
+```bash
+cd dsh-mobile-app/android
+./gradlew clean --no-daemon --console=plain
+```
+
+不要把删除整个 `~/.gradle/caches` 作为首选方案；这会使所有 Gradle 和 Flutter 引擎依赖重新下载。
+
+### A.6 Release 签名
+
+正式分发必须使用固定的 release keystore。若 `android/key.properties` 不存在，项目会回退到 Debug 证书，仅适合本机测试。
+
+生成 keystore：
+
+```bash
+cd dsh-mobile-app
+keytool -genkeypair -v \
+  -keystore android/app/release.jks \
+  -keyalg RSA \
+  -keysize 2048 \
+  -validity 10950 \
+  -alias dsh
+```
+
+创建 `android/key.properties`：
+
+```properties
+storePassword=<密码>
+keyPassword=<密码>
+keyAlias=dsh
+storeFile=app/release.jks
+```
+
+`release.jks` 与 `key.properties` 均已被 Git 忽略。不要提交，也必须安全备份；丢失或更换 keystore 后，已安装旧版本的用户无法直接覆盖升级。
+
+检查 APK 签名：
+
+```bash
+APP_ROOT="$(git rev-parse --show-toplevel)/dsh-mobile-app"
+APK="$APP_ROOT/build/app/outputs/flutter-apk/app-release.apk"
+APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner -print | sort -V | tail -1)"
+"$APKSIGNER" \
+  verify --verbose --print-certs "$APK"
+```
+
+至少应看到 `Verifies`、签名方案结果和正确的证书摘要。`CN=Android Debug` 表示当前使用的是 Debug 回退签名，不应作为正式发布包。如果 `APKSIGNER` 为空，请先通过 Android SDK Manager 安装 Android SDK Build-Tools。
+
+### A.7 产物校验
+
+构建完成后建议记录文件大小、SHA-256 和签名信息：
+
+```bash
+APK="$(git rev-parse --show-toplevel)/dsh-mobile-app/build/app/outputs/flutter-apk/app-release.apk"
+stat "$APK"
+sha256sum "$APK"
+file "$APK"
+```
+
+发布前还应确认：
+
+- `pubspec.yaml` 中的 `version: X.Y.Z+BUILD` 正确；
+- 使用预期的 release 证书，而不是 Debug 证书；
+- SHA-256 与发布清单一致；
+- 用相同签名覆盖安装旧版本成功；
+- 自动更新的检查、下载、签名预检和安装流程已真机验证。
+
+### A.8 常见问题与处理办法
+
+#### A.8.1 构建长时间停在 `:app:mergeReleaseNativeLibs`
+
+**现象**：普通日志只显示以下一行，数分钟没有新输出：
+
+```text
+> Task :app:mergeReleaseNativeLibs
+```
+
+**常见原因**：Gradle 正在后台下载 Flutter 的 ARMv7、ARM64 和 x86_64 引擎 JAR。普通日志不显示下载进度，看起来像死锁。本项目曾在这里等待，实际请求地址为 `storage.googleapis.com/download.flutter.io`。
+
+**诊断**：
+
+```bash
+cd dsh-mobile-app/android
+./gradlew :app:mergeReleaseNativeLibs \
+  --no-daemon --console=plain --max-workers=2 --info
+```
+
+若 `--info` 输出出现 `Downloading https://storage.googleapis.com/...`，说明任务没有死锁，只是在下载。
+
+**处理**：按附录 A.4同时配置环境变量和 JVM 代理参数，然后保持单个构建进程运行。首次下载可能需要 5～15 分钟；缓存完成后后续构建会明显加快。
+
+#### A.8.2 `curl` 能走代理，但 Gradle 仍然很慢或超时
+
+**原因**：代理环境变量只证明 `curl` 配置正确，Java/Gradle 可能未读取它们。
+
+**处理**：除 `HTTP_PROXY` 和 `HTTPS_PROXY` 外，再设置 `GRADLE_OPTS`，或向 Gradle 传入以下参数：
+
+```text
+-Dhttp.proxyHost=127.0.0.1
+-Dhttp.proxyPort=1080
+-Dhttps.proxyHost=127.0.0.1
+-Dhttps.proxyPort=1080
+```
+
+`proxyHost` 只写主机名或 IP，不要写 `http://`；协议只出现在 `HTTP_PROXY` 的 URL 中。
+
+#### A.8.3 多个 Gradle 构建互相等待或提示锁被占用
+
+**现象**：日志出现 cache lock、daemon busy，或多个构建都没有进度。
+
+**处理**：不要同时运行多个 Flutter/Gradle 构建。先确认进程：
+
+```bash
+pgrep -af 'GradleDaemon|GradleWrapperMain|flutter'
+```
+
+停止当前项目的 Gradle daemon：
+
+```bash
+cd dsh-mobile-app/android
+./gradlew --stop
+```
+
+确认旧构建已退出后，只启动一个新构建。不要盲目结束系统中属于其他项目的 Java 进程。
+
+#### A.8.4 Kotlin 增量缓存损坏
+
+**现象**：出现 `Could not close incremental caches`、缓存文件无法关闭或增量编译状态异常。
+
+**处理**：项目已在 `android/gradle.properties` 设置 `kotlin.incremental=false`。若仍发生：
+
+```bash
+cd dsh-mobile-app
+flutter clean
+flutter pub get
+flutter build apk --release
+```
+
+#### A.8.5 `flutter: command not found`、`java: not found` 或 JDK 版本错误
+
+**处理**：把 Flutter 和 JDK 17 加入 `PATH`，并设置 `JAVA_HOME`。随后重新执行：
+
+```bash
+flutter --version
+java -version
+flutter doctor -v
+```
+
+当前 Android 构建链以 JDK 17 为基线，不要随意切换到过旧 JDK。
+
+#### A.8.6 `SDK location not found` 或 `flutter.sdk not set`
+
+**处理**：检查 `dsh-mobile-app/android/local.properties`，确认 `sdk.dir` 和 `flutter.sdk` 是本机存在的绝对路径。该文件不可直接复制其他机器的路径。
+
+#### A.8.7 AGP 9 / Kotlin 弃用警告
+
+**现象**：日志提示 `android.builtInKotlin=false`、`android.newDsl=false` 或 `org.jetbrains.kotlin.android` 将弃用。
+
+**说明**：在当前 Flutter 3.47.1 模板和依赖组合中，这些是迁移警告，不是本次构建失败原因。只要最终出现 `BUILD SUCCESSFUL`，可以正常产出 APK。
+
+**处理**：不要为了消除警告单独删除配置或升级单个插件。后续迁移 Built-in Kotlin 时，应一起验证 Flutter、AGP、Kotlin 和 `mobile_scanner` 等插件，并完成完整构建与真机回归。
+
+#### A.8.8 插件 Manifest 或 Android API 弃用警告
+
+依赖插件可能提示 Manifest 的 `package` 属性被忽略，应用 Kotlin 代码也可能提示旧 Android API 弃用。这些警告不会阻止当前构建，但升级依赖时应复查。判断构建是否成功应以退出码、`BUILD SUCCESSFUL` 和 APK 校验为准。
+
+#### A.8.9 构建成功但手机提示签名不一致
+
+**原因**：新 APK 与手机已安装版本使用了不同 keystore，常见于正式签名与 Debug 回退签名混用。
+
+**处理**：
+
+- 正式升级：使用与旧版本完全相同的 keystore、alias 和密码重新构建；
+- 无法找回旧 keystore：只能卸载旧 App 后重新安装，并重新扫码配置；
+- 构建后用 `apksigner verify --print-certs` 对比证书 SHA-256。
+
+#### A.8.10 `apksigner` 提示 `java: not found`
+
+`apksigner` 自身也需要 Java。临时补充 JDK 17 到 `PATH`：
+
+```bash
+export JAVA_HOME=/path/to/jdk17
+export PATH="$JAVA_HOME/bin:$PATH"
+apksigner verify --verbose --print-certs app-release.apk
+```
+
+#### A.8.11 磁盘或内存不足
+
+Flutter、Gradle、Android SDK、NDK 和中间产物会占用数 GB 空间。检查：
+
+```bash
+df -h .
+free -h
+```
+
+优先清理当前项目产物：
+
+```bash
+cd dsh-mobile-app
+flutter clean
+```
+
+不要随意删除整个 Android SDK、Flutter SDK 或 Gradle 用户缓存。
+
+### A.9 本次成功构建记录
+
+2026-08-24 在 Linux 环境完成一次 Release 构建：
+
+- 分支：`feature/app-auto-update`；
+- 构建命令：直接执行 `:app:assembleRelease`；
+- Google 下载通过 `http://127.0.0.1:1080/`；
+- 首次构建耗时：11 分 33 秒；
+- Gradle 结果：`BUILD SUCCESSFUL`，366 个任务中 310 个执行、56 个命中缓存；
+- APK 大小：72,966,782 bytes；
+- SHA-256：`f5d0966cf219792bc23e0e71607d3b2f55456401abf9e4ad48ab55a747f1fe48`；
+- 因没有 `android/key.properties`，该次产物使用 Debug 回退证书，仅用于测试；
+- `apksigner` 验证结果为 v2 签名通过、v1 未启用。
+
+该哈希只对应这一次本地产物。代码、依赖、版本号或签名变化后，APK 大小与哈希都会改变。
