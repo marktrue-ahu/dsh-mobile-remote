@@ -29,7 +29,7 @@
 |---|---|---|---|---|
 | **预检** | preflight | 离线校验本地产物与元数据（清单/APK/载体 tarball/构建记录/发布字段/离线 `npm pack --dry-run`） | 否 | 构建后、发布前 |
 | **演练** | drill | 用**临时本地 registry** 真实跑一遍「发布 → 全新安装 → 载体发现 → 版本更新 → 失败路径」 | 否（只连 `127.0.0.1`） | 预检通过后、试发布/正式发布前 |
-| **试发布** | canary publish | 向**真实 npm** 发一次性包名或预发布版本，验证市场侧真实链路 | **是（需授权）** | 首次发版/大版本/链路变更时 |
+| **试发布** | canary publish | 向**真实 npm** 发**一次性包名**探针，验证真实 registry 的接收/体积/标签链路（预发布版本方式与现有纯 X.Y.Z 契约冲突，见 §7.1） | **是（需授权）** | 首次发版/大版本/链路变更时 |
 
 相关既有词汇：**发布清单**（`manifest.json`，配对权威）、**内容标识**（`plugin.contentSha256`）、**App 载体版本**（`X.Y.Z-app`，同包名预发布版本）。演练另有两个演练子域词汇：**演练 registry**（临时本地 Verdaccio 实例）、**演练版本**（`9.9.<随机补丁号>`，载体对应 `9.9.<补丁号>-app`；纯 X.Y.Z，不占正式版本线）。三词详细定义见 develop 的 `CONTEXT.md`（决策记录只落 develop，不在本分支重复）。
 
@@ -232,7 +232,7 @@ node tools/npm-drill.mjs --dist dsh-mobile-app/dist --phases preflight
 # 只跑某几段调试（更早的阶段作为静默前置自动执行；更晚的未选中阶段不执行）
 node tools/npm-drill.mjs --dist dsh-mobile-app/dist --phases publish,install
 
-# 复用已有 registry（CI/调试；低上限实例仍由脚本本机启动）
+# 复用已有 registry（CI/调试；默认只允许本机/私网地址，远端需 `DRILL_ALLOW_REMOTE_REGISTRY=1` 显式放行；低上限实例仍由脚本本机启动）
 # R1：只迁移该地址凭据；registry 与 @<scope>:registry 由专用 npm 配置固定并自检，
 #     不继承用户 npmrc 的路由（参见 6.5 的 drill-registry-scope-mismatch）
 node tools/npm-drill.mjs --dist dsh-mobile-app/dist --registry http://127.0.0.1:4873

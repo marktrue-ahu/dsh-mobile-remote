@@ -53,6 +53,7 @@ export const REASONS = Object.freeze({
 	OPTIONAL_MISSING_DEGRADED_MISMATCH: "drill-optional-missing-degraded-mismatch",
 	PLUGIN_ONLY_METADATA_MISMATCH: "drill-plugin-only-metadata-mismatch",
 	MISSING_CARRIER_UNEXPECTEDLY_PRESENT: "drill-missing-carrier-unexpectedly-present",
+	CARRIER_ABSENCE_CHECK_FAILED: "drill-carrier-absence-check-failed",
 	E413_NOT_REPRODUCED: "drill-e413-not-reproduced",
 	// 兜底
 	SETUP_FAILED: "drill-setup-failed",

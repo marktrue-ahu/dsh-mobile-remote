@@ -101,6 +101,9 @@ const HELP_TEXT = `npm-drill — 发版演练（本地 registry，全程不接�
 
 环境变量:
   DSH_DRILL_STATE_DIR  覆盖状态目录（默认 <DSH_HOME|~/.dsh>/mobile-remote/drill）
+  NPM_CONFIG_USERCONFIG  复用模式下的凭据来源（只迁移受检 host 的 token，不继承路由）
+  NPM_DRILL_REGISTRY_USERCONFIG  同上（备用名）
+  DRILL_ALLOW_REMOTE_REGISTRY=1  放行非本机/私网的 --registry（默认拒绝，防误发公共 npm）
   NPM_DRILL=1          仅测试套件使用：开启真实 registry 的端到端演练
 
 输出与退出码:
@@ -637,7 +640,8 @@ async function main() {
 		finalizeRecord(record, { runDir, keep: options.keep, evidenceDir: runDir });
 		// 成功且未要求保留现场时，清理重型临时内容（保留 run.json 与日志证据）。
 		if (record.status === "PASS" && !options.keep) {
-			for (const dir of [path.join(runDir, "work"), path.join(runDir, "registry"), path.join(runDir, "home")]) {
+			// npmrc/ 里有迁移后的 token 副本（0600）：成功路径一并清理，避免凭据长期留在证据目录。
+			for (const dir of [path.join(runDir, "work"), path.join(runDir, "registry"), path.join(runDir, "home"), path.join(runDir, "npmrc")]) {
 				if (existsDir(dir)) removeDir(dir);
 			}
 		}

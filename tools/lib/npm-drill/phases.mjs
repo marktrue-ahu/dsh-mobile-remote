@@ -612,7 +612,15 @@ export async function failurePhase(ctx) {
 		}
 		// 载体版本必须在 registry 中确实不存在（否则"缺失"不是真实缺包路径）。
 		const current = await fetchPackument(registryUrl, name);
-		const carrierInRegistry = current.ok && packumentVersions(current.json).includes(ctx.versions.carrierOnlyMissing);
+		if (!current.ok) {
+			// F4：packument 查询失败不能当作"载体确实不存在"——那是未验证，按 fail-closed 处理。
+			return {
+				pass: false,
+				reason: REASONS.CARRIER_ABSENCE_CHECK_FAILED,
+				detail: `packument 查询失败：${current.reason ?? current.status ?? "<未知>"}`,
+			};
+		}
+		const carrierInRegistry = packumentVersions(current.json).includes(ctx.versions.carrierOnlyMissing);
 		if (carrierInRegistry) {
 			return {
 				pass: false,
