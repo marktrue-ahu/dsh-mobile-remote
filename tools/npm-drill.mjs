@@ -13,7 +13,7 @@
 //   EVIDENCE: <运行记录目录>
 //
 // 阶段（--phases，逗号分隔；默认 all）：
-//   preflight  离线：对现成 dist 跑发布前预检（不联网、不需要 Verdaccio）
+//   preflight  离线：校验源产物不变量（真实插件 tgz/精确别名/内容标识）并对源 dist 跑发布前预检
 //   publish    发布：插件/载体发布、可查询、dist-tags、重复发布被拒        （A1–A4）
 //   install    全新安装：隔离 HOME + 新 profile、别名目录、lockfile/hoisted（A5–A10）
 //   discover   真实布局发现：载体发现、清单 App 版本、插件内容标识          （A11–A13）
@@ -25,6 +25,10 @@
 //             drill-dist-unreadable、drill-dist-preflight-failed、drill-build-failed、
 //             drill-version-namespace-invalid
 //   registry：drill-registry-not-installed、drill-registry-start-failed、drill-registry-not-alive、
+//             drill-registry-not-allowed、drill-registry-low-limit-not-ready、
+//             drill-registry-scope-mismatch（实际生效路由（含 scoped registry）≠ 受检地址）
+//   源产物：  drill-source-plugin-metadata-mismatch、drill-source-optional-alias-missing、
+//             drill-source-content-digest-mismatch、drill-source-artifact-mismatch
 //             drill-registry-low-limit-not-ready
 //   发布：    drill-projection-failed、drill-publish-failed、drill-carrier-publish-failed、
 //             drill-publish-version-missing、drill-dist-tag-mismatch、drill-republish-not-rejected、
@@ -35,7 +39,10 @@
 //   发现/身份：drill-carrier-not-found、drill-carrier-discovery-source-mismatch、
 //             drill-carrier-manifest-app-mismatch、drill-plugin-digest-mismatch
 //   更新：    drill-update-failed、drill-carrier-not-replaced
-//   失败路径：drill-optional-missing-degraded-mismatch、drill-preflight-unexpected-pass、
+//   失败路径：drill-optional-missing-degraded-mismatch、drill-plugin-only-metadata-mismatch、
+//             drill-missing-carrier-unexpectedly-present、drill-preflight-unexpected-pass、
+//             drill-preflight-reason-mismatch、drill-e413-not-reproduced
+//   发现/安装补充：drill-installed-carrier-manifest-mismatch
 //             drill-preflight-reason-mismatch、drill-e413-not-reproduced
 //   兜底：    drill-setup-failed、drill-assertion-failed
 //
@@ -48,13 +55,14 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-	ensureDir, commandVersion, existsDir, isolatedEnv, readTextFile, removeDir, runCommand, writeTextFile,
+	ensureDir, commandVersion, existsDir, existsFile, isolatedEnv, readTextFile, removeDir, runCommand, writeTextFile,
 } from "./lib/npm-drill/process.mjs";
 import {
-	LOW_LIMIT_MAX_BODY, NORMAL_MAX_BODY, detectVerdaccio, ensureRegistryUser, startVerdaccio,
-	stopVerdaccio, waitForRegistry, writeRegistryNpmrc,
+	LOW_LIMIT_MAX_BODY, NORMAL_MAX_BODY, buildIsolatedUserConfig, detectVerdaccio,
+	ensureRegistryUser, startVerdaccio, stopVerdaccio, verifyRegistryScope, waitForRegistry,
+	writeEmptyGlobalConfig,
 } from "./lib/npm-drill/registry.mjs";
-import { readDistAssets, writeDrillMainPackage } from "./lib/npm-drill/projection.mjs";
+import { readDistAssets } from "./lib/npm-drill/projection.mjs";
 import {
 	beginPhase, createRunRecord, endPhase, finalizeRecord, printCliFailure, printPhaseHeader,
 	printRunSummary, recordAssertion, utcStamp,
@@ -80,10 +88,16 @@ const HELP_TEXT = `npm-drill — 发版演练（本地 registry，全程不接�
                       "all" = preflight + 五个 registry 阶段；默认 all
                       preflight 是离线阶段（不需要 registry）；其余阶段需要 Verdaccio
   --registry <url>    复用已有 registry（跳过启动正常实例；低上限失败实例仍本机启动）
-                      复用源的发布凭据由环境变量 NPM_CONFIG_USERCONFIG 提供
+                      只从用户 npmrc 迁移**该地址**凭据；路由由专用配置固定（见下）
   --keep              保留演练现场（工作目录 / registry 存储 / 全部日志）
   --build             演练前先运行发布构建（dsh-mobile-app/tools/package-release.sh）
   -h, --help          打印本帮助并退出 0
+
+安全围栏（复用 registry 时）:
+  演练不继承调用方的 NPM_CONFIG_USERCONFIG/registry 路由：每个受检 registry 都会生成专用
+  npm 配置（registry=<受检地址> + @<scope>:registry=<受检地址>，只迁移目标 host 凭据），
+  并在发布/安装前用 npm config get 自检；实际生效值≠受检地址即 fail-closed
+  （reason: drill-registry-scope-mismatch）。
 
 环境变量:
   DSH_DRILL_STATE_DIR  覆盖状态目录（默认 <DSH_HOME|~/.dsh>/mobile-remote/drill）
@@ -183,7 +197,7 @@ function logsOf(ctx) {
 	return ctx.logsDir;
 }
 
-/** 在临时 registry 上注册一次性用户并写 npmrc（npm publish 需要凭据）。 */
+/** 在临时 registry 上注册一次性用户并生成**专用** npm 配置（R1：固定 registry + scope）。 */
 async function provisionRegistryCredentials(ctx, { url, label, logFile }) {
 	const username = "drill";
 	const password = crypto.randomBytes(18).toString("base64url");
@@ -195,8 +209,57 @@ async function provisionRegistryCredentials(ctx, { url, label, logFile }) {
 		logFile,
 	});
 	if (!user.ok) return { ok: false, detail: user.detail };
-	const userconfig = writeRegistryNpmrc({ runDir: ctx.runDir, label, url, token: user.token });
-	return { ok: true, userconfig };
+	const built = buildIsolatedUserConfig({
+		runDir: ctx.runDir,
+		label,
+		registryUrl: url,
+		pluginName: ctx.mainPackage.name,
+		env: process.env,
+		authToken: user.token,
+	});
+	return { ok: true, token: user.token, userconfig: built.path, built };
+}
+
+/**
+ * R1：生成并**自检**一个受检 registry 的专用 npm 配置。
+ * 覆盖模式的关键攻击是用户 npmrc 的 `@scope:registry` 覆盖了 `--registry`，因此这里固定
+ * registry/scope 并只迁移目标 host 凭据；随后用 `npm config get` 验证实际生效值。
+ */
+async function prepareRegistryConfig(ctx, { url, label, logFile, sourceUserConfigPath = "", authToken = "" }) {
+	const built = buildIsolatedUserConfig({
+		runDir: ctx.runDir,
+		label,
+		registryUrl: url,
+		pluginName: ctx.mainPackage.name,
+		sourceUserConfigPath,
+		env: process.env,
+		authToken,
+	});
+	const globalconfig = writeEmptyGlobalConfig({ runDir: ctx.runDir, label });
+	const check = await verifyRegistryScope({
+		registryUrl: url,
+		userconfig: built.path,
+		globalconfig,
+		pluginName: ctx.mainPackage.name,
+		env: isolatedEnv({ home: ctx.home }),
+		logFile,
+	});
+	if (!check.ok) {
+		throw new DrillSetupError(
+			REASONS.REGISTRY_SCOPE_MISMATCH,
+			`专用 npm 配置未把 registry 与 ${built.scope || "@scope"}:registry 钉在受检地址：${check.detail}`,
+		);
+	}
+	return { userconfig: built.path, globalconfig, built, check };
+}
+
+/** 读取调用方的用户 npmrc 路径（只用于**迁移目标 host 凭据**；不会被继承为路由）。 */
+function resolveUserNpmrcPath() {
+	const explicit = process.env.NPM_CONFIG_USERCONFIG || process.env.npm_config_userconfig
+		|| process.env.NPM_DRILL_REGISTRY_USERCONFIG;
+	if (typeof explicit === "string" && explicit.trim() !== "") return explicit.trim();
+	const candidate = path.join(os.homedir(), ".npmrc");
+	return existsFile(candidate) ? candidate : "";
 }
 
 /** 本机/私网地址判定：--registry 默认只允许这些地址，防止误把演练版本发到公共 npm（版本不可回收）。 */
@@ -233,16 +296,23 @@ async function prepareNormalRegistry(ctx, options) {
 		try {
 			const response = await fetch(new URL("/-/ping", url), { signal: AbortSignal.timeout(8_000) });
 			void response.arrayBuffer().catch(() => {});
-			ctx.registry.mode = "reused";
-			ctx.registry.normalUrl = url;
-			ctx.registry.normalUserConfig =
-				typeof process.env.NPM_CONFIG_USERCONFIG === "string"
-					? process.env.NPM_CONFIG_USERCONFIG
-					: (typeof process.env.NPM_DRILL_REGISTRY_USERCONFIG === "string" ? process.env.NPM_DRILL_REGISTRY_USERCONFIG : "");
-			return;
 		} catch (error) {
 			throw new DrillSetupError(REASONS.REGISTRY_NOT_ALIVE, `--registry ${url} 不可达：${String(error?.message ?? error).slice(0, 200)}`);
 		}
+		// R1：**不复用**调用方 NPM_CONFIG_USERCONFIG；只从中迁移该地址凭据，路由由专用配置固定。
+		const fence = await prepareRegistryConfig(ctx, {
+			url,
+			label: "normal",
+			logFile: path.join(logsOf(ctx), "npm-config-selfcheck.log"),
+			sourceUserConfigPath: resolveUserNpmrcPath(),
+		});
+		ctx.registry.mode = "reused";
+		ctx.registry.normalUrl = url;
+		ctx.registry.normalUserConfig = fence.userconfig;
+		ctx.registry.normalGlobalConfig = fence.globalconfig;
+		ctx.registry.normalScopeCheck = fence.check;
+		ctx.registry.normalConfigInfo = fence.built;
+		return;
 	}
 	const verdaccio = await detectVerdaccio({ env, logFile: path.join(ctx.logsDir, "verdaccio-detect.log") });
 	ctx.registry.verdaccio = verdaccio;
@@ -271,9 +341,18 @@ async function prepareNormalRegistry(ctx, options) {
 	if (!credentials.ok) {
 		throw new DrillSetupError(REASONS.REGISTRY_START_FAILED, `创建演练发布凭据失败：${credentials.detail}`);
 	}
+	const fence = await prepareRegistryConfig(ctx, {
+		url: handle.url,
+		label: "normal",
+		logFile: path.join(logsOf(ctx), "npm-config-selfcheck.log"),
+		authToken: credentials.token,
+	});
 	ctx.registry.mode = "spawned";
 	ctx.registry.normalUrl = handle.url;
-	ctx.registry.normalUserConfig = credentials.userconfig;
+	ctx.registry.normalUserConfig = fence.userconfig;
+	ctx.registry.normalGlobalConfig = fence.globalconfig;
+	ctx.registry.normalScopeCheck = fence.check;
+	ctx.registry.normalConfigInfo = fence.built;
 }
 
 /** 失败路径的低上限实例（10mb）：懒启动，复现 E413。 */
@@ -306,14 +385,31 @@ async function ensureLowLimitRegistry(ctx) {
 	ctx.registry.lowLimitHandle = handle;
 	const ready = await waitForRegistry(handle.url);
 	if (!ready.ok) return { ok: false, detail: `${REASONS.REGISTRY_LOW_LIMIT_NOT_READY}: ${ready.detail}` };
-	const credentials = await provisionRegistryCredentials(ctx, {
+	const username = "drill";
+	const password = crypto.randomBytes(18).toString("base64url");
+	const user = await ensureRegistryUser({
 		url: handle.url,
-		label: "low-limit",
+		username,
+		password,
+		email: "drill@drill.invalid",
 		logFile: path.join(ctx.logsDir, "verdaccio-low-limit.log"),
 	});
-	if (!credentials.ok) return { ok: false, detail: `${REASONS.REGISTRY_LOW_LIMIT_NOT_READY}: 凭据创建失败 ${credentials.detail}` };
+	if (!user.ok) return { ok: false, detail: `${REASONS.REGISTRY_LOW_LIMIT_NOT_READY}: 凭据创建失败 ${user.detail}` };
+	let fence;
+	try {
+		fence = await prepareRegistryConfig(ctx, {
+			url: handle.url,
+			label: "low-limit",
+			logFile: path.join(ctx.logsDir, "npm-config-selfcheck-low-limit.log"),
+			authToken: user.token,
+		});
+	} catch (error) {
+		return { ok: false, detail: `${REASONS.REGISTRY_SCOPE_MISMATCH}: ${error?.detail ?? error?.message ?? error}` };
+	}
 	ctx.registry.lowLimitUrl = handle.url;
-	ctx.registry.lowLimitUserConfig = credentials.userconfig;
+	ctx.registry.lowLimitUserConfig = fence.userconfig;
+	ctx.registry.lowLimitGlobalConfig = fence.globalconfig;
+	ctx.registry.lowLimitScopeCheck = fence.check;
 	return { ok: true, url: handle.url };
 }
 
@@ -349,6 +445,7 @@ function printBanner(ctx, options, selected) {
 		const mode = ctx.registry.mode === "reused" ? `复用 ${ctx.registry.normalUrl}` : "临时实例（绑定 127.0.0.1）";
 		const remoteWarn = ctx.registry.remoteAllowed ? "；⚠ 远端 registry 已放行（DRILL_ALLOW_REMOTE_REGISTRY=1）" : "";
 		console.log(`  registry : ${mode}${remoteWarn}`);
+		console.log(`  路由围栏 : registry 与 @scope:registry 均固定到受检地址（专用 npm 配置，不继承用户路由）`);
 		console.log(`  提示     : 只发布演练版本（9.9.x / 9.9.x-app），不发布公共包；退出码非 0 即失败`);
 	}
 }
@@ -395,16 +492,23 @@ async function main() {
 			normalUrl: null,
 			normalHandle: null,
 			normalUserConfig: "",
+			normalGlobalConfig: "",
+			normalScopeCheck: null,
+			normalConfigInfo: null,
 			lowLimitUrl: null,
 			lowLimitHandle: null,
 			lowLimitUserConfig: "",
+			lowLimitGlobalConfig: "",
+			lowLimitScopeCheck: null,
 			verdaccio: null,
 			maxBodySize: NORMAL_MAX_BODY,
 			lowLimitMaxBody: LOW_LIMIT_MAX_BODY,
 		},
 		assets: null,
 		mainPackage: null,
-		mainPkgPath: "",
+		source: null,
+		safeUserConfig: "",
+		safeGlobalConfig: "",
 		projection: null,
 		ensureLowLimitRegistry: () => ensureLowLimitRegistry(ctx),
 	};
@@ -445,17 +549,12 @@ async function main() {
 		return 1;
 	}
 	ctx.mainPackage = mainPackageRead;
+	// R1：离线阶段（preflight/--build 外的本地 npm pack 等）也用中性空 npm 配置，
+	// 不继承调用方的 registry 路由。
+	ctx.safeUserConfig = writeTextFile(path.join(runDir, "npmrc", "safe.npmrc"), "# drill: intentionally empty (no inherited registry routing)\n");
+	ctx.safeGlobalConfig = writeEmptyGlobalConfig({ runDir, label: "safe" });
 	// 发布目录不完整不在 CLI 层直接退出：留给 preflight 断言（P1）产出 run.json 证据。
 	ctx.assets = readDistAssets(dist);
-	if (ctx.assets.ok) {
-		// 主包元数据夹具（预检与投影共用；版本取源清单的 plugin.version）。
-		ctx.mainPkgPath = writeDrillMainPackage({
-			workDir: path.join(workDir, "main-package"),
-			pluginName: ctx.mainPackage.name,
-			pluginVersion: ctx.assets.manifest.plugin.version,
-			baseMainPackage: ctx.mainPackage,
-		});
-	}
 
 	const environment = await runEnvToolVersions(ctx);
 	const record = createRunRecord({ versions, dist, registry: null, environment });
@@ -480,9 +579,19 @@ async function main() {
 				await prepareProjection(ctx);
 				recordAssertion(setupPhase, {
 					id: "S1",
-					title: "演练环境就绪（registry + 演练产物投影）",
+					title: "演练环境就绪（registry + 源产物校验 + 演练产物投影）",
 					pass: true,
-					detail: `registry=${ctx.registry.mode}; ${ctx.registry.normalUrl}; carrierA=${ctx.projection.carrierA.size}B`,
+					detail: `registry=${ctx.registry.mode}; ${ctx.registry.normalUrl}; source=${ctx.source?.name}@${ctx.source?.version}; carrierA=${ctx.projection.carrierA.size}B`,
+				});
+				// R1：发布/安装前自检实际生效的 registry 路由（含 scoped registry）。
+				const scopeCheck = ctx.registry.normalScopeCheck;
+				const migrated = ctx.registry.normalConfigInfo?.migrated ?? [];
+				recordAssertion(setupPhase, {
+					id: "S2",
+					title: "registry 路由自检：registry 与 @scope:registry 均指向受检地址（不被用户 npmrc 覆盖）",
+					pass: scopeCheck?.ok === true,
+					reason: REASONS.REGISTRY_SCOPE_MISMATCH,
+					detail: `${scopeCheck?.detail ?? "<未执行>"}；迁移目标 host 凭据=${migrated.length} 项`,
 				});
 			} catch (error) {
 				recordAssertion(setupPhase, setupFailureAssertion(error));

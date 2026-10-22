@@ -82,7 +82,20 @@ npm 全局前缀需可写（本机为 `~/.local`，已验证可用）；若 `EAC
 - [ ] 当前分支与 HEAD 符合发布授权；`git status --short` 干净（或仅有不影响产物的明确变更）。
 - [ ] 版本三处一致（见 §3 校验命令）：根 `package.json` version、`dsh-mobile-app/pubspec.yaml` version、根 `package.json` 的载体别名。
 - [ ] `CHANGELOG.md` 已写本次发布条目（清单 `notes` 取最新 `##` 条目全文，缺条目构建会失败）。
-- [ ] 门禁测试通过：`node --test test/*.mjs`；App 侧 `cd dsh-mobile-app && flutter analyze && flutter test`。
+- [ ] 门禁测试通过（**必须用一次性隔离 HOME，禁止在运行中 profile 的 HOME 下跑**）：
+      ```bash
+      # 每条门禁命令都在一次性隔离环境中执行：HOME/DSH_HOME/XDG/cache 全部指向临时目录。
+      GATE_HOME="$(mktemp -d)"
+      env HOME="$GATE_HOME" DSH_HOME="$GATE_HOME/.dsh" \
+          XDG_CONFIG_HOME="$GATE_HOME/.config" XDG_CACHE_HOME="$GATE_HOME/.cache" \
+          XDG_DATA_HOME="$GATE_HOME/.local/share" npm_config_cache="$GATE_HOME/.npm-cache" \
+          node --test test/*.mjs
+      # App 侧同样隔离 HOME（Flutter/Dart 也会写用户缓存）
+      ( cd dsh-mobile-app && env HOME="$GATE_HOME" flutter analyze && env HOME="$GATE_HOME" flutter test )
+      ```
+      > 为什么：部分 HTTP 夹具会真实调用插件 `apply()`，插件启动逻辑按 `homedir()` 读取并收敛
+      > 更新事务；只隔离工作区或只设 `DSH_HOME` 不足以隔离这一读写链。失败时**保留**
+      > `$GATE_HOME` 作为证据（脚本里不要自动 `rm -rf`），排查后再清理。
 - [ ] 构建机环境就绪（附录 A）；签名 keystore 已备份、未丢失。
 - [ ] 演练环境就绪：`verdaccio --version`；且已在当前 HEAD 的发布目录上跑通 §6 演练（`RESULT: PASS`）。
 - [ ] 已取得本次**发布授权**（试发布与正式发布均需授权；本手册不代授权）。
@@ -220,6 +233,8 @@ node tools/npm-drill.mjs --dist dsh-mobile-app/dist --phases preflight
 node tools/npm-drill.mjs --dist dsh-mobile-app/dist --phases publish,install
 
 # 复用已有 registry（CI/调试；低上限实例仍由脚本本机启动）
+# R1：只迁移该地址凭据；registry 与 @<scope>:registry 由专用 npm 配置固定并自检，
+#     不继承用户 npmrc 的路由（参见 6.5 的 drill-registry-scope-mismatch）
 node tools/npm-drill.mjs --dist dsh-mobile-app/dist --registry http://127.0.0.1:4873
 
 # 保留现场（工作目录、registry 存储、全部日志）
@@ -252,12 +267,12 @@ CLI 契约：
 | 阶段 | 断言 | 验收内容 |
 |---|---|---|
 | **发布**（publish） | A1–A4 | A1 registry 存活；A2 插件发布成功且可查询；A3 载体发布成功，dist-tags 中 `app`→载体、`latest`→插件、载体不在 `latest`；A4 重复发布同版本被拒 |
-| **全新安装**（install） | A5–A10 | A5 全新隔离 HOME + 新 profile 安装主插件成功；A6 载体别名目录存在；A7 别名目录 `package.json` 的真实 name/version 正确且带 `dsh.appCarrier` 标记；A8 载体内 APK size+sha256 与清单一致；A9 lockfile 记录别名 mapping；A10 `.modules.yaml` 的 hoisted 位置映射包含载体 |
-| **真实布局发现**（discover） | A11–A13 | A11 实际安装布局下载体发现返回 found 且来源为插件自身作用域；A12 载体清单 App 版本的**构建号**与发布目录清单一致、APK 身份（file/size/sha256）一致（语义版本被投影为演练版本）；A13 插件内容标识与清单 `plugin.contentSha256` 一致 |
+| **全新安装**（install） | A5–A10 | A5 全新隔离 HOME + 新 profile 安装主插件成功；A6 载体别名目录存在；A7 别名目录 `package.json` 的真实 name/version 正确且带 `dsh.appCarrier` 标记；A8 载体内 APK size+sha256 与清单一致；A9 lockfile `snapshots` 中插件快照的 `optionalDependencies` **精确映射**载体别名→载体 ID（结构化解析，忽略注释）；A10 `.modules.yaml` 的 `hoistedLocations[载体]` **精确落点**为别名目录 |
+| **真实布局发现**（discover） | A11–A13 | A11 实际安装布局下载体发现返回 found 且来源为插件自身作用域；A12 载体清单 App 版本的**构建号**与发布目录清单一致、APK 身份（file/size/sha256）一致（语义版本被投影为演练版本）；A13 以**实际安装目录中的载体清单**为 expected，要求安装后插件内容标识等于该清单 `plugin.contentSha256`，且载体发现返回 `pluginContent.matches === true`、随包清单身份与本次投影一致 |
 | **版本更新**（update） | A14–A16 | A14 发布第二对新版本成功；A15 原安装更新成功，别名目录版本变为新载体版本；A16 旧载体被替换，再次发现得到新版本 |
-| **失败路径**（failure） | A17–A20 | A17 只发插件不发载体：安装不报错但别名目录缺失，发现结果为「载体未安装」；A18 载体发布元数据不合规时预检以稳定 reason 失败；A19 版本配对错误时预检以稳定 reason 失败；A20 低上限（10mb）registry 发布大体量载体失败（E413 类） |
+| **失败路径**（failure） | A17–A20 | A17 只发插件不发载体：先核验实际安装的插件版本=pluginOnly 且 `optionalDependencies` 精确指向**未发布**的载体版本、registry 确实没有该版本，再断言安装不报错但别名目录缺失、发现结果为「载体未安装」；A18 载体发布元数据不合规时预检以稳定 reason 失败；A19 版本配对错误时预检以稳定 reason 失败；A20 低上限（10mb）registry 发布大体量载体失败——只认 npm **结构化错误码** `npm error code E413`，不扫描任意文本里的裸数字 |
 
-离线阶段 `preflight`（`--phases preflight`）另有辅助断言：发布目录完整且预检通过、演练版本命名合法。默认测试套件只跑该离线阶段，不联网。
+离线阶段 `preflight`（`--phases preflight`）另有辅助断言：P1 在**投影之前**校验源产物不变量（解包真实插件 tgz → name/version 与源清单一致、`optionalDependencies` 含精确别名、用真实包内容实算内容标识并与清单比对、再对**源 dist** 跑发布预检；失败 reason 为 `drill-source-*`，不得进入投影）；P2 演练版本命名合法。默认测试套件只跑该离线阶段，不联网。setup 阶段另有 S2：用与发布相同的 npm 配置执行 `npm config get registry` / `npm config get @<scope>:registry`，两者都必须等于受检地址。
 
 ### 6.4 演练版本与隔离
 
@@ -271,7 +286,7 @@ CLI 契约：
 
 - 逐条 `PASS/FAIL`（失败行带 `[reason:drill-*]`）+ 阶段摘要 + `RESULT: PASS|FAIL` + `REASONS:` + `EVIDENCE:`（证据目录）+ 退出码非 0 即失败。
 - 运行记录：`<状态目录>/drill/<UTC时间>-<演练版本>/run.json`（阶段/断言/结果/reason/耗时）+ registry 与包管理器日志。状态目录默认 `~/.dsh/mobile-remote/drill`（可用 `DSH_DRILL_STATE_DIR` 覆盖）。
-- 常见 reason：`drill-registry-not-installed`（未装 Verdaccio）、`drill-registry-start-failed`、`drill-publish-failed`、`drill-dist-tag-mismatch`、`drill-install-failed`、`drill-carrier-alias-missing`、`drill-plugin-digest-mismatch`、`drill-e413-not-reproduced` 等；完整词表见脚本头部注释。
+- 常见 reason：`drill-registry-not-installed`（未装 Verdaccio）、`drill-registry-start-failed`、`drill-registry-not-allowed`、`drill-registry-scope-mismatch`（实际生效的 registry/scope 路由不等于受检地址）、`drill-source-plugin-metadata-mismatch` / `drill-source-optional-alias-missing` / `drill-source-content-digest-mismatch` / `drill-source-artifact-mismatch`（源产物不变量）、`drill-publish-failed`、`drill-dist-tag-mismatch`、`drill-install-failed`、`drill-carrier-alias-missing`、`drill-lockfile-alias-missing` / `drill-hoisted-mapping-missing`（布局结构）、`drill-plugin-digest-mismatch` / `drill-installed-carrier-manifest-mismatch`（安装后清单/摘要）、`drill-plugin-only-metadata-mismatch` / `drill-missing-carrier-unexpectedly-present`（缺载体降级前置）、`drill-e413-not-reproduced` 等；完整词表见脚本头部注释。
 
 ### 6.6 失败时
 
@@ -285,34 +300,38 @@ CLI 契约：
 
 > **需授权**：试发布会向真实 npm 发布内容。未经明确授权不得执行。本手册不实现自动化。
 
-目的：验证公共 npm 的真实接收、镜像同步与 dist-tag 行为（本地演练无法覆盖这些）。两种形态二选一：
+目的：验证公共 npm 的**真实接收能力**（体积/请求体上限、认证、dist-tag 机制、镜像可取性）——这些是本地演练覆盖不到的。试发布是**真源补充**，不能替代 §5 预检与 §6 演练。
 
-### 7.1 形态一：预发布版本（推荐，常规试发布）
+> **为什么不再推荐同包名 prerelease**：现有构建器、预检与运行时载体发现都只接受纯 `X.Y.Z` 插件版本（载体才是 `X.Y.Z-app`）；`X.Y.(Z+1)-canary.1` 这类包会直接被预检以 `main-version-not-x-y-z` 拒绝，手册不应引导用绕开门禁的方式发布。本仓库暂无专用 canary 产物生成/验收流程，因此试发布只用**一次性包名探针**。
 
-在正式版本之前发一个预发布版本（同一包名，加 `canary` dist-tag），例如 `X.Y.(Z+1)-canary.1`：
+### 7.1 一次性包名探针（唯一可执行形态）
 
 ```bash
-# 授权后，仅人工执行；先载体后插件
-npm publish <dist>/<carrier-canary.tgz> --tag canary
-npm view @marktrue/dsh-mobile-remote dist-tags --json    # canary 指向载体，latest 不变
-npm publish <dist>/<plugin-canary.tgz> --tag canary
-npm view @marktrue/dsh-mobile-remote dist-tags --json    # canary 指向插件，latest 不变
+# 需授权后人工执行。探针只验证"公共源能收多大/能打什么 tag"，不碰正式包名。
+PROBE_NAME="@marktrue/dsh-mobile-remote-probe-$(date -u +%Y%m%d%H%M%S)"
+PROBE_DIR="$(mktemp -d)"
+cp dsh-mobile-app/dist/DSH-Remote-vX.Y.Z.apk "$PROBE_DIR/"   # 用与真实载体同规模的 APK 做体积探针
+cat > "$PROBE_DIR/package.json" <<EOF
+{ "name": "$PROBE_NAME", "version": "0.0.1", "description": "one-off npm reception probe", "license": "MIT", "files": ["DSH-Remote-vX.Y.Z.apk"] }
+EOF
+( cd "$PROBE_DIR" && npm pack --pack-destination . )
+# 授权后：发布探针并核对 tag/体积/镜像；探针版本不会进 latest
+npm publish "$PROBE_DIR"/*.tgz --tag canary --access public
+npm view "$PROBE_NAME" dist-tags versions --json
 ```
 
-风险：预发布版本同样**不可回收**；`latest` 必须保持不变；发布前用 §5 预检 + §6 演练确认产物。
+核对项：发布请求体/体积被公共源接收；`canary` tag 正确、`latest` 未被探针占用；镜像站可取得该 tarball；认证与 npm 客户端配置指向预期源（`npm config get registry`）。
+达到验证目的后按 7.2 的边界处理回收（能 unpublish 就及时操作；不能则记录并遗忘该一次性名）。
 
-### 7.2 形态二：一次性包名（验证大包接收/镜像）
+### 7.2 边界与风险
 
-用一个**一次性包名**（如 `@marktrue/dsh-mobile-remote-canary-<日期>`）发布载体同规模 tarball，验证公共 registry 的请求体/体积上限与镜像可取性。**不要**用正式包名做体积实验。
+- **版本不可回收**：任何试发布（含探针）发布的版本都不可覆盖；探针版本号也占该一次性名的不可变版本（用一个版本即可，勿反复发同版本）。
+- **72 小时 unpublish 边界**：公共 npm 对 `unpublish` 有严格限制（超过 72 小时的版本一般不可删；受政策/依赖/下载量约束），即使删成功也可能已被镜像缓存。
+- **包名长期可见**：一次性包名可能被镜像站长期保留；命名必须可识别为试验包（`-probe-<时间>`）并记录用途/回收说明。
+- **验证边界**：探针**不能**验证载体别名解析、载体发现、安装布局与版本更新——这些只由 §6 演练（使用真实配对产物）覆盖；也不得用探针结果绕开预检/演练。
+- **授权**：任何真实 npm 写入（探针或正式发布）都要事先取得发布授权并记录包名/版本/时间。
 
-风险与边界：
-
-- 版本号一旦发布**不可回收**；即使 72 小时内 `npm unpublish`，也可能已被镜像/缓存（见下）。
-- 公共 registry 对 `unpublish` 有严格限制：超过 72 小时的版本一般不可 unpublish；同包名下删除/重发策略受 npm 政策约束，且强力删包后同名可能长期不可复用。
-- 一次性包名会在公共 npm 长期可见（镜像站可能长期保留），命名需可识别为试验包并写清用途/回收说明。
-- 任何试发布前必须：授权 → 预检通过 → 演练通过 → 记录包名/版本/时间；试发布后立即核验 `npm view` 与镜像可取性。
-
-> 试发布只是**真源补充**，不能替代演练（演练覆盖安装/别名/更新；试发布覆盖公共接收与镜像）。
+> 试发布只补公共接收/镜像这一环；**正式发布仍必须**先过 §5 预检与 §6 演练。
 
 ---
 
@@ -338,12 +357,15 @@ npm view @marktrue/dsh-mobile-remote dist-tags --json    # canary 指向插件�
 
    若使用镜像/企业源，确认该版本已可取得（镜像同步可能需要时间）。
 
-3. **发布同一份主插件 tgz**（`latest`，禁止重打）：
+3. **发布同一份主插件 tgz**（显式 `--tag latest`，禁止重打）：
 
    ```bash
-   npm publish dsh-mobile-app/dist/dsh-mobile-remote-vX.Y.Z.tgz
-   npm view @marktrue/dsh-mobile-remote dist-tags --json    # latest = X.Y.Z
+   npm publish dsh-mobile-app/dist/dsh-mobile-remote-vX.Y.Z.tgz --tag latest
+   npm view @marktrue/dsh-mobile-remote dist-tags --json    # 必须看到 latest = X.Y.Z、app = X.Y.Z-app
    ```
+
+   > 必须显式写 `--tag latest`：主包 `publishConfig` 未固定 tag，npm 会继承用户环境/配置里的
+   > dist-tag（例如 `NPM_CONFIG_TAG=canary`），省略时可能"发布成功但 latest 仍停在旧版"。
 
 4. **发布 Release 三资产**（同一清单、同一 APK、同一主插件 tgz；文件名/大小/哈希逐字节一致）。
 5. **记录结果**：两次发布各自的耗时/结果/公开 URL；失败与部分成功按 §10 处理。

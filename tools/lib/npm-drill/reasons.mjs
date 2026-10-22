@@ -11,12 +11,19 @@ export const REASONS = Object.freeze({
 	PREFLIGHT_REASON_MISMATCH: "drill-preflight-reason-mismatch",
 	BUILD_FAILED: "drill-build-failed",
 	VERSION_NAMESPACE_INVALID: "drill-version-namespace-invalid",
+	// 源产物不变量（R2：投影前必须钉住源输入事实）
+	SOURCE_PLUGIN_METADATA_MISMATCH: "drill-source-plugin-metadata-mismatch",
+	SOURCE_OPTIONAL_ALIAS_MISSING: "drill-source-optional-alias-missing",
+	SOURCE_CONTENT_DIGEST_MISMATCH: "drill-source-content-digest-mismatch",
+	SOURCE_ARTIFACT_MISMATCH: "drill-source-artifact-mismatch",
 	// registry
 	REGISTRY_NOT_INSTALLED: "drill-registry-not-installed",
 	REGISTRY_START_FAILED: "drill-registry-start-failed",
 	REGISTRY_NOT_ALIVE: "drill-registry-not-alive",
 	REGISTRY_NOT_ALLOWED: "drill-registry-not-allowed",
 	REGISTRY_LOW_LIMIT_NOT_READY: "drill-registry-low-limit-not-ready",
+	// R1：实际生效的 registry 路由（含 scoped registry）必须指向受检地址
+	REGISTRY_SCOPE_MISMATCH: "drill-registry-scope-mismatch",
 	// 产物投影 / 发布
 	PROJECTION_FAILED: "drill-projection-failed",
 	PUBLISH_FAILED: "drill-publish-failed",
@@ -38,11 +45,14 @@ export const REASONS = Object.freeze({
 	CARRIER_DISCOVERY_SOURCE_MISMATCH: "drill-carrier-discovery-source-mismatch",
 	CARRIER_MANIFEST_APP_MISMATCH: "drill-carrier-manifest-app-mismatch",
 	PLUGIN_DIGEST_MISMATCH: "drill-plugin-digest-mismatch",
+	INSTALLED_CARRIER_MANIFEST_MISMATCH: "drill-installed-carrier-manifest-mismatch",
 	// 更新
 	UPDATE_FAILED: "drill-update-failed",
 	CARRIER_NOT_REPLACED: "drill-carrier-not-replaced",
 	// 失败路径
 	OPTIONAL_MISSING_DEGRADED_MISMATCH: "drill-optional-missing-degraded-mismatch",
+	PLUGIN_ONLY_METADATA_MISMATCH: "drill-plugin-only-metadata-mismatch",
+	MISSING_CARRIER_UNEXPECTEDLY_PRESENT: "drill-missing-carrier-unexpectedly-present",
 	E413_NOT_REPRODUCED: "drill-e413-not-reproduced",
 	// 兜底
 	SETUP_FAILED: "drill-setup-failed",

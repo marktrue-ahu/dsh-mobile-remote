@@ -1,19 +1,175 @@
 // 演练 registry 子域：临时 Verdaccio 实例（正常 200mb / 失败演练 10mb）、健康检查、
-// registry 元数据查询（dist-tags / versions）、npm publish 与 pnpm install 封装。
+// registry 元数据查询（dist-tags / versions）、npm 发布与 pnpm 安装封装。
 //
-// 硬约束：只绑定 127.0.0.1、无 uplink、数据目录在仓库外；只检查全局 Verdaccio 是否存在，
-// 绝不自动安装或修改全局环境（issue #37 Implementation Decisions）。
+// ── R1 安全围栏（复评 BLOCKING）────────────────────────────────────────────────────
+// npm 对 scoped 包优先使用 `@scope:registry`，且会继承 `NPM_CONFIG_USERCONFIG` 里的路由；
+// 只给子进程传 `--registry` 并不能阻止"发到用户配置里的另一个源"。因此演练**永远不原样继承**
+// 用户 npm 配置：为每个受检 registry 生成专用 userconfig（固定 registry 与 `@scope:registry`），
+// 只迁移目标 host 的凭据；发布/安装前用 `npm config get` 自检实际生效路由，失败即 fail-closed。
+//
+// 其余硬约束：临时实例只绑定 127.0.0.1、无 uplink、数据目录在仓库外；只检查全局 Verdaccio
+// 是否存在，绝不自动安装或修改全局环境（issue #37 Implementation Decisions）。
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import {
-	ensureDir, freePort, isolatedEnv, runCommand, sleep, writeTextFile,
+	ensureDir, existsFile, freePort, isolatedEnv, readTextFile, runCommand, sleep, writeTextFile,
 } from "./process.mjs";
 
 /** 正常演练实例的请求体上限（> 实测发布请求体，issue #37）。 */
 export const NORMAL_MAX_BODY = "200mb";
 /** 失败演练实例的上限：默认 10mb（Verdaccio 默认值），用于复现 E413。 */
 export const LOW_LIMIT_MAX_BODY = "10mb";
+
+/** registry 地址归一（统一尾斜杠），用于 npm 配置与比对。 */
+export function normalizeRegistryUrl(url) {
+	return `${String(url ?? "").trim().replace(/\/+$/, "")}/`;
+}
+
+/** 包名 → scope（`@marktrue/dsh-mobile-remote` → `@marktrue`；无 scope 返回空串）。 */
+export function packageScope(packageName) {
+	const match = /^(@[^/\s]+)\//.exec(String(packageName ?? ""));
+	return match ? match[1] : "";
+}
+
+/** 读取 npmrc 文本为有序键值（忽略空行与注释；值保持原始文本）。 */
+export function parseNpmrcEntries(text) {
+	const entries = [];
+	for (const line of String(text ?? "").split(/\r?\n/)) {
+		const trimmed = line.trim();
+		if (trimmed === "" || trimmed.startsWith("#") || trimmed.startsWith(";")) continue;
+		const eq = trimmed.indexOf("=");
+		if (eq === -1) continue;
+		entries.push({ key: trimmed.slice(0, eq).trim(), value: trimmed.slice(eq + 1).trim() });
+	}
+	return entries;
+}
+
+function npmAuthEnv({ env, userconfig, globalconfig }) {
+	const merged = { ...env };
+	if (userconfig !== "") {
+		merged.NPM_CONFIG_USERCONFIG = userconfig;
+		merged.npm_config_userconfig = userconfig;
+	}
+	if (globalconfig !== "") {
+		merged.NPM_CONFIG_GLOBALCONFIG = globalconfig;
+		merged.npm_config_globalconfig = globalconfig;
+	}
+	return merged;
+}
+
+/**
+ * R1：生成演练专用 userconfig。
+ * - 固定 `registry=<受检地址>` 与 `@<scope>:registry=<受检地址>`（scope 从根 package.json 推导）；
+ * - 仅从用户 userconfig 迁移**目标 host** 的凭据行（`//host/.../:_authToken|_auth|username|
+ *   _password|email`），不继承其他 registry 路由；
+ * - 目标 host 无用户凭据时，可用调用方提供的一次性 token 或环境 `NPM_TOKEN`/`NODE_AUTH_TOKEN`。
+ */
+export function buildIsolatedUserConfig({
+	runDir,
+	label,
+	registryUrl,
+	pluginName,
+	sourceUserConfigPath = "",
+	env = process.env,
+	authToken = "",
+}) {
+	const target = normalizeRegistryUrl(registryUrl);
+	const parsed = new URL(target);
+	const host = parsed.host;
+	const scope = packageScope(pluginName);
+	const lines = [`registry=${target}`];
+	if (scope !== "") lines.push(`${scope}:registry=${target}`);
+	const migrated = [];
+	if (sourceUserConfigPath !== "" && existsFile(sourceUserConfigPath)) {
+		const hostPrefix = `//${host}/`;
+		for (const entry of parseNpmrcEntries(readTextFile(sourceUserConfigPath))) {
+			if (!entry.key.startsWith(hostPrefix)) continue;
+			if (!/:(_authToken|_auth|_password|username|email)$/i.test(entry.key)) continue;
+			lines.push(`${entry.key}=${entry.value}`);
+			migrated.push(entry.key);
+		}
+	}
+	const hasHostToken = migrated.some((key) => /:(_authToken|_auth)$/i.test(key));
+	let usedEnvToken = false;
+	if (!hasHostToken) {
+		const envToken = typeof env.NPM_TOKEN === "string" && env.NPM_TOKEN !== ""
+			? env.NPM_TOKEN
+			: (typeof env.NODE_AUTH_TOKEN === "string" ? env.NODE_AUTH_TOKEN : "");
+		const materialized = authToken !== "" ? authToken : envToken;
+		if (materialized !== "") {
+			lines.push(`//${host}/:_authToken=${materialized}`);
+			usedEnvToken = authToken === "" && envToken !== "";
+		}
+	}
+	const userconfig = path.join(runDir, "npmrc", `${label}.npmrc`);
+	ensureDir(path.dirname(userconfig));
+	writeTextFile(userconfig, `${lines.join("\n")}\n`);
+	try {
+		fs.chmodSync(userconfig, 0o600);
+	} catch {
+		// 权限收紧失败不阻塞；文件只含一次性演练 token。
+	}
+	return { ok: true, path: userconfig, host, scope, migrated, usedEnvToken };
+}
+
+/** 空白 globalconfig：屏蔽系统/全局 npm 配置里的 registry 路由（只影响演练子进程）。 */
+export function writeEmptyGlobalConfig({ runDir, label }) {
+	const file = path.join(runDir, "npmrc", `${label}.global.npmrc`);
+	ensureDir(path.dirname(file));
+	writeTextFile(file, "# drill: intentionally empty (blocks global registry routing)\n");
+	return file;
+}
+
+function unquoteNpmValue(value) {
+	const text = String(value ?? "").trim();
+	if (text.length >= 2 && ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'")))) {
+		return text.slice(1, -1);
+	}
+	return text;
+}
+
+/**
+ * R1：发布/安装前自检——用与发布**相同**的 userconfig/globalconfig 读取实际生效的
+ * `registry` 与 `@<scope>:registry`，两者都必须等于受检地址，否则 fail-closed。
+ */
+export async function verifyRegistryScope({ registryUrl, userconfig, globalconfig = "", pluginName, env, logFile = null }) {
+	const target = normalizeRegistryUrl(registryUrl);
+	const scope = packageScope(pluginName);
+	const runEnv = npmAuthEnv({ env: env ?? isolatedEnv({ home: path.dirname(path.dirname(userconfig)) }), userconfig, globalconfig });
+	const argsFor = (key) => [
+		"config", "get", key,
+		"--userconfig", userconfig,
+		...(globalconfig !== "" ? ["--globalconfig", globalconfig] : []),
+	];
+	const read = async (key) => {
+		const result = await runCommand({
+			command: "npm",
+			args: argsFor(key),
+			// 用专用配置所在目录作为 cwd，避免项目级 .npmrc 覆盖 scoped registry 路由。
+			cwd: path.dirname(userconfig),
+			env: runEnv,
+			logFile,
+			timeoutMs: 30_000,
+			label: `npm config get ${key}`,
+		});
+		return { ok: result.ok, value: result.ok ? String(result.stdout).trim() : "" };
+	};
+	const registryValue = await read("registry");
+	const scopeKey = scope !== "" ? `${scope}:registry` : null;
+	const scopeValue = scopeKey === null ? { ok: true, value: target } : await read(scopeKey);
+	const normalize = (value) => normalizeRegistryUrl(unquoteNpmValue(value));
+	const ok = registryValue.ok && scopeValue.ok
+		&& normalize(registryValue.value) === target
+		&& (scopeKey === null || normalize(scopeValue.value) === target);
+	return {
+		ok,
+		target,
+		registry: normalize(registryValue.value),
+		scoped: scopeKey === null ? null : normalize(scopeValue.value),
+		detail: `registry=${normalize(registryValue.value) || "<空>"} ${scopeKey ?? "@scope:registry"}=${scopeKey === null ? "<无 scope>" : (normalize(scopeValue.value) || "<空>")} 期望=${target}`,
+	};
+}
 
 /** Verdaccio 是否已全局安装（只检查，不安装）。 */
 export async function detectVerdaccio({ env, logFile = null }) {
@@ -165,10 +321,10 @@ export function packumentDistTags(json) {
 }
 
 /** npm publish（本地 registry，禁止任何公共源）。`tag` 必须显式给出（载体 app / 插件 latest）。 */
-export async function npmPublish({ tarball, tag, registryUrl, env, logFile, label, userconfig = "" }) {
-	const publishEnv = userconfig !== "" ? { ...env, NPM_CONFIG_USERCONFIG: userconfig } : env;
+export async function npmPublish({ tarball, tag, registryUrl, env, logFile, label, userconfig = "", globalconfig = "" }) {
 	return runCommand({
 		command: "npm",
+		cwd: userconfig !== "" ? path.dirname(userconfig) : process.cwd(),
 		args: [
 			"publish", tarball,
 			"--registry", registryUrl,
@@ -179,8 +335,9 @@ export async function npmPublish({ tarball, tag, registryUrl, env, logFile, labe
 			"--no-fund",
 			"--loglevel", "notice",
 			...(userconfig !== "" ? ["--userconfig", userconfig] : []),
+			...(globalconfig !== "" ? ["--globalconfig", globalconfig] : []),
 		],
-		env: publishEnv,
+		env: npmAuthEnv({ env, userconfig, globalconfig }),
 		logFile,
 		timeoutMs: 180_000,
 		label: label ?? `npm publish ${path.basename(tarball)} --tag ${tag}`,
@@ -189,7 +346,7 @@ export async function npmPublish({ tarball, tag, registryUrl, env, logFile, labe
 
 /**
  * 在临时 registry 上注册一个一次性演练用户（npm publish 需要 token；publish: $all 只放开权限，
- * npm CLI 仍要求凭据）。返回 token 与 npmrc 路径。
+ * npm CLI 仍要求凭据）。返回 token。
  */
 export async function ensureRegistryUser({ url, username, password, email, logFile }) {
 	const endpoint = `${url.replace(/\/+$/, "")}/-/user/org.couchdb.user:${encodeURIComponent(username)}`;
@@ -210,21 +367,8 @@ export async function ensureRegistryUser({ url, username, password, email, logFi
 	}
 }
 
-/** 为一个 registry 写 npm 认证配置（只含该 registry 的 token；文件在运行目录内）。 */
-export function writeRegistryNpmrc({ runDir, label, url, token }) {
-	const parsed = new URL(url);
-	const userconfig = path.join(runDir, "npmrc", `${label}.npmrc`);
-	ensureDir(path.dirname(userconfig));
-	writeTextFile(userconfig, [
-		`registry=${url.replace(/\/+$/, "")}/`,
-		`//${parsed.host}/:_authToken=${token}`,
-		"",
-	].join("\n"));
-	return userconfig;
-}
-
-/** 在隔离 profile 目录里写 pnpm 配置（hoisted 布局，与真实 profile 一致）。 */
-export function writeProfile({ profileDir, registryUrl }) {
+/** 在隔离 profile 目录里写 pnpm 配置（hoisted 布局，与真实 profile 一致；R1 同时钉住 scoped registry）。 */
+export function writeProfile({ profileDir, registryUrl, pluginName = "" }) {
 	ensureDir(profileDir);
 	writeTextFile(path.join(profileDir, "package.json"), `${JSON.stringify({ name: "dsh-drill-profile", private: true }, null, 2)}\n`);
 	// pnpm 10+ 的 pnpm 专属设置放在 pnpm-workspace.yaml（.npmrc 只保留 registry）。
@@ -242,12 +386,17 @@ export function writeProfile({ profileDir, registryUrl }) {
 			"",
 		].join("\n"),
 	);
-	writeTextFile(path.join(profileDir, ".npmrc"), `registry=${registryUrl}\nauto-install-peers=false\nstrict-peer-dependencies=false\n`);
+	const target = normalizeRegistryUrl(registryUrl);
+	const scope = packageScope(pluginName);
+	const npmrc = [`registry=${target}`];
+	if (scope !== "") npmrc.push(`${scope}:registry=${target}`);
+	npmrc.push("auto-install-peers=false", "strict-peer-dependencies=false", "");
+	writeTextFile(path.join(profileDir, ".npmrc"), npmrc.join("\n"));
 	return profileDir;
 }
 
-/** pnpm add 精确版本（隔离 HOME；hoisted 布局）。 */
-export async function pnpmAdd({ profileDir, spec, registryUrl, env, logFile, label }) {
+/** pnpm add 精确版本（隔离 HOME；hoisted 布局；使用专用 userconfig/globalconfig）。 */
+export async function pnpmAdd({ profileDir, spec, registryUrl, env, logFile, label, userconfig = "", globalconfig = "" }) {
 	return runCommand({
 		command: "pnpm",
 		args: [
@@ -256,7 +405,7 @@ export async function pnpmAdd({ profileDir, spec, registryUrl, env, logFile, lab
 			"--reporter", "append-only",
 		],
 		cwd: profileDir,
-		env: { ...env, npm_config_registry: registryUrl },
+		env: npmAuthEnv({ env: { ...env, npm_config_registry: registryUrl }, userconfig, globalconfig }),
 		logFile,
 		timeoutMs: 240_000,
 		label: label ?? `pnpm add ${spec}`,
