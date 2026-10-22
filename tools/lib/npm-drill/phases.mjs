@@ -9,16 +9,17 @@ import { APP_CARRIER_STATUS, discoverAppCarrier } from "../../../lib/app-carrier
 import { pluginContentDigest } from "../../../lib/plugin-content-digest.js";
 import { sha256Buffer, sha256File } from "../../../dsh-mobile-app/tools/lib/release-checks.mjs";
 import {
-	ensureDir, existsDir, existsFile, isolatedEnv, readTextFile,
+	ensureDir, existsDir, existsFile, isolatedEnv, npmErrorCodes, readTextFile,
 } from "./process.mjs";
 import {
-	LOW_LIMIT_MAX_BODY, fetchPackument, npmPublish, packumentDistTags, packumentVersions,
-	pnpmAdd, writeProfile,
+	LOW_LIMIT_MAX_BODY, fetchPackument, fetchPackumentChecked, npmPublish, packumentDistTags,
+	packumentVersions, pnpmAdd, verifyRegistryScope, writeProfile,
 } from "./registry.mjs";
 import {
 	makePreflightFixture, projectCarrier, projectPlugin, runPublishCarrierCheck,
-	writeDrillMainPackage,
+	validateSourceArtifacts,
 } from "./projection.mjs";
+import { parseHoistedLocations, parsePnpmLockCarrierAlias } from "./layout.mjs";
 import { REASONS } from "./reasons.mjs";
 import { validateDrillVersions } from "./versions.mjs";
 
@@ -66,14 +67,34 @@ async function registryAlive(url) {
 	}
 }
 
+/**
+ * R1：所有 npm/pnpm 子进程都用演练生成的**专用** userconfig/globalconfig（显式固定
+ * registry 与 `@scope:registry`，只含目标 host 凭据）；离线阶段用中性空配置，避免继承用户路由。
+ */
 function envForContext(ctx, registryUrl = ctx.registry.normalUrl) {
-	const extra = registryUrl ? { npm_config_registry: registryUrl } : {};
-	// 发布到哪个 registry 就用哪个 registry 的临时 token（读安装不需要，但无害）。
-	const userconfig = registryUrl === ctx.registry.lowLimitUrl
+	const isLowLimit = registryUrl !== null && registryUrl === ctx.registry.lowLimitUrl;
+	const userconfig = isLowLimit
 		? ctx.registry.lowLimitUserConfig
-		: ctx.registry.normalUserConfig;
-	if (typeof userconfig === "string" && userconfig !== "") extra.NPM_CONFIG_USERCONFIG = userconfig;
+		: (registryUrl ? ctx.registry.normalUserConfig : ctx.safeUserConfig);
+	const globalconfig = isLowLimit
+		? ctx.registry.lowLimitGlobalConfig
+		: (registryUrl ? ctx.registry.normalGlobalConfig : ctx.safeGlobalConfig);
+	const extra = {};
+	if (registryUrl) extra.npm_config_registry = registryUrl;
+	if (typeof userconfig === "string" && userconfig !== "") {
+		extra.NPM_CONFIG_USERCONFIG = userconfig;
+		extra.npm_config_userconfig = userconfig;
+	}
+	if (typeof globalconfig === "string" && globalconfig !== "") {
+		extra.NPM_CONFIG_GLOBALCONFIG = globalconfig;
+		extra.npm_config_globalconfig = globalconfig;
+	}
 	return isolatedEnv({ home: ctx.home, extra });
+}
+
+/** 源产物校验通过后，包名以**源插件包内真实 package.json** 为准（R2：不用合成元数据）。 */
+function pluginName(ctx) {
+	return ctx.source?.name ?? ctx.mainPackage?.name ?? "";
 }
 
 function logFile(ctx, name) {
@@ -83,7 +104,7 @@ function logFile(ctx, name) {
 // ── 静默前置：产物投影（可被 preflight 阶段单独覆盖，不在 20 条断言内）────────────────────
 
 export async function prepareProjection(ctx) {
-	const name = ctx.mainPackage.name;
+	const name = pluginName(ctx);
 	const workDir = ensureDir(path.join(ctx.workDir, "artifacts"));
 	const env = envForContext(ctx, null);
 	const log = logFile(ctx, "projection");
@@ -143,38 +164,27 @@ export async function prepareProjection(ctx) {
 	});
 	if (!pluginOnly.ok) throw new Error(`${REASONS.PROJECTION_FAILED}: ${pluginOnly.error}`);
 	ctx.projection = { pluginA, carrierA, pluginB, carrierB, pluginOnly };
-	if (!ctx.mainPkgPath) {
-		ctx.mainPkgPath = writeDrillMainPackage({
-			workDir: path.join(ctx.workDir, "main-package"),
-			pluginName: name,
-			pluginVersion: ctx.assets.manifest.plugin.version,
-			baseMainPackage: ctx.mainPackage,
-		});
-	}
 }
 
 // ── 阶段 0（离线）：preflight ─────────────────────────────────────────────────────────
 
 export async function preflightPhase(ctx) {
 	const assertions = [];
-	assertions.push(await assertion("P1", "发布目录完整且发布前预检通过（离线）", async () => {
-		if (!ctx.assets.ok) {
-			return { pass: false, reason: REASONS.DIST_UNREADABLE, detail: ctx.assets.problems.join("; ") };
-		}
-		const result = await runPublishCarrierCheck({
-			distDir: ctx.dist,
-			mainPkgPath: ctx.mainPkgPath,
+	assertions.push(await assertion("P1", "源产物不变量通过（真实插件 tgz/精确别名/内容标识）且对源 dist 预检 PASS（离线）", async () => {
+		const result = await validateSourceArtifacts({
+			assets: ctx.assets,
+			workDir: path.join(ctx.workDir, "source-validation"),
 			env: envForContext(ctx, null),
 			logFile: logFile(ctx, "preflight-source"),
 		});
 		if (!result.ok) {
-			return {
-				pass: false,
-				reason: REASONS.DIST_PREFLIGHT_FAILED,
-				detail: `reasons=${result.reasons.join(",") || "unknown"}; ${tail(result.stdout || result.stderr, 300)}`,
-			};
+			return { pass: false, reason: result.reason, detail: result.detail };
 		}
-		return { pass: true, detail: "publish-carrier-check PASS" };
+		ctx.source = result;
+		return {
+			pass: true,
+			detail: `source=${result.name}@${result.version}; 内容标识=${result.contentSha256.slice(0, 12)}…; publish-carrier-check PASS`,
+		};
 	}));
 	assertions.push(await assertion("P2", "演练版本命名合法（9.9.x ↔ 9.9.x-app，纯 X.Y.Z，A/B/C 互不相同）", async () => {
 		const result = validateDrillVersions(ctx.versions);
@@ -193,7 +203,7 @@ export async function preflightPhase(ctx) {
 
 export async function publishPhase(ctx) {
 	const assertions = [];
-	const name = ctx.mainPackage.name;
+	const name = pluginName(ctx);
 	const registryUrl = ctx.registry.normalUrl;
 	const env = envForContext(ctx, registryUrl);
 	const meta = () => fetchPackument(registryUrl, name);
@@ -210,6 +220,7 @@ export async function publishPhase(ctx) {
 		registryUrl,
 		env,
 		userconfig: ctx.registry.normalUserConfig,
+		pluginName: name,
 		logFile: logFile(ctx, "publish-carrier-a"),
 		label: `npm publish carrierA ${ctx.versions.carrierA} --tag app`,
 	});
@@ -219,6 +230,7 @@ export async function publishPhase(ctx) {
 		registryUrl,
 		env,
 		userconfig: ctx.registry.normalUserConfig,
+		pluginName: name,
 		logFile: logFile(ctx, "publish-plugin-a"),
 		label: `npm publish pluginA ${ctx.versions.pluginA}`,
 	});
@@ -261,6 +273,7 @@ export async function publishPhase(ctx) {
 			registryUrl,
 			env,
 			userconfig: ctx.registry.normalUserConfig,
+			pluginName: name,
 			logFile: logFile(ctx, "republish-plugin-a"),
 			label: "npm publish duplicate pluginA",
 		});
@@ -285,10 +298,10 @@ function aliasPackageName(name) {
 
 export async function installPhase(ctx) {
 	const assertions = [];
-	const name = ctx.mainPackage.name;
+	const name = pluginName(ctx);
 	const registryUrl = ctx.registry.normalUrl;
 	const env = envForContext(ctx, registryUrl);
-	const profileDir = writeProfile({ profileDir: path.join(ctx.workDir, "profile-a"), registryUrl });
+	const profileDir = writeProfile({ profileDir: path.join(ctx.workDir, "profile-a"), registryUrl, pluginName: name });
 	const installLog = logFile(ctx, "pnpm-install-a");
 	const install = await pnpmAdd({
 		profileDir,
@@ -347,22 +360,27 @@ export async function installPhase(ctx) {
 		return { pass, reason: REASONS.APK_BYTES_MISMATCH, detail: `size=${buffer.length}/${app.size}` };
 	}));
 
-	assertions.push(await assertion("A9", "安装 lockfile 记录载体别名 mapping", async () => {
+	assertions.push(await assertion("A9", "lockfile 中插件快照的 optionalDependencies 精确映射载体别名", async () => {
 		const lockfile = path.join(profileDir, "pnpm-lock.yaml");
 		if (!existsFile(lockfile)) return { pass: false, reason: REASONS.LOCKFILE_ALIAS_MISSING, detail: "pnpm-lock.yaml 缺失" };
-		const text = readTextFile(lockfile);
-		const alias = aliasPackageName(name);
-		const pass = text.includes(alias) && text.includes(`${name}@${ctx.versions.carrierA}`);
-		return { pass, reason: REASONS.LOCKFILE_ALIAS_MISSING, detail: `${alias} → ${name}@${ctx.versions.carrierA}` };
+		const parsed = parsePnpmLockCarrierAlias(readTextFile(lockfile), {
+			pluginName: name,
+			pluginVersion: ctx.versions.pluginA,
+			carrierAlias: aliasPackageName(name),
+		});
+		return { pass: parsed.ok, reason: REASONS.LOCKFILE_ALIAS_MISSING, detail: parsed.detail };
 	}));
 
-	assertions.push(await assertion("A10", ".modules.yaml 的 hoisted 位置映射包含载体", async () => {
+	assertions.push(await assertion("A10", ".modules.yaml 的 hoistedLocations 精确落点包含载体", async () => {
 		const modulesFile = path.join(profileDir, "node_modules", ".modules.yaml");
 		if (!existsFile(modulesFile)) return { pass: false, reason: REASONS.HOISTED_MAPPING_MISSING, detail: ".modules.yaml 缺失" };
-		const text = readTextFile(modulesFile);
-		const expected = `${name}@${ctx.versions.carrierA}`;
-		const pass = text.includes(expected) && text.includes(aliasPackageName(name));
-		return { pass, reason: REASONS.HOISTED_MAPPING_MISSING, detail: expected };
+		const parsed = parseHoistedLocations(readTextFile(modulesFile), {
+			carrierName: name,
+			carrierVersion: ctx.versions.carrierA,
+			carrierAlias: aliasPackageName(name),
+			profileRoot: profileDir,
+		});
+		return { pass: parsed.ok, reason: REASONS.HOISTED_MAPPING_MISSING, detail: parsed.detail };
 	}));
 
 	return assertions;
@@ -372,7 +390,7 @@ export async function installPhase(ctx) {
 
 export async function discoverPhase(ctx) {
 	const assertions = [];
-	const name = ctx.mainPackage.name;
+	const name = pluginName(ctx);
 	const pluginDir = fs.realpathSync(ctx.install.pluginDir);
 	const aliasDir = installedRoot(ctx.install.profileDir, aliasPackageName(name));
 	const discovery = discoverAppCarrier({ pluginRoot: pluginDir, dshHome: ctx.dshHome });
@@ -409,14 +427,41 @@ export async function discoverPhase(ctx) {
 		};
 	}));
 
-	assertions.push(await assertion("A13", "插件内容标识与演练清单中的 plugin.contentSha256 一致", async () => {
+	assertions.push(await assertion("A13", "已安装插件内容标识与随包清单的 plugin.contentSha256 一致（expected 读自安装目录）", async () => {
+		// R4：expected 必须来自**实际安装/实际发现的载体清单**，不能用内存里的投影清单。
+		const installedManifestFile = path.join(aliasDir, "manifest.json");
+		if (!existsFile(installedManifestFile)) {
+			return { pass: false, reason: REASONS.INSTALLED_CARRIER_MANIFEST_MISMATCH, detail: "安装载体清单缺失" };
+		}
+		let installedManifest;
+		try {
+			installedManifest = JSON.parse(readTextFile(installedManifestFile));
+		} catch (error) {
+			return { pass: false, reason: REASONS.INSTALLED_CARRIER_MANIFEST_MISMATCH, detail: String(error?.message ?? error) };
+		}
+		const expected = installedManifest.plugin?.contentSha256;
 		const actual = pluginContentDigest(pluginDir);
-		const expected = ctx.projection.carrierA.manifest.plugin.contentSha256;
-		const pass = actual === expected;
+		// 随包清单除摘要外，还应与本次投影发布的身份一致（版本/文件名/大小/字节哈希）。
+		const projected = ctx.projection.carrierA.manifest.plugin;
+		const identityOk = installedManifest.plugin?.version === projected.version
+			&& installedManifest.plugin?.file === projected.file
+			&& installedManifest.plugin?.size === projected.size
+			&& installedManifest.plugin?.sha256 === projected.sha256
+			&& typeof expected === "string" && /^[a-f0-9]{64}$/.test(expected);
+		if (!identityOk) {
+			return {
+				pass: false,
+				reason: REASONS.INSTALLED_CARRIER_MANIFEST_MISMATCH,
+				detail: `安装清单 plugin 段与投影身份不符：${JSON.stringify(installedManifest.plugin ?? null)}`,
+			};
+		}
+		// 载体发现另行返回 pluginContent.matches；FOUND 不代表摘要匹配，必须显式要求它成立。
+		const discoveryMatches = discovery.pluginContent?.matches === true;
+		const pass = actual === expected && discoveryMatches;
 		return {
 			pass,
 			reason: REASONS.PLUGIN_DIGEST_MISMATCH,
-			detail: `actual=${actual.slice(0, 12)}… expected=${String(expected).slice(0, 12)}…`,
+			detail: `actual=${actual.slice(0, 12)}… installed-manifest=${String(expected).slice(0, 12)}… discovery.matches=${discovery.pluginContent?.matches}`,
 		};
 	}));
 
@@ -428,7 +473,7 @@ export async function discoverPhase(ctx) {
 
 export async function updatePhase(ctx) {
 	const assertions = [];
-	const name = ctx.mainPackage.name;
+	const name = pluginName(ctx);
 	const registryUrl = ctx.registry.normalUrl;
 	const env = envForContext(ctx, registryUrl);
 	const meta = () => fetchPackument(registryUrl, name);
@@ -439,6 +484,7 @@ export async function updatePhase(ctx) {
 		registryUrl,
 		env,
 		userconfig: ctx.registry.normalUserConfig,
+		pluginName: name,
 		logFile: logFile(ctx, "publish-carrier-b"),
 		label: `npm publish carrierB ${ctx.versions.carrierB} --tag app`,
 	});
@@ -448,6 +494,7 @@ export async function updatePhase(ctx) {
 		registryUrl,
 		env,
 		userconfig: ctx.registry.normalUserConfig,
+		pluginName: name,
 		logFile: logFile(ctx, "publish-plugin-b"),
 		label: `npm publish pluginB ${ctx.versions.pluginB}`,
 	});
@@ -525,7 +572,7 @@ export async function updatePhase(ctx) {
 
 export async function failurePhase(ctx) {
 	const assertions = [];
-	const name = ctx.mainPackage.name;
+	const name = pluginName(ctx);
 	const registryUrl = ctx.registry.normalUrl;
 	const env = envForContext(ctx, registryUrl);
 
@@ -536,10 +583,11 @@ export async function failurePhase(ctx) {
 		registryUrl,
 		env,
 		userconfig: ctx.registry.normalUserConfig,
+		pluginName: name,
 		logFile: logFile(ctx, "publish-plugin-only"),
 		label: `npm publish pluginOnly ${ctx.versions.pluginOnly}`,
 	});
-	const profileC = writeProfile({ profileDir: path.join(ctx.workDir, "profile-c"), registryUrl });
+	const profileC = writeProfile({ profileDir: path.join(ctx.workDir, "profile-c"), registryUrl, pluginName: name });
 	const installC = await pnpmAdd({
 		profileDir: profileC,
 		spec: `${name}@${ctx.versions.pluginOnly}`,
@@ -551,6 +599,46 @@ export async function failurePhase(ctx) {
 	assertions.push(await assertion("A17", "只发插件不发载体：安装不报错但别名目录缺失，发现结果为「载体未安装」", async () => {
 		const pluginDirC = installedRoot(profileC, name);
 		const aliasDirC = installedRoot(profileC, aliasPackageName(name));
+		// R9：先核验这次降级确实经过"缺失 optional 载体"路径，而不是包里根本没声明。
+		let installedPkg = null;
+		try {
+			installedPkg = JSON.parse(readTextFile(path.join(pluginDirC, "package.json")));
+		} catch {
+			installedPkg = null;
+		}
+		const alias = aliasPackageName(name);
+		const expectedAlias = `npm:${name}@${ctx.versions.carrierOnlyMissing}`;
+		const declaredOk = installedPkg?.version === ctx.versions.pluginOnly
+			&& installedPkg?.optionalDependencies?.[alias] === expectedAlias;
+		if (!declaredOk) {
+			return {
+				pass: false,
+				reason: REASONS.PLUGIN_ONLY_METADATA_MISMATCH,
+				detail: `installed=${installedPkg?.version ?? "<缺失>"}; ${alias}=${installedPkg?.optionalDependencies?.[alias] ?? "<未声明>"} 期望=${expectedAlias}`,
+			};
+		}
+		// R9 续：只有**结构有效**的 packument（同名、versions 为非数组对象、能看到刚发布的
+		// pluginOnly）才有资格证明"载体版本不存在"；HTTP 200 的错误 JSON 等一律 fail-closed。
+		const current = await fetchPackumentChecked({
+			registryUrl,
+			packageName: name,
+			requiredVersions: [ctx.versions.pluginOnly],
+		});
+		if (!current.ok) {
+			return {
+				pass: false,
+				reason: REASONS.CARRIER_ABSENCE_CHECK_FAILED,
+				detail: `${current.reason}: ${current.detail}`,
+			};
+		}
+		const carrierInRegistry = Object.hasOwn(current.versions, ctx.versions.carrierOnlyMissing);
+		if (carrierInRegistry) {
+			return {
+				pass: false,
+				reason: REASONS.MISSING_CARRIER_UNEXPECTEDLY_PRESENT,
+				detail: `registry 意外存在 ${ctx.versions.carrierOnlyMissing}`,
+			};
+		}
 		let discovery = { status: null, reason: null };
 		try {
 			discovery = discoverAppCarrier({ pluginRoot: fs.realpathSync(pluginDirC), dshHome: ctx.dshHome });
@@ -565,7 +653,7 @@ export async function failurePhase(ctx) {
 		return {
 			pass,
 			reason: REASONS.OPTIONAL_MISSING_DEGRADED_MISMATCH,
-			detail: `publish=${pluginOnlyPublish.status}; install=${installC.status}; aliasMissing=${!existsDir(aliasDirC)}; discovery=${discovery.status}/${discovery.reason}`,
+			detail: `declared=${alias}→${expectedAlias}; carrierAbsent=${!carrierInRegistry}; publish=${pluginOnlyPublish.status}; install=${installC.status}; aliasMissing=${!existsDir(aliasDirC)}; discovery=${discovery.status}/${discovery.reason}`,
 		};
 	}));
 
@@ -574,7 +662,7 @@ export async function failurePhase(ctx) {
 		assets: ctx.assets,
 		workDir: path.join(ctx.workDir, "fixtures"),
 		kind: "bad-metadata",
-		mainPackage: ctx.mainPackage,
+		mainPackage: ctx.source?.packageJson ?? ctx.mainPackage,
 		env: envForContext(ctx, null),
 		logFile: logFile(ctx, "fixture-bad-metadata"),
 	});
@@ -603,7 +691,7 @@ export async function failurePhase(ctx) {
 		assets: ctx.assets,
 		workDir: path.join(ctx.workDir, "fixtures"),
 		kind: "bad-version-pairing",
-		mainPackage: ctx.mainPackage,
+		mainPackage: ctx.source?.packageJson ?? ctx.mainPackage,
 		env: envForContext(ctx, null),
 		logFile: logFile(ctx, "fixture-bad-version-pairing"),
 	});
@@ -634,24 +722,39 @@ export async function failurePhase(ctx) {
 			return { pass: false, reason: REASONS.REGISTRY_LOW_LIMIT_NOT_READY, detail: ready.detail };
 		}
 		const tarballBytes = ctx.projection.carrierA.size;
+		// R1：低上限发布同样先做路由自检（专用 userconfig 必须把 scope 钉在该实例上）。
+		const scopeCheck = await verifyRegistryScope({
+			registryUrl: ready.url,
+			userconfig: ctx.registry.lowLimitUserConfig,
+			globalconfig: ctx.registry.lowLimitGlobalConfig,
+			pluginName: name,
+			env: envForContext(ctx, null),
+			logFile: logFile(ctx, "scope-check-low-limit"),
+		});
+		if (!scopeCheck.ok) {
+			return { pass: false, reason: REASONS.REGISTRY_SCOPE_MISMATCH, detail: scopeCheck.detail };
+		}
 		const publish = await npmPublish({
 			tarball: ctx.projection.carrierA.tarball,
 			tag: "app",
 			registryUrl: ready.url,
 			env: envForContext(ctx, ready.url),
 			userconfig: ctx.registry.lowLimitUserConfig,
+			pluginName: name,
+			globalconfig: ctx.registry.lowLimitGlobalConfig,
 			logFile: logFile(ctx, "publish-low-limit"),
 			label: "npm publish carrierA to low-limit registry",
 		});
-		const output = `${publish.stdout}\n${publish.stderr}`;
-		const matched = /E413|413|Payload Too Large|entity too large/i.test(output);
+		// R5：只认 npm **结构化错误码**（整行 `npm error code E413`）；不扫描任意文本里的裸数字。
+		const codes = npmErrorCodes(publish);
+		const matched = codes.includes("E413");
 		const pass = !publish.ok && matched;
 		return {
 			pass,
 			reason: REASONS.E413_NOT_REPRODUCED,
 			detail: pass
-				? `tarball=${tarballBytes}B; lowLimit=${LOW_LIMIT_MAX_BODY}`
-				: `tarball=${tarballBytes}B（需 >10mb 的发布请求体才能复现）; exit=${publish.status}; ${tail(output, 300)}`,
+				? `tarball=${tarballBytes}B; lowLimit=${LOW_LIMIT_MAX_BODY}; npmErrorCodes=${codes.join(",")}`
+				: `tarball=${tarballBytes}B; exit=${publish.status}; npmErrorCodes=${codes.join(",") || "<无>"}; ${tail(`${publish.stdout}\n${publish.stderr}`, 300)}`,
 		};
 	}));
 

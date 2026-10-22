@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
+import { pluginContentDigest } from "../lib/plugin-content-digest.js";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const CLI = join(ROOT, "tools", "npm-drill.mjs");
@@ -274,4 +275,107 @@ test("R2 围栏：--registry 指向非本机/私网地址被拒绝（drill-regis
 	const runs = await findRunJson(stateDir);
 	assert.equal(runs.length, 1);
 	assert.ok(runs[0].record.reasons.includes("drill-registry-not-allowed"));
+});
+
+// ── R2 负向回归：投影前必须钉住源产物不变量（评审复现场景） ───────────────────────────
+
+function runTar(args) {
+	const result = spawnSync("tar", args, { encoding: "utf8" });
+	assert.equal(result.status, 0, `tar 失败：${args.join(" ")}\n${result.stderr}`);
+}
+
+async function sha256Of(file) {
+	return crypto.createHash("sha256").update(await readFile(file)).digest("hex");
+}
+
+async function readJson(file) {
+	return JSON.parse(await readFile(file, "utf8"));
+}
+
+async function writeJson(file, value) {
+	await writeFile(file, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+/**
+ * 从合法夹具派生"坏源产物"（严格按评审复现：保持 APK/tgz 字节哈希、内嵌/外部清单与构建
+ * 记录相互一致，只让真实输入事实错误）：
+ * - bad-digest：源清单 plugin.contentSha256 改全 0（真实插件摘要非零）；
+ * - no-alias：源插件 tgz 内删除 optionalDependencies（重算 tgz 身份与内容标识并同步记录）。
+ */
+async function makeSourceDefect({ valid, kind, workRoot }) {
+	const dist = join(workRoot, `defect-${kind}`);
+	await cp(valid.dist, dist, { recursive: true });
+	const manifestPath = join(dist, "manifest.json");
+	const recordPath = join(dist, "app-carrier.json");
+	const manifest = await readJson(manifestPath);
+	const record = await readJson(recordPath);
+	const pluginTgz = join(dist, manifest.plugin.file);
+	const carrierTgz = join(dist, record.file);
+	if (kind === "bad-digest") {
+		manifest.plugin.contentSha256 = "0".repeat(64);
+	} else if (kind === "no-alias") {
+		const pluginExtract = join(workRoot, `plugin-extract-${kind}`);
+		await mkdir(pluginExtract, { recursive: true });
+		runTar(["-xzf", pluginTgz, "-C", pluginExtract]);
+		const pkgPath = join(pluginExtract, "package", "package.json");
+		const pkg = await readJson(pkgPath);
+		delete pkg.optionalDependencies;
+		await writeJson(pkgPath, pkg);
+		runTar(["-czf", pluginTgz, "-C", pluginExtract, "package"]);
+		manifest.plugin.size = (await stat(pluginTgz)).size;
+		manifest.plugin.sha256 = await sha256Of(pluginTgz);
+		manifest.plugin.contentSha256 = pluginContentDigest(join(pluginExtract, "package"));
+	} else {
+		throw new Error(`unknown defect kind: ${kind}`);
+	}
+	await writeJson(manifestPath, manifest);
+	// 同步载体内的随包清单 + 构建记录，确保"除目标缺陷外其余一致"。
+	const carrierExtract = join(workRoot, `carrier-extract-${kind}`);
+	await mkdir(carrierExtract, { recursive: true });
+	runTar(["-xzf", carrierTgz, "-C", carrierExtract]);
+	await writeJson(join(carrierExtract, "package", "manifest.json"), manifest);
+	runTar(["-czf", carrierTgz, "-C", carrierExtract, "package"]);
+	record.manifest = manifest;
+	record.size = (await stat(carrierTgz)).size;
+	record.sha256 = await sha256Of(carrierTgz);
+	await writeJson(recordPath, record);
+	return dist;
+}
+
+test("R2 负向：源清单内容标识错误（真实插件摘要不符）→ 投影前拦截 drill-source-content-digest-mismatch", async () => {
+	const workRoot = await mkdtemp(join(tmpdir(), "npm-drill-defect-digest-"));
+	try {
+		const dist = await makeSourceDefect({ valid: fixture, kind: "bad-digest", workRoot });
+		const stateDir = join(workRoot, "state");
+		const result = runDrill({ args: ["--dist", dist, "--phases", "preflight"], stateDir, home: fixture.home });
+		assert.notEqual(result.status, 0, result.stdout);
+		assert.match(result.stdout, /RESULT: FAIL/);
+		assert.match(result.stdout, /\[reason:drill-source-content-digest-mismatch\]/);
+		const runs = await findRunJson(stateDir);
+		assert.equal(runs.length, 1);
+		assert.equal(runs[0].record.status, "FAIL");
+		assert.ok(runs[0].record.reasons.includes("drill-source-content-digest-mismatch"));
+		assert.equal(runs[0].record.phases.some((phase) => phase.name === "setup"), false, "不得进入投影/registry 阶段");
+	} finally {
+		await rm(workRoot, { recursive: true, force: true });
+	}
+});
+
+test("R2 负向：源插件 tgz 缺 optionalDependencies（其余字节一致）→ 投影前拦截 drill-source-optional-alias-missing", async () => {
+	const workRoot = await mkdtemp(join(tmpdir(), "npm-drill-defect-alias-"));
+	try {
+		const dist = await makeSourceDefect({ valid: fixture, kind: "no-alias", workRoot });
+		const stateDir = join(workRoot, "state");
+		const result = runDrill({ args: ["--dist", dist, "--phases", "preflight"], stateDir, home: fixture.home });
+		assert.notEqual(result.status, 0, result.stdout);
+		assert.match(result.stdout, /RESULT: FAIL/);
+		assert.match(result.stdout, /\[reason:drill-source-optional-alias-missing\]/);
+		const runs = await findRunJson(stateDir);
+		assert.equal(runs.length, 1);
+		assert.equal(runs[0].record.status, "FAIL");
+		assert.ok(runs[0].record.reasons.includes("drill-source-optional-alias-missing"));
+		assert.equal(runs[0].record.phases.some((phase) => phase.name === "setup"), false, "不得进入投影/registry 阶段");
+	} finally {
+		await rm(workRoot, { recursive: true, force: true });
+	}
 });

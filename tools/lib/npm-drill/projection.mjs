@@ -17,6 +17,7 @@ import { sha256Buffer, sha256File, tarExtract } from "../../../dsh-mobile-app/to
 import {
 	ensureDir, existsFile, linkOrCopyFile, readTextFile, runCommand, writeTextFile,
 } from "./process.mjs";
+import { REASONS } from "./reasons.mjs";
 
 // publish-carrier-check 属于 **App 发布链**（dsh-mobile-app/tools）：演练只读调用它。
 // 本模块位于仓库根 tools/lib/npm-drill/，故需跨到 dsh-mobile-app/tools。
@@ -47,6 +48,90 @@ export function readDistAssets(distDir) {
 	if (!carrierTgz || !existsFile(carrierTgz)) problems.push(`carrier-tgz-missing: ${record?.file ?? "<缺失>"}`);
 	if (problems.length > 0) return { ok: false, problems };
 	return { ok: true, problems: [], distDir, manifest, record, pluginTgz, apk, carrierTgz };
+}
+
+/**
+ * R2：**投影之前**钉住源产物不变量。评审复现指出：直接用合成正确的主包元数据做预检，
+ * 会把"源插件缺载体依赖 / 源清单内容标识错误"的坏产物修好后放行。这里改为从源插件 tgz
+ * 解包读取真实 package.json，逐项核验后再允许投影：
+ *   1. 源插件 tgz 字节与清单 plugin.size/sha256 一致；
+ *   2. 包内 name 非空、version == 清单 plugin.version；
+ *   3. optionalDependencies 含精确别名 `npm:<name>@<version>-app`；
+ *   4. 用解包后的真实包内容实算内容标识 == 清单 plugin.contentSha256；
+ *   5. 对**源 dist** 跑现有发布预检（--package-json 用真实包内 package.json，不合成）。
+ * 返回 `{ok, reason, detail, packageDir, packageJson, name, version, contentSha256}`。
+ */
+export async function validateSourceArtifacts({ assets, workDir, env, logFile }) {
+	if (!assets?.ok) {
+		return { ok: false, reason: REASONS.DIST_UNREADABLE, detail: (assets?.problems ?? ["assets-unreadable"]).join("; ") };
+	}
+	const manifest = assets.manifest ?? {};
+	const pluginSegment = manifest.plugin ?? {};
+	const extractDir = path.join(workDir, "source-plugin");
+	const extract = tarExtract(assets.pluginTgz, extractDir);
+	if (!extract.ok) {
+		return { ok: false, reason: REASONS.SOURCE_ARTIFACT_MISMATCH, detail: `插件 tgz 解包失败：${extract.error}` };
+	}
+	const root = path.join(extractDir, "package");
+	let pkg;
+	try {
+		pkg = readPackageJson(root);
+	} catch (error) {
+		return { ok: false, reason: REASONS.SOURCE_PLUGIN_METADATA_MISMATCH, detail: `源插件 package.json 不可读：${String(error?.message ?? error)}` };
+	}
+	// 1) 源插件 tgz 字节身份 = 源清单 plugin 段
+	const size = fs.statSync(assets.pluginTgz).size;
+	const sha256 = sha256File(assets.pluginTgz);
+	if (size !== pluginSegment.size || sha256 !== pluginSegment.sha256) {
+		return {
+			ok: false,
+			reason: REASONS.SOURCE_ARTIFACT_MISMATCH,
+			detail: `plugin tgz 实际 size=${size} sha256=${sha256}；清单 size=${pluginSegment.size ?? "<缺>"} sha256=${pluginSegment.sha256 ?? "<缺>"}`,
+		};
+	}
+	// 2) 真实包内 name/version 与清单一致
+	if (typeof pkg.name !== "string" || pkg.name === "" || pkg.version !== pluginSegment.version) {
+		return {
+			ok: false,
+			reason: REASONS.SOURCE_PLUGIN_METADATA_MISMATCH,
+			detail: `包内 name=${pkg.name ?? "<缺>"} version=${pkg.version ?? "<缺>"}；清单 plugin.version=${pluginSegment.version ?? "<缺>"}`,
+		};
+	}
+	// 3) 精确可选载体别名（缺声明/范围声明/指向别的名字都不放行）
+	const carrierAlias = `${pkg.name}-app`;
+	const expectedAlias = `npm:${pkg.name}@${pkg.version}-app`;
+	const actualAlias = pkg.optionalDependencies?.[carrierAlias];
+	if (actualAlias !== expectedAlias) {
+		return {
+			ok: false,
+			reason: REASONS.SOURCE_OPTIONAL_ALIAS_MISSING,
+			detail: `${carrierAlias}=${actualAlias ?? "<未声明>"} 期望=${expectedAlias}`,
+		};
+	}
+	// 4) 用真实包内容实算内容标识，与源清单比对（不是投影后重算的值）
+	const contentSha256 = pluginContentDigest(root);
+	if (contentSha256 !== pluginSegment.contentSha256) {
+		return {
+			ok: false,
+			reason: REASONS.SOURCE_CONTENT_DIGEST_MISMATCH,
+			detail: `实算 contentSha256=${contentSha256}；源清单=${pluginSegment.contentSha256 ?? "<缺>"}`,
+		};
+	}
+	// 5) 对源 dist 跑现有发布预检：主包元数据取自**真实包内 package.json**（不是合成副本）
+	const preflight = await runPublishCarrierCheck({
+		distDir: assets.distDir,
+		mainPkgPath: path.join(root, "package.json"),
+		env,
+		logFile,
+	});
+	if (!preflight.ok) {
+		return {
+			ok: false,
+			reason: REASONS.DIST_PREFLIGHT_FAILED,
+			detail: `reasons=${preflight.reasons.join(",") || "unknown"}`,
+		};
+	}
+	return { ok: true, packageDir: root, packageJson: pkg, name: pkg.name, version: pkg.version, contentSha256 };
 }
 
 function parsePackJson(stdout) {
@@ -83,6 +168,57 @@ async function npmPack({ dir, destination, env, logFile, label }) {
 	return { ok: true, tarball, filename, size, sha256: sha256File(tarball) };
 }
 
+/** 发布路由键：`publishConfig.registry` 或 `publishConfig["@scope:registry"]`。 */
+export function isPublishConfigRoutingKey(key) {
+	const text = String(key ?? "");
+	return text === "registry" || /^@[^:\s]+:registry$/i.test(text);
+}
+
+/**
+ * R1 续：包内 `publishConfig` 的 registry 路由会在 npm 配置合并中生效，能把发布改投到别的
+ * registry 路径。演练投影对这类路由做**受控改写**（删除），保留 access/tag 等非路由字段；
+ * 并在 npm pack 之后再次从 tarball 读取真实 package.json 断言没有路由键（防投影遗漏）。
+ */
+export function sanitizePublishConfig(pkg) {
+	if (!pkg || typeof pkg !== "object") return [];
+	const publishConfig = pkg.publishConfig;
+	if (!publishConfig || typeof publishConfig !== "object" || Array.isArray(publishConfig)) return [];
+	const removed = [];
+	for (const key of Object.keys(publishConfig)) {
+		if (!isPublishConfigRoutingKey(key)) continue;
+		delete publishConfig[key];
+		removed.push(key);
+	}
+	if (Object.keys(publishConfig).length === 0) delete pkg.publishConfig;
+	return removed;
+}
+
+/** 从已打包 tarball 读取真实 package.json（用于发布前证明包内无路由改投配置）。 */
+async function readPackedPackageJson({ tarball, env, logFile }) {
+	const result = await runCommand({
+		command: "tar",
+		args: ["-xzOf", tarball, "package/package.json"],
+		env,
+		logFile,
+		timeoutMs: 60_000,
+		label: `tar -xzOf ${path.basename(tarball)} package/package.json`,
+	});
+	if (!result.ok) return { ok: false, error: (result.error ?? result.stderr ?? "tar-failed").trim().slice(-400) };
+	try {
+		return { ok: true, value: JSON.parse(result.stdout) };
+	} catch (error) {
+		return { ok: false, error: `packed-package-json-unparsable: ${String(error?.message ?? error)}` };
+	}
+}
+
+async function assertPackedPublishConfigRoutingFree({ tarball, env, logFile }) {
+	const packed = await readPackedPackageJson({ tarball, env, logFile });
+	if (!packed.ok) return packed;
+	const keys = Object.keys(packed.value?.publishConfig ?? {}).filter(isPublishConfigRoutingKey);
+	if (keys.length > 0) return { ok: false, error: `packed-publishconfig-routing-present: ${keys.join(",")}` };
+	return { ok: true, keys: [] };
+}
+
 function readPackageJson(packageDir) {
 	return JSON.parse(readTextFile(path.join(packageDir, "package.json")));
 }
@@ -108,14 +244,18 @@ export async function projectPlugin({ sourceTgz, workDir, name, version, carrier
 	}
 	pkg.version = version;
 	pkg.optionalDependencies = { ...(pkg.optionalDependencies ?? {}), [`${name}-app`]: `npm:${name}@${carrierVersion}` };
+	const sanitizedPublishConfig = sanitizePublishConfig(pkg);
 	writePackageJson(root, pkg);
 	const packed = await npmPack({ dir: root, destination: workDir, env, logFile, label: label ?? `npm pack plugin ${version}` });
 	if (!packed.ok) return packed;
+	const routingFree = await assertPackedPublishConfigRoutingFree({ tarball: packed.tarball, env, logFile });
+	if (!routingFree.ok) return { ok: false, error: routingFree.error };
 	return {
 		ok: true,
 		packageDir: root,
 		packageJson: pkg,
 		pluginVersion: version,
+		sanitizedPublishConfig,
 		contentSha256: pluginContentDigest(root),
 		...packed,
 	};
@@ -137,6 +277,7 @@ export async function projectCarrier({ sourceTgz, workDir, version, manifest, pl
 		return { ok: false, error: `package-json-unreadable: ${String(error?.message ?? error)}` };
 	}
 	pkg.version = version;
+	const sanitizedPublishConfig = sanitizePublishConfig(pkg);
 	writePackageJson(root, pkg);
 	// 清单投影：运行时载体发现要求「插件版本是纯 X.Y.Z，且清单 app 版本语义部分 == 插件版本」。
 	// 因此把 app.version 的语义部分投影成演练插件版本、保留原构建号 +N；APK 的 file/size/sha256
@@ -163,7 +304,9 @@ export async function projectCarrier({ sourceTgz, workDir, version, manifest, pl
 	writeTextFile(path.join(root, "manifest.json"), `${JSON.stringify(nextManifest, null, 2)}\n`);
 	const packed = await npmPack({ dir: root, destination: workDir, env, logFile, label: label ?? `npm pack carrier ${version}` });
 	if (!packed.ok) return packed;
-	return { ok: true, packageDir: root, packageJson: pkg, manifest: nextManifest, ...packed };
+	const routingFree = await assertPackedPublishConfigRoutingFree({ tarball: packed.tarball, env, logFile });
+	if (!routingFree.ok) return { ok: false, error: routingFree.error };
+	return { ok: true, packageDir: root, packageJson: pkg, sanitizedPublishConfig, manifest: nextManifest, ...packed };
 }
 
 /** 证据：解析预检输出里的稳定 reason（`REASONS:` 行与 FAIL 行的 `[reason:...]`）。 */
@@ -188,22 +331,6 @@ export async function runPublishCarrierCheck({ distDir, mainPkgPath, env, logFil
 		label: `publish-carrier-check ${distDir}`,
 	});
 	return { ...result, reasons: parsePreflightReasons(result.stdout) };
-}
-
-/** 为一个演练 run 造「主包 package.json」（版本与源清单一致，别名精确指向源载体版本）。 */
-export function writeDrillMainPackage({ workDir, pluginName, pluginVersion, baseMainPackage }) {
-	const alias = `${pluginName}-app`;
-	const mainPkg = {
-		name: pluginName,
-		version: pluginVersion,
-		optionalDependencies: { [alias]: `npm:${pluginName}@${pluginVersion}-app` },
-		license: baseMainPackage?.license,
-		repository: baseMainPackage?.repository,
-		description: baseMainPackage?.description,
-	};
-	const file = path.join(workDir, "package.json");
-	writeTextFile(file, `${JSON.stringify(mainPkg, null, 2)}\n`);
-	return file;
 }
 
 async function repackPackageDir({ extractParent, tarball, env, logFile }) {
@@ -235,13 +362,9 @@ export async function makePreflightFixture({ assets, workDir, kind, mainPackage,
 	ensureDir(fixtureDir);
 	const manifest = structuredClone(assets.manifest);
 	const record = structuredClone(assets.record);
-	const pluginName = typeof mainPackage?.name === "string" ? mainPackage.name : "@marktrue/dsh-mobile-remote";
-	const mainPkgPath = writeDrillMainPackage({
-		workDir: fixtureDir,
-		pluginName,
-		pluginVersion: manifest.plugin?.version,
-		baseMainPackage: mainPackage,
-	});
+	// R2：夹具的主包元数据同样来自**真实源插件包内 package.json**（不是合成副本）。
+	const mainPkgPath = path.join(fixtureDir, "package.json");
+	writeTextFile(mainPkgPath, `${JSON.stringify(mainPackage ?? {}, null, 2)}\n`);
 	writeTextFile(path.join(fixtureDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 	writeTextFile(path.join(fixtureDir, "app-carrier.json"), `${JSON.stringify(record, null, 2)}\n`);
 	linkOrCopyFile(assets.pluginTgz, path.join(fixtureDir, path.basename(assets.pluginTgz)));
@@ -261,7 +384,7 @@ export async function makePreflightFixture({ assets, workDir, kind, mainPackage,
 		refreshRecordForTarball(path.join(fixtureDir, "app-carrier.json"), carrierCopy);
 	} else if (kind === "bad-version-pairing") {
 		// 清单 plugin 版本与主包版本不再配对（版本配对错误的典型形态）。
-		manifest.plugin.version = "9.9.9-drill.pairingmismatch";
+		manifest.plugin.version = "9.9.999999";
 		writeTextFile(path.join(fixtureDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 		linkOrCopyFile(assets.carrierTgz, carrierCopy);
 	} else {

@@ -8,8 +8,35 @@ import { spawn } from "node:child_process";
 
 const MAX_CAPTURE = 2 * 1024 * 1024;
 
-/** 隔离的进程环境：独立 HOME/XDG/npm cache，清空代理变量（避免本机代理劫持 loopback 请求）。 */
-export function isolatedEnv({ home, extra = {}, clearProxy = true }) {
+/** 去掉 ANSI 转义（npm 输出在 TTY/管道下的颜色码可能干扰错误码整行匹配）。 */
+export function stripAnsi(text) {
+	return String(text ?? "").replace(/\u001B\[[0-9;?]*[ -/]*[@-~]/g, "");
+}
+
+/**
+ * 清掉从父进程继承的 npm 路由/凭据类配置。
+ *
+ * R1：npm 对 scoped 包优先使用 `@scope:registry` 与 `NPM_CONFIG_USERCONFIG` 里的路由；如果
+ * 演练子进程原样继承用户配置，`--registry` 并不能真正把发布/安装钉在受检地址上。因此所有
+ * npm/pnpm 子进程都必须**显式**拿到演练生成的专用 userconfig/globalconfig（见 registry.mjs
+ * `buildIsolatedUserConfig`），继承链上的路由与 token 一律清除。
+ */
+function scrubInheritedNpmRouting(env) {
+	for (const key of Object.keys(env)) {
+		const lower = key.toLowerCase();
+		if (lower === "npm_token" || lower === "node_auth_token") {
+			delete env[key];
+			continue;
+		}
+		if (!lower.startsWith("npm_config_")) continue;
+		const routing = lower.includes("registry") || lower.includes("userconfig") || lower.includes("globalconfig")
+			|| lower.includes("tag") || lower.includes("@") || lower.includes("token") || lower.includes("auth");
+		if (routing) delete env[key];
+	}
+}
+
+/** 隔离的进程环境：独立 HOME/XDG/npm cache，清空代理变量与继承的 npm 路由配置。 */
+export function isolatedEnv({ home, extra = {}, clearProxy = true, scrubNpmRouting = true }) {
 	const env = {
 		...process.env,
 		HOME: home,
@@ -30,7 +57,22 @@ export function isolatedEnv({ home, extra = {}, clearProxy = true }) {
 			env[key] = "";
 		}
 	}
+	if (scrubNpmRouting) scrubInheritedNpmRouting(env);
 	return { ...env, ...extra };
+}
+
+/**
+ * 从子进程输出里抽取 npm **结构化错误码**（R5：只认独立错误码行，不扫描裸数字）。
+ * npm 11 形如 `npm error code E413`；旧版形如 `npm ERR! code E413`。
+ */
+export function npmErrorCodes(result) {
+	const text = stripAnsi(`${result?.stdout ?? ""}\n${result?.stderr ?? ""}`);
+	const codes = [];
+	for (const line of text.split(/\r?\n/)) {
+		const match = /^npm (?:error|ERR!) code ([A-Z0-9_]+)\s*$/.exec(line.trim());
+		if (match) codes.push(match[1]);
+	}
+	return [...new Set(codes)];
 }
 
 /** 取一个本机空闲端口（只绑定 127.0.0.1）。 */
