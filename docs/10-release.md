@@ -345,7 +345,8 @@ if (pkg.name === "@marktrue/dsh-mobile-remote") { console.error("拒绝用正式
 const apkName = path.basename(apk);
 const entry = list.find((name) => name === `package/${apkName}`);
 if (!entry) { console.error(`tarball 内缺少 APK：${apkName}`); process.exit(1); }
-const packed = execFileSync("tar", ["-xzOf", tgz, entry]);
+// 75MB 级 APK 远超 execFileSync 默认 1MB maxBuffer：必须显式放大，否则 ENOBUFS（准备失败即停）。
+const packed = execFileSync("tar", ["-xzOf", tgz, entry], { maxBuffer: 512 * 1024 * 1024 });
 const source = fs.readFileSync(apk);
 const sha = (buffer) => crypto.createHash("sha256").update(buffer).digest("hex");
 if (packed.length !== source.length || sha(packed) !== sha(source)) {
