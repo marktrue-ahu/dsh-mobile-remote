@@ -59,11 +59,31 @@ function npmAuthEnv({ env, userconfig, globalconfig }) {
 }
 
 /**
+ * 解析 npm nerf-dart 凭据键：`//host[:port]/path/:_authToken` → `{host, path, field}`。
+ * 仅识别受支持的凭据字段；其他键（registry=、scope 路由等）不迁移。
+ */
+export function parseNerfDartKey(key) {
+	const match = /^\/\/([^/]+)(\/[^:]*)?:(_authToken|_auth|_password|username|email)$/i.exec(String(key ?? ""));
+	if (!match) return null;
+	const rawPath = match[2] ?? "/";
+	const host = match[1];
+	const pathName = rawPath.endsWith("/") ? rawPath : `${rawPath}/`;
+	return { host, path: pathName, field: match[3].toLowerCase() };
+}
+
+/** 凭据路径是否是受检 registry 路径的前缀（npm 的最长前缀匹配语义）。 */
+export function nerfDartAppliesTo(credentialPath, registryPath) {
+	const cred = String(credentialPath ?? "");
+	const target = String(registryPath ?? "");
+	return cred !== "" && cred.startsWith("/") && target.startsWith(cred);
+}
+
+/**
  * R1：生成演练专用 userconfig。
- * - 固定 `registry=<受检地址>` 与 `@<scope>:registry=<受检地址>`（scope 从根 package.json 推导）；
- * - 仅从用户 userconfig 迁移**目标 host** 的凭据行（`//host/.../:_authToken|_auth|username|
- *   _password|email`），不继承其他 registry 路由；
- * - 目标 host 无用户凭据时，可用调用方提供的一次性 token 或环境 `NPM_TOKEN`/`NODE_AUTH_TOKEN`。
+ * - 固定 `registry=<受检地址>` 与 `@<scope>:registry=<受检地址>`（scope 从**已校验的真实源包名**推导）；
+ * - 仅迁移**受检 registry 路径**实际需要的凭据（npm nerf-dart 前缀语义）：同 host 下其他
+ *   registry 路径的凭据不迁移；
+ * - 目标路径无用户凭据时，可用调用方提供的一次性 token 或环境 `NPM_TOKEN`/`NODE_AUTH_TOKEN`。
  */
 export function buildIsolatedUserConfig({
 	runDir,
@@ -77,15 +97,23 @@ export function buildIsolatedUserConfig({
 	const target = normalizeRegistryUrl(registryUrl);
 	const parsed = new URL(target);
 	const host = parsed.host;
+	const registryPath = parsed.pathname.endsWith("/") ? parsed.pathname : `${parsed.pathname}/`;
 	const scope = packageScope(pluginName);
 	const lines = [`registry=${target}`];
 	if (scope !== "") lines.push(`${scope}:registry=${target}`);
 	const migrated = [];
+	const skipped = [];
 	if (sourceUserConfigPath !== "" && existsFile(sourceUserConfigPath)) {
-		const hostPrefix = `//${host}/`;
 		for (const entry of parseNpmrcEntries(readTextFile(sourceUserConfigPath))) {
-			if (!entry.key.startsWith(hostPrefix)) continue;
-			if (!/:(_authToken|_auth|_password|username|email)$/i.test(entry.key)) continue;
+			const credential = parseNerfDartKey(entry.key);
+			if (credential === null) continue;
+			if (credential.host !== host) continue;
+			// R1 续：同一 host 下只有"受检 registry 路径的前缀"凭据才迁移；其他路径的
+			// registry 命名空间凭据不得带进演练子进程（否则包内/项目配置改投时仍有凭据可用）。
+			if (!nerfDartAppliesTo(credential.path, registryPath)) {
+				skipped.push(entry.key);
+				continue;
+			}
 			lines.push(`${entry.key}=${entry.value}`);
 			migrated.push(entry.key);
 		}
@@ -110,7 +138,7 @@ export function buildIsolatedUserConfig({
 	} catch {
 		// 权限收紧失败不阻塞；文件只含一次性演练 token。
 	}
-	return { ok: true, path: userconfig, host, scope, migrated, usedEnvToken };
+	return { ok: true, path: userconfig, host, scope, registryPath, migrated, skipped, usedEnvToken };
 }
 
 /** 空白 globalconfig：屏蔽系统/全局 npm 配置里的 registry 路由（只影响演练子进程）。 */
@@ -320,14 +348,92 @@ export function packumentDistTags(json) {
 	return json && typeof json["dist-tags"] === "object" && json["dist-tags"] !== null ? json["dist-tags"] : {};
 }
 
-/** npm publish（本地 registry，禁止任何公共源）。`tag` 必须显式给出（载体 app / 插件 latest）。 */
-export async function npmPublish({ tarball, tag, registryUrl, env, logFile, label, userconfig = "", globalconfig = "" }) {
+function isPlainObject(value) {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * R9 续：packument 结构校验（共用元数据读取层）。
+ * “某版本不存在”只能由**有效版本列表**证明：响应必须是同名包的非数组对象、versions 是非数组
+ * 对象，且必须能看到刚刚发布的版本（版本对象若带 name/version 还必须匹配）。HTTP 200 的错误
+ * JSON、缺 versions、versions:null/[]、包名不符、刚发布版本不可见都不得当作“确实不存在”。
+ * @returns {{ok:boolean, reason:string, detail:string, versions:object|null}}
+ */
+export function validatePackument(json, { packageName, requiredVersions = [] } = {}) {
+	if (!isPlainObject(json)) {
+		return { ok: false, reason: "packument-not-object", detail: `响应不是非数组对象（实际：${Array.isArray(json) ? "数组" : typeof json}）`, versions: null };
+	}
+	if (Object.hasOwn(json, "error") && json.error !== undefined) {
+		return { ok: false, reason: "packument-error-field", detail: `响应含 error 字段：${JSON.stringify(json.error).slice(0, 160)}`, versions: null };
+	}
+	if (typeof json.name !== "string" || json.name !== packageName) {
+		return { ok: false, reason: "packument-name-mismatch", detail: `响应 name=${JSON.stringify(json.name ?? null)} 期望=${packageName}`, versions: null };
+	}
+	if (!isPlainObject(json.versions)) {
+		return { ok: false, reason: "packument-versions-not-object", detail: `versions 不是非数组对象（实际：${json.versions === undefined ? "缺失" : Array.isArray(json.versions) ? "数组" : typeof json.versions}）`, versions: null };
+	}
+	const versions = json.versions;
+	for (const required of requiredVersions) {
+		if (!Object.hasOwn(versions, required)) {
+			return { ok: false, reason: "packument-required-version-missing", detail: `versions 中看不到刚发布的 ${required}（共 ${Object.keys(versions).length} 个版本）`, versions: null };
+		}
+		const entry = versions[required];
+		if (!isPlainObject(entry)) {
+			return { ok: false, reason: "packument-version-entry-invalid", detail: `versions[${required}] 不是版本对象（实际：${entry === null ? "null" : typeof entry}）`, versions: null };
+		}
+		if (Object.hasOwn(entry, "name") && entry.name !== packageName) {
+			return { ok: false, reason: "packument-version-name-mismatch", detail: `versions[${required}].name=${JSON.stringify(entry.name)}`, versions: null };
+		}
+		if (Object.hasOwn(entry, "version") && entry.version !== required) {
+			return { ok: false, reason: "packument-version-version-mismatch", detail: `versions[${required}].version=${JSON.stringify(entry.version)}`, versions: null };
+		}
+	}
+	return { ok: true, reason: "ok", detail: `versions=${Object.keys(versions).length}`, versions };
+}
+
+/** 读取并**结构校验** packument；任何失败都返回稳定 reason，调用方据此 fail-closed。 */
+export async function fetchPackumentChecked({ registryUrl, packageName, requiredVersions = [], timeoutMs = 20_000 }) {
+	const raw = await fetchPackument(registryUrl, packageName, { timeoutMs });
+	if (!raw.ok) {
+		return {
+			ok: false,
+			reason: "packument-fetch-failed",
+			detail: `${raw.error ?? "fetch-failed"}${raw.status === null ? "" : ` status=${raw.status}`}`,
+			versions: null,
+			json: raw.json,
+		};
+	}
+	const validated = validatePackument(raw.json, { packageName, requiredVersions });
+	return { ...validated, json: raw.json, status: raw.status };
+}
+
+/**
+ * R1 续：npm publish 的 argv 同时固定默认 registry 与作用域 registry。
+ * 包内 `publishConfig["@scope:registry"]` 会在 npm 配置合并中生效，只有**CLI 单参数**
+ * `--@scope:registry=<受检地址>` 的优先级能覆盖它（复核已实测：错路径 PUT 2→0）。
+ * scope 必须来自**已校验的真实源包名**（不是根 package.json 的猜测）。
+ */
+export async function npmPublish({
+	tarball,
+	tag,
+	registryUrl,
+	env,
+	logFile,
+	label,
+	userconfig = "",
+	globalconfig = "",
+	pluginName = "",
+}) {
+	const scope = packageScope(pluginName);
+	const pinned = scope === "" ? "" : `--${scope}:registry=${normalizeRegistryUrl(registryUrl)}`;
 	return runCommand({
 		command: "npm",
 		cwd: userconfig !== "" ? path.dirname(userconfig) : process.cwd(),
 		args: [
 			"publish", tarball,
 			"--registry", registryUrl,
+			// 必须是单个 argv 元素（`--@scope:registry=URL`），不能拆成两个参数。
+			...(pinned === "" ? [] : [pinned]),
 			"--tag", tag,
 			"--access", "public",
 			"--ignore-scripts",

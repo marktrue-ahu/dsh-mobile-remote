@@ -168,6 +168,57 @@ async function npmPack({ dir, destination, env, logFile, label }) {
 	return { ok: true, tarball, filename, size, sha256: sha256File(tarball) };
 }
 
+/** 发布路由键：`publishConfig.registry` 或 `publishConfig["@scope:registry"]`。 */
+export function isPublishConfigRoutingKey(key) {
+	const text = String(key ?? "");
+	return text === "registry" || /^@[^:\s]+:registry$/i.test(text);
+}
+
+/**
+ * R1 续：包内 `publishConfig` 的 registry 路由会在 npm 配置合并中生效，能把发布改投到别的
+ * registry 路径。演练投影对这类路由做**受控改写**（删除），保留 access/tag 等非路由字段；
+ * 并在 npm pack 之后再次从 tarball 读取真实 package.json 断言没有路由键（防投影遗漏）。
+ */
+export function sanitizePublishConfig(pkg) {
+	if (!pkg || typeof pkg !== "object") return [];
+	const publishConfig = pkg.publishConfig;
+	if (!publishConfig || typeof publishConfig !== "object" || Array.isArray(publishConfig)) return [];
+	const removed = [];
+	for (const key of Object.keys(publishConfig)) {
+		if (!isPublishConfigRoutingKey(key)) continue;
+		delete publishConfig[key];
+		removed.push(key);
+	}
+	if (Object.keys(publishConfig).length === 0) delete pkg.publishConfig;
+	return removed;
+}
+
+/** 从已打包 tarball 读取真实 package.json（用于发布前证明包内无路由改投配置）。 */
+async function readPackedPackageJson({ tarball, env, logFile }) {
+	const result = await runCommand({
+		command: "tar",
+		args: ["-xzOf", tarball, "package/package.json"],
+		env,
+		logFile,
+		timeoutMs: 60_000,
+		label: `tar -xzOf ${path.basename(tarball)} package/package.json`,
+	});
+	if (!result.ok) return { ok: false, error: (result.error ?? result.stderr ?? "tar-failed").trim().slice(-400) };
+	try {
+		return { ok: true, value: JSON.parse(result.stdout) };
+	} catch (error) {
+		return { ok: false, error: `packed-package-json-unparsable: ${String(error?.message ?? error)}` };
+	}
+}
+
+async function assertPackedPublishConfigRoutingFree({ tarball, env, logFile }) {
+	const packed = await readPackedPackageJson({ tarball, env, logFile });
+	if (!packed.ok) return packed;
+	const keys = Object.keys(packed.value?.publishConfig ?? {}).filter(isPublishConfigRoutingKey);
+	if (keys.length > 0) return { ok: false, error: `packed-publishconfig-routing-present: ${keys.join(",")}` };
+	return { ok: true, keys: [] };
+}
+
 function readPackageJson(packageDir) {
 	return JSON.parse(readTextFile(path.join(packageDir, "package.json")));
 }
@@ -193,14 +244,18 @@ export async function projectPlugin({ sourceTgz, workDir, name, version, carrier
 	}
 	pkg.version = version;
 	pkg.optionalDependencies = { ...(pkg.optionalDependencies ?? {}), [`${name}-app`]: `npm:${name}@${carrierVersion}` };
+	const sanitizedPublishConfig = sanitizePublishConfig(pkg);
 	writePackageJson(root, pkg);
 	const packed = await npmPack({ dir: root, destination: workDir, env, logFile, label: label ?? `npm pack plugin ${version}` });
 	if (!packed.ok) return packed;
+	const routingFree = await assertPackedPublishConfigRoutingFree({ tarball: packed.tarball, env, logFile });
+	if (!routingFree.ok) return { ok: false, error: routingFree.error };
 	return {
 		ok: true,
 		packageDir: root,
 		packageJson: pkg,
 		pluginVersion: version,
+		sanitizedPublishConfig,
 		contentSha256: pluginContentDigest(root),
 		...packed,
 	};
@@ -222,6 +277,7 @@ export async function projectCarrier({ sourceTgz, workDir, version, manifest, pl
 		return { ok: false, error: `package-json-unreadable: ${String(error?.message ?? error)}` };
 	}
 	pkg.version = version;
+	const sanitizedPublishConfig = sanitizePublishConfig(pkg);
 	writePackageJson(root, pkg);
 	// 清单投影：运行时载体发现要求「插件版本是纯 X.Y.Z，且清单 app 版本语义部分 == 插件版本」。
 	// 因此把 app.version 的语义部分投影成演练插件版本、保留原构建号 +N；APK 的 file/size/sha256
@@ -248,7 +304,9 @@ export async function projectCarrier({ sourceTgz, workDir, version, manifest, pl
 	writeTextFile(path.join(root, "manifest.json"), `${JSON.stringify(nextManifest, null, 2)}\n`);
 	const packed = await npmPack({ dir: root, destination: workDir, env, logFile, label: label ?? `npm pack carrier ${version}` });
 	if (!packed.ok) return packed;
-	return { ok: true, packageDir: root, packageJson: pkg, manifest: nextManifest, ...packed };
+	const routingFree = await assertPackedPublishConfigRoutingFree({ tarball: packed.tarball, env, logFile });
+	if (!routingFree.ok) return { ok: false, error: routingFree.error };
+	return { ok: true, packageDir: root, packageJson: pkg, sanitizedPublishConfig, manifest: nextManifest, ...packed };
 }
 
 /** 证据：解析预检输出里的稳定 reason（`REASONS:` 行与 FAIL 行的 `[reason:...]`）。 */

@@ -40,8 +40,9 @@
 //             drill-carrier-manifest-app-mismatch、drill-plugin-digest-mismatch
 //   更新：    drill-update-failed、drill-carrier-not-replaced
 //   失败路径：drill-optional-missing-degraded-mismatch、drill-plugin-only-metadata-mismatch、
-//             drill-missing-carrier-unexpectedly-present、drill-preflight-unexpected-pass、
-//             drill-preflight-reason-mismatch、drill-e413-not-reproduced
+//             drill-missing-carrier-unexpectedly-present、drill-carrier-absence-check-failed、
+//             drill-preflight-unexpected-pass、drill-preflight-reason-mismatch、
+//             drill-e413-not-reproduced
 //   发现/安装补充：drill-installed-carrier-manifest-mismatch
 //             drill-preflight-reason-mismatch、drill-e413-not-reproduced
 //   兜底：    drill-setup-failed、drill-assertion-failed
@@ -95,9 +96,11 @@ const HELP_TEXT = `npm-drill — 发版演练（本地 registry，全程不接�
 
 安全围栏（复用 registry 时）:
   演练不继承调用方的 NPM_CONFIG_USERCONFIG/registry 路由：每个受检 registry 都会生成专用
-  npm 配置（registry=<受检地址> + @<scope>:registry=<受检地址>，只迁移目标 host 凭据），
-  并在发布/安装前用 npm config get 自检；实际生效值≠受检地址即 fail-closed
-  （reason: drill-registry-scope-mismatch）。
+  npm 配置（registry=<受检地址> + @<scope>:registry=<受检地址>），并且只迁移**受检 registry
+  路径**需要的凭据（同 host 其他 registry 路径凭据不迁移）。每次 npm publish 的 argv 同时固定
+  --registry 与单参数 --@<scope>:registry=<受检URL>（scope 来自已校验源包名）；演练投影会
+  受控改写包内 publishConfig 的 registry 路由，发布前再用 npm config get 自检实际生效值；
+  实际生效值≠受检地址即 fail-closed（reason: drill-registry-scope-mismatch）。
 
 环境变量:
   DSH_DRILL_STATE_DIR  覆盖状态目录（默认 <DSH_HOME|~/.dsh>/mobile-remote/drill）
@@ -200,6 +203,14 @@ function logsOf(ctx) {
 	return ctx.logsDir;
 }
 
+/**
+ * R1 续：scope 必须来自**已校验的真实源包名**（P1 从源插件 tgz 解包并核对过），
+ * 而不是根 package.json 的猜测；未通过源校验时不允许走到 registry 阶段。
+ */
+function verifiedPluginName(ctx) {
+	return ctx.source?.name ?? "";
+}
+
 /** 在临时 registry 上注册一次性用户并生成**专用** npm 配置（R1：固定 registry + scope）。 */
 async function provisionRegistryCredentials(ctx, { url, label, logFile }) {
 	const username = "drill";
@@ -216,7 +227,7 @@ async function provisionRegistryCredentials(ctx, { url, label, logFile }) {
 		runDir: ctx.runDir,
 		label,
 		registryUrl: url,
-		pluginName: ctx.mainPackage.name,
+		pluginName: verifiedPluginName(ctx),
 		env: process.env,
 		authToken: user.token,
 	});
@@ -229,11 +240,14 @@ async function provisionRegistryCredentials(ctx, { url, label, logFile }) {
  * registry/scope 并只迁移目标 host 凭据；随后用 `npm config get` 验证实际生效值。
  */
 async function prepareRegistryConfig(ctx, { url, label, logFile, sourceUserConfigPath = "", authToken = "" }) {
+	if (verifiedPluginName(ctx) === "") {
+		throw new DrillSetupError(REASONS.SETUP_FAILED, "源产物未通过校验，无法确定受检 scope（不允许进入 registry 阶段）");
+	}
 	const built = buildIsolatedUserConfig({
 		runDir: ctx.runDir,
 		label,
 		registryUrl: url,
-		pluginName: ctx.mainPackage.name,
+		pluginName: verifiedPluginName(ctx),
 		sourceUserConfigPath,
 		env: process.env,
 		authToken,
@@ -243,7 +257,7 @@ async function prepareRegistryConfig(ctx, { url, label, logFile, sourceUserConfi
 		registryUrl: url,
 		userconfig: built.path,
 		globalconfig,
-		pluginName: ctx.mainPackage.name,
+		pluginName: verifiedPluginName(ctx),
 		env: isolatedEnv({ home: ctx.home }),
 		logFile,
 	});
@@ -589,12 +603,17 @@ async function main() {
 				// R1：发布/安装前自检实际生效的 registry 路由（含 scoped registry）。
 				const scopeCheck = ctx.registry.normalScopeCheck;
 				const migrated = ctx.registry.normalConfigInfo?.migrated ?? [];
+				const skipped = ctx.registry.normalConfigInfo?.skipped ?? [];
+				const sanitized = [
+					...(ctx.projection?.pluginA?.sanitizedPublishConfig ?? []),
+					...(ctx.projection?.carrierA?.sanitizedPublishConfig ?? []),
+				];
 				recordAssertion(setupPhase, {
 					id: "S2",
 					title: "registry 路由自检：registry 与 @scope:registry 均指向受检地址（不被用户 npmrc 覆盖）",
 					pass: scopeCheck?.ok === true,
 					reason: REASONS.REGISTRY_SCOPE_MISMATCH,
-					detail: `${scopeCheck?.detail ?? "<未执行>"}；迁移目标 host 凭据=${migrated.length} 项`,
+					detail: `${scopeCheck?.detail ?? "<未执行>"}；scope=${ctx.registry.normalConfigInfo?.scope ?? "<未知>"}（源包名=${verifiedPluginName(ctx)}）；迁移目标路径凭据=${migrated.length} 项；未迁移同 host 其他路径凭据=${skipped.length} 项；投影包内 publishConfig 路由改写=${sanitized.length} 项`,
 				});
 			} catch (error) {
 				recordAssertion(setupPhase, setupFailureAssertion(error));

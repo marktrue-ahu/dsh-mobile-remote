@@ -82,20 +82,26 @@ npm 全局前缀需可写（本机为 `~/.local`，已验证可用）；若 `EAC
 - [ ] 当前分支与 HEAD 符合发布授权；`git status --short` 干净（或仅有不影响产物的明确变更）。
 - [ ] 版本三处一致（见 §3 校验命令）：根 `package.json` version、`dsh-mobile-app/pubspec.yaml` version、根 `package.json` 的载体别名。
 - [ ] `CHANGELOG.md` 已写本次发布条目（清单 `notes` 取最新 `##` 条目全文，缺条目构建会失败）。
-- [ ] 门禁测试通过（**必须用一次性隔离 HOME，禁止在运行中 profile 的 HOME 下跑**）：
+- [ ] 门禁测试通过（**局部子 shell + 统一隔离变量；禁止在运行中 profile 的 HOME 下跑**）：
       ```bash
-      # 每条门禁命令都在一次性隔离环境中执行：HOME/DSH_HOME/XDG/cache 全部指向临时目录。
-      GATE_HOME="$(mktemp -d)"
-      env HOME="$GATE_HOME" DSH_HOME="$GATE_HOME/.dsh" \
-          XDG_CONFIG_HOME="$GATE_HOME/.config" XDG_CACHE_HOME="$GATE_HOME/.cache" \
-          XDG_DATA_HOME="$GATE_HOME/.local/share" npm_config_cache="$GATE_HOME/.npm-cache" \
-          node --test test/*.mjs
-      # App 侧同样隔离 HOME（Flutter/Dart 也会写用户缓存）
-      ( cd dsh-mobile-app && env HOME="$GATE_HOME" flutter analyze && env HOME="$GATE_HOME" flutter test )
+      # fail-fast：Node 非零即整体失败（不会再跑 Flutter）；flutter analyze 非零不会跑 flutter test。
+      # 失败时保留 GATE_HOME 作为证据（不自动删除；确认无用后再手动清理）。
+      (
+        set -euo pipefail
+        GATE_HOME="$(mktemp -d)"
+        printf 'GATE_HOME=%s\n' "$GATE_HOME"
+        export HOME="$GATE_HOME" DSH_HOME="$GATE_HOME/.dsh"
+        export XDG_CONFIG_HOME="$GATE_HOME/.config" XDG_CACHE_HOME="$GATE_HOME/.cache"
+        export XDG_DATA_HOME="$GATE_HOME/.local/share" npm_config_cache="$GATE_HOME/.npm-cache"
+        export PUB_CACHE="$GATE_HOME/.pub-cache"
+        node --test test/*.mjs
+        ( cd dsh-mobile-app && flutter analyze && flutter test )
+      )
       ```
       > 为什么：部分 HTTP 夹具会真实调用插件 `apply()`，插件启动逻辑按 `homedir()` 读取并收敛
-      > 更新事务；只隔离工作区或只设 `DSH_HOME` 不足以隔离这一读写链。失败时**保留**
-      > `$GATE_HOME` 作为证据（脚本里不要自动 `rm -rf`），排查后再清理。
+      > 更新事务；只隔离工作区或只设 `DSH_HOME` 不足以隔离这一读写链，Flutter 还会读取
+      > `XDG_CONFIG_HOME`/`PUB_CACHE`。统一 `export` 让 Node 与 Flutter 子进程共用同一临时根；
+      > `set -euo pipefail` 保证前一步失败不会继续执行后续门禁。
 - [ ] 构建机环境就绪（附录 A）；签名 keystore 已备份、未丢失。
 - [ ] 演练环境就绪：`verdaccio --version`；且已在当前 HEAD 的发布目录上跑通 §6 演练（`RESULT: PASS`）。
 - [ ] 已取得本次**发布授权**（试发布与正式发布均需授权；本手册不代授权）。
@@ -233,8 +239,9 @@ node tools/npm-drill.mjs --dist dsh-mobile-app/dist --phases preflight
 node tools/npm-drill.mjs --dist dsh-mobile-app/dist --phases publish,install
 
 # 复用已有 registry（CI/调试；默认只允许本机/私网地址，远端需 `DRILL_ALLOW_REMOTE_REGISTRY=1` 显式放行；低上限实例仍由脚本本机启动）
-# R1：只迁移该地址凭据；registry 与 @<scope>:registry 由专用 npm 配置固定并自检，
-#     不继承用户 npmrc 的路由（参见 6.5 的 drill-registry-scope-mismatch）
+# R1 续：只迁移**受检 registry 路径**需要的凭据（同 host 其他路径不迁移）；每次 npm publish
+#        的 argv 同时固定 --registry 与单参数 --@<scope>:registry=<受检URL>，并在投影时受控
+#        改写包内 publishConfig 的 registry 路由；发布前用专用配置自检实际生效路由。
 node tools/npm-drill.mjs --dist dsh-mobile-app/dist --registry http://127.0.0.1:4873
 
 # 保留现场（工作目录、registry 存储、全部日志）
@@ -267,12 +274,12 @@ CLI 契约：
 | 阶段 | 断言 | 验收内容 |
 |---|---|---|
 | **发布**（publish） | A1–A4 | A1 registry 存活；A2 插件发布成功且可查询；A3 载体发布成功，dist-tags 中 `app`→载体、`latest`→插件、载体不在 `latest`；A4 重复发布同版本被拒 |
-| **全新安装**（install） | A5–A10 | A5 全新隔离 HOME + 新 profile 安装主插件成功；A6 载体别名目录存在；A7 别名目录 `package.json` 的真实 name/version 正确且带 `dsh.appCarrier` 标记；A8 载体内 APK size+sha256 与清单一致；A9 lockfile `snapshots` 中插件快照的 `optionalDependencies` **精确映射**载体别名→载体 ID（结构化解析，忽略注释）；A10 `.modules.yaml` 的 `hoistedLocations[载体]` **精确落点**为别名目录 |
+| **全新安装**（install） | A5–A10 | A5 全新隔离 HOME + 新 profile 安装主插件成功；A6 载体别名目录存在；A7 别名目录 `package.json` 的真实 name/version 正确且带 `dsh.appCarrier` 标记；A8 载体内 APK size+sha256 与清单一致；A9 只在顶层 `snapshots:` 段内、快照直接层级读取 `optionalDependencies` 的**精确映射**（离开该段即停止；拒绝越界层级/嵌套/重复键/仅注释命中）；A10 `.modules.yaml` 的 `hoistedLocations[载体]` 必须是 `string[]`，落点规范化后**严格等于** `node_modules/<别名>`（拒绝任意前缀/后缀与 `..` 越界；绝对路径按已知 profile 根解析） |
 | **真实布局发现**（discover） | A11–A13 | A11 实际安装布局下载体发现返回 found 且来源为插件自身作用域；A12 载体清单 App 版本的**构建号**与发布目录清单一致、APK 身份（file/size/sha256）一致（语义版本被投影为演练版本）；A13 以**实际安装目录中的载体清单**为 expected，要求安装后插件内容标识等于该清单 `plugin.contentSha256`，且载体发现返回 `pluginContent.matches === true`、随包清单身份与本次投影一致 |
 | **版本更新**（update） | A14–A16 | A14 发布第二对新版本成功；A15 原安装更新成功，别名目录版本变为新载体版本；A16 旧载体被替换，再次发现得到新版本 |
-| **失败路径**（failure） | A17–A20 | A17 只发插件不发载体：先核验实际安装的插件版本=pluginOnly 且 `optionalDependencies` 精确指向**未发布**的载体版本、registry 确实没有该版本，再断言安装不报错但别名目录缺失、发现结果为「载体未安装」；A18 载体发布元数据不合规时预检以稳定 reason 失败；A19 版本配对错误时预检以稳定 reason 失败；A20 低上限（10mb）registry 发布大体量载体失败——只认 npm **结构化错误码** `npm error code E413`，不扫描任意文本里的裸数字 |
+| **失败路径**（failure） | A17–A20 | A17 只发插件不发载体：先核验实际安装的插件版本=pluginOnly 且 `optionalDependencies` 精确指向**未发布**的载体版本；再要求 registry 返回**结构有效**的 packument（同名、`versions` 为非数组对象、能看到刚发布的 pluginOnly）且其中不含该载体版本（坏形状一律 `drill-carrier-absence-check-failed`）；最后断言安装不报错但别名目录缺失、发现结果为「载体未安装」；A18 载体发布元数据不合规时预检以稳定 reason 失败；A19 版本配对错误时预检以稳定 reason 失败；A20 低上限（10mb）registry 发布大体量载体失败——只认 npm **结构化错误码** `npm error code E413`，不扫描任意文本里的裸数字 |
 
-离线阶段 `preflight`（`--phases preflight`）另有辅助断言：P1 在**投影之前**校验源产物不变量（解包真实插件 tgz → name/version 与源清单一致、`optionalDependencies` 含精确别名、用真实包内容实算内容标识并与清单比对、再对**源 dist** 跑发布预检；失败 reason 为 `drill-source-*`，不得进入投影）；P2 演练版本命名合法。默认测试套件只跑该离线阶段，不联网。setup 阶段另有 S2：用与发布相同的 npm 配置执行 `npm config get registry` / `npm config get @<scope>:registry`，两者都必须等于受检地址。
+离线阶段 `preflight`（`--phases preflight`）另有辅助断言：P1 在**投影之前**校验源产物不变量（解包真实插件 tgz → name/version 与源清单一致、`optionalDependencies` 含精确别名、用真实包内容实算内容标识并与清单比对、再对**源 dist** 跑发布预检；失败 reason 为 `drill-source-*`，不得进入投影）；P2 演练版本命名合法。默认测试套件只跑该离线阶段，不联网。setup 阶段另有 S2：scope 从**已校验的源包名**推导；用与发布相同的 npm 配置执行 `npm config get registry` / `npm config get @<scope>:registry`，两者都必须等于受检地址；同时记录投影包内 `publishConfig` 路由改写数与同 host 其他路径凭据未迁移数（发布 argv 另以单参数 `--@<scope>:registry` 固定作用域路由）。
 
 ### 6.4 演练版本与隔离
 
@@ -286,7 +293,7 @@ CLI 契约：
 
 - 逐条 `PASS/FAIL`（失败行带 `[reason:drill-*]`）+ 阶段摘要 + `RESULT: PASS|FAIL` + `REASONS:` + `EVIDENCE:`（证据目录）+ 退出码非 0 即失败。
 - 运行记录：`<状态目录>/drill/<UTC时间>-<演练版本>/run.json`（阶段/断言/结果/reason/耗时）+ registry 与包管理器日志。状态目录默认 `~/.dsh/mobile-remote/drill`（可用 `DSH_DRILL_STATE_DIR` 覆盖）。
-- 常见 reason：`drill-registry-not-installed`（未装 Verdaccio）、`drill-registry-start-failed`、`drill-registry-not-allowed`、`drill-registry-scope-mismatch`（实际生效的 registry/scope 路由不等于受检地址）、`drill-source-plugin-metadata-mismatch` / `drill-source-optional-alias-missing` / `drill-source-content-digest-mismatch` / `drill-source-artifact-mismatch`（源产物不变量）、`drill-publish-failed`、`drill-dist-tag-mismatch`、`drill-install-failed`、`drill-carrier-alias-missing`、`drill-lockfile-alias-missing` / `drill-hoisted-mapping-missing`（布局结构）、`drill-plugin-digest-mismatch` / `drill-installed-carrier-manifest-mismatch`（安装后清单/摘要）、`drill-plugin-only-metadata-mismatch` / `drill-missing-carrier-unexpectedly-present`（缺载体降级前置）、`drill-e413-not-reproduced` 等；完整词表见脚本头部注释。
+- 常见 reason：`drill-registry-not-installed`（未装 Verdaccio）、`drill-registry-start-failed`、`drill-registry-not-allowed`、`drill-registry-scope-mismatch`（实际生效的 registry/scope 路由不等于受检地址）、`drill-source-plugin-metadata-mismatch` / `drill-source-optional-alias-missing` / `drill-source-content-digest-mismatch` / `drill-source-artifact-mismatch`（源产物不变量）、`drill-publish-failed`、`drill-dist-tag-mismatch`、`drill-install-failed`、`drill-carrier-alias-missing`、`drill-lockfile-alias-missing` / `drill-hoisted-mapping-missing`（布局结构）、`drill-plugin-digest-mismatch` / `drill-installed-carrier-manifest-mismatch`（安装后清单/摘要）、`drill-plugin-only-metadata-mismatch` / `drill-missing-carrier-unexpectedly-present` / `drill-carrier-absence-check-failed`（缺载体降级前置与缺失证明）、`drill-e413-not-reproduced` 等；完整词表见脚本头部注释。
 
 ### 6.6 失败时
 
@@ -307,19 +314,54 @@ CLI 契约：
 ### 7.1 一次性包名探针（唯一可执行形态）
 
 ```bash
-# 需授权后人工执行。探针只验证"公共源能收多大/能打什么 tag"，不碰正式包名。
-PROBE_NAME="@marktrue/dsh-mobile-remote-probe-$(date -u +%Y%m%d%H%M%S)"
-PROBE_DIR="$(mktemp -d)"
-cp dsh-mobile-app/dist/DSH-Remote-vX.Y.Z.apk "$PROBE_DIR/"   # 用与真实载体同规模的 APK 做体积探针
-cat > "$PROBE_DIR/package.json" <<EOF
-{ "name": "$PROBE_NAME", "version": "0.0.1", "description": "one-off npm reception probe", "license": "MIT", "files": ["DSH-Remote-vX.Y.Z.apk"] }
+# 需授权后人工执行。准备阶段任何失败都必须中止（publish 调用次数为 0）。
+(
+  set -euo pipefail
+  # APK 路径：显式参数优先；否则按当前版本推导（也可显式传：bash ./probe.sh <apk>）
+  APK="${1:-dsh-mobile-app/dist/DSH-Remote-vX.Y.Z.apk}"
+  test -s "$APK" || { echo "APK 缺失或为空：$APK" >&2; exit 1; }
+  PROBE_NAME="@marktrue/dsh-mobile-remote-probe-$(date -u +%Y%m%d%H%M%S)"
+  PROBE_DIR="$(mktemp -d)"
+  cp "$APK" "$PROBE_DIR/" || { echo "复制 APK 失败" >&2; exit 1; }
+  cat > "$PROBE_DIR/package.json" <<EOF
+{ "name": "$PROBE_NAME", "version": "0.0.1", "description": "one-off npm reception probe", "license": "MIT", "files": ["$(basename "$APK")"] }
 EOF
-( cd "$PROBE_DIR" && npm pack --pack-destination . )
-# 授权后：发布探针并核对 tag/体积/镜像；探针版本不会进 latest
-npm publish "$PROBE_DIR"/*.tgz --tag canary --access public
-npm view "$PROBE_NAME" dist-tags versions --json
+  # 用 npm pack 的 JSON 输出定位**唯一** tarball（不用通配符；pack 失败即退出）。
+  PACK_JSON="$( cd "$PROBE_DIR" && npm pack --json --pack-destination "$PROBE_DIR" )"
+  TGZ_NAME="$( printf '%s' "$PACK_JSON" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const a=JSON.parse(s);if(!Array.isArray(a)||a.length!==1)process.exit(2);process.stdout.write(a[0].filename);});' )"
+  test -n "$TGZ_NAME" && test -s "$PROBE_DIR/$TGZ_NAME" || { echo "npm pack 未产出唯一 tarball" >&2; exit 1; }
+  TGZ="$PROBE_DIR/$TGZ_NAME"
+  # 发布前核验：包名确为本次一次性 probe；tarball 内含 APK 且字节数/sha256 与源 APK 一致。
+  node - "$TGZ" "$PROBE_NAME" "$APK" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const { execFileSync } = require("node:child_process");
+const [tgz, probeName, apk] = process.argv.slice(2);
+const list = execFileSync("tar", ["-tzf", tgz], { encoding: "utf8" }).trim().split("\n").filter(Boolean);
+const pkg = JSON.parse(execFileSync("tar", ["-xzOf", tgz, "package/package.json"], { encoding: "utf8" }));
+if (pkg.name !== probeName) { console.error(`包名不是本次一次性 probe：${pkg.name}`); process.exit(1); }
+if (pkg.name === "@marktrue/dsh-mobile-remote") { console.error("拒绝用正式包名做探针"); process.exit(1); }
+const apkName = path.basename(apk);
+const entry = list.find((name) => name === `package/${apkName}`);
+if (!entry) { console.error(`tarball 内缺少 APK：${apkName}`); process.exit(1); }
+const packed = execFileSync("tar", ["-xzOf", tgz, entry]);
+const source = fs.readFileSync(apk);
+const sha = (buffer) => crypto.createHash("sha256").update(buffer).digest("hex");
+if (packed.length !== source.length || sha(packed) !== sha(source)) {
+  console.error(`tarball 内 APK 与源 APK 不一致（${packed.length}/${source.length} 字节）`);
+  process.exit(1);
+}
+console.log(`ok: ${probeName} 内含与源一致的 ${packed.length} 字节 APK`);
+NODE
+  echo "准备完成：$TGZ"
+  # 只有以上全部通过且已获授权，才执行显式 canary 发布并核对：
+  # npm publish "$TGZ" --tag canary --access public
+  # npm view "$PROBE_NAME" dist-tags versions --json
+)
 ```
 
+失败即停：APK 缺失/空、`cp` 失败、`npm pack` 非零或产出不是唯一 tarball、包名不是本次一次性 probe、tarball 内缺 APK 或字节/哈希与源不一致——任一发生都不会执行 publish。
 核对项：发布请求体/体积被公共源接收；`canary` tag 正确、`latest` 未被探针占用；镜像站可取得该 tarball；认证与 npm 客户端配置指向预期源（`npm config get registry`）。
 达到验证目的后按 7.2 的边界处理回收（能 unpublish 就及时操作；不能则记录并遗忘该一次性名）。
 

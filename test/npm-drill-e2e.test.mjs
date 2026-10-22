@@ -51,7 +51,7 @@ async function exists(file) {
 	}
 }
 
-async function makeFixtureDist({ apkBytes }) {
+async function makeFixtureDist({ apkBytes, pluginExtra = {} }) {
 	const base = await mkdtemp(join(tmpdir(), "npm-drill-e2e-"));
 	const pluginRoot = join(base, "plugin");
 	const dist = join(base, "dist");
@@ -69,6 +69,7 @@ async function makeFixtureDist({ apkBytes }) {
 		optionalDependencies: { [alias]: `npm:${repoPkg.name}@${repoPkg.version}-app` },
 		license: repoPkg.license ?? "MIT",
 		repository: repoPkg.repository ?? undefined,
+		...pluginExtra,
 	};
 	await writeFile(join(pluginRoot, "package.json"), `${JSON.stringify(pluginPkg, null, 2)}\n`);
 	await writeFile(join(pluginRoot, "lib", "index.js"), "export const drillFixture = true;\n");
@@ -236,6 +237,8 @@ test("完整演练：五阶段 + 20 条断言全部 PASS（本地 registry，不
 	assert.ok(s2 && s2.pass === true, `S2 registry 路由自检应 PASS：${JSON.stringify(s2)}`);
 	const p1 = assertionOf(record, "P1");
 	assert.match(String(p1?.detail ?? ""), /内容标识/, "P1 应报告源产物内容标识校验");
+	const a17 = assertionOf(record, "A17");
+	assert.match(String(a17?.detail ?? ""), /carrierAbsent=true/, "A17 应在有效 packument 上确认载体缺失");
 
 	// 证据与清理：默认成功后保 run.json + 日志，清理工作目录/隔离 HOME/registry 存储。
 	assert.ok(await exists(join(dir, "run.json")));
@@ -349,6 +352,41 @@ if (result.status === 0 && args[0] === "add") {
     fs.writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + "\\n");
     note("injected: pluginOnly installed package optionalDependencies erased (R9)");
   }
+  if (mode === "snapshot-outside" && count === 1) {
+    // R8 续①：插件快照移到 snapshots 之外的顶层字段。
+    const pkg = JSON.parse(fs.readFileSync(path.join(pluginDir, "package.json"), "utf8"));
+    fs.writeFileSync(path.join(cwd, "pnpm-lock.yaml"),
+      "lockfileVersion: '9.0'\\nsnapshots:\\n  unrelated@1.0.0: {}\\nreviewDecoy:\\n  '" + name + "@" + pkg.version + "':\\n    optionalDependencies:\\n      '" + alias + "': '" + name + "@" + pkg.version + "-app'\\n");
+    note("injected: plugin snapshot moved outside top-level snapshots (R8)");
+  }
+  if (mode === "alias-nested" && count === 1) {
+    // R8 续②：真实 alias 映射被藏进嵌套对象。
+    const lockPath = path.join(cwd, "pnpm-lock.yaml");
+    const lines = fs.readFileSync(lockPath, "utf8").split("\\n");
+    const index = lines.findIndex((line) => {
+      const trimmed = line.trim();
+      return trimmed.startsWith("'" + alias + "':") || trimmed.startsWith(alias + ":");
+    });
+    if (index === -1) throw new Error("alias mapping not found for injection");
+    const indent = (/^\\s*/.exec(lines[index])[0]);
+    lines[index] = indent + "nested:\\n" + indent + "  " + lines[index].trim();
+    fs.writeFileSync(lockPath, lines.join("\\n"));
+    note("injected: alias mapping nested under an object (R8)");
+  }
+  if ((mode === "hoisted-prefix" || mode === "hoisted-traversal") && count === 1) {
+    // R8 续③：hoistedLocations 落点带错误前缀 / ../ 越界。
+    const pkg = JSON.parse(fs.readFileSync(path.join(pluginDir, "package.json"), "utf8"));
+    const carrierKey = name + "@" + pkg.version + "-app";
+    const modulesPath = path.join(cwd, "node_modules", ".modules.yaml");
+    const modules = JSON.parse(fs.readFileSync(modulesPath, "utf8"));
+    modules.hoistedLocations[carrierKey] = [mode === "hoisted-prefix" ? "wrong-prefix/node_modules/" + alias : "../" + alias];
+    fs.writeFileSync(modulesPath, JSON.stringify(modules, null, 2) + "\\n");
+    note("injected: hoisted location " + (mode === "hoisted-prefix" ? "prefixed" : "traversal") + " (R8)");
+  }
+  if (mode === "r9-marker" && path.basename(cwd) === "profile-c") {
+    fs.writeFileSync(process.env.DRILL_R9_MARKER, "installed pluginOnly; optional declaration unchanged\\n");
+    note("marker: profile-c install completed (R9)");
+  }
 }
 process.exit(result.status === 0 ? 0 : (result.status ?? 1));
 `;
@@ -456,7 +494,7 @@ test("R4 负向：安装后篡改随包清单 plugin.contentSha256 → A13 必�
 	assert.match(result.stdout, /RESULT: FAIL/);
 	const { record } = await readRunRecord(stateDir);
 	const a13 = assertionOf(record, "A13");
-	assert.ok(a13, "缺少 A13 记录");
+	assert.ok(a13, `缺少 A13 记录\n--- stdout ---\n${result.stdout}\n--- stderr ---\n${result.stderr}`);
 	assert.equal(a13.pass, false);
 	assert.equal(a13.reason, "drill-plugin-digest-mismatch");
 	assert.match(result.stdout, /FAIL  A13 /);
@@ -511,7 +549,7 @@ test("R9 负向：安装后的 pluginOnly 未声明 optional 载体 → A17 必�
 	assert.notEqual(result.status, 0, result.stdout);
 	const { record } = await readRunRecord(stateDir);
 	const a17 = assertionOf(record, "A17");
-	assert.equal(a17?.pass, false);
+	assert.equal(a17?.pass, false, `A17 应 FAIL\n--- stdout ---\n${result.stdout}\n--- stderr ---\n${result.stderr}`);
 	assert.equal(a17?.reason, "drill-plugin-only-metadata-mismatch");
 	assert.match(result.stdout, /FAIL  A17 /);
 });
@@ -539,4 +577,141 @@ test("R5 负向：低上限发布返回 ENEEDAUTH（错误路径含 413 字样�
 	assert.equal(a20?.pass, false);
 	assert.equal(a20?.reason, "drill-e413-not-reproduced");
 	assert.match(result.stdout, /FAIL  A20 /);
+});
+
+// ── 二次复核负向回归（R1 续 / R8 续 / R9 续）─────────────────────────────────────────
+
+test("R1 续负向：包内 publishConfig 把 scoped registry 指向同 host 另一路径 → 错路径 PUT 恒为 0", { skip: SKIP }, async () => {
+	const requests = [];
+	const server = http.createServer((req, res) => {
+		let size = 0;
+		req.on("data", (chunk) => { size += chunk.length; });
+		req.on("end", () => {
+			requests.push({ method: req.method, url: req.url, size });
+			res.setHeader("content-type", "application/json");
+			if (req.url === "/-/ping") { res.end("{}"); return; }
+			if (req.method === "PUT") { res.statusCode = 201; res.end(JSON.stringify({ ok: true })); return; }
+			res.statusCode = 200;
+			res.end(JSON.stringify({ name: PLUGIN_NAME, versions: {}, "dist-tags": {} }));
+		});
+	});
+	await new Promise((resolve, reject) => {
+		server.on("error", reject);
+		server.listen(0, "127.0.0.1", resolve);
+	});
+	const host = `127.0.0.1:${server.address().port}`;
+	const intended = `http://${host}`;
+	const wrongPath = "/wrong-registry/";
+	let small = null;
+	try {
+		// 合法源 dist：源插件包内带 scoped publishConfig 指向同 host 的另一 registry 路径。
+		small = await makeFixtureDist({
+			apkBytes: crypto.randomBytes(64 * 1024),
+			pluginExtra: { publishConfig: { access: "public", "@marktrue:registry": `${intended}${wrongPath}` } },
+		});
+		const userHome = join(scratch, "r1b-user-home");
+		await mkdir(userHome, { recursive: true });
+		await writeFile(join(userHome, ".npmrc"), [
+			`registry=${intended}/`,
+			`@marktrue:registry=${intended}/`,
+			`//${host}/:_authToken=root-token`,
+			`//${host}${wrongPath}:_authToken=other-path-token`,
+			"",
+		].join("\n"));
+		const stateDir = join(scratch, "state-r1b");
+		const result = await runCliAsync({ args: ["--dist", small.dist, "--phases", "publish", "--registry", intended], stateDir, home: userHome });
+		const puts = requests.filter((event) => event.method === "PUT");
+		const wrongPuts = puts.filter((event) => event.url.startsWith(wrongPath));
+		const intendedPuts = puts.filter((event) => !event.url.startsWith(wrongPath));
+		assert.equal(wrongPuts.length, 0, `错路径收到发布 PUT：${JSON.stringify(wrongPuts)}`);
+		assert.ok(intendedPuts.length >= 1, `受检路径未收到发布 PUT：${JSON.stringify(requests)}`);
+		assert.doesNotMatch(result.stdout, /drill-registry-scope-mismatch/, "专用配置自检不应失败");
+		// 只迁移受检 registry 路径需要的凭据；同 host 另一路径凭据必须被跳过。
+		const { record } = await readRunRecord(stateDir);
+		const info = record.registry?.normalConfigInfo;
+		assert.deepEqual(info?.migrated, [`//${host}/:_authToken`]);
+		assert.deepEqual(info?.skipped, [`//${host}${wrongPath}:_authToken`]);
+	} finally {
+		await new Promise((resolve) => server.close(resolve));
+		if (small) await rm(small.base, { recursive: true, force: true });
+	}
+});
+
+test("R8 续负向：快照越界 / alias 嵌套 / 错误落点 → A9/A10 必须 FAIL（既有稳定 reason）", { skip: SKIP || SKIP_VERDACCIO }, async () => {
+	const cases = [
+		{ mode: "snapshot-outside", id: "A9", reason: "drill-lockfile-alias-missing" },
+		{ mode: "alias-nested", id: "A9", reason: "drill-lockfile-alias-missing" },
+		{ mode: "hoisted-prefix", id: "A10", reason: "drill-hoisted-mapping-missing" },
+		{ mode: "hoisted-traversal", id: "A10", reason: "drill-hoisted-mapping-missing" },
+	];
+	for (const current of cases) {
+		const shimDir = join(scratch, `shim-r8b-${current.mode}`);
+		await writeShim(shimDir, "pnpm", PNPM_SHIM);
+		const stateDir = join(scratch, `state-r8b-${current.mode}`);
+		const result = runCli({
+			args: ["--dist", fixture.dist, "--phases", "publish,install"],
+			stateDir,
+			home: fixture.home,
+			env: {
+				PATH: `${shimDir}:${TOOL_PATH}`,
+				DRILL_REAL_PNPM: REAL_PNPM,
+				DRILL_PNPM_TAMPER: current.mode,
+				DRILL_PNPM_COUNTER: join(scratch, `r8b-counter-${current.mode}`),
+				DRILL_INJECTION_LOG: join(scratch, `r8b-${current.mode}.log`),
+				DRILL_PLUGIN_NAME: PLUGIN_NAME,
+			},
+		});
+		assert.notEqual(result.status, 0, `${current.mode} 应失败：\n${result.stdout}`);
+		const { record } = await readRunRecord(stateDir);
+		const assertion = assertionOf(record, current.id);
+		assert.equal(assertion?.pass, false, `${current.mode} ${current.id} 应 FAIL：${JSON.stringify(assertion)}`);
+		assert.equal(assertion?.reason, current.reason, `${current.mode} ${current.id} reason`);
+		assert.match(result.stdout, new RegExp(`FAIL  ${current.id} `));
+		await rm(stateDir, { recursive: true, force: true });
+	}
+});
+
+test("R9 续负向：HTTP 200 坏 packument 不得当成“载体确实缺失” → A17 FAIL（drill-carrier-absence-check-failed）", { skip: SKIP || SKIP_VERDACCIO }, async () => {
+	const shimDir = join(scratch, "shim-r9b");
+	await writeShim(shimDir, "pnpm", PNPM_SHIM);
+	const preload = join(scratch, "r9b-preload.mjs");
+	await writeFile(preload, [
+		'import fs from "node:fs";',
+		`const CLI = ${JSON.stringify(CLI)};`,
+		"if (process.argv[1] === CLI) {",
+		"  const original = globalThis.fetch;",
+		"  globalThis.fetch = async (input, init) => {",
+		"    const url = String(input);",
+		'    const marker = process.env.DRILL_R9_MARKER;',
+		'    const method = init?.method ?? "GET";',
+		'    if (marker && fs.existsSync(marker) && method === "GET" && /\\/@marktrue%2fdsh-mobile-remote$/.test(url)) {',
+		'      return new Response(JSON.stringify({ error: "packument-backend-unavailable" }), { status: 200, headers: { "content-type": "application/json" } });',
+		"    }",
+		"    return original(input, init);",
+		"  };",
+		"}",
+		"",
+	].join("\n"));
+	const stateDir = join(scratch, "state-r9b");
+	const result = runCli({
+		args: ["--dist", fixture.dist, "--phases", "all"],
+		stateDir,
+		home: fixture.home,
+		env: {
+			PATH: `${shimDir}:${TOOL_PATH}`,
+			DRILL_REAL_PNPM: REAL_PNPM,
+			DRILL_PNPM_TAMPER: "r9-marker",
+			DRILL_PNPM_COUNTER: join(scratch, "r9b-counter"),
+			DRILL_INJECTION_LOG: join(scratch, "r9b-injections.log"),
+			DRILL_PLUGIN_NAME: PLUGIN_NAME,
+			DRILL_R9_MARKER: join(scratch, "r9b-marker"),
+			NODE_OPTIONS: `--import=${preload}`,
+		},
+	});
+	assert.notEqual(result.status, 0, result.stdout);
+	assert.match(result.stdout, /FAIL  A17 /);
+	const { record } = await readRunRecord(stateDir);
+	const a17 = assertionOf(record, "A17");
+	assert.equal(a17?.pass, false, JSON.stringify(a17));
+	assert.equal(a17?.reason, "drill-carrier-absence-check-failed");
 });

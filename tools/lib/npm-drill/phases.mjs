@@ -12,8 +12,8 @@ import {
 	ensureDir, existsDir, existsFile, isolatedEnv, npmErrorCodes, readTextFile,
 } from "./process.mjs";
 import {
-	LOW_LIMIT_MAX_BODY, fetchPackument, npmPublish, packumentDistTags, packumentVersions,
-	pnpmAdd, verifyRegistryScope, writeProfile,
+	LOW_LIMIT_MAX_BODY, fetchPackument, fetchPackumentChecked, npmPublish, packumentDistTags,
+	packumentVersions, pnpmAdd, verifyRegistryScope, writeProfile,
 } from "./registry.mjs";
 import {
 	makePreflightFixture, projectCarrier, projectPlugin, runPublishCarrierCheck,
@@ -220,6 +220,7 @@ export async function publishPhase(ctx) {
 		registryUrl,
 		env,
 		userconfig: ctx.registry.normalUserConfig,
+		pluginName: name,
 		logFile: logFile(ctx, "publish-carrier-a"),
 		label: `npm publish carrierA ${ctx.versions.carrierA} --tag app`,
 	});
@@ -229,6 +230,7 @@ export async function publishPhase(ctx) {
 		registryUrl,
 		env,
 		userconfig: ctx.registry.normalUserConfig,
+		pluginName: name,
 		logFile: logFile(ctx, "publish-plugin-a"),
 		label: `npm publish pluginA ${ctx.versions.pluginA}`,
 	});
@@ -271,6 +273,7 @@ export async function publishPhase(ctx) {
 			registryUrl,
 			env,
 			userconfig: ctx.registry.normalUserConfig,
+			pluginName: name,
 			logFile: logFile(ctx, "republish-plugin-a"),
 			label: "npm publish duplicate pluginA",
 		});
@@ -375,6 +378,7 @@ export async function installPhase(ctx) {
 			carrierName: name,
 			carrierVersion: ctx.versions.carrierA,
 			carrierAlias: aliasPackageName(name),
+			profileRoot: profileDir,
 		});
 		return { pass: parsed.ok, reason: REASONS.HOISTED_MAPPING_MISSING, detail: parsed.detail };
 	}));
@@ -480,6 +484,7 @@ export async function updatePhase(ctx) {
 		registryUrl,
 		env,
 		userconfig: ctx.registry.normalUserConfig,
+		pluginName: name,
 		logFile: logFile(ctx, "publish-carrier-b"),
 		label: `npm publish carrierB ${ctx.versions.carrierB} --tag app`,
 	});
@@ -489,6 +494,7 @@ export async function updatePhase(ctx) {
 		registryUrl,
 		env,
 		userconfig: ctx.registry.normalUserConfig,
+		pluginName: name,
 		logFile: logFile(ctx, "publish-plugin-b"),
 		label: `npm publish pluginB ${ctx.versions.pluginB}`,
 	});
@@ -577,6 +583,7 @@ export async function failurePhase(ctx) {
 		registryUrl,
 		env,
 		userconfig: ctx.registry.normalUserConfig,
+		pluginName: name,
 		logFile: logFile(ctx, "publish-plugin-only"),
 		label: `npm publish pluginOnly ${ctx.versions.pluginOnly}`,
 	});
@@ -610,17 +617,21 @@ export async function failurePhase(ctx) {
 				detail: `installed=${installedPkg?.version ?? "<缺失>"}; ${alias}=${installedPkg?.optionalDependencies?.[alias] ?? "<未声明>"} 期望=${expectedAlias}`,
 			};
 		}
-		// 载体版本必须在 registry 中确实不存在（否则"缺失"不是真实缺包路径）。
-		const current = await fetchPackument(registryUrl, name);
+		// R9 续：只有**结构有效**的 packument（同名、versions 为非数组对象、能看到刚发布的
+		// pluginOnly）才有资格证明"载体版本不存在"；HTTP 200 的错误 JSON 等一律 fail-closed。
+		const current = await fetchPackumentChecked({
+			registryUrl,
+			packageName: name,
+			requiredVersions: [ctx.versions.pluginOnly],
+		});
 		if (!current.ok) {
-			// F4：packument 查询失败不能当作"载体确实不存在"——那是未验证，按 fail-closed 处理。
 			return {
 				pass: false,
 				reason: REASONS.CARRIER_ABSENCE_CHECK_FAILED,
-				detail: `packument 查询失败：${current.reason ?? current.status ?? "<未知>"}`,
+				detail: `${current.reason}: ${current.detail}`,
 			};
 		}
-		const carrierInRegistry = packumentVersions(current.json).includes(ctx.versions.carrierOnlyMissing);
+		const carrierInRegistry = Object.hasOwn(current.versions, ctx.versions.carrierOnlyMissing);
 		if (carrierInRegistry) {
 			return {
 				pass: false,
@@ -729,6 +740,7 @@ export async function failurePhase(ctx) {
 			registryUrl: ready.url,
 			env: envForContext(ctx, ready.url),
 			userconfig: ctx.registry.lowLimitUserConfig,
+			pluginName: name,
 			globalconfig: ctx.registry.lowLimitGlobalConfig,
 			logFile: logFile(ctx, "publish-low-limit"),
 			label: "npm publish carrierA to low-limit registry",
