@@ -3,17 +3,26 @@
 // 模块的每条边界钉死——真实 listen / ctx / 诊断接线由接线方另行测试。
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
 	BRIDGE_PORT_CANDIDATES,
+	DESKTOP_HOST_ENTRY_SUFFIX,
+	buildPhoneEndpointView,
+	canonicalHostPath,
+	desktopHostEntryOf,
+	isDesktopHostEntry,
+	isLoopbackHostname,
+	isUnspecifiedHostname,
 	listPrivateIpv4,
 	persistBridge,
 	rankPrivateIpv4,
 	pickPrivateAddress,
 	readPersistedBridge,
+	resolveRuntimeFormEvidence,
+	sameHostPath,
 	selectBridgeEndpoint,
 } from "../lib/desktop-form.js";
 
@@ -537,4 +546,282 @@ test("模块不向 stdout 写任何内容（日志只经注入回调，不污染
 	} finally {
 		await cleanup(home);
 	}
+});
+
+// ── #36 follow-up：可信 Desktop 形态证据（issue note 1509 §3）────────────────
+
+const DESKTOP_VERSIONS = { electron: "44.7.0", node: "24.21.0" };
+const DESKTOP_HOST_ENTRY = `C:\\Program Files\\DeepSeek\\DeepSeek Harness\\resources\\app.asar\\dsh\\node_modules\\${DESKTOP_HOST_ENTRY_SUFFIX.replaceAll("/", "\\")}`;
+
+test("形态证据：DSH_DESKTOP=1 优先（environment），不依赖 profile/目录", () => {
+	const fact = resolveRuntimeFormEvidence({
+		environment: { DSH_DESKTOP: "1" },
+		versions: {},
+		profileContext: { name: "web", dir: "/x", home: "/h" },
+	});
+	assert.deepEqual(fact, { form: "desktop", source: "environment", reason: "" });
+});
+
+test("形态证据：desktopBrowserAccess 服务次之（兼容旧桌面）", () => {
+	const fact = resolveRuntimeFormEvidence({ environment: {}, versions: {}, hasDesktopBrowserAccess: true });
+	assert.deepEqual(fact, { form: "desktop", source: "desktopBrowserAccess", reason: "" });
+});
+
+test("形态证据：profileContext desktop + <home>/profiles/desktop + Electron 标记 → desktop-profile", () => {
+	const canonical = (value) => (value === "/h/.dsh/profiles/desktop" ? "/h/.dsh/profiles/desktop" : value);
+	const fact = resolveRuntimeFormEvidence({
+		environment: {},
+		versions: DESKTOP_VERSIONS,
+		profileContext: { name: "desktop", dir: "/h/.dsh/profiles/desktop", home: "/h/.dsh" },
+		hostEntry: DESKTOP_HOST_ENTRY,
+		canonicalize: canonical,
+	});
+	assert.deepEqual(fact, { form: "desktop", source: "desktop-profile", reason: "" });
+});
+
+test("形态证据：缺 Electron 宿主标记 → 不通过（desktop-launch-evidence-missing，保持 cli/unknown）", () => {
+	const fact = resolveRuntimeFormEvidence({
+		environment: {},
+		versions: { node: "24.21.0" },
+		profileContext: { name: "desktop", dir: "/h/.dsh/profiles/desktop", home: "/h/.dsh" },
+	});
+	assert.equal(fact.form, "cli");
+	assert.equal(fact.source, "unknown");
+	assert.equal(fact.reason, "desktop-launch-evidence-missing");
+});
+
+test("形态证据：profile 名不是 desktop（含 Electron 标记）→ 不通过（profile-not-desktop）", () => {
+	const fact = resolveRuntimeFormEvidence({
+		environment: {},
+		versions: DESKTOP_VERSIONS,
+		profileContext: { name: "web", dir: "/h/.dsh/profiles/web", home: "/h/.dsh" },
+	});
+	assert.deepEqual(fact, { form: "cli", source: "unknown", reason: "profile-not-desktop" });
+});
+
+test("形态证据：desktop 名但目录不是 <home>/profiles/desktop → profile-dir-untrusted（不按 basename 猜）", () => {
+	const fact = resolveRuntimeFormEvidence({
+		environment: {},
+		versions: DESKTOP_VERSIONS,
+		profileContext: { name: "desktop", dir: "/h/.dsh/profiles/desktop-copy", home: "/h/.dsh" },
+		hostEntry: DESKTOP_HOST_ENTRY,
+		canonicalize: (value) => value,
+	});
+	assert.deepEqual(fact, { form: "cli", source: "unknown", reason: "profile-dir-untrusted" });
+});
+
+test("形态证据：无 profileContext → profile-context-missing（旧宿主保持 unknown，不猜）", () => {
+	assert.deepEqual(resolveRuntimeFormEvidence({ environment: {}, versions: DESKTOP_VERSIONS }), {
+		form: "cli",
+		source: "unknown",
+		reason: "profile-context-missing",
+	});
+	const invalid = resolveRuntimeFormEvidence({ environment: {}, versions: DESKTOP_VERSIONS, profileContext: { name: "desktop" } });
+	assert.equal(invalid.reason, "profile-context-invalid");
+});
+
+test("路径等价：realpath 解析 symlink/junction 后相同即等价；不可解析返回 false", async () => {
+	const home = await makeHome();
+	try {
+		const actual = join(home, "profiles", "desktop");
+		await mkdir(actual, { recursive: true });
+		const link = join(home, "desktop-link");
+		await symlink(actual, link);
+		assert.equal(canonicalHostPath(actual), canonicalHostPath(link));
+		assert.equal(sameHostPath(actual, link), true);
+		assert.equal(canonicalHostPath(join(home, "missing")), null);
+		assert.equal(sameHostPath(actual, join(home, "missing")), false);
+	} finally {
+		await cleanup(home);
+	}
+});
+
+test("路径等价：Windows 语义大小写/分隔符不敏感（platform=win32），POSIX 严格", () => {
+	const canonicalize = (value) => String(value).replace(/\\/g, "/");
+	assert.equal(sameHostPath("C:\\Users\\A\\.dsh\\profiles\\desktop", "c:/users/a/.dsh/profiles/desktop", { canonicalize, platform: "win32" }), true);
+	assert.equal(sameHostPath("C:\\Users\\A\\.dsh\\profiles\\desktop", "c:/users/a/.dsh/profiles/desktop", { canonicalize, platform: "linux" }), false);
+	// 多义（规范化失败）即不可信
+	assert.equal(sameHostPath("/a", "/a", { canonicalize: () => null }), false);
+});
+
+// ── #36 follow-up：手机端点视图（issue note 1509 §5）────────────────────────
+
+const ADDRESSES = ["192.168.50.142", "10.0.0.7"];
+const LOOPBACK_WS = { host: "127.0.0.1", port: 53956 };
+
+test("端点：loopback webserver + 无监听桥 → unavailable/loopback-only（不生成 私有IP:回环端口）", () => {
+	const view = buildPhoneEndpointView({ bridge: { phase: "skipped", reason: "form-unknown" }, webServer: LOOPBACK_WS, addresses: ADDRESSES });
+	assert.equal(view.state, "unavailable");
+	assert.deepEqual([...view.origins], []);
+	assert.equal(view.reason, "form-unknown", "保留桥决策的稳定 reason，便于诊断");
+	assert.ok(view.hint.length > 0);
+});
+
+test("端点：显式 publicOrigin 优先且可 ready（含反代/隧道场景）", () => {
+	const view = buildPhoneEndpointView({
+		configuredOrigin: "https://remote.example.com",
+		bridge: { phase: "listening", host: "192.168.50.142", port: 3082 },
+		webServer: LOOPBACK_WS,
+		addresses: ADDRESSES,
+	});
+	assert.equal(view.state, "ready");
+	assert.equal(view.source, "configured");
+	assert.deepEqual([...view.origins], ["https://remote.example.com"]);
+});
+
+test("端点：显式 publicOrigin 若是回环/通配则忽略（不当作手机端点）", () => {
+	for (const configuredOrigin of ["http://127.0.0.1:8080", "http://0.0.0.0:8080", "http://[::1]:8080"]) {
+		const view = buildPhoneEndpointView({ configuredOrigin, bridge: { phase: "skipped" }, webServer: LOOPBACK_WS, addresses: ADDRESSES });
+		assert.equal(view.state, "unavailable", configuredOrigin);
+		assert.deepEqual([...view.origins], []);
+	}
+});
+
+test("端点：已监听桥的具体 IP 只发布该 IP + 实际端口（不追加其它网卡）", () => {
+	const view = buildPhoneEndpointView({
+		bridge: { phase: "listening", host: "192.168.50.142", port: 3082 },
+		webServer: LOOPBACK_WS,
+		addresses: ["192.168.50.142", "10.0.0.7"],
+	});
+	assert.equal(view.state, "ready");
+	assert.equal(view.source, "lan-bridge");
+	assert.deepEqual([...view.origins], ["http://192.168.50.142:3082"]);
+});
+
+test("端点：桥绑回环不算手机端点（继续看 webserver；均回环 → unavailable）", () => {
+	const view = buildPhoneEndpointView({ bridge: { phase: "listening", host: "127.0.0.1", port: 3082 }, webServer: LOOPBACK_WS, addresses: ADDRESSES });
+	assert.equal(view.state, "unavailable");
+	assert.deepEqual([...view.origins], []);
+	const withWebLan = buildPhoneEndpointView({
+		bridge: { phase: "listening", host: "127.0.0.1", port: 3082 },
+		webServer: { host: "192.168.50.142", port: 53956 },
+		addresses: ADDRESSES,
+	});
+	assert.equal(withWebLan.state, "ready");
+	assert.equal(withWebLan.source, "web-lan");
+	assert.deepEqual([...withWebLan.origins], ["http://192.168.50.142:53956"]);
+});
+
+test("端点：桥通配 0.0.0.0 → 只枚举实际 IPv4 网卡；无网卡 → address-unavailable", () => {
+	const view = buildPhoneEndpointView({
+		bridge: { phase: "listening", host: "0.0.0.0", port: 3082 },
+		webServer: LOOPBACK_WS,
+		addresses: ["192.168.50.142", "127.0.0.1", "0.0.0.0", "10.0.0.7"],
+	});
+	assert.deepEqual([...view.origins], ["http://192.168.50.142:3082", "http://10.0.0.7:3082"]);
+	const none = buildPhoneEndpointView({ bridge: { phase: "listening", host: "0.0.0.0", port: 3082 }, webServer: LOOPBACK_WS, addresses: [] });
+	assert.equal(none.state, "unavailable");
+	assert.equal(none.reason, "address-unavailable");
+});
+
+test("端点：IPv6-only 监听（::）不捏造 IPv4 候选；IPv6 回环同样不发布", () => {
+	const v6 = buildPhoneEndpointView({ bridge: { phase: "listening", host: "::", port: 3082 }, webServer: LOOPBACK_WS, addresses: ADDRESSES });
+	assert.equal(v6.state, "unavailable");
+	assert.equal(v6.reason, "ipv6-listener-unsupported");
+	const v6loop = buildPhoneEndpointView({ bridge: { phase: "skipped", reason: "form-unknown" }, webServer: { host: "::1", port: 53956 }, addresses: ADDRESSES });
+	assert.equal(v6loop.state, "unavailable");
+	assert.deepEqual([...v6loop.origins], []);
+});
+
+test("端点：webserver 通配 0.0.0.0 → 枚举 IPv4 网卡；具体非回环 IP → 直接发布", () => {
+	const wildcard = buildPhoneEndpointView({ webServer: { host: "0.0.0.0", port: 3080 }, addresses: ADDRESSES });
+	assert.equal(wildcard.state, "ready");
+	assert.equal(wildcard.source, "web-lan");
+	assert.deepEqual([...wildcard.origins], ["http://192.168.50.142:3080", "http://10.0.0.7:3080"]);
+	const specific = buildPhoneEndpointView({ webServer: { host: "192.168.50.142", port: 3080 } });
+	assert.deepEqual([...specific.origins], ["http://192.168.50.142:3080"]);
+});
+
+test("端点：桥 init/关闭生命周期 → starting / failed / disabled / skipped 各有稳定 reason", () => {
+	assert.equal(buildPhoneEndpointView({ bridge: { phase: "starting" }, webServer: LOOPBACK_WS }).state, "starting");
+	assert.equal(buildPhoneEndpointView({ bridge: { phase: "pending" }, webServer: LOOPBACK_WS }).reason, "bridge-starting");
+	const failed = buildPhoneEndpointView({ bridge: { phase: "failed", reason: "listen-error", hint: "端口被占用" }, webServer: LOOPBACK_WS });
+	assert.equal(failed.reason, "listen-error", "保留桥决策的稳定 reason，便于连接页显示可执行原因");
+	assert.equal(failed.hint, "端口被占用");
+	const failedNoReason = buildPhoneEndpointView({ bridge: { phase: "failed" }, webServer: LOOPBACK_WS });
+	assert.equal(failedNoReason.reason, "bridge-failed");
+	const disabled = buildPhoneEndpointView({ bridge: { phase: "disabled" }, webServer: LOOPBACK_WS });
+	assert.equal(disabled.reason, "bridge-disabled");
+	const skipped = buildPhoneEndpointView({ bridge: { phase: "skipped", reason: "no-private-address" }, webServer: LOOPBACK_WS });
+	assert.equal(skipped.reason, "no-private-address");
+});
+
+test("端点：主机名判定覆盖 localhost/127/8/::1/IPv4-mapped 与通配", () => {
+	for (const host of ["localhost", "127.0.0.1", "127.9.9.9", "::1", "[::1]", "::ffff:127.0.0.1", "::ffff:7f00:1", "::FFFF:7F00:1"]) {
+		assert.equal(isLoopbackHostname(host), true, host);
+	}
+	assert.equal(isLoopbackHostname("::ffff:a00:1"), false, "IPv4-mapped 非回环（10.0.0.1）不算回环");
+	for (const host of ["0.0.0.0", "::", "[::]", "0:0:0:0:0:0:0:0"]) assert.equal(isUnspecifiedHostname(host), true, host);
+	for (const host of ["192.168.1.2", "10.0.0.7", "172.16.0.1", "example.com"]) {
+		assert.equal(isLoopbackHostname(host), false, host);
+		assert.equal(isUnspecifiedHostname(host), false, host);
+	}
+});
+
+// ── W2（T16）：Desktop host 启动 marker（实机核验的 argv entrypoint）──────────
+
+test("W2 marker：精确匹配 dsh-desktop-host entrypoint（Windows/Posix 分隔符都规范化）", () => {
+	const win = "D:\\Program Files\\DeepSeek\\DeepSeek Harness\\resources\\app.asar\\dsh\\node_modules\\@deepseek-ai\\dsh-desktop-host\\lib\\index.js";
+	const posix = "/opt/dsh/app.asar/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/index.js";
+	assert.equal(isDesktopHostEntry(win), true);
+	assert.equal(isDesktopHostEntry(posix), true);
+	// 不是完整路径段后缀的一律不认（防子串/伪造参数）。
+	assert.equal(isDesktopHostEntry("/tmp/@deepseek-ai/dsh-desktop-host/lib/index.js.bak"), false);
+	assert.equal(isDesktopHostEntry("evil/@deepseek-ai/dsh-desktop-host/lib/index.js"), false);
+	assert.equal(isDesktopHostEntry("C:\\Users\\x\\node_modules\\@deepseek-ai\\other-host\\lib\\index.js"), false);
+	assert.equal(isDesktopHostEntry(""), false);
+	assert.equal(isDesktopHostEntry(undefined), false);
+});
+
+test("W2 marker：只检查 argv 启动前缀（argv[1..3]），用户应用参数里的同名串不算", () => {
+	const entry = "C:\\app\\resources\\app.asar\\dsh\\node_modules\\@deepseek-ai\\dsh-desktop-host\\lib\\index.js";
+	assert.equal(desktopHostEntryOf(["DeepSeek Harness.exe", entry, "runtimeDir", "projectDir"]), entry);
+	// argv[1] 被 shell flag 占据时允许落在 argv[2]（Node flags 正常在 process.execArgv）。
+	assert.equal(desktopHostEntryOf(["exe", "--expose-internals", entry, "runtimeDir"]), entry);
+	// 第 4 位之后（用户 app 参数）不采信。
+	assert.equal(desktopHostEntryOf(["exe", "web", "x", "y", entry]), "");
+	assert.equal(desktopHostEntryOf(["exe"]), "");
+});
+
+test("W2 evidence：Electron 运行时但缺 dsh-desktop-host marker → fail-closed（不因 Electron 判 Desktop）", () => {
+	const fact = resolveRuntimeFormEvidence({
+		environment: {},
+		versions: DESKTOP_VERSIONS,
+		profileContext: { name: "desktop", dir: "/h/.dsh/profiles/desktop", home: "/h/.dsh" },
+		hostEntry: "",
+		canonicalize: (value) => value,
+	});
+	assert.deepEqual(fact, { form: "cli", source: "unknown", reason: "desktop-host-marker-missing" });
+});
+
+test("W2 evidence：env/service 仍最高优先（无需 marker），profileContext 路径才要求 marker", () => {
+	assert.equal(resolveRuntimeFormEvidence({ environment: { DSH_DESKTOP: "1" }, versions: {}, hostEntry: "" }).source, "environment");
+	assert.equal(resolveRuntimeFormEvidence({ environment: {}, versions: {}, hasDesktopBrowserAccess: true, hostEntry: "" }).source, "desktopBrowserAccess");
+});
+
+test("W2 evidence：marker + Electron 都齐但 profile 目录不符 → profile-dir-untrusted（双保险）", () => {
+	const fact = resolveRuntimeFormEvidence({
+		environment: {},
+		versions: DESKTOP_VERSIONS,
+		profileContext: { name: "desktop", dir: "/h/.dsh/profiles/desktop-copy", home: "/h/.dsh" },
+		hostEntry: DESKTOP_HOST_ENTRY,
+		canonicalize: (value) => value,
+	});
+	assert.deepEqual(fact, { form: "cli", source: "unknown", reason: "profile-dir-untrusted" });
+});
+
+// ── N1 / N4（T16 NIT）────────────────────────────────────────────────────
+
+test("N1：具体 IPv6 listener（web/bridge 非回环）→ 稳定 ipv6-listener-unsupported", () => {
+	const web = buildPhoneEndpointView({ bridge: { phase: "skipped" }, webServer: { host: "fe80::1", port: 53956 }, addresses: ADDRESSES });
+	assert.equal(web.reason, "ipv6-listener-unsupported");
+	const bridge = buildPhoneEndpointView({ bridge: { phase: "listening", host: "2001:db8::7", port: 3082 }, webServer: LOOPBACK_WS, addresses: ADDRESSES });
+	assert.equal(bridge.reason, "ipv6-listener-unsupported");
+	assert.deepEqual([...bridge.origins], []);
+});
+
+test("N4：canonicalHostPath 拒绝相对路径（会按 cwd 解析=伪等价），sameHostPath 同步 fail-closed", () => {
+	assert.equal(canonicalHostPath("relative/path"), null);
+	assert.equal(canonicalHostPath("./profiles/desktop"), null);
+	assert.equal(sameHostPath("relative/a", "relative/a", { canonicalize: (value) => (value.startsWith("/") ? value : null) }), false);
 });
