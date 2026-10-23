@@ -211,6 +211,30 @@ void main() {
     });
   });
 
+  // issue #25 二期：未加载轮次以**短而淡**的刻度区分于已加载轮次——把这条视觉契约
+  // 抽成纯函数后就能钉死，而不是只靠肉眼看 build。
+  group('未加载刻度的视觉权重', () {
+    test('未加载刻度比已加载刻度更短', () {
+      expect(
+        turnTickScale(active: false, previewed: false, unloaded: true),
+        lessThan(turnTickScale(active: false, previewed: false, unloaded: false)),
+      );
+    });
+
+    test('未加载刻度比已加载刻度更淡', () {
+      expect(
+        turnTickAlpha(unloaded: true),
+        lessThan(turnTickAlpha(unloaded: false)),
+      );
+    });
+
+    test('当前轮与预览态优先级更高（不受未加载标记影响）', () {
+      expect(turnTickScale(active: true, previewed: false, unloaded: true), 1.0);
+      expect(turnTickScale(active: false, previewed: true, unloaded: true), 0.9);
+    });
+  });
+
+  // issue #24 评审 note 1054 缺陷 2：100 刻度时被裁出的刻度必须能浏览。
   group('缺陷 2：超长刻度轨可浏览被裁出的刻度', () {
     List<TurnAnchor> anchors100() =>
         [for (var i = 1; i <= 100; i++) TurnAnchor(turn: i, seq: i * 10)];
