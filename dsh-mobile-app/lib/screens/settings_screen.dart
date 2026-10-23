@@ -11,10 +11,15 @@ import '../floating.dart';
 import '../l10n.dart';
 import '../logger.dart';
 import '../models.dart';
+import '../plugin_update_resume.dart';
 import '../store.dart';
 import '../theme.dart';
 import '../toast.dart';
 import '../fmt.dart';
+import '../update_core.dart';
+import '../update_flow.dart';
+import '../updater.dart';
+import '../version_alignment.dart';
 import 'sheets.dart';
 import 'providers_screen.dart';
 import 'usage_screen.dart';
@@ -42,6 +47,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String _diagTime = '';
   String _appVersion = ''; // App 自身版本（package_info_plus，构建时打包）
   bool _bubbleOn = false; // 悬浮球开关状态（与服务实际运行状态同步）
+  bool _updateFlowBusy = false;
 
   @override
   void initState() {
@@ -1106,7 +1112,69 @@ class _SettingsScreenState extends State<SettingsScreen> {
             title: L10n.t('版本', 'Version'),
             sub:
                 'App v${_appVersion.isEmpty ? '…' : _appVersion}'
-                ' · ${L10n.t('插件', 'plugin')} v${api.pluginVersion.isEmpty ? '…' : api.pluginVersion}',
+                ' · ${L10n.t('插件', 'plugin')} v${api.pluginVersion.isEmpty ? '…' : api.pluginVersion}'
+                '${_alignmentNote()}'
+                '${store.updateCandidate != null ? ' · ${L10n.t('有新版本', 'update available')} ${store.updateCandidate!.version}' : ''}',
+            onTap: store.updateCandidate == null
+                ? null
+                : () {
+                    final candidate = store.updateCandidate;
+                    if (candidate != null) {
+                      unawaited(runUpdateFlow(context, store, candidate));
+                    }
+                  },
+            trailing: store.updateCandidate != null
+                ? Icon(Icons.brightness_1, size: 9, color: DshColors.danger(context))
+                : (store.alignment.needsAttention
+                    ? Icon(Icons.brightness_1, size: 9, color: DshColors.danger(context))
+                    : null),
+          ),
+          // 插件更新入口由**内容状态**驱动（评审 R11）：同版本不同内容时也必须能操作，
+          // 而不是只看版本号对齐。不能自更新的形态给出**对应那一条**可复制指引。
+          // 有进行中的记录时可点开「处理」：取消旧目标并按电脑端当前状态重新检查（F13）。
+          if (api.pluginUpdate.contentUpdateAvailable || store.pluginUpdateJournal != null)
+            _row(
+              leading: const Icon(Icons.desktop_windows_outlined),
+              title: L10n.t('更新电脑端插件', 'Update desktop plugin'),
+              sub: store.pluginUpdateJournal != null
+                  ? _journalSub(store)
+                  : api.pluginUpdate.canSelfUpdate
+                      ? L10n.t('电脑端插件有新版本：可在这里直接触发更新',
+                          'A newer desktop plugin is available — trigger the update here')
+                      : L10n.t('电脑端插件有新版本：本机形态需按指引更新',
+                          'A newer desktop plugin is available — follow the guide for your install'),
+              onTap: store.pluginUpdateJournal != null
+                  ? () => unawaited(_updateJournalActions(store))
+                  : (api.pluginUpdate.canSelfUpdate ? _triggerPluginUpdate : _showPluginUpdateGuidance),
+              trailing: store.pluginUpdateJournal == null
+                  ? Text(
+                      api.pluginUpdate.canSelfUpdate ? L10n.t('更新 ▸', 'Update ▸') : L10n.t('指引 ▸', 'Guide ▸'),
+                      style: TextStyle(fontSize: 12, color: brand))
+                  : Text(L10n.t('处理 ▸', 'Manage ▸'), style: TextStyle(fontSize: 12, color: brand)),
+            ),
+          _row(
+            leading: const Icon(Icons.sync_outlined),
+            title: L10n.t('检查更新', 'Check for updates'),
+            sub: store.updateChecking
+                ? L10n.t('检查中…', 'Checking…')
+                : L10n.t('检查电脑端固定发布 / 主机目录是否有新版本',
+                    'Check the desktop fixed release / host directory for updates'),
+            trailing: TextButton(
+              onPressed: store.updateChecking || _updateFlowBusy ? null : _checkUpdate,
+              child: Text(store.updateChecking ? L10n.t('检查中…', 'Checking…') : L10n.t('检查 ▸', 'Check ▸'),
+                  style: TextStyle(fontSize: 12, color: brand)),
+            ),
+          ),
+          _row(
+            leading: const Icon(Icons.storage_outlined),
+            title: L10n.t('更新源', 'Update source'),
+            // 来源接线（F04/F19）：App 不再直连 GitHub；两种来源都由电脑端投影固定下载地址。
+            sub: store.updateSource == 'host'
+                ? L10n.t('主机 updateDir 人工目录', 'host updateDir (manual)')
+                : L10n.t('自动（电脑端检查结果）', 'Automatic (desktop check)'),
+            trailing: Text(store.updateSource == 'host' ? L10n.t('主机目录 ▸', 'Host dir ▸') : L10n.t('自动 ▸', 'Auto ▸'),
+                style: TextStyle(fontSize: 12, color: brand)),
+            onTap: _pickUpdateSource,
           ),
           _row(
             leading: const Icon(Icons.monitor_heart_outlined),
@@ -1194,6 +1262,152 @@ class _SettingsScreenState extends State<SettingsScreen> {
         }
       },
     );
+  }
+
+  /// 不能自更新时展示**与实际安装方式对应的那一条**指引（可复制），而不是先诱导点"一键更新"。
+  Future<void> _showPluginUpdateGuidance() async {
+    final g = api.pluginUpdate.guidance;
+    final shape = api.pluginUpdate.installShape;
+    final lines = <String>[
+      if (g != null && g.summary.isNotEmpty) g.summary,
+      if (g != null) ...g.steps.map((s) => '· $s'),
+      if (shape.isNotEmpty) '${L10n.t('安装方式', 'install shape')}: $shape',
+    ];
+    final commands = g?.commands ?? const <String>[];
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(L10n.t('电脑端插件更新指引', 'Desktop plugin update guide')),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (final l in lines)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: Text(l, style: const TextStyle(fontSize: 13)),
+                ),
+              if (commands.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                for (final c in commands)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 4),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: SelectableText(c, style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
+                        ),
+                        TextButton(
+                          onPressed: () async {
+                            await Clipboard.setData(ClipboardData(text: c));
+                            if (ctx.mounted) showToast(ctx, L10n.t('已复制', 'Copied'));
+                          },
+                          child: Text(L10n.t('复制', 'Copy'), style: const TextStyle(fontSize: 12)),
+                        ),
+                      ],
+                    ),
+                  ),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: Text(L10n.t('关闭', 'Close'))),
+        ],
+      ),
+    );
+  }
+
+  /// 在手机上触发电脑端插件更新。
+  ///
+  /// 只做一次确认弹窗（说明"宿主会重启、连接会短暂断开"），**不要求用户再到电脑上确认**——
+  /// 那正是 ADR 0019 的产品取舍。真正的下载/安装/重启都在电脑侧完成。
+  Future<void> _triggerPluginUpdate() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(L10n.t('更新电脑端插件？', 'Update desktop plugin?')),
+        content: Text(L10n.t(
+          '电脑上的插件会被替换为最新版，并且宿主会重启——连接会短暂断开，这是正常过程。',
+          'The plugin on your computer will be replaced with the latest version and the host will restart. '
+              'The connection drops briefly; that is expected.',
+        )),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text(L10n.t('取消', 'Cancel')),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text(L10n.t('开始更新', 'Update')),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    await widget.store.beginPluginUpdate();
+    if (!mounted) return;
+    final notice = widget.store.pluginUpdateNotice;
+    if (notice != null) showToast(context, notice);
+  }
+
+  /// 进行中记录的状态说明（不同阶段该做什么不同）。
+  String _journalSub(AppStore store) {
+    return switch (store.pluginUpdateJournal?.phase) {
+      UpdatePhase.appPending => L10n.t('电脑端插件已确认；App 更新待安装/待核验',
+          'Desktop plugin confirmed; the app update is pending install/verification'),
+      UpdatePhase.pluginConfirmed => L10n.t('电脑端插件已更新；正在确定 App 目标…',
+          'Desktop plugin updated; resolving the app target…'),
+      UpdatePhase.pluginRetry => L10n.t('上次更新未确认；可重试，或取消并重新检查',
+          'Last update was not confirmed; retry, or cancel and re-check'),
+      _ => L10n.t('等待电脑端完成更新并重启…', 'Waiting for the desktop plugin to restart…'),
+    };
+  }
+
+  /// 接续记录的出口（F13）：长时间没有成功证明时，允许取消旧目标并按当前状态重查。
+  Future<void> _updateJournalActions(AppStore store) async {
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 14, 20, 6),
+            child: Text(L10n.t('处理进行中的更新', 'Manage pending update'),
+                style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700)),
+          ),
+          ListTile(
+            title: Text(L10n.t('继续等待', 'Keep waiting')),
+            subtitle: Text(L10n.t('重连后会自动确认；不会先装 App',
+                'It continues automatically after reconnecting and never installs the app first')),
+            onTap: () => Navigator.of(ctx).pop('wait'),
+          ),
+          ListTile(
+            title: Text(L10n.t('取消并重新检查', 'Cancel and re-check')),
+            subtitle: Text(L10n.t('清除本地旧目标，按电脑端当前状态重新检查；不会自动降级 App',
+                'Clears the local old target and re-checks the current desktop state; the app is never downgraded')),
+            onTap: () => Navigator.of(ctx).pop('recheck'),
+          ),
+          const SizedBox(height: 8),
+        ]),
+      ),
+    );
+    if (choice != 'recheck' || !mounted) return;
+    await store.cancelUpdateAndRecheck();
+    if (!mounted) return;
+    final notice = store.pluginUpdateNotice;
+    if (notice != null) showToast(context, notice);
+  }
+
+  /// 版本行的对齐尾注：未连接不判定；对齐时不加噪声；失配时说清**该动哪一端**。
+  String _alignmentNote() {
+    if (api.pluginVersion.isEmpty) return '';
+    return switch (widget.store.alignment.state) {
+      AlignmentState.ok => '',
+      AlignmentState.appOutdated => ' · ${L10n.t('App 需更新', 'App needs update')}',
+      AlignmentState.pluginOutdated => ' · ${L10n.t('插件需更新', 'plugin needs update')}',
+      AlignmentState.unknown => ' · ${L10n.t('对齐无法判定', 'alignment unknown')}',
+    };
   }
 
   /// 悬浮球操作说明弹窗（状态含义 + 手势操作）。
@@ -1354,6 +1568,66 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
     );
     if (choice != null) await store.setLanguage(choice);
+  }
+
+  Future<void> _checkUpdate() async {
+    final store = widget.store;
+    // 两端编排（F8）：**唯一判据在 store.appUpdateGate()**，这里只是同一个门禁的入口
+    store.updateChecking = true;
+    if (mounted) setState(() {});
+    final outcome = await Updater.check(store);
+    store.updateChecking = false;
+    if (!mounted) return;
+    setState(() {});
+    switch (outcome.verdict) {
+      case UpdateVerdict.updateAvailable:
+        final candidate = outcome.candidate;
+        if (candidate == null) return;
+        store.setUpdateCandidate(candidate);
+        _updateFlowBusy = true;
+        setState(() {});
+        await runUpdateFlow(context, store, candidate);
+        _updateFlowBusy = false;
+        if (mounted) setState(() {});
+        break;
+      case UpdateVerdict.upToDate:
+        showToast(context, outcome.error ?? L10n.t('已是最新版本', 'Already up to date'));
+        break;
+      case UpdateVerdict.remoteOlder:
+        showToast(context, L10n.t('更新源版本低于当前版本，已忽略', 'Update source is older than current — ignored'));
+        break;
+    }
+  }
+
+  Future<void> _pickUpdateSource() async {
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 14, 20, 6),
+            child: Text(L10n.t('选择更新源', 'Choose update source'),
+                style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700)),
+          ),
+          for (final item in [
+            // 来源接线（F04/F19）：App 不再直连 GitHub；两种来源都只下载电脑端投影的固定地址。
+            ('github', L10n.t('自动（电脑端检查结果）', 'Automatic (desktop check)'),
+                L10n.t('由电脑端插件的更新检查来源决定；App 统一从电脑端固定目标下载',
+                    'Decided by the desktop plugin update source; the app always downloads the desktop fixed target')),
+            ('host', L10n.t('主机 updateDir 人工目录', 'Host updateDir (manual)'),
+                L10n.t('电脑端 updateDir 里人工放置的完整清单', 'A complete manifest placed manually in the host updateDir')),
+          ])
+            ListTile(
+              title: Text(item.$2),
+              subtitle: Text(item.$3),
+              trailing: widget.store.updateSource == item.$1 ? const Icon(Icons.check) : null,
+              onTap: () => Navigator.of(ctx).pop(item.$1),
+            ),
+          const SizedBox(height: 8),
+        ]),
+      ),
+    );
+    if (choice != null) await widget.store.setUpdateSource(choice);
   }
 
   /// 应用日志：查看 / 复制 / 清空

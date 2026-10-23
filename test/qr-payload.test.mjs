@@ -61,15 +61,15 @@ test("LAN 桥地址已自带挂载路径：不再补 mount（不产生 /m/m）",
 	assert.ok(!payload.includes("/m/m"), "载荷里不应出现双重挂载路径 /m/m");
 });
 
-test("回环地址同样自带挂载路径（服务端两条分支都拼 basePath）", () => {
-	// 这条覆盖 PR 作者原判断的反例：回环模式并非"url 本身无路径"
-	const payload = buildQrPayload({
-		urls: ["http://127.0.0.1:3080/m"],
-		token: "tok",
-		basePath: "/m",
-	});
-	assert.equal(payload, "DSHREMOTE|http://127.0.0.1:3080/m|tok");
-	assert.ok(!payload.includes("/m/m"));
+test("只有回环地址时不再生成二维码（#36 follow-up：不伪造回环连接码）", () => {
+	// 旧契约是"回环地址也补 mount 生成二维码"；#36 note 1509 §6 明确删除该回退：
+	// 手机扫到 127.0.0.1 只会连到手机自己，是坏码。
+	assert.equal(buildQrPayload({ urls: ["http://127.0.0.1:3080/m"], token: "tok", basePath: "/m" }), null);
+	assert.equal(buildQrPayload({ urls: ["http://localhost:3080/m"], token: "tok", basePath: "/m" }), null);
+	assert.equal(buildQrPayload({ urls: ["http://[::1]:3080/m"], token: "tok", basePath: "/m" }), null);
+	assert.equal(buildQrPayload({ urls: ["http://0.0.0.0:3080/m"], token: "tok", basePath: "/m" }), null);
+	// URL 会把 IPv4-mapped 回环规范化成十六进制形式 [::ffff:7f00:1]：同样不得构码。
+	assert.equal(buildQrPayload({ urls: ["http://[::ffff:127.0.0.1]:3080/m"], token: "tok", basePath: "/m" }), null);
 });
 
 test("地址本身不含路径时仍补 mount（兼容裸 url 的服务端）", () => {
@@ -113,9 +113,38 @@ test("首选地址仍优先非回环项（不改变原有选路语义）", () =>
 	);
 });
 
-test("urls 为空时回退默认回环地址并补 mount", () => {
-	assert.equal(buildQrPayload({ urls: [], token: "t", basePath: "/m" }), "DSHREMOTE|http://127.0.0.1:3080/m|t");
-	assert.equal(buildQrPayload({ token: "t", basePath: "/m" }), "DSHREMOTE|http://127.0.0.1:3080/m|t");
+test("urls 为空/缺失时返回 null（删除默认 127.0.0.1:3080 回退）", () => {
+	assert.equal(buildQrPayload({ urls: [], token: "t", basePath: "/m" }), null);
+	assert.equal(buildQrPayload({ token: "t", basePath: "/m" }), null);
+	assert.equal(buildQrPayload(null), null);
+	assert.equal(buildQrPayload(undefined), null);
+});
+
+test("宿主 connection 明确非 ready（starting/unavailable）时一律不构码", () => {
+	for (const state of ["starting", "unavailable"]) {
+		assert.equal(
+			buildQrPayload({
+				urls: ["http://192.168.1.5:3082/m"],
+				token: "t",
+				basePath: "/m",
+				connection: { state, reason: state === "starting" ? "bridge-starting" : "loopback-only" },
+			}),
+			null,
+			state,
+		);
+	}
+});
+
+test("connection=ready 但 urls 为空 → null；urls 只有回环 → null（不从任何地方猜地址）", () => {
+	assert.equal(buildQrPayload({ urls: [], connection: { state: "ready", origins: [] } }), null);
+	assert.equal(buildQrPayload({ urls: [], connection: { state: "ready", origins: ["http://127.0.0.1:3080"] } }), null);
+});
+
+test("兼容新响应：urls 为空但 connection.origins 有手机可达地址时可构码（仍不拼重复 mount）", () => {
+	assert.equal(
+		buildQrPayload({ urls: [], token: "t", basePath: "/m", connection: { state: "ready", origins: ["http://192.168.1.5:3082"] } }),
+		"DSHREMOTE|http://192.168.1.5:3082/m|t",
+	);
 });
 
 test("basePath 缺失时按默认 /m 处理", () => {

@@ -1,9 +1,12 @@
 {
-  "name": "dsh-mobile-remote",
+  "name": "@marktrue/dsh-mobile-remote",
   "version": "3.2.0",
   "description": "DSH Mobile：把 DeepSeek Harness 变成随身控制台——手机远程发消息派活、看进度、收通知、审批决策、管理会话；配套 Flutter App（当前 Android 端，iOS 未开发）",
   "type": "module",
   "main": "lib/index.js",
+  "scripts": {
+    "release:carrier:check": "node dsh-mobile-app/tools/publish-carrier-check.mjs"
+  },
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
@@ -16,7 +19,11 @@
     "FAQ.md",
     "CHANGELOG.md",
     "CONTRIBUTING.md",
-    "LICENSE"
+    "LICENSE",
+    "cordis.patch.yml",
+    "!docs/adr",
+    "!docs/agents",
+    "!docs/design"
   ],
   "dsh": {
     "client": {
@@ -25,6 +32,9 @@
         "@deepseek-ai/dsh-client-runtime",
         "@deepseek-ai/dsh-client-ui-settings"
       ]
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
     }
   },
   "keywords": [
@@ -38,6 +48,12 @@
   "dependencies": {
     "qrcode": "^1.5.4"
   },
+  "bundleDependencies": [
+    "qrcode"
+  ],
+  "optionalDependencies": {
+    "@marktrue/dsh-mobile-remote-app": "npm:@marktrue/dsh-mobile-remote@3.2.0-app"
+  },
   "peerDependencies": {
     "@deepseek-ai/dsh-credentials": ">=0.1.0-rc.6 <0.3.0",
     "@deepseek-ai/dsh-llm": ">=0.1.0-rc.6 <0.3.0",
@@ -50,5 +66,14 @@
     "dsh-codex-connect": {
       "optional": true
     }
-  }
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org",
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/marktrue-ahu/dsh-mobile-remote.git"
+  },
+  "homepage": "https://github.com/marktrue-ahu/dsh-mobile-remote#readme"
 }

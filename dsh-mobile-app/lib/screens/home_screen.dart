@@ -1,4 +1,5 @@
 // 首页：欢迎 + 最近会话 + 新建会话
+import 'dart:async';
 import 'package:flutter/material.dart';
 import '../l10n.dart';
 import '../toast.dart';
@@ -7,6 +8,9 @@ import '../session_list.dart';
 import '../store.dart';
 import '../theme.dart';
 import '../fmt.dart';
+import '../update_core.dart';
+import '../update_flow.dart';
+import '../version_alignment.dart';
 import '../widgets/session_indicator.dart';
 import 'chat_screen.dart';
 import 'sheets.dart';
@@ -105,6 +109,34 @@ class _HomeScreenState extends State<HomeScreen>
 
     return Column(
       children: [
+        // 3.0.0+8 自动更新：启动静默检查命中后显示的「有新版本」横幅
+        if (store.updateCandidate != null)
+          _UpdateBanner(
+            candidate: store.updateCandidate!,
+            onUpdate: () {
+              final c = store.updateCandidate;
+              if (c != null) {
+                // 取消/失败保留横幅（US22：直到更新或版本变更才消失）
+                unawaited(runUpdateFlow(context, store, c));
+              }
+            },
+            onDismiss: () => store.clearUpdateCandidate(),
+          ),
+        // 两端版本不一致：温和提示、不阻断（ADR 0019：版本号只决定提示文案）。
+        // App 落后 → 引导去看更新；插件落后 → 说明要去电脑上更新插件。
+        if (store.alignmentVisible)
+          _AlignmentBanner(
+            alignment: store.alignment,
+            onUpdateApp: store.updateCandidate == null
+                ? null
+                : () {
+                    final c = store.updateCandidate;
+                    if (c != null) {
+                      unawaited(runUpdateFlow(context, store, c));
+                    }
+                  },
+            onDismiss: () => store.dismissAlignment(),
+          ),
         Expanded(
           // 下拉刷新：探测 → 自愈（轮换地址/重建连接）→ 拉数据；仅失败时提示
           child: RefreshIndicator(
@@ -291,6 +323,133 @@ class _SessionRow extends StatelessWidget {
               ),
             ),
             Icon(Icons.chevron_right, size: 18, color: ink3),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 3.0.0+8：自动更新「有新版本」横幅（顶部单行，可更新/可关闭）。
+class _UpdateBanner extends StatelessWidget {  final UpdateCandidate candidate;
+  final VoidCallback onUpdate;
+  final VoidCallback onDismiss;
+  const _UpdateBanner({required this.candidate, required this.onUpdate, required this.onDismiss});
+
+  @override
+  Widget build(BuildContext context) {
+    final brand = DshColors.brand(context);
+    final ink2 = DshColors.ink2(context);
+    final line = DshColors.line(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: DshColors.brandSoft(context),
+          border: Border.all(color: line),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Row(
+          children: [
+            const Icon(Icons.system_update_alt, size: 18, color: Color(0xFF426EFE)),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                L10n.t('发现新版本 v${candidate.version}（${candidate.source}）', 'New version v${candidate.version} (${candidate.source})'),
+                style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: ink2),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            TextButton(
+              onPressed: onUpdate,
+              style: TextButton.styleFrom(
+                minimumSize: const Size(0, 26),
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+              child: Text(L10n.t('更新', 'Update'), style: TextStyle(fontSize: 12, color: brand)),
+            ),
+            GestureDetector(
+              onTap: onDismiss,
+              child: const Padding(
+                padding: EdgeInsets.all(4),
+                child: Icon(Icons.close, size: 15, color: Color(0xFF5C6470)),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 两端版本不一致的温和提示（ADR 0019）：只说明"该动哪一端"，不阻断任何功能。
+/// `unknown` 不走这里（见 Store.alignmentVisible），只有明确的一侧落后才提示。
+class _AlignmentBanner extends StatelessWidget {
+  final AppAlignment alignment;
+  final VoidCallback? onUpdateApp;
+  final VoidCallback onDismiss;
+  const _AlignmentBanner({required this.alignment, required this.onUpdateApp, required this.onDismiss});
+
+  @override
+  Widget build(BuildContext context) {
+    final brand = DshColors.brand(context);
+    final ink2 = DshColors.ink2(context);
+    final line = DshColors.line(context);
+    final pluginBehind = alignment.state == AlignmentState.pluginOutdated;
+    final text = pluginBehind
+        ? L10n.t(
+            '电脑端插件 v${alignment.pluginVersion} 落后于 App v${alignment.appVersion}：请在电脑上更新插件并重启',
+            'Desktop plugin v${alignment.pluginVersion} is behind App v${alignment.appVersion} — update the plugin on your computer',
+          )
+        : L10n.t(
+            '电脑端插件 v${alignment.pluginVersion} 比 App v${alignment.appVersion} 新：请把 App 更新到同版本',
+            'Plugin v${alignment.pluginVersion} is newer than App v${alignment.appVersion} — update the app',
+          );
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: DshColors.brandSoft(context),
+          border: Border.all(color: line),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              pluginBehind ? Icons.desktop_windows_outlined : Icons.system_update_alt,
+              size: 18,
+              color: const Color(0xFF426EFE),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                text,
+                style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: ink2),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            if (!pluginBehind && onUpdateApp != null)
+              TextButton(
+                onPressed: onUpdateApp,
+                style: TextButton.styleFrom(
+                  minimumSize: const Size(0, 26),
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                child: Text(L10n.t('更新', 'Update'), style: TextStyle(fontSize: 12, color: brand)),
+              ),
+            GestureDetector(
+              onTap: onDismiss,
+              child: const Padding(
+                padding: EdgeInsets.all(4),
+                child: Icon(Icons.close, size: 15, color: Color(0xFF5C6470)),
+              ),
+            ),
           ],
         ),
       ),
