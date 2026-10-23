@@ -29,8 +29,10 @@ function harness(options = {}) {
   const profile = join(testHome, `profile-${Math.random().toString(36).slice(2)}`);
   mkdirSync(profile); writeFileSync(join(profile, 'package.json'), JSON.stringify({ dependencies: { 'dsh-mobile-remote': 'file:/fixture-old' } }));
   const routes = []; const logs = []; let cleanup;
+  // T16/W1：endpoint view 依据真实监听的 webServer.host/port 生成手机可达地址。
+  const webServerHost = options.webServerHost ?? '127.0.0.1';
   const ctx = {
-    webServer: { host: '127.0.0.1', port: 39401, register(route) { routes.push(route); return () => {}; } },
+    webServer: { host: webServerHost, port: 39401, register(route) { routes.push(route); return () => {}; } },
     logger: { warn: m => logs.push(String(m)), info: m => logs.push(String(m)) },
     get: name => ['agents','sessions'].includes(name) ? { list: () => [], roots: () => [], get: () => undefined } : undefined,
     provide() {}, inject() {}, on: () => () => {}, effect(fn) { cleanup = fn(); return cleanup; },
@@ -108,12 +110,19 @@ test('D3: host manifest projects phone-reachable routes for BOTH artifacts (neve
   writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ schema: 1, version: '3.3.0+70', apk: 'app.apk', size: apk.length, sha256: digest(apk),
     app: { version: '3.3.0+70', file: 'app.apk', size: apk.length, sha256: digest(apk) },
     plugin: { version: '3.3.0', file: 'plugin.tgz', size: tgz.length, sha256: digest(tgz), contentSha256: 'c'.repeat(64) } }));
-  const h = harness({ config: { updateDir: dir, pluginUpdateManifest: 'off', trustedHosts: ['192.168.1.9'] } });  // 信任集合按 hostname（端口被剥离）
+  // T16/W1：trustedHosts 只是主机名白名单，公开 URL 的端口必须等于真实监听端口
+  // （harness webServer.port=39401）；未监听端口（如 :3080/:9999）一律不得进入公开投影。
+  // endpoint view 以**真实监听**的 webServer.host 为准（192.168.1.9:39401），Host 头不再是公开基址来源。
+  const h = harness({ webServerHost: '192.168.1.9', config: { updateDir: dir, pluginUpdateManifest: 'off', trustedHosts: ['192.168.1.9'] } });
   try {
-    const r = await request(h.route, undefined, '/m/api/update/manifest', { host: '192.168.1.9:3080' });
+    const r = await request(h.route, undefined, '/m/api/update/manifest', { host: '192.168.1.9:39401' });
     assert.equal(r.status, 200);
-    assert.equal(r.body.manifest.app.url, 'http://192.168.1.9:3080/m/api/update/apk');
-    assert.equal(r.body.manifest.plugin.url, 'http://192.168.1.9:3080/m/api/update/plugin');
+    assert.equal(r.body.manifest.app.url, 'http://192.168.1.9:39401/m/api/update/apk');
+    assert.equal(r.body.manifest.plugin.url, 'http://192.168.1.9:39401/m/api/update/plugin');
+    // 伪造未监听端口（旧实现会原样投影）必须被拒绝：无 URL，而不是 :9999。
+    const forged = await request(h.route, undefined, '/m/api/update/manifest', { host: '192.168.1.9:9999' });
+    assert.equal(forged.status, 200);
+    assert.equal(JSON.stringify(forged.body).includes(':9999'), false, '不得从 Host 伪造未监听端口');
     assert.equal(/\/api\/update\/[^/]*\.apk$/.test(r.body.manifest.app.url), false, '不得虚构文件路由');
     assert.equal(r.body.manifest.app.url.includes('127.0.0.1'), false, '手机上的 127.0.0.1 是手机自己');
     // 固定快照必须与主机检查产出的候选一致（同一份产物、同一地址）
@@ -162,6 +171,7 @@ test('E2: phone POST accepted returns a phone-reachable fixed APK route, not the
   const testHome = mkdtempSync(join(tmpdir(), 'e2-home-'));
   const h = harness({
     homeDir: testHome,
+    webServerHost: '192.0.2.9',
     config: { updateDir: dir, authToken: token, trustedHosts: ['192.0.2.9'], pluginUpdateManifest: `http://127.0.0.1:39401${manifestPath}` },
     pluginUpdates: {
       // 宿主的清单请求者是自己（回环），不是发 POST 的手机
@@ -201,6 +211,7 @@ test('E3: non-default mount path keeps credentials on the host loopback fetch', 
   const token = 'fixture-only-token';
   const h = harness({
     homeDir: mkdtempSync(join(tmpdir(), 'e3-home-')),
+    webServerHost: '192.0.2.9',
     config: { path: '/phone', updateDir: dir, authToken: token, trustedHosts: ['192.0.2.9'],
       pluginUpdateManifest: 'http://127.0.0.1:39401/phone/api/update/manifest' },
     pluginUpdates: {
@@ -243,6 +254,7 @@ test('F1: queued worker keeps the internal loopback locator while public views s
   const f1Home = mkdtempSync(join(tmpdir(), 'f1-home-'));
   h = harness({
     homeDir: f1Home,
+    webServerHost: '192.0.2.9',
     config: { updateDir: dir, authToken: token, trustedHosts: ['192.0.2.9'],
       pluginUpdateManifest: 'http://127.0.0.1:39401/m/api/update/manifest' },
     pluginUpdates: {
@@ -296,5 +308,33 @@ test('F1: queued worker keeps the internal loopback locator while public views s
     const holder = readLock(updateLockPath(f1Home));
     if (holder) finishOwnedTerminal(transactionFile(f1Home), { phase: 'failed', result: { ok: false, reason: 'fixture-done' }, expectedPhases: ['restart-pending'] },
       { lockPath: updateLockPath(f1Home), lease: holder, currentFile: transactionFile(f1Home) });
+  } finally { h.dispose(); }
+});
+
+test('W1/T16: public manifest URL never uses a Host/trustedHosts port that is not a real listener', async () => {
+  const dir = join(home, 'w1-port-artifacts'); mkdirSync(dir);
+  const apk = Buffer.from('apk-w1'), tgz = Buffer.from('tgz-w1');
+  const digest = b => hashOf('sha256').update(b).digest('hex');
+  writeFileSync(join(dir, 'app.apk'), apk); writeFileSync(join(dir, 'plugin.tgz'), tgz);
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ schema: 1, version: '3.3.0+70', apk: 'app.apk', size: apk.length, sha256: digest(apk),
+    app: { version: '3.3.0+70', file: 'app.apk', size: apk.length, sha256: digest(apk) },
+    plugin: { version: '3.3.0', file: 'plugin.tgz', size: tgz.length, sha256: digest(tgz), contentSha256: 'c'.repeat(64) } }));
+  const h = harness({ webServerHost: '192.168.1.9', config: { updateDir: dir, pluginUpdateManifest: 'off', trustedHosts: ['192.168.1.9'] } });
+  try {
+    // 公开基址只来自真实监听视图（webServer.host=192.168.1.9 + 真实端口 39401）。
+    const real = await request(h.route, undefined, '/m/api/update/manifest', { host: '192.168.1.9:39401' });
+    assert.equal(real.status, 200);
+    assert.equal(real.body.manifest.app.url, 'http://192.168.1.9:39401/m/api/update/apk');
+    // 伪造 Host 端口不得覆盖真实监听视图（任何 Host 都不能引入未监听端口）。
+    for (const host of ['192.168.1.9:9999', '127.0.0.1:9999']) {
+      const forged = await request(h.route, undefined, '/m/api/update/manifest', { host });
+      assert.equal(forged.status, 200, host);
+      assert.equal(JSON.stringify(forged.body).includes(':9999'), false, host);
+      // 只有当 Host 是回环时走本机兼容分支；其余一律取真实监听视图，不出现未监听端口。
+      assert.match(forged.body.manifest.app.url, /^http:\/\/(?:192\.168\.1\.9|127\.0\.0\.1):39401\/m\/api\/update\/apk$/, host);
+    }
+    // 不被允许的 Host 由既有 Host 围栏拒绝（不因投影逻辑放宽）。
+    const outsider = await request(h.route, undefined, '/m/api/update/manifest', { host: 'evil.example:9999' });
+    assert.equal(outsider.status, 403);
   } finally { h.dispose(); }
 });
