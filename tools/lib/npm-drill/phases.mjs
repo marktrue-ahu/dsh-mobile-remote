@@ -49,6 +49,11 @@ async function assertion(id, title, run) {
 	}
 }
 
+/** 主插件 dist-tag（--plugin-tag，默认 latest）；载体始终 app。 */
+function pluginTagOf(ctx) {
+	return typeof ctx?.pluginTag === "string" && ctx.pluginTag !== "" ? ctx.pluginTag : "latest";
+}
+
 function tail(text, limit = 400) {
 	const value = String(text ?? "").trim();
 	return value.length <= limit ? value : `…${value.slice(-limit)}`;
@@ -207,13 +212,14 @@ export async function publishPhase(ctx) {
 	const registryUrl = ctx.registry.normalUrl;
 	const env = envForContext(ctx, registryUrl);
 	const meta = () => fetchPackument(registryUrl, name);
+	const pluginTag = pluginTagOf(ctx);
 
 	assertions.push(await assertion("A1", "registry 存活（本地临时实例或显式复用地址）", async () => {
 		const probe = await registryAlive(registryUrl);
 		return { pass: probe.ok, reason: REASONS.REGISTRY_NOT_ALIVE, detail: `${registryUrl} ${probe.detail}` };
 	}));
 
-	// 真实发布顺序：先载体（app tag），再主插件（latest）。
+	// 真实发布顺序：先载体（app tag），再主插件（--plugin-tag，默认 latest）。
 	const carrierPublish = await npmPublish({
 		tarball: ctx.projection.carrierA.tarball,
 		tag: "app",
@@ -224,17 +230,21 @@ export async function publishPhase(ctx) {
 		logFile: logFile(ctx, "publish-carrier-a"),
 		label: `npm publish carrierA ${ctx.versions.carrierA} --tag app`,
 	});
+	// alpha 路径要证明"latest 不被本次预发布移动"：必须在插件发布**前**记录 latest
+	// （可能缺省；Verdaccio 会对首个发布自动补 latest，属本地 registry 行为）。
+	const metaAfterCarrier = await meta();
+	const latestBeforeA = metaAfterCarrier.ok ? (packumentDistTags(metaAfterCarrier.json).latest ?? null) : null;
 	const pluginPublish = await npmPublish({
 		tarball: ctx.projection.pluginA.tarball,
-		tag: "latest",
+		tag: pluginTag,
 		registryUrl,
 		env,
 		userconfig: ctx.registry.normalUserConfig,
 		pluginName: name,
 		logFile: logFile(ctx, "publish-plugin-a"),
-		label: `npm publish pluginA ${ctx.versions.pluginA}`,
+		label: `npm publish pluginA ${ctx.versions.pluginA} --tag ${pluginTag}`,
 	});
-	ctx.publish = { carrierPublish, pluginPublish };
+	ctx.publish = { carrierPublish, pluginPublish, latestBeforeA };
 
 	assertions.push(await assertion("A2", "插件发布成功且 registry 可查询到该版本", async () => {
 		const current = await meta();
@@ -249,27 +259,41 @@ export async function publishPhase(ctx) {
 		};
 	}));
 
-	assertions.push(await assertion("A3", "载体发布成功；dist-tags 中 app→载体、latest→插件，载体不在 latest", async () => {
-		const current = await meta();
-		if (!current.ok) {
-			return { pass: false, reason: REASONS.CARRIER_PUBLISH_FAILED, detail: `registry meta: ${current.error}` };
-		}
-		const tags = packumentDistTags(current.json);
-		const pass = carrierPublish.ok
-			&& tags.app === ctx.versions.carrierA
-			&& tags.latest === ctx.versions.pluginA
-			&& tags.latest !== ctx.versions.carrierA;
-		return {
-			pass,
-			reason: REASONS.DIST_TAG_MISMATCH,
-			detail: `publish=${carrierPublish.status}; dist-tags=${JSON.stringify(tags)}`,
-		};
-	}));
+	assertions.push(await assertion(
+		"A3",
+		pluginTag === "latest"
+			? "载体发布成功；dist-tags 中 app→载体、latest→插件，载体不在 latest"
+			: `载体发布成功；dist-tags 中 app→载体、${pluginTag}→插件，latest 不被本次预发布移动`,
+		async () => {
+			const current = await meta();
+			if (!current.ok) {
+				return { pass: false, reason: REASONS.CARRIER_PUBLISH_FAILED, detail: `registry meta: ${current.error}` };
+			}
+			const tags = packumentDistTags(current.json);
+			const tagOk = tags[pluginTag] === ctx.versions.pluginA;
+			const latestAfter = tags.latest ?? null;
+			const latestUnchanged = latestAfter === latestBeforeA;
+			// 稳定路径：latest 指向本次插件；预发布路径：latest 必须保持发布前的值
+			// （新 registry 缺省时允许仍缺省），且绝不能被本次 alpha 插件占用。
+			const latestOk = pluginTag === "latest"
+				? latestAfter === ctx.versions.pluginA
+				: latestUnchanged && latestAfter !== ctx.versions.pluginA;
+			const pass = carrierPublish.ok
+				&& tags.app === ctx.versions.carrierA
+				&& tagOk
+				&& latestOk;
+			return {
+				pass,
+				reason: REASONS.DIST_TAG_MISMATCH,
+				detail: `publish=${carrierPublish.status}; pluginTag=${pluginTag}; latestBefore=${latestBeforeA ?? "<缺省>"}; latestAfter=${latestAfter ?? "<缺省>"}; latestUnchanged=${latestUnchanged}; dist-tags=${JSON.stringify(tags)}`,
+			};
+		},
+	));
 
 	assertions.push(await assertion("A4", "重复发布同版本被拒（版本不可覆盖）", async () => {
 		const duplicate = await npmPublish({
 			tarball: ctx.projection.pluginA.tarball,
-			tag: "latest",
+			tag: pluginTag,
 			registryUrl,
 			env,
 			userconfig: ctx.registry.normalUserConfig,
@@ -488,30 +512,41 @@ export async function updatePhase(ctx) {
 		logFile: logFile(ctx, "publish-carrier-b"),
 		label: `npm publish carrierB ${ctx.versions.carrierB} --tag app`,
 	});
+	const pluginTag = pluginTagOf(ctx);
+	// 同 A3：第二对的 latestBefore 必须在 pluginB 发布前采样。
+	const metaAfterCarrierB = await meta();
+	const latestBeforeB = metaAfterCarrierB.ok ? (packumentDistTags(metaAfterCarrierB.json).latest ?? null) : null;
 	const pluginPublishB = await npmPublish({
 		tarball: ctx.projection.pluginB.tarball,
-		tag: "latest",
+		tag: pluginTag,
 		registryUrl,
 		env,
 		userconfig: ctx.registry.normalUserConfig,
 		pluginName: name,
 		logFile: logFile(ctx, "publish-plugin-b"),
-		label: `npm publish pluginB ${ctx.versions.pluginB}`,
+		label: `npm publish pluginB ${ctx.versions.pluginB} --tag ${pluginTag}`,
 	});
 
 	assertions.push(await assertion("A14", "发布第二对新版本成功（插件 + 载体 + dist-tags）", async () => {
 		const current = await meta();
 		const versions = current.ok ? packumentVersions(current.json) : [];
 		const tags = current.ok ? packumentDistTags(current.json) : {};
+		const tagOk = tags[pluginTag] === ctx.versions.pluginB;
+		const latestAfter = tags.latest ?? null;
+		const latestUnchanged = latestAfter === latestBeforeB;
+		const latestOk = pluginTag === "latest"
+			? latestAfter === ctx.versions.pluginB
+			: latestUnchanged && latestAfter !== ctx.versions.pluginB;
 		const pass = carrierPublishB.ok && pluginPublishB.ok && current.ok
 			&& versions.includes(ctx.versions.pluginB)
 			&& versions.includes(ctx.versions.carrierB)
 			&& tags.app === ctx.versions.carrierB
-			&& tags.latest === ctx.versions.pluginB;
+			&& tagOk
+			&& latestOk;
 		return {
 			pass,
 			reason: REASONS.SECOND_PAIR_PUBLISH_FAILED,
-			detail: `carrier=${carrierPublishB.status}; plugin=${pluginPublishB.status}; tags=${JSON.stringify(tags)}`,
+			detail: `carrier=${carrierPublishB.status}; plugin=${pluginPublishB.status}; pluginTag=${pluginTag}; latestBefore=${latestBeforeB ?? "<缺省>"}; latestAfter=${latestAfter ?? "<缺省>"}; latestUnchanged=${latestUnchanged}; tags=${JSON.stringify(tags)}`,
 		};
 	}));
 
@@ -579,7 +614,7 @@ export async function failurePhase(ctx) {
 	// A17：只发插件、不发载体 → 安装不报错但别名缺失，发现结果为「载体未安装」。
 	const pluginOnlyPublish = await npmPublish({
 		tarball: ctx.projection.pluginOnly.tarball,
-		tag: "latest",
+		tag: pluginTagOf(ctx),
 		registryUrl,
 		env,
 		userconfig: ctx.registry.normalUserConfig,

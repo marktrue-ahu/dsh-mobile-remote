@@ -35,28 +35,90 @@ const goodManifest = (over = {}) => ({
 	},
 });
 
-test("parseVersion 只接受 X.Y.Z 与 X.Y.Z+N", () => {
-	assert.deepEqual(parseVersion("3.2.0"), { major: 3, minor: 2, patch: 0, build: null });
-	assert.deepEqual(parseVersion("3.2.0+44"), { major: 3, minor: 2, patch: 0, build: 44 });
-	assert.deepEqual(parseVersion(" 3.2.0 "), { major: 3, minor: 2, patch: 0, build: null });
+test("parseVersion 接受 X.Y.Z、可选 SemVer prerelease 与 X.Y.Z+N", () => {
+	assert.deepEqual(parseVersion("3.2.0"), { major: 3, minor: 2, patch: 0, version: "3.2.0", prerelease: [], build: null });
+	assert.deepEqual(parseVersion("3.2.0+44"), { major: 3, minor: 2, patch: 0, version: "3.2.0", prerelease: [], build: 44 });
+	assert.deepEqual(parseVersion(" 3.2.0 "), { major: 3, minor: 2, patch: 0, version: "3.2.0", prerelease: [], build: null });
+	// 插件 prerelease（3.2.1-alpha.1）：core 仍可单独取用（App 配对只比 core）。
+	assert.deepEqual(parseVersion("3.2.1-alpha.1"), { major: 3, minor: 2, patch: 1, version: "3.2.1", prerelease: ["alpha", "1"], build: null });
+	assert.deepEqual(parseVersion("3.2.1-alpha.10+24"), { major: 3, minor: 2, patch: 1, version: "3.2.1", prerelease: ["alpha", "10"], build: 24 });
+	// 非法 prerelease 不接受（SemVer：标识符非空、仅 ASCII alnum/连字符、纯数字标识符无前导零）。
+	for (const bad of ["3.2.1-", "3.2.1-alpha..1", "3.2.1-01", "3.2.1-alpha_1", "3.2.1-+.1", "3.2.1+"]) {
+		assert.equal(parseVersion(bad), null, bad);
+	}
 	assert.equal(parseVersion("3.2"), null);
 	assert.equal(parseVersion("v3.2.0"), null);
 	assert.equal(parseVersion(""), null);
 	assert.equal(parseVersion(undefined), null);
 });
 
-test("compareVersion 在语义版本相同时才比较 build", () => {
+test("compareVersion 按 SemVer 处理 prerelease（alpha < stable、alpha.2 > alpha.1）", () => {
+	// 契约：release/v3.2.1-alpha.1 —— 插件 3.2.1-alpha.1 与 3.2.1 stable 的排序
+	assert.equal(compareVersion("3.2.1-alpha.1", "3.2.1"), -1);
+	assert.equal(compareVersion("3.2.1", "3.2.1-alpha.1"), 1);
+	assert.equal(compareVersion("3.2.1-alpha.2", "3.2.1-alpha.1"), 1);
+	assert.equal(compareVersion("3.2.1-alpha.1", "3.2.1-alpha.2"), -1);
+	assert.equal(compareVersion("3.2.1-alpha.1", "3.2.1-alpha.1"), 0);
+	assert.equal(compareVersion("3.2.1-alpha.10", "3.2.1-alpha.2"), 1); // 数字标识符按数值比
+	assert.equal(compareVersion("3.2.1-alpha", "3.2.1-alpha.1"), -1); // 前缀更短更低
+	assert.equal(compareVersion("3.2.1-alpha.1", "3.2.1-beta"), -1); // 字母序
+	assert.equal(compareVersion("3.2.1-alpha.1", "3.2.1-alpha.1+44"), 0); // build 只在一侧时不参与
+	assert.equal(compareVersion("3.2.1-alpha.1+45", "3.2.1-alpha.1+44"), 1); // 同 prerelease 时 build 参与
+	assert.equal(compareVersion("3.2.1-alpha.1+99", "3.2.1+1"), -1); // prerelease 优先于 build
+	assert.equal(compareVersion("3.2.1-alpha.1", "3.2.2-alpha.1"), -1); // core 优先于 prerelease
+	// 既有契约不回退
 	assert.equal(compareVersion("3.2.0", "3.2.0"), 0);
 	assert.equal(compareVersion("3.2.0+44", "3.2.0+23"), 1);
 	assert.equal(compareVersion("3.1.9+99", "3.2.0+1"), -1);
-	assert.equal(compareVersion("3.2.0+44", "3.2.0"), 0); // 一侧无 build 时不参与
+	assert.equal(compareVersion("3.2.0+44", "3.2.0"), 0);
 	assert.equal(compareVersion("bad", "3.2.0"), null);
 });
 
-test("compareSemanticVersion 忽略 build（同一发布周期内不误报）", () => {
+test("compareSemanticVersion 只比较 core：prerelease 与 build 都不参与", () => {
 	assert.equal(compareSemanticVersion("3.2.0+44", "3.2.0+23"), 0);
 	assert.equal(compareSemanticVersion("3.2.0", "3.1.5"), 1);
 	assert.equal(compareSemanticVersion("3.1.5", "3.2.0"), -1);
+	// App 3.2.1+24 与插件 3.2.1-alpha.1 按 core 3.2.1 对齐
+	assert.equal(compareSemanticVersion("3.2.1-alpha.1", "3.2.1+24"), 0);
+	assert.equal(compareSemanticVersion("3.2.1-alpha.2", "3.2.1-alpha.1"), 0);
+	assert.equal(compareSemanticVersion("3.2.1-alpha.1", "3.2.0+23"), 1);
+	assert.equal(compareSemanticVersion("3.2.0", "3.2.1-alpha.1"), -1);
+});
+
+test("normalizeReleaseManifest 接受 prerelease 插件版本并保留全字串", () => {
+	const r = normalizeReleaseManifest(goodManifest({ version: "3.2.1-alpha.1" }));
+	assert.equal(r.ok, true);
+	assert.equal(r.plugin.version, "3.2.1-alpha.1");
+});
+
+test("decidePluginUpdate：prerelease 远端按 SemVer 排序，不把 alpha 当降级", () => {
+	const local = (localVersion) => ({ localVersion, localContentSha256: DIGEST_A });
+	const remote = (version) => ({ version, contentSha256: DIGEST_B });
+	assert.equal(
+		decidePluginUpdate({ ...local("3.2.0+23"), remote: remote("3.2.1-alpha.1") }).action,
+		UPDATE_ACTION.UPDATE_AVAILABLE,
+	);
+	assert.equal(
+		decidePluginUpdate({ ...local("3.2.1-alpha.1"), remote: remote("3.2.1-alpha.2") }).action,
+		UPDATE_ACTION.UPDATE_AVAILABLE,
+	);
+	assert.equal(
+		decidePluginUpdate({ ...local("3.2.1-alpha.2"), remote: remote("3.2.1-alpha.1") }).action,
+		UPDATE_ACTION.LOCAL_AHEAD,
+	);
+	assert.equal(
+		decidePluginUpdate({ ...local("3.2.1-alpha.1"), remote: remote("3.2.1") }).action,
+		UPDATE_ACTION.UPDATE_AVAILABLE,
+	);
+	assert.equal(
+		decidePluginUpdate({ ...local("3.2.1"), remote: remote("3.2.1-alpha.1") }).action,
+		UPDATE_ACTION.LOCAL_AHEAD,
+	);
+});
+
+test("classifySpecifier 认识 prerelease 精确版本", () => {
+	assert.equal(classifySpecifier("3.2.1-alpha.1"), INSTALL_SHAPE.REGISTRY);
+	assert.equal(classifySpecifier("^3.2.1-alpha.1"), INSTALL_SHAPE.REGISTRY);
 });
 
 test("normalizeReleaseManifest 接受 schema 1 并保留所需字段", () => {

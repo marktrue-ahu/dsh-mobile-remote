@@ -33,21 +33,31 @@ const CARRIER_FILE = "marktrue-dsh-mobile-remote-3.2.0-app.tgz";
 const CARRIER_VERSION = `${PLUGIN_VERSION}-app`;
 const CARRIER_ALIAS = `${PLUGIN_NAME}-app`;
 
+// 预发布配对契约（task-28）：插件 3.2.1-alpha.1 + App 3.2.1+24 + 载体 3.2.1-alpha.1-app；
+// App/APK 文件名只用 core 3.2.1，插件 tgz 名用完整 prerelease。
+const PRE_PLUGIN_VERSION = "3.2.1-alpha.1";
+const PRE_APP_VERSION = "3.2.1+24";
+const PRE_APK_FILE = "DSH-Remote-v3.2.1.apk";
+const PRE_CARRIER_VERSION = `${PRE_PLUGIN_VERSION}-app`;
+const PRE_CARRIER_FILE = "marktrue-dsh-mobile-remote-3.2.1-alpha.1-app.tgz";
+
 /** 2MB 假 APK（不可压缩随机字节，避免 tarball 被压成 0 字节而掩盖体积/哈希问题）。 */
 const APK_BYTES = crypto.randomBytes(2 * 1024 * 1024);
 
-const AAPT_STUB = [
-	"#!/bin/sh",
-	'if [ "$1" = "dump" ] && [ "$2" = "badging" ]; then',
-	"  cat <<'EOF'",
-	"package: name='com.marktrue.dsh_mobile_remote' versionCode='23' versionName='3.2.0' platformBuildVersionName='14'",
-	"EOF",
-	"  exit 0",
-	"fi",
-	'echo "fake aapt: unsupported args: $*" >&2',
-	"exit 1",
-	"",
-].join("\n");
+function aaptStub({ versionName = "3.2.0", versionCode = "23" } = {}) {
+	return [
+		"#!/bin/sh",
+		'if [ "$1" = "dump" ] && [ "$2" = "badging" ]; then',
+		"  cat <<'EOF'",
+		`package: name='com.marktrue.dsh_mobile_remote' versionCode='${versionCode}' versionName='${versionName}' platformBuildVersionName='14'`,
+		"EOF",
+		"  exit 0",
+		"fi",
+		'echo "fake aapt: unsupported args: $*" >&2',
+		"exit 1",
+		"",
+	].join("\n");
+}
 
 function pathJoin(parts) {
 	return parts.filter(Boolean).join(process.platform === "win32" ? ";" : ":");
@@ -83,7 +93,12 @@ async function packPlugin(pluginRoot, dist) {
  * 造一套“已构建好”的发布输入：插件源码（精确别名声明）+ 由它 npm pack 的 tgz + APK +
  * CHANGELOG + 仅实现 `dump badging` 的假 aapt（让“实读 APK 版本”分支可重复测试）。
  */
-async function makeFixture() {
+async function makeFixture({
+	pluginVersion = PLUGIN_VERSION,
+	appVersion = APP_VERSION,
+	apkFile = APK_FILE,
+	carrierFile = CARRIER_FILE,
+} = {}) {
 	const base = await mkdtemp(join(tmpdir(), "release-pairing-"));
 	const pluginRoot = join(base, "plugin");
 	const dist = join(base, "dist");
@@ -94,27 +109,30 @@ async function makeFixture() {
 	await mkdir(binDir, { recursive: true });
 	await mkdir(home, { recursive: true });
 
+	const fixtureCarrierVersion = `${pluginVersion}-app`;
+	const fixtureCarrierAlias = `${PLUGIN_NAME}-app`;
 	const pluginPkg = {
 		name: PLUGIN_NAME,
-		version: PLUGIN_VERSION,
+		version: pluginVersion,
 		files: ["lib", "README.md", "LICENSE"],
-		optionalDependencies: { [CARRIER_ALIAS]: `npm:${PLUGIN_NAME}@${CARRIER_VERSION}` },
+		optionalDependencies: { [fixtureCarrierAlias]: `npm:${PLUGIN_NAME}@${fixtureCarrierVersion}` },
 		// 载体发布元数据继承来源（P3-A：license/repository 随载体发布）
 		license: "MIT",
 		repository: { type: "git", url: "git+https://example.com/fixture.git" },
 	};
 	await writeFile(join(pluginRoot, "package.json"), `${JSON.stringify(pluginPkg, null, 2)}\n`);
-	await writeFile(join(pluginRoot, "lib", "index.js"), "export const plugin = '3.2.0';\n");
+	await writeFile(join(pluginRoot, "lib", "index.js"), `export const plugin = '${pluginVersion}';\n`);
 	await writeFile(join(pluginRoot, "README.md"), "# fixture plugin\n");
 	await writeFile(join(pluginRoot, "LICENSE"), "MIT (fixture)\n");
 
-	const apkPath = join(dist, APK_FILE);
+	const apkPath = join(dist, apkFile);
 	await writeFile(apkPath, APK_BYTES);
 	const changelog = join(base, "CHANGELOG.md");
-	await writeFile(changelog, "## v3.2.0（配对测试）\n\n- 一条发布说明。\n");
+	await writeFile(changelog, `## v${pluginVersion}（配对测试）\n\n- 一条发布说明。\n`);
 
+	const [appCore, appBuild] = appVersion.split("+");
 	const fakeAapt = join(binDir, "aapt");
-	await writeFile(fakeAapt, AAPT_STUB);
+	await writeFile(fakeAapt, aaptStub({ versionName: appCore, versionCode: appBuild }));
 	await chmod(fakeAapt, 0o755);
 
 	const tgz = await packPlugin(pluginRoot, dist);
@@ -129,8 +147,13 @@ async function makeFixture() {
 		tgz,
 		manifestPath: join(dist, "manifest.json"),
 		recordPath: join(dist, "app-carrier.json"),
-		carrierFile: join(dist, CARRIER_FILE),
+		carrierFile: join(dist, carrierFile),
 		mainPkgPath: join(pluginRoot, "package.json"),
+		pluginVersion,
+		appVersion,
+		apkFile,
+		carrierVersion: fixtureCarrierVersion,
+		carrierAlias: fixtureCarrierAlias,
 	};
 }
 
@@ -142,7 +165,7 @@ function toolEnv(fixture, { aapt = true } = {}) {
 	return { ...process.env, HOME: fixture.home, PATH: pathValue };
 }
 
-function buildCarrier(fixture, { appVersion = APP_VERSION, aapt = true, pluginTgz = fixture.tgz } = {}) {
+function buildCarrier(fixture, { appVersion = fixture.appVersion ?? APP_VERSION, aapt = true, pluginTgz = fixture.tgz } = {}) {
 	const args = [
 		BUILD,
 		"--apk", fixture.apkPath,
@@ -294,6 +317,9 @@ test("正常顺序：先插件 tgz 后载体；清单/载体/APK/tgz 四者一�
 		assert.equal(carrierPkg.repository?.url, "git+https://example.com/fixture.git", "repository 继承主包");
 		assert.ok(String(carrierPkg.description ?? "").trim() !== "", "description 非空");
 		assertPassLine(build, "publishConfig.tag 必须是 app");
+		// 发布 tag 契约（task-28）：稳定版主插件用 latest；载体恒为 app。
+		assert.match(build.stdout, /主插件发布[^\n]*--tag latest/, "稳定版主插件发布 hint 必须是 --tag latest");
+		assert.match(build.stdout, /载体发布[^\n]*--tag app/, "载体发布 hint 必须是 --tag app");
 
 		// 严格发布门禁
 		const verify = verifyPairing(f);
@@ -517,7 +543,8 @@ test("哈希不符被拒：dist APK、载体内 APK、插件 tgz、构建记录�
 		await writeFile(f.tgz, originalTgz);
 		assertExitPass(buildCarrier(f));
 		const record = JSON.parse(await readFile(f.recordPath, "utf8"));
-		record.sha256 = `0${record.sha256.slice(1)}`;
+		// 修复已知 flake：原值首位可能本来就是 "0"，此时改写是 no-op，会误判为“篡改未生效”。
+		record.sha256 = `${record.sha256[0] === "0" ? "1" : "0"}${record.sha256.slice(1)}`;
 		await writeFile(f.recordPath, `${JSON.stringify(record, null, 2)}\n`);
 		const verifyRecord = verifyPairing(f);
 		assertExitFail(verifyRecord, "构建记录被篡改必须失败");
@@ -609,6 +636,7 @@ test("publish-carrier-check PASS：发布元数据/版本配对/产物哈希/离
 		assertPassLine(check, "载体 tarball 体积/哈希与构建记录一致");
 		// 只打印发布方案（必须带 --tag app），绝不执行发布
 		assert.match(check.stdout, /--tag app/);
+		assert.match(check.stdout, /主插件 dist-tag: latest/, "稳定版发布计划必须提示主插件 latest");
 		assert.match(check.stdout, /NOT executed by this check/);
 
 		// 预检必须零写盘：dry-run 不产出 tarball，不新增/删除 dist 文件
@@ -680,6 +708,110 @@ test("publish-carrier-check FAIL：APK 或构建记录被篡改/缺失 → 稳�
 		const missingCheck = publishCheck(f);
 		assertExitFail(missingCheck, "缺构建记录必须失败");
 		assertReasonLine(missingCheck, "carrier-record-missing");
+	} finally {
+		await rm(f.base, { recursive: true, force: true });
+	}
+});
+
+// ── 14. 预发布配对（task-28 契约）────────────────────────────────────────────────
+test("预发布配对：插件 3.2.1-alpha.1 + App 3.2.1+24 + 载体 3.2.1-alpha.1-app 全链 PASS（tag/文件名契约）", async () => {
+	const f = await makeFixture({
+		pluginVersion: PRE_PLUGIN_VERSION,
+		appVersion: PRE_APP_VERSION,
+		apkFile: PRE_APK_FILE,
+		carrierFile: PRE_CARRIER_FILE,
+	});
+	try {
+		const build = buildCarrier(f, { appVersion: null }); // 走 aapt 实读 core 3.2.1 / build 24
+		assertExitPass(build, "预发布载体构建应成功");
+		assert.match(build.stdout, /实读 versionName=3\.2\.1 versionCode=24/);
+		// 发布 tag：主插件预发布用 alpha（不移动 latest）；载体恒 app。
+		assert.match(build.stdout, /主插件发布[^\n]*--tag alpha/, "预发布主插件发布 hint 必须是 --tag alpha");
+		assert.doesNotMatch(build.stdout, /主插件发布[^\n]*--tag latest/, "预发布不得提示 latest");
+		assert.match(build.stdout, /载体发布[^\n]*--tag app/);
+
+		const manifest = JSON.parse(await readFile(f.manifestPath, "utf8"));
+		assert.equal(manifest.schema, 1);
+		// 插件段：完整 prerelease（含 tgz 文件名）
+		assert.equal(manifest.plugin.version, PRE_PLUGIN_VERSION);
+		assert.equal(manifest.plugin.file, `marktrue-dsh-mobile-remote-${PRE_PLUGIN_VERSION}.tgz`,
+			"插件 tgz filename 必须使用完整 prerelease");
+		assert.ok(f.tgz.endsWith(`marktrue-dsh-mobile-remote-${PRE_PLUGIN_VERSION}.tgz`), "npm pack 插件 tgz 名应含完整 prerelease");
+		// App/APK 身份只用 core 3.2.1
+		assert.equal(manifest.app.version, PRE_APP_VERSION, "app.version 保留 core+build");
+		assert.equal(manifest.app.file, PRE_APK_FILE, "APK 文件名只用 core 3.2.1");
+		assert.equal(manifest.version, PRE_APP_VERSION);
+		assert.equal(manifest.apk, PRE_APK_FILE);
+
+		// 载体版本/文件名 = 插件完整 prerelease + -app；发布元数据 tag 仍固定 app
+		const record = JSON.parse(await readFile(f.recordPath, "utf8"));
+		assert.equal(record.version, PRE_CARRIER_VERSION);
+		assert.equal(record.file, PRE_CARRIER_FILE);
+		assert.equal(await exists(f.carrierFile), true, "必须产出预发布载体 tarball");
+		const extracted = await extractCarrier(f, "prerelease");
+		try {
+			const carrierPkg = JSON.parse(await readFile(join(extracted.packageDir, "package.json"), "utf8"));
+			assert.equal(carrierPkg.version, PRE_CARRIER_VERSION);
+			assert.equal(carrierPkg.dsh.appCarrier, true);
+			assert.deepEqual(carrierPkg.publishConfig, { access: "public", tag: "app" },
+				"载体 dist-tag 恒为 app，绝不用 latest");
+			const mainPkg = JSON.parse(await readFile(f.mainPkgPath, "utf8"));
+			assert.equal(
+				mainPkg.optionalDependencies[CARRIER_ALIAS],
+				`npm:${PLUGIN_NAME}@${PRE_CARRIER_VERSION}`,
+				"载体别名必须精确到完整 prerelease + -app",
+			);
+		} finally {
+			await rm(extracted.root, { recursive: true, force: true });
+		}
+
+		// 发布门禁与发布前预检都必须接受 prerelease 配对
+		const verify = verifyPairing(f);
+		assertExitPass(verify, "预发布配对校验应 PASS");
+		assertPassLine(verify, "两条版本严格配对");
+		const pub = publishCheck(f);
+		assertExitPass(pub, "预发布载体发布前预检应 PASS");
+		assert.match(pub.stdout, /主插件 dist-tag: alpha/, "预发布发布计划必须提示 alpha");
+		assert.match(pub.stdout, /dist-tag: app/);
+
+		// 负向：清单 app core 与插件 core 不一致 → 必须 FAIL（核心版本配对）
+		const badManifest = structuredClone(manifest);
+		badManifest.app.version = "3.2.0+24";
+		await writeFile(f.manifestPath, `${JSON.stringify(badManifest, null, 2)}\n`);
+		const badVerify = verifyPairing(f);
+		assertExitFail(badVerify, "app core 与插件 core 不一致必须失败");
+		assertFailLine(badVerify, "app.version 语义版本与 plugin.version 严格配对");
+	} finally {
+		await rm(f.base, { recursive: true, force: true });
+	}
+});
+
+test("预发布核心版本不配对被拒：App core 必须等于插件 core（构建器与 gen-manifest 双拦）", async () => {
+	const f = await makeFixture({
+		pluginVersion: PRE_PLUGIN_VERSION,
+		appVersion: "3.2.0+24",
+		apkFile: "DSH-Remote-v3.2.0.apk",
+		carrierFile: PRE_CARRIER_FILE,
+	});
+	try {
+		const build = buildCarrier(f, { appVersion: null });
+		assertExitFail(build, "app core 与插件 core 不同必须失败");
+		assertFailLine(build, "APK versionName 与插件版本严格配对");
+
+		// gen-manifest 是发布链的清单生成器：core 不配对的直接调用也必须 fail-closed。
+		const genOut = join(f.dist, "manifest-gen.json");
+		const gen = spawnSync(process.execPath, [
+			GEN,
+			"--apk", f.apkPath,
+			"--version", "3.2.0+24",
+			"--plugin-tgz", f.tgz,
+			"--plugin-root", f.pluginRoot,
+			"--changelog", f.changelog,
+			"--out", genOut,
+		], { encoding: "utf8", env: toolEnv(f) });
+		assert.notEqual(gen.status, 0, `gen-manifest 应拒绝 core 不配对\n${gen.stdout}\n${gen.stderr}`);
+		assert.match(`${gen.stderr}${gen.stdout}`, /核心版本|core/, "应给出核心版本不配对错误");
+		assert.equal(await exists(genOut), false, "失败时不得产出清单");
 	} finally {
 		await rm(f.base, { recursive: true, force: true });
 	}

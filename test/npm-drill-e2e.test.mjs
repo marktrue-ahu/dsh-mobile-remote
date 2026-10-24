@@ -61,6 +61,8 @@ async function makeFixtureDist({ apkBytes, pluginExtra = {} }) {
 	await mkdir(home, { recursive: true });
 
 	const repoPkg = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8"));
+	const appCoreVersion = /^(\d+\.\d+\.\d+)(?:-|$)/.exec(repoPkg.version)?.[1];
+	assert.ok(appCoreVersion, `无法从插件版本解析 App core：${repoPkg.version}`);
 	const alias = `${repoPkg.name}-app`;
 	const pluginPkg = {
 		name: repoPkg.name,
@@ -82,7 +84,7 @@ async function makeFixtureDist({ apkBytes, pluginExtra = {} }) {
 	const end = pack.stdout.lastIndexOf("]");
 	const pluginTgz = join(dist, JSON.parse(pack.stdout.slice(start, end + 1))[0].filename);
 
-	const apk = join(dist, `DSH-Remote-v${repoPkg.version}.apk`);
+	const apk = join(dist, `DSH-Remote-v${appCoreVersion}.apk`);
 	await writeFile(apk, apkBytes);
 	const changelog = join(base, "CHANGELOG.md");
 	await writeFile(changelog, `## v${repoPkg.version}（演练 E2E 夹具）\n\n- 一条发布说明。\n`);
@@ -93,7 +95,7 @@ async function makeFixtureDist({ apkBytes, pluginExtra = {} }) {
 		"--plugin-tgz", pluginTgz,
 		"--plugin-root", pluginRoot,
 		"--changelog", changelog,
-		"--app-version", `${repoPkg.version}+57`,
+		"--app-version", `${appCoreVersion}+57`,
 		"--out-dir", dist,
 	], { env, encoding: "utf8" });
 	assert.equal(build.status, 0, `载体夹具构建失败：\n${build.stdout}\n${build.stderr}`);
@@ -192,7 +194,7 @@ const EXPECTED_ASSERTIONS = Array.from({ length: 20 }, (_, index) => `A${index +
 test("完整演练：五阶段 + 20 条断言全部 PASS（本地 registry，不触碰公共 npm）", { skip: SKIP || SKIP_VERDACCIO }, async () => {
 	const stateDir = join(scratch, "state-full");
 	const startedAt = Date.now();
-	const result = runCli({ args: ["--dist", fixture.dist, "--phases", "all"], stateDir, home: fixture.home });
+	const result = runCli({ args: ["--dist", fixture.dist, "--phases", "all", "--plugin-tag", "alpha"], stateDir, home: fixture.home });
 	const elapsedMs = Date.now() - startedAt;
 	assert.equal(result.status, 0, `演练失败：\n${result.stdout}\n${result.stderr}`);
 	assert.match(result.stdout, /RESULT: PASS/);
@@ -240,6 +242,22 @@ test("完整演练：五阶段 + 20 条断言全部 PASS（本地 registry，不
 	const a17 = assertionOf(record, "A17");
 	assert.match(String(a17?.detail ?? ""), /carrierAbsent=true/, "A17 应在有效 packument 上确认载体缺失");
 
+	// --plugin-tag alpha：主插件走 alpha，载体仍 app，latest 不被这次预发布移动（初始无 latest）。
+	assert.equal(record.pluginTag, "alpha", "run.json 必须记录显式 plugin tag");
+	const a3 = assertionOf(record, "A3");
+	assert.equal(a3?.pass, true);
+	assert.match(String(a3?.detail ?? ""), /pluginTag=alpha/);
+	assert.match(String(a3?.detail ?? ""), /"alpha":"9\.9\.\d+"/, "alpha tag 必须指向演练插件版本");
+	assert.match(String(a3?.detail ?? ""), /"app":"9\.9\.\d+-app"/, "app tag 必须指向演练载体版本");
+	// latest 的判据是“alpha 发布前后不变”，而不是“必须缺省”：Verdaccio 会对首个发布自动补
+	// latest（本地 registry 行为），因此断言 latestUnchanged=true 且 latestAfter 不是 alpha 插件。
+	assert.match(String(a3?.detail ?? ""), /latestUnchanged=true/, "alpha 发布不得移动 latest");
+	assert.doesNotMatch(String(a3?.detail ?? ""), new RegExp(`latestAfter=${record.drillVersion.replace(/\./g, "\\.")}(?:;|$)`), "latestAfter 不得是本次 alpha 插件版本");
+	const a14 = assertionOf(record, "A14");
+	assert.equal(a14?.pass, true);
+	assert.match(String(a14?.detail ?? ""), /pluginTag=alpha/);
+	assert.match(String(a14?.detail ?? ""), /latestUnchanged=true/, "第二对 alpha 发布仍不得移动 latest");
+
 	// 证据与清理：默认成功后保 run.json + 日志，清理工作目录/隔离 HOME/registry 存储。
 	assert.ok(await exists(join(dir, "run.json")));
 	assert.ok(await exists(join(dir, "logs")));
@@ -247,6 +265,23 @@ test("完整演练：五阶段 + 20 条断言全部 PASS（本地 registry，不
 	assert.equal(await exists(join(dir, "registry")), false, "成功后默认清理 registry 存储");
 	assert.equal(await exists(join(dir, "home")), false, "成功后默认清理隔离 HOME");
 	console.log(`[npm-drill e2e] RESULT=PASS 断言=20 耗时=${(elapsedMs / 1000).toFixed(1)}s 记录=${dir}`);
+});
+
+test("默认 latest：稳定路径 dist-tags 行为不变（latest→插件、app→载体、无 alpha）", { skip: SKIP || SKIP_VERDACCIO }, async () => {
+	const stateDir = join(scratch, "state-default-latest");
+	const result = runCli({ args: ["--dist", fixture.dist, "--phases", "publish,update"], stateDir, home: fixture.home });
+	assert.equal(result.status, 0, `演练失败：\n${result.stdout}\n${result.stderr}`);
+	assert.match(result.stdout, /RESULT: PASS/);
+	const { record } = await readRunRecord(stateDir);
+	assert.equal(record.pluginTag, "latest", "默认必须是 latest");
+	const a3 = assertionOf(record, "A3");
+	assert.equal(a3?.pass, true);
+	assert.match(String(a3?.detail ?? ""), /"latest":"9\.9\.\d+"/, "默认 latest 必须指向插件版本");
+	assert.match(String(a3?.detail ?? ""), /"app":"9\.9\.\d+-app"/);
+	assert.doesNotMatch(String(a3?.detail ?? ""), /"alpha":/, "默认路径不得出现 alpha tag");
+	const a14 = assertionOf(record, "A14");
+	assert.equal(a14?.pass, true);
+	assert.match(String(a14?.detail ?? ""), /"latest":"9\.9\.\d+"/, "第二对默认 latest 也必须指向插件版本");
 });
 
 test("--phases 子集：未选中的前置阶段静默执行，只报告选中阶段", { skip: SKIP || SKIP_VERDACCIO }, async () => {

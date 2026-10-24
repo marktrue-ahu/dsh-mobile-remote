@@ -52,6 +52,8 @@ async function makeFixtureDist({ apkBytes }) {
 	await mkdir(home, { recursive: true });
 
 	const repoPkg = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8"));
+	const appCoreVersion = /^(\d+\.\d+\.\d+)(?:-|$)/.exec(repoPkg.version)?.[1];
+	assert.ok(appCoreVersion, `无法从插件版本解析 App core：${repoPkg.version}`);
 	const alias = `${repoPkg.name}-app`;
 	const pluginPkg = {
 		name: repoPkg.name,
@@ -75,7 +77,7 @@ async function makeFixtureDist({ apkBytes }) {
 	const end = pack.stdout.lastIndexOf("]");
 	const pluginTgz = join(dist, JSON.parse(pack.stdout.slice(start, end + 1))[0].filename);
 
-	const apk = join(dist, `DSH-Remote-v${repoPkg.version}.apk`);
+	const apk = join(dist, `DSH-Remote-v${appCoreVersion}.apk`);
 	await writeFile(apk, apkBytes);
 	const changelog = join(base, "CHANGELOG.md");
 	await writeFile(changelog, `## v${repoPkg.version}（演练测试夹具）\n\n- 一条发布说明。\n`);
@@ -86,7 +88,7 @@ async function makeFixtureDist({ apkBytes }) {
 		"--plugin-tgz", pluginTgz,
 		"--plugin-root", pluginRoot,
 		"--changelog", changelog,
-		"--app-version", `${repoPkg.version}+57`,
+		"--app-version", `${appCoreVersion}+57`,
 		"--out-dir", dist,
 	], { env: toolEnv({ HOME: home, npm_config_cache: join(home, ".npm-cache") }), encoding: "utf8" });
 	assert.equal(build.status, 0, `载体夹具构建失败：\n${build.stdout}\n${build.stderr}`);
@@ -144,7 +146,7 @@ test("--help：打印 CLI 契约并以 0 退出，不产生运行目录", async 
 	const stateDir = join(scratch, "state-help");
 	const result = runDrill({ args: ["--help"], stateDir, home: fixture.home });
 	assert.equal(result.status, 0, result.stdout + result.stderr);
-	for (const fragment of ["--dist", "--phases", "--registry", "--keep", "--build", "用法", "RESULT"]) {
+	for (const fragment of ["--dist", "--phases", "--registry", "--plugin-tag", "--keep", "--build", "用法", "RESULT"]) {
 		assert.ok(result.stdout.includes(fragment), `帮助缺少 ${fragment}`);
 	}
 	assert.deepEqual(await runDirs(stateDir), [], "帮助不应创建运行目录");
@@ -164,6 +166,22 @@ test("参数错误：非法 --phases 以稳定 reason 失败", async () => {
 	assert.notEqual(result.status, 0);
 	assert.match(result.stdout, /\[reason:drill-phases-invalid\]/);
 	assert.match(result.stdout, /RESULT: FAIL/);
+});
+
+test("参数错误：非法 --plugin-tag 以稳定 reason 失败（缺值 / semver range / 版本号都不是 dist-tag）", async () => {
+	const variants = [
+		["--plugin-tag"],
+		["--plugin-tag", "^1.2.3"],
+		["--plugin-tag", "1.2.3"],
+	];
+	for (const [index, extra] of variants.entries()) {
+		const stateDir = join(scratch, `state-bad-tag-${index}`);
+		const result = runDrill({ args: ["--dist", fixture.dist, "--phases", "preflight", ...extra], stateDir, home: fixture.home });
+		assert.notEqual(result.status, 0, `应拒绝 --plugin-tag=${extra.join(" ")}`);
+		assert.match(result.stdout, /RESULT: FAIL/);
+		assert.match(result.stdout, /\[reason:drill-cli-invalid-argument\]/);
+		assert.deepEqual(await runDirs(stateDir), [], "参数错误不应留下运行目录");
+	}
 });
 
 test("发布目录缺失：以稳定 reason 失败且不留下运行目录", async () => {
@@ -197,6 +215,7 @@ test("--phases preflight PASS：离线预检通过，run.json 结构完整，成
 	assert.match(record.finishedAt, /^\d{4}-\d{2}-\d{2}T.*Z$/);
 	assert.deepEqual(record.reasons, []);
 	assert.equal(record.registry, null, "离线阶段不得初始化 registry");
+	assert.equal(record.pluginTag, "latest", "默认主插件 dist-tag 必须是 latest（稳定路径）");
 	assert.ok(record.environment?.node, "记录 Node 版本");
 	const preflight = record.phases.find((phase) => phase.name === "preflight");
 	assert.ok(preflight, "缺少 preflight 阶段记录");
@@ -208,6 +227,21 @@ test("--phases preflight PASS：离线预检通过，run.json 结构完整，成
 	assert.ok(await exists(join(dir, "logs", "preflight-source.log")), "保留预检日志作为证据");
 	assert.equal(await exists(join(dir, "work")), false, "成功后默认清理工作目录");
 	assert.equal(await exists(join(dir, "home")), false, "成功后默认清理隔离 HOME");
+});
+
+test("--plugin-tag alpha：离线预检 PASS 且 run.json 记录 alpha（不发布、无 registry）", async () => {
+	const stateDir = join(scratch, "state-plugin-tag-alpha");
+	const result = runDrill({
+		args: ["--dist", fixture.dist, "--phases", "preflight", "--plugin-tag", "alpha"],
+		stateDir,
+		home: fixture.home,
+	});
+	assert.equal(result.status, 0, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+	assert.match(result.stdout, /RESULT: PASS/);
+	const runs = await findRunJson(stateDir);
+	assert.equal(runs.length, 1);
+	assert.equal(runs[0].record.pluginTag, "alpha");
+	assert.equal(runs[0].record.registry, null, "离线阶段不得初始化 registry");
 });
 
 test("--keep：保留演练现场（工作目录与日志）", async () => {

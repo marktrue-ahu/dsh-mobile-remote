@@ -48,6 +48,7 @@ import {
 	carrierContentsChecks,
 	carrierRecordChecks,
 	exactCarrierAliasChecks,
+	isPluginVersion,
 	packedFiles,
 	readJsonFile,
 	reportChecks,
@@ -129,7 +130,7 @@ if (appFile && fs.existsSync(appFile)) {
 
 // ── plugin 段 ──
 const plugin = m.plugin && typeof m.plugin === "object" ? m.plugin : {};
-check("plugin.version 为 X.Y.Z", /^\d+\.\d+\.\d+$/.test(plugin.version ?? ""), `plugin.version=${plugin.version}`);
+check("plugin.version 为 X.Y.Z 或 X.Y.Z-prerelease", isPluginVersion(plugin.version), `plugin.version=${plugin.version}`);
 const tgz = typeof plugin.file === "string" ? path.join(dir, plugin.file) : "";
 let pluginTgzUsable = false;
 let packedPluginPackage = null; // 已发布 tgz 内 package.json（配对段据此核对真实产物而非仅源码）
@@ -235,7 +236,9 @@ if (carrierFile === "" && recordPresent && typeof recordRead.value?.file === "st
 }
 if (carrierFile === "") {
 	try {
-		carrierCandidates = fs.readdirSync(dir).filter((name) => /-\d+\.\d+\.\d+-app\.tgz$/.test(name)).sort();
+		carrierCandidates = fs.readdirSync(dir)
+			.filter((name) => /-\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?-app\.tgz$/.test(name))
+			.sort();
 	} catch {
 		carrierCandidates = [];
 	}
