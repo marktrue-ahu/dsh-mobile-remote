@@ -674,6 +674,52 @@ test("/subagents：休眠/归档父会话仍可列出子代理（US35，不依�
 	}
 });
 
+test("/subagents：持久标题刷新未命中时回退近期已知标题", async () => {
+	const rows = [
+		record("session-parent"),
+		record("session-child", { origin: "subagent", parentSession: "session-parent" }),
+	];
+	let revision = "1:2:3:4:5";
+	let titleReads = 0;
+	const harness = createHarness({
+		records: rows,
+		liveSessions: [],
+		agents: { get: () => undefined, list: () => [] },
+		query: {
+			listSessions: async () => rows,
+			async readTitleSnapshots(ids) {
+				titleReads += 1;
+				if (titleReads === 1) {
+					return ids.map((id) => ({
+						status: "fulfilled",
+						value: { title: { title: `近期标题 ${id}` } },
+					}));
+				}
+				// 语料 revision 已变化，但当前轮标题折叠暂时没有结果。
+				return ids.map(() => ({ status: "rejected" }));
+			},
+		},
+	});
+	harness.provide("sessionPersistence", {
+		name: "session-persistence-jsonl",
+		config: { root: "/tmp/session-title-cache-fallback", compression: "none" },
+		async stat() { return { revision }; },
+	});
+	try {
+		const first = await call(harness.route, "/m/api/subagents?parentSessionId=session-parent");
+		assert.equal(first.status, 200);
+		assert.equal(first.body.subagents[0].title, "近期标题 session-child");
+
+		revision = "2:2:3:4:5";
+		const second = await call(harness.route, "/m/api/subagents?parentSessionId=session-parent");
+		assert.equal(second.status, 200);
+		assert.equal(titleReads, 2, "新 revision 会触发标题刷新，近期 cache 仅作失配回退");
+		assert.equal(second.body.subagents[0].title, "近期标题 session-child");
+	} finally {
+		harness.clean();
+	}
+});
+
 test("/subagents：嵌套子代理（子代理自身作为父）同样可列出", async () => {
 	const rows = [
 		record("session-parent"),
