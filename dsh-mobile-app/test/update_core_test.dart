@@ -180,6 +180,90 @@ void main() {
     });
   });
 
+  group('ReleaseArtifact prerelease（插件 3.2.1-alpha.1 / App 3.2.1+24）', () {
+    const hash = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    Map<String, dynamic> releaseJson({String pluginVersion = '3.2.1-alpha.1', String appVersion = '3.2.1+24'}) => {
+          'schema': 1,
+          'manifestUrl': 'https://desktop.example/m/api/update/manifest',
+          'app': {'version': appVersion, 'file': 'DSH-Remote-v3.2.1.apk', 'size': 4, 'sha256': hash,
+            'url': 'https://desktop.example/m/api/update/apk'},
+          'plugin': {'version': pluginVersion, 'file': 'dsh-mobile-remote-3.2.1-alpha.1.tgz', 'size': 8,
+            'sha256': hash, 'contentSha256': hash, 'url': 'https://desktop.example/m/api/update/plugin'},
+        };
+    Map<String, dynamic> pluginArtifactJson(String version) => {
+          'version': version, 'file': 'dsh-mobile-remote-3.2.1-alpha.1.tgz', 'size': 8,
+          'sha256': hash, 'contentSha256': hash, 'url': 'https://desktop.example/m/api/update/plugin',
+        };
+
+    test('插件 prerelease 可解析并原样保存（快照往返）', () {
+      final s = ReleaseSnapshot.fromJson(releaseJson())!;
+      expect(s.plugin.version, '3.2.1-alpha.1');
+      expect(s.app.version, '3.2.1+24');
+      final back = ReleaseSnapshot.fromJson(s.toJson())!;
+      expect(back.plugin.version, '3.2.1-alpha.1', reason: '保存后不得被改写/截断');
+      expect(back.app.version, '3.2.1+24');
+    });
+
+    test('ReleaseArtifact 直接解析插件 prerelease 并保留原始串', () {
+      final a = ReleaseArtifact.fromJson(pluginArtifactJson('3.2.1-alpha.1'), plugin: true);
+      expect(a?.version, '3.2.1-alpha.1');
+      expect(a?.toJson()['version'], '3.2.1-alpha.1');
+      // prerelease + 旧式数字 build 也保留原样（不重写）。
+      final b = ReleaseArtifact.fromJson(pluginArtifactJson('3.2.1-alpha.1+5'), plugin: true);
+      expect(b?.version, '3.2.1-alpha.1+5');
+    });
+
+    test('App 版本仍必须是 X.Y.Z[+N]：App 段带 prerelease 被拒绝', () {
+      expect(ReleaseSnapshot.fromJson(releaseJson(appVersion: '3.2.1-alpha.1')), isNull);
+      expect(
+        ReleaseArtifact.fromJson({
+          'version': '3.2.1-alpha.1', 'file': 'a.apk', 'size': 4, 'sha256': hash,
+          'url': 'https://desktop.example/m/api/update/apk',
+        }),
+        isNull,
+        reason: 'App 自身版本格式保持 X.Y.Z+N，不随插件 prerelease 放宽',
+      );
+    });
+
+    test('非法插件 prerelease 仍拒绝（不猜测）', () {
+      for (final version in ['3.2.1-', '3.2.1-@bad', '3.2.1-alpha..1', '3.2', 'alpha', '']) {
+        expect(ReleaseSnapshot.fromJson(releaseJson(pluginVersion: version)), isNull, reason: version);
+      }
+    });
+
+    test('无 prerelease 的插件版本保持向后兼容（含旧 v 前缀/数字 build 容忍）', () {
+      for (final version in ['3.2.1', 'v3.2.1', '3.2.1+55']) {
+        expect(ReleaseSnapshot.fromJson(releaseJson(pluginVersion: version))?.plugin.version, version,
+            reason: version);
+      }
+      // 非数字 build 在旧解析下也不接受：保持该约束，不借 prerelease 支持顺手放宽。
+      expect(ReleaseSnapshot.fromJson(releaseJson(pluginVersion: '3.2.1+build.5')), isNull);
+    });
+
+    test('经 normalizedReleaseFromManifest 的完整清单也接受插件 prerelease', () {
+      final manifest = {
+        'schema': 1,
+        'app': {'version': '3.2.1+24', 'file': 'DSH-Remote-v3.2.1.apk', 'size': 4, 'sha256': hash},
+        'plugin': {'version': '3.2.1-alpha.1', 'file': 'dsh-mobile-remote-3.2.1-alpha.1.tgz',
+          'size': 8, 'sha256': hash, 'contentSha256': hash},
+      };
+      final s = normalizedReleaseFromManifest(manifest,
+          manifestUrl: 'https://desktop.example/m/api/update/manifest',
+          appUrl: 'https://desktop.example/m/api/update/apk',
+          pluginUrl: 'https://desktop.example/m/api/update/plugin');
+      expect(s?.plugin.version, '3.2.1-alpha.1');
+      expect(s?.app.version, '3.2.1+24');
+      expect(s?.candidate.version, '3.2.1+24', reason: 'App 更新候选仍取 App 版本');
+    });
+
+    test('现有更新比较语义不变（App 3.2.1+24 vs 本机 build）', () {
+      final target = parseAppVersion('3.2.1+24')!;
+      expect(verdictFor(local: parseAppVersion('3.2.1+23')!, remote: target), UpdateVerdict.updateAvailable);
+      expect(verdictFor(local: parseAppVersion('3.2.1+24')!, remote: target), UpdateVerdict.upToDate);
+      expect(verdictFor(local: parseAppVersion('3.2.1+25')!, remote: target), UpdateVerdict.remoteOlder);
+    });
+  });
+
   group('hostApiBase（检查与下载同 base，挂载路径不硬编码 /m）', () {
     test('默认挂载路径', () {
       expect(hostApiBase(baseUrl: 'http://192.168.1.10:3080', mountPath: '/m'),

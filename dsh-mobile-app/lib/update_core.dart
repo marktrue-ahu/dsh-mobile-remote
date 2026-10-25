@@ -46,6 +46,21 @@ AppVersion? parseAppVersion(String input) {
   return AppVersion(nums[0], nums[1], nums[2], build: build, buildSet: plus != -1);
 }
 
+/// 插件版本格式：`X.Y.Z` + 可选 SemVer prerelease（如 `3.2.1-alpha.1`）
+/// + 可选旧式数字 `+build`（与 [parseAppVersion] 的容忍一致）。
+///
+/// 插件版本串**原样保留**在 [ReleaseArtifact.version] 里，不截断/不改写；
+/// App 自身版本仍必须是 `X.Y.Z[+N]`（[parseAppVersion] 不接受 prerelease）。
+final RegExp _pluginVersionPattern = RegExp(
+  r'^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+\d+)?$',
+);
+
+bool _validPluginVersion(String input) {
+  var s = input.trim();
+  if (s.startsWith('v')) s = s.substring(1).trim(); // 兼容旧 tag 形态
+  return _pluginVersionPattern.hasMatch(s);
+}
+
 /// 版本比较：a < b → 负；相等 → 0；a > b → 正。先比 major/minor/patch，再比 build。
 int compareAppVersion(AppVersion a, AppVersion b) {
   for (final pair in [
@@ -111,7 +126,8 @@ class ReleaseArtifact {
     final hash = value['sha256'];
     final url = value['url'];
     final content = value['contentSha256'];
-    if (version is! String || parseAppVersion(version) == null ||
+    if (version is! String ||
+        (plugin ? !_validPluginVersion(version) : parseAppVersion(version) == null) ||
         file is! String || file.isEmpty || size is! int || size <= 0 ||
         hash is! String || !_digest.hasMatch(hash) || url is! String || !_absoluteHttp(url) ||
         (plugin && (content is! String || !_digest.hasMatch(content)))) {

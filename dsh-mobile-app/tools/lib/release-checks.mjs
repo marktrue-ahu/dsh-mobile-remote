@@ -46,10 +46,54 @@ export function sha256File(file) {
 	return sha256Buffer(fs.readFileSync(file));
 }
 
-/** 解析 `X.Y.Z` / `X.Y.Z+N`；不合法返回 null。 */
+/** 解析 App 版本 `X.Y.Z` / `X.Y.Z+N`；不合法返回 null（App 仍严格带 +N 构建号）。 */
 export function parseVersion(version) {
 	const m = /^(\d+\.\d+\.\d+)(?:\+(\d+))?$/.exec(String(version ?? ""));
 	return m ? { version: m[1], build: m[2] ?? null } : null;
+}
+
+/**
+ * 解析**插件**版本：正式版 `X.Y.Z` 或预发布 `X.Y.Z-<prerelease>`。
+ * - 不接受 `+N`（构建号属于 App）与 `-app`（载体后缀，避免与插件预发布歧义）；
+ * - `core` 是能与 App/APK 文件名的 X.Y.Z 配对的核心版本。
+ * @returns {{version:string, core:string, prerelease:string|null, isPrerelease:boolean}|null}
+ */
+export function parsePluginVersion(version) {
+	const m = /^(\d+\.\d+\.\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.exec(String(version ?? ""));
+	if (!m) return null;
+	const core = m[1];
+	const prerelease = m[2] ?? null;
+	if (prerelease !== null && /(?:^|\.)app$/.test(prerelease)) return null;
+	return { version: core, core, prerelease, isPrerelease: prerelease !== null };
+}
+
+/** 插件版本是否合法（正式或预发布）。 */
+export function isPluginVersion(version) {
+	return parsePluginVersion(version) !== null;
+}
+
+/** 插件版本的核心 `X.Y.Z`（与 App/APK 文件名的 core 配对）；非法返回空串。 */
+export function pluginCoreVersion(version) {
+	return parsePluginVersion(version)?.core ?? "";
+}
+
+/**
+ * 主插件发布 dist-tag：正式版 latest；预发布取 prerelease 第一段（如 `3.2.1-alpha.1` → alpha），
+ * 显式发布预发布 tag 才不会移动 latest。非法版本返回空串。
+ */
+export function pluginPublishTag(version) {
+	const parsed = parsePluginVersion(version);
+	if (parsed === null) return "";
+	if (!parsed.isPrerelease) return "latest";
+	const tag = String(parsed.prerelease).split(".")[0];
+	// npm dist-tag 不能是合法 semver range；纯数字 tag（如 "1"）退化为通用 prerelease。
+	return /^\d+(?:\.\d+)*$/.test(tag) ? "prerelease" : tag;
+}
+
+/** 载体版本是否合法：`<插件版本>-app`（含预发布，如 `3.2.1-alpha.1-app`）。 */
+export function isCarrierVersion(version) {
+	const m = /^(\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)-app$/.exec(String(version ?? ""));
+	return m !== null && isPluginVersion(m[1]);
 }
 
 /** 从发布产物文件名取语义版本；不符合约定返回 null。 */
@@ -226,7 +270,7 @@ export function exactCarrierAliasChecks(pkg) {
 	const name = typeof pkg?.name === "string" ? pkg.name : "";
 	const version = typeof pkg?.version === "string" ? pkg.version : "";
 	const alias = name ? carrierAlias(name) : "";
-	const expected = name && /^\d+\.\d+\.\d+$/.test(version) ? carrierDependencySpec(name, version) : "";
+	const expected = name && isPluginVersion(version) ? carrierDependencySpec(name, version) : "";
 	const optional = pkg?.optionalDependencies && typeof pkg.optionalDependencies === "object"
 		? pkg.optionalDependencies
 		: {};
@@ -246,8 +290,8 @@ export function exactCarrierAliasChecks(pkg) {
 	const target = /^npm:(@[^@/\s]+\/[^@/\s]+|[^@/\s]+)@(.+)$/.exec(spec);
 	checks.push({
 		name: "载体别名目标版本是 X.Y.Z-app（不是 latest/tag/range）",
-		pass: target !== null && /^\d+\.\d+\.\d+-app$/.test(target[2]),
-		detail: `target=${target?.[2] ?? "<无法解析>"}`,
+		pass: target !== null && isPluginVersion(version) && target[2] === carrierVersion(version),
+		detail: `target=${target?.[2] ?? "<无法解析>"} 期望=${isPluginVersion(version) ? carrierVersion(version) : "<无法推导>"}`,
 	});
 	checks.push({
 		name: "载体别名目标包名与主包同包名",
@@ -409,7 +453,7 @@ export function carrierPublishMetadataChecks(pkg, {
 	checks.push({
 		code: "carrier-publish-version-not-app-suffix",
 		name: "发布版本是 semver 预发布 X.Y.Z-app（npm 范围依赖不会误匹配）",
-		pass: /^\d+\.\d+\.\d+-app$/.test(version),
+		pass: isCarrierVersion(version),
 		detail: `version=${version || "<缺失>"}`,
 	});
 	checks.push({
@@ -511,10 +555,11 @@ export function apkManifestIdentityChecks({ app, pluginVersion }) {
 		pass: appVersion !== null && appVersion.build !== null,
 		detail: `app.version=${app?.version ?? "<缺失>"}`,
 	});
+	const pluginCore = pluginCoreVersion(pluginVersion);
 	checks.push({
 		name: "app.version 语义版本与 plugin.version 严格配对",
-		pass: appVersion !== null && appVersion.version === pluginVersion,
-		detail: `app=${appVersion?.version ?? "<无法解析>"} plugin=${pluginVersion ?? "<缺失>"}`,
+		pass: appVersion !== null && pluginCore !== "" && appVersion.version === pluginCore,
+		detail: `app=${appVersion?.version ?? "<无法解析>"} plugin=${pluginVersion ?? "<缺失>"}（核心=${pluginCore || "<非法>"}）`,
 	});
 	checks.push({
 		name: "app.version 与 APK 文件名版本一致",

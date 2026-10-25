@@ -17,6 +17,20 @@ export const DRILL_VERSION_MINOR = 9;
 const PLUGIN_PATTERN = /^9\.9\.\d{1,6}$/;
 const CARRIER_PATTERN = /^9\.9\.\d{1,6}-app$/;
 
+/** 默认主插件 dist-tag（稳定发布路径）。 */
+export const DEFAULT_PLUGIN_TAG = "latest";
+
+/**
+ * npm dist-tag 合法性：非空、长度 ≤64、只允许字母数字/._-，且**不能是 semver 版本/range**
+ * （npm 拒绝 `1.2.3`、`^1.2.3`、`~1`、`>=1` 等 tag）。`latest` 与 `alpha` 均合法。
+ */
+export function isValidDistTag(tag) {
+	if (typeof tag !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(tag)) return false;
+	if (/^[\^~><=*|]/.test(tag)) return false;
+	if (/^v?\d+(?:\.\d+){0,2}(?:[-+].*)?$/.test(tag)) return false;
+	return true;
+}
+
 /** 随机补丁号（1–999999）。 */
 export function randomPatch() {
 	return 1 + (crypto.randomBytes(3).readUIntBE(0, 3) % 999999);

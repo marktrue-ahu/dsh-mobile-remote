@@ -13,11 +13,34 @@ import {
 
 const align = (header, pluginVersion = "3.2.0") => computeAppAlignment({ appVersionHeader: header, pluginVersion });
 
-test("semanticVersion 只取 X.Y.Z（build 不参与配对）", () => {
+test("semanticVersion 只取 X.Y.Z（build 与 prerelease 都不参与配对）", () => {
 	assert.equal(semanticVersion("3.2.0+44"), "3.2.0");
 	assert.equal(semanticVersion("3.2.0"), "3.2.0");
+	assert.equal(semanticVersion("3.2.1-alpha.1"), "3.2.1");
+	assert.equal(semanticVersion("3.2.1-alpha.1+24"), "3.2.1");
 	assert.equal(semanticVersion("bad"), "");
 	assert.equal(semanticVersion(undefined), "");
+});
+
+test("插件 prerelease 与 App X.Y.Z+N 按 core 3.2.1 对齐（release/v3.2.1-alpha.1 契约）", () => {
+	const r = computeAppAlignment({ appVersionHeader: "3.2.1+24", pluginVersion: "3.2.1-alpha.1" });
+	assert.equal(r.state, ALIGNMENT_STATE.OK);
+	assert.equal(r.reason, "aligned");
+	assert.equal(r.hint, "");
+	assert.equal(r.appVersion, "3.2.1+24");
+	assert.equal(r.pluginVersion, "3.2.1-alpha.1");
+	assert.equal(r.expectedAppVersion, "3.2.1");
+});
+
+test("插件 prerelease 的两端新旧仍按 core 判断", () => {
+	const olderApp = computeAppAlignment({ appVersionHeader: "3.2.0+23", pluginVersion: "3.2.1-alpha.1" });
+	assert.equal(olderApp.state, ALIGNMENT_STATE.APP_OUTDATED);
+	assert.equal(olderApp.reason, "app-older-than-plugin");
+	assert.match(olderApp.hint, /3\.2\.1/);
+
+	const newerApp = computeAppAlignment({ appVersionHeader: "3.2.2+1", pluginVersion: "3.2.1-alpha.1" });
+	assert.equal(newerApp.state, ALIGNMENT_STATE.PLUGIN_OUTDATED);
+	assert.equal(newerApp.reason, "plugin-older-than-app");
 });
 
 test("readAppVersionHeader 容忍缺失、数组与空白", () => {

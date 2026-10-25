@@ -40,8 +40,10 @@ function temporary(t) {
 
 /** 与 gen-manifest.js 产出一致的完整 schema 1 清单。 */
 function buildManifest(pluginRoot, { apkBytes = APK_BYTES, apkFile = APK_FILE, appVersion, pluginVersion = PLUGIN_VERSION } = {}) {
+	// App 版本精确到构建号，语义版本与插件 **core** 配对（插件可为 prerelease，如 3.2.1-alpha.1）。
+	const pluginCore = String(pluginVersion).split("-")[0];
 	const app = {
-		version: appVersion ?? `${PLUGIN_VERSION}+42`,
+		version: appVersion ?? `${pluginCore}+42`,
 		file: apkFile,
 		size: apkBytes.length,
 		sha256: sha256(apkBytes),
@@ -109,7 +111,7 @@ function fixture(t, {
 			name: pluginName, version: appCarrierVersion(pluginVersion), dsh: { appCarrier: true },
 		}), null, 2));
 		if (!manifestMissing) {
-			const manifest = manifestRaw ?? JSON.stringify(carrierManifest(buildManifest(pluginRoot, { apkBytes, apkFile })), null, 2);
+			const manifest = manifestRaw ?? JSON.stringify(carrierManifest(buildManifest(pluginRoot, { apkBytes, apkFile, pluginVersion })), null, 2);
 			put(join(carrierRoot, MANIFEST_REL), manifest);
 		}
 		if (writeApk) put(join(carrierRoot, apkFile), apkBytes);
@@ -145,9 +147,80 @@ test("导出身份推导：别名/版本/精确别名依赖；默认插件根是
 	assert.equal(appCarrierAlias("dsh-mobile-remote"), "dsh-mobile-remote-app");
 	assert.equal(appCarrierVersion("3.2.0"), "3.2.0-app");
 	assert.equal(appCarrierDependencySpec("@marktrue/dsh-mobile-remote", "3.2.0"), "npm:@marktrue/dsh-mobile-remote@3.2.0-app");
+	// prerelease 插件：载体版本 = 插件全字串 + `-app`（3.2.1-alpha.1 → 3.2.1-alpha.1-app）
+	assert.equal(appCarrierVersion("3.2.1-alpha.1"), "3.2.1-alpha.1-app");
+	assert.equal(appCarrierDependencySpec("@marktrue/dsh-mobile-remote", "3.2.1-alpha.1"), "npm:@marktrue/dsh-mobile-remote@3.2.1-alpha.1-app");
 	assert.equal(defaultPluginRoot(), resolve(fileURLToPath(new URL("..", import.meta.url))));
 	assert.throws(() => appCarrierAlias("../evil"), /invalid-plugin-name/);
 	assert.equal(APP_CARRIER_MANIFEST_FILE, "manifest.json");
+});
+
+test("prerelease 配对：插件 3.2.1-alpha.1 + 载体 3.2.1-alpha.1-app + App 3.2.1+42 被发现", (t) => {
+	const f = fixture(t, { pluginVersion: "3.2.1-alpha.1" });
+	const result = discoverAppCarrier({ pluginRoot: f.pluginRoot, dshHome: f.dshHome });
+	assert.equal(result.ok, true, result.reason);
+	assert.equal(result.status, APP_CARRIER_STATUS.FOUND);
+	assert.equal(result.plugin.version, "3.2.1-alpha.1");
+	assert.equal(result.carrier.version, "3.2.1-alpha.1-app");
+	assert.equal(result.declaration.spec, `npm:${PLUGIN_NAME}@3.2.1-alpha.1-app`);
+	assert.equal(result.declaration.kind, "npm-alias");
+	// 清单 plugin 段是插件全字串；app 段 core 与插件 core 配对，build 来自 App 自身。
+	assert.equal(result.manifest.pluginVersion, "3.2.1-alpha.1");
+	assert.equal(result.manifest.appVersion, "3.2.1+42");
+	assert.equal(result.apk.size, APK_BYTES.length);
+	assert.equal(result.apk.sha256, sha256(APK_BYTES));
+	assert.equal(result.pluginContent.matches, true);
+	const diagnostic = describeAppCarrier(result);
+	assert.equal(diagnostic.carrier.version, "3.2.1-alpha.1-app");
+	assert.equal(JSON.stringify(diagnostic).includes(f.base), false);
+});
+
+test("prerelease 配对错位必须 mismatch，不得当可用载体", (t) => {
+	// 载体版本丢了 prerelease（3.2.1-app ≠ 3.2.1-alpha.1-app）
+	const wrongCarrier = fixture(t, {
+		pluginVersion: "3.2.1-alpha.1",
+		carrierPackage: (pkg) => ({ ...pkg, version: "3.2.1-app" }),
+	});
+	const r1 = discoverAppCarrier({ pluginRoot: wrongCarrier.pluginRoot, dshHome: wrongCarrier.dshHome });
+	assert.equal(r1.status, APP_CARRIER_STATUS.MISMATCH);
+	assert.equal(r1.reason, "carrier-version-mismatch");
+	assert.equal(r1.carrier, undefined);
+
+	// 清单 plugin 段只写 core（契约要求与插件全字串一致）
+	const coreOnly = fixture(t, {
+		pluginVersion: "3.2.1-alpha.1",
+		carrierManifest: (m) => { m.plugin.version = "3.2.1"; return m; },
+	});
+	const r2 = discoverAppCarrier({ pluginRoot: coreOnly.pluginRoot, dshHome: coreOnly.dshHome });
+	assert.equal(r2.status, APP_CARRIER_STATUS.MISMATCH);
+	assert.equal(r2.reason, "carrier-manifest-plugin-version-mismatch");
+
+	// manifest plugin 段不是合法 prerelease 字串
+	const invalidVersion = fixture(t, {
+		pluginVersion: "3.2.1-alpha.1",
+		carrierManifest: (m) => { m.plugin.version = "3.2.1-alpha..1"; return m; },
+	});
+	const r3 = discoverAppCarrier({ pluginRoot: invalidVersion.pluginRoot, dshHome: invalidVersion.dshHome });
+	assert.equal(r3.status, APP_CARRIER_STATUS.MISMATCH);
+	assert.equal(r3.reason, "carrier-manifest-incomplete");
+
+	// App 段 core 与插件 core 不一致（3.2.0 ≠ 3.2.1）
+	const wrongAppCore = fixture(t, {
+		pluginVersion: "3.2.1-alpha.1",
+		carrierManifest: (m) => { m.app.version = "3.2.0+24"; syncMirrors(m); return m; },
+	});
+	const r4 = discoverAppCarrier({ pluginRoot: wrongAppCore.pluginRoot, dshHome: wrongAppCore.dshHome });
+	assert.equal(r4.status, APP_CARRIER_STATUS.MISMATCH);
+	assert.equal(r4.reason, "carrier-manifest-app-version-mismatch");
+});
+
+test("闭包排除：prerelease 插件与载体按全字串配对通过后仍从运行闭包排除", (t) => {
+	const f = fixture(t, { pluginVersion: "3.2.1-alpha.1" });
+	const exclusion = appCarrierExclusion({ root: f.pluginRoot });
+	assert.equal(exclusion.exclude, true, exclusion.reason);
+	assert.equal(exclusion.alias, ALIAS);
+	assert.equal(exclusion.carrier.version, "3.2.1-alpha.1-app");
+	assert.equal(exclusion.apk.sha256, sha256(APK_BYTES));
 });
 
 test("pnpm sibling 作用域找到并校验随包载体：身份、清单、APK 全部通过", (t) => {

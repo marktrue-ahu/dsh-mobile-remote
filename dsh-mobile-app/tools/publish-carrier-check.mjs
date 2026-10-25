@@ -70,8 +70,11 @@ import {
 	carrierRecordChecks,
 	carrierVersion,
 	exactCarrierAliasChecks,
+	isPluginVersion,
 	packedFiles,
 	parseVersion,
+	pluginCoreVersion,
+	pluginPublishTag,
 	readJsonFile,
 	sha256Buffer,
 	sha256File,
@@ -220,8 +223,8 @@ function main() {
 
 	// ── 版本配对：主包 X.Y.Z ↔ 清单 plugin X.Y.Z ↔ 清单 app X.Y.Z+N ↔ 载体 X.Y.Z-app ──
 	check({
-		name: "主包版本为 X.Y.Z（正式插件版本，载体版本后缀 -app 的来源）",
-		pass: /^\d+\.\d+\.\d+$/.test(String(mainPkg.version ?? "")),
+		name: "主包版本为 X.Y.Z 或 X.Y.Z-prerelease（载体版本在此基础上追加 -app）",
+		pass: isPluginVersion(mainPkg.version),
 		detail: `version=${mainPkg.version ?? "<缺失>"}`,
 		code: "main-version-not-x-y-z",
 	});
@@ -232,17 +235,16 @@ function main() {
 		code: "manifest-plugin-version-mismatch",
 	});
 	const appVersion = parseVersion(app.version);
+	const mainCore = pluginCoreVersion(mainPkg.version);
 	check({
 		name: "清单 app.version 语义版本与主包版本配对（保留真实构建号 +N）",
-		pass: appVersion !== null && appVersion.build !== null && appVersion.version === mainPkg.version,
-		detail: `app=${app.version ?? "<缺失>"} 主包=${mainPkg.version ?? "<缺失>"}`,
+		pass: appVersion !== null && appVersion.build !== null && mainCore !== "" && appVersion.version === mainCore,
+		detail: `app=${app.version ?? "<缺失>"} 主包=${mainPkg.version ?? "<缺失>"}（核心=${mainCore || "<非法>"}）`,
 		code: "manifest-app-version-mismatch",
 	});
 	reportShared(exactCarrierAliasChecks(mainPkg), "main-carrier-alias-invalid");
 
-	const expectedCarrierVersion = /^\d+\.\d+\.\d+$/.test(String(mainPkg.version ?? ""))
-		? carrierVersion(String(mainPkg.version))
-		: "";
+	const expectedCarrierVersion = isPluginVersion(mainPkg.version) ? carrierVersion(String(mainPkg.version)) : "";
 	const expectedFiles = [app.file, "manifest.json", "README.md", "LICENSE"].filter((value) => typeof value === "string" && value !== "");
 
 	// ── 清单 app 段 ↔ dist 内 APK 本体 ──
@@ -287,7 +289,9 @@ function main() {
 	let carrierCandidates = [];
 	if (carrierFile === "") {
 		try {
-			carrierCandidates = fs.readdirSync(distDir).filter((name) => /-\d+\.\d+\.\d+-app\.tgz$/.test(name)).sort();
+			carrierCandidates = fs.readdirSync(distDir)
+				.filter((name) => /-\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?-app\.tgz$/.test(name))
+				.sort();
 		} catch {
 			carrierCandidates = [];
 		}
@@ -429,11 +433,14 @@ function main() {
 
 		// ── 发布计划（只打印；真正 publish 必须人工另行执行）──
 		console.log("");
+		const pluginTag = pluginPublishTag(mainPkg.version);
 		console.log("Publish plan (NOT executed by this check):");
 		console.log(`  package : ${carrierPkg.name ?? "<缺失>"}@${carrierPkg.version ?? "<缺失>"}`);
 		console.log(`  tarball : ${carrierFile} (${fs.statSync(carrierFile).size} B, sha256 ${sha256File(carrierFile)})`);
+		console.log(`  主插件 dist-tag: ${pluginTag || "<无法推导>"}${pluginTag === "latest" ? "" : "（预发布，显式 tag 不移动 latest）"}`);
 		console.log(`  dist-tag: app (NEVER latest)`);
 		console.log(`  command : npm publish ${carrierFile} --tag app`);
+		console.log(`  主插件发布: npm publish ${pluginTgzFile || "<dist内插件 tgz>"} --tag ${pluginTag || "<tag>"}`);
 	} finally {
 		fs.rmSync(tmp, { recursive: true, force: true });
 	}

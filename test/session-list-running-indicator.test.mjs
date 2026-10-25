@@ -140,8 +140,7 @@ function createHarness({ records, liveSessions = [], query, noQuery = false, age
 		route: routes.find((route) => route.path === "/m/api").handler,
 		/** 投递一条实时会话事件（走插件真实的 session/event 订阅路径）。 */
 		emit(sessionId, event) { onSessionEvent?.({ id: sessionId }, event); },
-		/** 追加/替换一个内核服务：issue #21 的目录用例用它注入 `subagents`，
-		 *  issue #20 的取消用例用它把 sessionQuery 换成可取消实现。 */
+		/** 追加/替换一个内核服务：目录、取消与宿主兼容用例都用它注入服务。 */
 		provide(name, value) { provided.set(name, value); },
 		/** 捕获到的 warn 日志（断言"取消不记为失败"用）。 */
 		logs,
@@ -615,6 +614,49 @@ test("/subagents：目录不可用时退回持久化枚举（保留 #14 的休�
 	}
 });
 
+test("/subagents：目录读取期间客户端断开会取消 listChildren 且不写响应", async () => {
+	let seenSignal;
+	let queryCalls = 0;
+	let signalReady;
+	const catalogStarted = new Promise((resolve) => { signalReady = resolve; });
+	const harness = createHarness({
+		records: [record("session-parent")],
+		agents: { get: (id) => (id === "session-parent" ? { id, session: { id } } : undefined), list: () => [] },
+		query: {
+			listSessions: async () => { queryCalls += 1; return [record("session-parent")]; },
+			readTitleSnapshots: async () => [],
+		},
+	});
+	harness.provide("subagents", {
+		async listChildren(parentSessionId, signal) {
+			assert.equal(parentSessionId, "session-parent");
+			assert.ok(signal instanceof AbortSignal, "host directory read receives the request signal");
+			seenSignal = signal;
+			const cancelled = new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+			signalReady();
+			await cancelled;
+			return [];
+		},
+	});
+	try {
+		const req = new FakeRequest("/m/api/subagents?parentSessionId=session-parent");
+		const res = new FakeResponse();
+		let finished = false;
+		res.once("finish", () => { finished = true; });
+		harness.route(req, res);
+		await catalogStarted;
+		assert.ok(seenSignal, "directory read started");
+		res.destroy();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(seenSignal.aborted, true, "disconnect aborts host catalog observation");
+		assert.equal(queryCalls, 0, "cancelled catalog read does not start persistent fallback");
+		assert.equal(finished, false, "no response is written after disconnect");
+		assert.equal(res.chunks.length, 0);
+	} finally {
+		harness.clean();
+	}
+});
+
 test("/subagents：休眠/归档父会话仍可列出子代理（US35，不依赖父 agent 活跃）", async () => {
 	// 父会话已休眠：内核内存无 agent 实例（agents.get 恒 undefined）
 	const harness = createHarness({
@@ -648,6 +690,52 @@ test("/subagents：休眠/归档父会话仍可列出子代理（US35，不依�
 		const ids = body.subagents.map((e) => e.id).sort();
 		assert.deepEqual(ids, ["session-child-1", "session-child-2"], "只列该父会话的子代理，排除 fork 与别人的子代理");
 		for (const e of body.subagents) assert.equal(typeof e.title, "string");
+	} finally {
+		harness.clean();
+	}
+});
+
+test("/subagents：持久标题刷新未命中时回退近期已知标题", async () => {
+	const rows = [
+		record("session-parent"),
+		record("session-child", { origin: "subagent", parentSession: "session-parent" }),
+	];
+	let revision = "1:2:3:4:5";
+	let titleReads = 0;
+	const harness = createHarness({
+		records: rows,
+		liveSessions: [],
+		agents: { get: () => undefined, list: () => [] },
+		query: {
+			listSessions: async () => rows,
+			async readTitleSnapshots(ids) {
+				titleReads += 1;
+				if (titleReads === 1) {
+					return ids.map((id) => ({
+						status: "fulfilled",
+						value: { title: { title: `近期标题 ${id}` } },
+					}));
+				}
+				// 语料 revision 已变化，但当前轮标题折叠暂时没有结果。
+				return ids.map(() => ({ status: "rejected" }));
+			},
+		},
+	});
+	harness.provide("sessionPersistence", {
+		name: "session-persistence-jsonl",
+		config: { root: "/tmp/session-title-cache-fallback", compression: "none" },
+		async stat() { return { revision }; },
+	});
+	try {
+		const first = await call(harness.route, "/m/api/subagents?parentSessionId=session-parent");
+		assert.equal(first.status, 200);
+		assert.equal(first.body.subagents[0].title, "近期标题 session-child");
+
+		revision = "2:2:3:4:5";
+		const second = await call(harness.route, "/m/api/subagents?parentSessionId=session-parent");
+		assert.equal(second.status, 200);
+		assert.equal(titleReads, 2, "新 revision 会触发标题刷新，近期 cache 仅作失配回退");
+		assert.equal(second.body.subagents[0].title, "近期标题 session-child");
 	} finally {
 		harness.clean();
 	}

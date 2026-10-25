@@ -81,6 +81,40 @@ void main() {
     });
   });
 
+  group('prerelease（插件 3.2.1-alpha.1 / App 3.2.1+24）', () {
+    test('插件 prerelease 与 App build 版本按 core 3.2.1 判 aligned', () {
+      final a = computeAlignment(pluginVersion: '3.2.1-alpha.1', appVersion: '3.2.1+24');
+      expect(a.state, AlignmentState.ok);
+      expect(a.reason, 'aligned');
+      expect(a.pluginVersion, '3.2.1-alpha.1', reason: '插件版本串原样保留，不因比较而改写');
+    });
+
+    test('semanticVersion 剥离 prerelease 与 build', () {
+      expect(semanticVersion('3.2.1-alpha.1'), '3.2.1');
+      expect(semanticVersion('3.2.1-alpha.1+24'), '3.2.1');
+      expect(semanticVersion('3.2.1+build.5'), '3.2.1');
+      expect(semanticVersion('3.2.1-alpha'), '3.2.1');
+    });
+
+    test('compareSemanticVersion 只比 core：alpha 不参与两端配对', () {
+      expect(compareSemanticVersion('3.2.1-alpha.1', '3.2.1+24'), 0);
+      expect(compareSemanticVersion('3.2.1-alpha.2', '3.2.1-alpha.1'), 0);
+      expect(compareSemanticVersion('3.2.2-alpha.1', '3.2.1+24'), 1);
+      expect(compareSemanticVersion('3.2.0-alpha.1', '3.2.1+24'), -1);
+    });
+
+    test('core 不同仍能判出该动哪一端（不回退成 unknown）', () {
+      expect(
+        computeAlignment(pluginVersion: '3.2.2-alpha.1', appVersion: '3.2.1+24').state,
+        AlignmentState.appOutdated,
+      );
+      expect(
+        computeAlignment(pluginVersion: '3.2.0-alpha.1', appVersion: '3.2.1+24').state,
+        AlignmentState.pluginOutdated,
+      );
+    });
+  });
+
   group('AppAlignment', () {
     test('needsAttention 只在对齐时为假', () {
       expect(const AppAlignment.unknown().needsAttention, isTrue);

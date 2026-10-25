@@ -78,9 +78,10 @@ npm 全局前缀需可写（本机为 `~/.local`，已验证可用）；若 `EAC
 
 按顺序执行；任一项不满足即停止，不放行发布。
 
-- [ ] 规划中的版本号 `<X.Y.Z>` 已在 npm 上确认**未占用**：`npm view @marktrue/dsh-mobile-remote versions --json`（只读网络操作）。
+- [ ] 规划中的插件版本 `<X.Y.Z[-prerelease]>` 已在 npm 上确认**未占用**：`npm view @marktrue/dsh-mobile-remote versions --json`（需认证的只读网络操作）；预发布必须显式使用专用 dist-tag，不能移动 `latest`。
+- [ ] 预发布前确认 registry 已有有效的稳定插件 `latest`。若包尚无稳定版本，首次发布载体可能初始化 `latest` 为载体；必须暂停并先决定稳定 bootstrap 或新包名方案，不能仅凭 `--tag alpha` 推断安全。
 - [ ] 当前分支与 HEAD 符合发布授权；`git status --short` 干净（或仅有不影响产物的明确变更）。
-- [ ] 版本三处一致（见 §3 校验命令）：根 `package.json` version、`dsh-mobile-app/pubspec.yaml` version、根 `package.json` 的载体别名。
+- [ ] 版本配对一致（见 §3 校验命令）：根 `package.json` 的插件完整版本、App `pubspec.yaml` 的 `X.Y.Z+N`（core 必须匹配插件）、根 `package.json` 精确载体别名（`<插件完整版本>-app`）。
 - [ ] `CHANGELOG.md` 已写本次发布条目（清单 `notes` 取最新 `##` 条目全文，缺条目构建会失败）。
 - [ ] 门禁测试通过（**局部子 shell + 统一隔离变量；禁止在运行中 profile 的 HOME 下跑**）：
       ```bash
@@ -111,19 +112,19 @@ npm 全局前缀需可写（本机为 `~/.local`，已验证可用）；若 `EAC
 
 ## 3. 版本 bump
 
-正式版本形如 `X.Y.Z`；App 内部构建号为递增的 `+N`（只增不减，防降级）。一次 bump 至少改四处：
+插件版本可为稳定版 `X.Y.Z`，或经授权的 npm prerelease `X.Y.Z-<pre>`（如 `3.2.1-alpha.1`）；App 版本仍为 `X.Y.Z+N`，其 core 必须与插件 core `X.Y.Z` 相同，`+N` 只增不减以防 Android 降级。载体版本始终是**插件完整版本追加 `-app`**，例如 `3.2.1-alpha.1-app`。一次 bump 至少改四处：
 
-1. 根 `package.json`：`"version": "X.Y.Z"`。
+1. 根 `package.json`：`"version": "X.Y.Z[-pre]"`（prerelease 只能在授权的 `alpha` 等通道发布，不能移动 `latest`）。
 2. 根 `package.json` 载体别名（精确 npm 别名，禁 range）：
 
    ```json
    "optionalDependencies": {
-     "@marktrue/dsh-mobile-remote-app": "npm:@marktrue/dsh-mobile-remote@X.Y.Z-app"
+     "@marktrue/dsh-mobile-remote-app": "npm:@marktrue/dsh-mobile-remote@<插件完整版本>-app"
    }
    ```
 
-3. `dsh-mobile-app/pubspec.yaml`：`version: X.Y.Z+N`（语义版本与插件一致，构建号递增）。
-4. `CHANGELOG.md`：新增 `## vX.Y.Z（build N，issues …）— 摘要` 条目（正文会进清单 `notes`）。
+3. `dsh-mobile-app/pubspec.yaml`：`version: X.Y.Z+N`（core 与插件版本相同；APK 文件名也只用 core `X.Y.Z`）。
+4. `CHANGELOG.md`：新增 `## vX.Y.Z[-pre]（build N，issues …）— 摘要` 条目（正文会进清单 `notes`）。
 
 校核（任一项不通过不得继续）：
 
@@ -230,19 +231,20 @@ node dsh-mobile-app/tools/verify-update-manifest.mjs dsh-mobile-app/dist \
 
 ```bash
 # 完整演练（默认 --phases all；自动起本地 registry，退出销毁现场）
-node tools/npm-drill.mjs --dist dsh-mobile-app/dist
+# 稳定版默认插件 tag=latest；预发布显式传 tag（如本次 alpha），carrier 恒为 app，latest 不动。
+node tools/npm-drill.mjs --dist dsh-mobile-app/dist --plugin-tag alpha
 
 # 只做离线预检阶段（不联网、不需要 Verdaccio）
 node tools/npm-drill.mjs --dist dsh-mobile-app/dist --phases preflight
 
 # 只跑某几段调试（更早的阶段作为静默前置自动执行；更晚的未选中阶段不执行）
-node tools/npm-drill.mjs --dist dsh-mobile-app/dist --phases publish,install
+node tools/npm-drill.mjs --dist dsh-mobile-app/dist --phases publish,install --plugin-tag alpha
 
 # 复用已有 registry（CI/调试；默认只允许本机/私网地址，远端需 `DRILL_ALLOW_REMOTE_REGISTRY=1` 显式放行；低上限实例仍由脚本本机启动）
 # R1 续：只迁移**受检 registry 路径**需要的凭据（同 host 其他路径不迁移）；每次 npm publish
 #        的 argv 同时固定 --registry 与单参数 --@<scope>:registry=<受检URL>，并在投影时受控
 #        改写包内 publishConfig 的 registry 路由；发布前用专用配置自检实际生效路由。
-node tools/npm-drill.mjs --dist dsh-mobile-app/dist --registry http://127.0.0.1:4873
+node tools/npm-drill.mjs --dist dsh-mobile-app/dist --registry http://127.0.0.1:4873 --plugin-tag alpha
 
 # 保留现场（工作目录、registry 存储、全部日志）
 node tools/npm-drill.mjs --dist dsh-mobile-app/dist --keep
@@ -264,8 +266,9 @@ CLI 契约：
 |---|---|
 | `--dist <dir>` | 发布产物目录（默认 `dsh-mobile-app/dist`） |
 | `--phases <list>` | `preflight,publish,install,discover,update,failure` 或 `all`；默认 `all` |
+| `--plugin-tag <tag>` | 主插件演练 dist-tag；默认 `latest`，prerelease 用 `alpha` 等专用 tag；载体始终 `app` |
 | `--registry <url>` | 复用已有 registry（跳过启动正常实例） |
-| `--keep` | 保留演练现场（默认成功后退毁临时现场） |
+| `--keep` | 保留演练现场（默认成功后销毁临时现场） |
 | `--build` | 演练前先执行发布构建 |
 | `-h/--help` | 帮助 |
 
@@ -273,10 +276,10 @@ CLI 契约：
 
 | 阶段 | 断言 | 验收内容 |
 |---|---|---|
-| **发布**（publish） | A1–A4 | A1 registry 存活；A2 插件发布成功且可查询；A3 载体发布成功，dist-tags 中 `app`→载体、`latest`→插件、载体不在 `latest`；A4 重复发布同版本被拒 |
+| **发布**（publish） | A1–A4 | A1 registry 存活；A2 插件发布成功且可查询；A3 载体发布成功，`app`→载体，主插件由 `--plugin-tag` 指定的 tag→插件；预发布时 `latest` 不得被移动；A4 重复发布同版本被拒 |
 | **全新安装**（install） | A5–A10 | A5 全新隔离 HOME + 新 profile 安装主插件成功；A6 载体别名目录存在；A7 别名目录 `package.json` 的真实 name/version 正确且带 `dsh.appCarrier` 标记；A8 载体内 APK size+sha256 与清单一致；A9 只在顶层 `snapshots:` 段内、快照直接层级读取 `optionalDependencies` 的**精确映射**（离开该段即停止；拒绝越界层级/嵌套/重复键/仅注释命中）；A10 `.modules.yaml` 的 `hoistedLocations[载体]` 必须是 `string[]`，落点规范化后**严格等于** `node_modules/<别名>`（拒绝任意前缀/后缀与 `..` 越界；绝对路径按已知 profile 根解析） |
 | **真实布局发现**（discover） | A11–A13 | A11 实际安装布局下载体发现返回 found 且来源为插件自身作用域；A12 载体清单 App 版本的**构建号**与发布目录清单一致、APK 身份（file/size/sha256）一致（语义版本被投影为演练版本）；A13 以**实际安装目录中的载体清单**为 expected，要求安装后插件内容标识等于该清单 `plugin.contentSha256`，且载体发现返回 `pluginContent.matches === true`、随包清单身份与本次投影一致 |
-| **版本更新**（update） | A14–A16 | A14 发布第二对新版本成功；A15 原安装更新成功，别名目录版本变为新载体版本；A16 旧载体被替换，再次发现得到新版本 |
+| **版本更新**（update） | A14–A16 | A14 用指定主插件 tag 发布第二对新版本，载体 tag 仍为 `app`，预发布时 `latest` 不得被移动；A15 原安装更新成功，别名目录版本变为新载体版本；A16 旧载体被替换，再次发现得到新版本 |
 | **失败路径**（failure） | A17–A20 | A17 只发插件不发载体：先核验实际安装的插件版本=pluginOnly 且 `optionalDependencies` 精确指向**未发布**的载体版本；再要求 registry 返回**结构有效**的 packument（同名、`versions` 为非数组对象、能看到刚发布的 pluginOnly）且其中不含该载体版本（坏形状一律 `drill-carrier-absence-check-failed`）；最后断言安装不报错但别名目录缺失、发现结果为「载体未安装」；A18 载体发布元数据不合规时预检以稳定 reason 失败；A19 版本配对错误时预检以稳定 reason 失败；A20 低上限（10mb）registry 发布大体量载体失败——只认 npm **结构化错误码** `npm error code E413`，不扫描任意文本里的裸数字 |
 
 离线阶段 `preflight`（`--phases preflight`）另有辅助断言：P1 在**投影之前**校验源产物不变量（解包真实插件 tgz → name/version 与源清单一致、`optionalDependencies` 含精确别名、用真实包内容实算内容标识并与清单比对、再对**源 dist** 跑发布预检；失败 reason 为 `drill-source-*`，不得进入投影）；P2 演练版本命名合法。默认测试套件只跑该离线阶段，不联网。setup 阶段另有 S2：scope 从**已校验的源包名**推导；用与发布相同的 npm 配置执行 `npm config get registry` / `npm config get @<scope>:registry`，两者都必须等于受检地址；同时记录投影包内 `publishConfig` 路由改写数与同 host 其他路径凭据未迁移数（发布 argv 另以单参数 `--@<scope>:registry` 固定作用域路由）。
@@ -284,7 +287,7 @@ CLI 契约：
 ### 6.4 演练版本与隔离
 
 - 演练版本：`9.9.<随机补丁号>`，载体对应 `9.9.<补丁号>-app`；第二对版本用**不同补丁号**；跨次运行互不冲突，也不会被误认为正式版本。
-  > 为什么不是 issue 建议的 `9.9.9-drill.<随机后缀>`：运行时载体发现（`lib/app-carrier.js`）要求插件版本为**纯 X.Y.Z**、且载体清单 `app.version` 的语义部分等于插件版本；预发布版本会把这些「发现/更新」断言误判成版本不符。演练清单因此把 app 版本语义部分投影为演练版本、保留原构建号与 APK 字节身份（见断言 A12）。
+  > 演练把**分发身份**投影到独立的稳定版 `9.9.x`，保留源 APK 字节与 build 号；源 prerelease 本身仍须先通过预检。完整演练覆盖安装/载体发现/更新与失败路径；用 `--plugin-tag alpha` 时还会验证 `alpha`→主插件、`app`→载体，且 `latest` 在 prerelease 发布前后不变。
 - 演练 registry：临时 Verdaccio，`127.0.0.1:<随机空闲端口>`，数据目录在仓库外；正常实例 `max_body_size: 200mb`；失败路径另起 10mb 上限实例复现 E413；无 uplink，不代理公共源。
 - 演练 HOME/安装目录：独立临时目录，不影响本机 `~/.dsh`、运行中 profile 与 pnpm store。
 - 演练退出：默认销毁临时 registry 与安装现场；失败时保留证据目录（便于贴 issue）。`--keep` 保留全部现场。
@@ -292,7 +295,7 @@ CLI 契约：
 ### 6.5 输出、记录与 reason
 
 - 逐条 `PASS/FAIL`（失败行带 `[reason:drill-*]`）+ 阶段摘要 + `RESULT: PASS|FAIL` + `REASONS:` + `EVIDENCE:`（证据目录）+ 退出码非 0 即失败。
-- 运行记录：`<状态目录>/drill/<UTC时间>-<演练版本>/run.json`（阶段/断言/结果/reason/耗时）+ registry 与包管理器日志。状态目录默认 `~/.dsh/mobile-remote/drill`（可用 `DSH_DRILL_STATE_DIR` 覆盖）。
+- 运行记录：`<状态目录>/drill/<UTC时间>-<演练版本>/run.json`（阶段/断言/结果/reason/耗时、`pluginTag`）+ registry 与包管理器日志。状态目录默认 `~/.dsh/mobile-remote/drill`（可用 `DSH_DRILL_STATE_DIR` 覆盖）。
 - 常见 reason：`drill-registry-not-installed`（未装 Verdaccio）、`drill-registry-start-failed`、`drill-registry-not-allowed`、`drill-registry-scope-mismatch`（实际生效的 registry/scope 路由不等于受检地址）、`drill-source-plugin-metadata-mismatch` / `drill-source-optional-alias-missing` / `drill-source-content-digest-mismatch` / `drill-source-artifact-mismatch`（源产物不变量）、`drill-publish-failed`、`drill-dist-tag-mismatch`、`drill-install-failed`、`drill-carrier-alias-missing`、`drill-lockfile-alias-missing` / `drill-hoisted-mapping-missing`（布局结构）、`drill-plugin-digest-mismatch` / `drill-installed-carrier-manifest-mismatch`（安装后清单/摘要）、`drill-plugin-only-metadata-mismatch` / `drill-missing-carrier-unexpectedly-present` / `drill-carrier-absence-check-failed`（缺载体降级前置与缺失证明）、`drill-e413-not-reproduced` 等；完整词表见脚本头部注释。
 
 ### 6.6 失败时
@@ -309,9 +312,9 @@ CLI 契约：
 
 目的：验证公共 npm 的**真实接收能力**（体积/请求体上限、认证、dist-tag 机制、镜像可取性）——这些是本地演练覆盖不到的。试发布是**真源补充**，不能替代 §5 预检与 §6 演练。
 
-> **为什么不再推荐同包名 prerelease**：现有构建器、预检与运行时载体发现都只接受纯 `X.Y.Z` 插件版本（载体才是 `X.Y.Z-app`）；`X.Y.(Z+1)-canary.1` 这类包会直接被预检以 `main-version-not-x-y-z` 拒绝，手册不应引导用绕开门禁的方式发布。本仓库暂无专用 canary 产物生成/验收流程，因此试发布只用**一次性包名探针**。
+> **同包名 prerelease**：发布工具与运行时现已支持经授权的 `X.Y.Z-<pre>` 插件版本，载体精确配对为 `<插件完整版本>-app`。本次 alpha 示例为插件 `3.2.1-alpha.1`、App `3.2.1+24`、载体 `3.2.1-alpha.1-app`；主插件显式使用 `--tag alpha`，载体使用 `--tag app`。发布前必须确认 `latest` 已指向稳定插件；新包的首次载体发布可能初始化 `latest` 为载体，遇到这种情况必须先解决 tag 初始化方案，不能直接把它当作安全的 alpha 发布。预发布仍必须通过 §5 预检与 §6 演练，不能绕过门禁。
 
-### 7.1 一次性包名探针（唯一可执行形态）
+### 7.1 一次性包名探针（可选的公共源接收验证）
 
 ```bash
 # 需授权后人工执行。准备阶段任何失败都必须中止（publish 调用次数为 0）。
@@ -387,28 +390,38 @@ NODE
 1. **先发载体**（`app` tag，绝不 latest）：
 
    ```bash
-   npm publish dsh-mobile-app/dist/marktrue-dsh-mobile-remote-X.Y.Z-app.tgz --tag app
+   PLUGIN_VERSION=3.2.1-alpha.1
+   CARRIER_VERSION="${PLUGIN_VERSION}-app"
+   npm publish "dsh-mobile-app/dist/marktrue-dsh-mobile-remote-${CARRIER_VERSION}.tgz" \
+     --tag app --registry=https://registry.npmjs.org \
+     --@marktrue:registry=https://registry.npmjs.org
    ```
 
 2. **核验 registry 中的载体**（不能只看退出码）：
 
    ```bash
-   npm view @marktrue/dsh-mobile-remote@X.Y.Z-app version dist.tarball --json
-   npm view @marktrue/dsh-mobile-remote dist-tags --json
-   # 期望：app = X.Y.Z-app；latest 仍指向上一个主插件版本
+   npm view "@marktrue/dsh-mobile-remote@${CARRIER_VERSION}" version dist.tarball --json \
+     --registry=https://registry.npmjs.org --@marktrue:registry=https://registry.npmjs.org
+   npm view @marktrue/dsh-mobile-remote dist-tags --json \
+     --registry=https://registry.npmjs.org --@marktrue:registry=https://registry.npmjs.org
+   # 期望：app = 3.2.1-alpha.1-app；latest 仍指向上一个稳定主插件版本
    ```
 
    若使用镜像/企业源，确认该版本已可取得（镜像同步可能需要时间）。
 
-3. **发布同一份主插件 tgz**（显式 `--tag latest`，禁止重打）：
+3. **发布同一份主插件 tgz**（显式 `--tag alpha`，禁止重打）：
 
    ```bash
-   npm publish dsh-mobile-app/dist/dsh-mobile-remote-vX.Y.Z.tgz --tag latest
-   npm view @marktrue/dsh-mobile-remote dist-tags --json    # 必须看到 latest = X.Y.Z、app = X.Y.Z-app
+   npm publish dsh-mobile-app/dist/dsh-mobile-remote-v3.2.1-alpha.1.tgz \
+     --tag alpha --registry=https://registry.npmjs.org \
+     --@marktrue:registry=https://registry.npmjs.org
+   npm view @marktrue/dsh-mobile-remote dist-tags --json \
+     --registry=https://registry.npmjs.org --@marktrue:registry=https://registry.npmjs.org
+   # 必须看到 alpha = 3.2.1-alpha.1、app = 3.2.1-alpha.1-app，latest 保持上一个稳定版
    ```
 
-   > 必须显式写 `--tag latest`：主包 `publishConfig` 未固定 tag，npm 会继承用户环境/配置里的
-   > dist-tag（例如 `NPM_CONFIG_TAG=canary`），省略时可能"发布成功但 latest 仍停在旧版"。
+   > `--tag alpha` 是必要的：主包 `publishConfig` 不固定 prerelease tag；若省略，npm 环境/配置可能把
+   > prerelease 指到 `latest`。稳定正式版才显式用 `--tag latest`。
 
 4. **发布 Release 三资产**（同一清单、同一 APK、同一主插件 tgz；文件名/大小/哈希逐字节一致）。
 5. **记录结果**：两次发布各自的耗时/结果/公开 URL；失败与部分成功按 §10 处理。
@@ -426,10 +439,10 @@ NODE
 
 依次核验（只读）：
 
-1. **registry 元数据**：`npm view @marktrue/dsh-mobile-remote dist-tags versions --json`；确认 `latest=X.Y.Z`、`app=X.Y.Z-app`、载体不在 `latest`。
-2. **字节一致**：`npm view @marktrue/dsh-mobile-remote@X.Y.Z dist.integrity` 与本地 `sha512` 一致；`npm view ... dist.tarball` 下载后 sha256 与本地 tgz 一致；载体同理。
+1. **registry 元数据**：`npm view @marktrue/dsh-mobile-remote dist-tags versions --json`；本次 prerelease 应确认 `alpha=3.2.1-alpha.1`、`app=3.2.1-alpha.1-app`，且 `latest` 仍指向上一个稳定版、载体不在 `latest`。
+2. **字节一致**：查询 `@marktrue/dsh-mobile-remote@3.2.1-alpha.1` 与 `@marktrue/dsh-mobile-remote@3.2.1-alpha.1-app` 的 `dist.integrity`，与本地 tgz `sha512` 一致；下载后 sha256 同样一致。
 3. **镜像可取性**：在有代表性的镜像/网络环境重试上述查询与下载（记录耗时）。
-4. **全新安装冒烟**：在隔离 HOME/新目录 `pnpm add @marktrue/dsh-mobile-remote@X.Y.Z`，确认载体别名目录存在且版本为 `X.Y.Z-app`、APK 哈希与清单一致。
+4. **全新安装冒烟**：在隔离 HOME/新目录 `pnpm add @marktrue/dsh-mobile-remote@3.2.1-alpha.1`，确认精确别名目录存在且版本为 `3.2.1-alpha.1-app`、APK 哈希与清单一致。
 5. **Release 三资产**：GitHub Release 的清单/APK/插件 tgz 与本地 dist 逐字节一致（sha256）。
 6. **宿主更新目录**：如使用 `UPDATE_DIR`，确认清单/APK/tgz 已落位且 `manifest.json` 可解析；宿主重启后更新入口可用。
 7. **真机**：按 `docs/06-install-run.md` 手工验证 App 更新/首装（本手册不自动化真机），记录机型、网络与结果。

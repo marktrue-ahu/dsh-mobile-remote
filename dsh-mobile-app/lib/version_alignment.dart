@@ -6,8 +6,9 @@
 /// 电脑端会算好一份随 bootstrap 下发；但**旧插件不会下发**，而"插件旧于 App"
 /// 恰恰是旧插件自己说不出来的那一侧，所以客户端必须能自己算一份。
 ///
-/// 比较只看语义版本 `X.Y.Z`：App 的 `+build` 是它自己的构建号，同一发布周期内
-/// 每次构建都不同，比进去会把提示刷成噪声。
+/// 比较只看语义版本 core `X.Y.Z`：App 的 `+build` 是它自己的构建号，同一发布周期内
+/// 每次构建都不同，比进去会把提示刷成噪声；插件版本的 SemVer prerelease
+/// （如 `3.2.1-alpha.1`）同样不参与配对，只按 core `3.2.1` 与 App 对齐。
 library;
 
 /// 对齐状态。取值与电脑端 `lib/app-alignment.js` 的 `ALIGNMENT_STATE` 一一对应。
@@ -46,7 +47,8 @@ class AppAlignment {
   /// 手机端自身版本（`X.Y.Z+build`）；空串表示尚未取得。
   final String appVersion;
 
-  /// 电脑端插件版本（`X.Y.Z`）；空串表示尚未取得。
+  /// 电脑端插件版本（`X.Y.Z`，可带 SemVer prerelease 如 `3.2.1-alpha.1`）；
+  /// 空串表示尚未取得。
   final String pluginVersion;
 
   /// 判定依据（稳定代码；文案由界面按 state 本地化）。
@@ -83,13 +85,19 @@ class AppAlignment {
   }
 }
 
-/// 取语义版本 `X.Y.Z`；不可解析返回空串。
+/// 取语义版本 core `X.Y.Z`：先剥离 `+build`，再剥离 SemVer prerelease（`-alpha.1`）；
+/// 不可解析返回空串。
+///
+/// 插件 prerelease 与 App 的 build 版本按同一个 core 配对（`3.2.1-alpha.1` ↔ `3.2.1+24`）；
+/// prerelease 之间的先后顺序不影响两端对齐判定。
 String semanticVersion(String raw) {
-  final v = raw.trim();
+  var v = raw.trim();
   if (v.isEmpty) return '';
   final plus = v.indexOf('+');
-  final base = plus == -1 ? v : v.substring(0, plus);
-  final m = RegExp(r'^(\d+)\.(\d+)\.(\d+)$').firstMatch(base);
+  if (plus != -1) v = v.substring(0, plus).trim();
+  final dash = v.indexOf('-');
+  if (dash != -1) v = v.substring(0, dash).trim();
+  final m = RegExp(r'^(\d+)\.(\d+)\.(\d+)$').firstMatch(v);
   if (m == null) return '';
   return '${int.parse(m.group(1)!)}.${int.parse(m.group(2)!)}.${int.parse(m.group(3)!)}';
 }

@@ -1,6 +1,9 @@
 # Archive a release: copies the APK and packs the plugin tarball into
-# dsh-mobile-app/dist/ with versioned filenames. Version comes from pubspec.yaml;
-# plugin version is kept in sync (App version = plugin version = git tag).
+# dsh-mobile-app/dist/ with versioned filenames.
+# Version contract: plugin version comes from root package.json (X.Y.Z or X.Y.Z-prerelease);
+# App/APK filenames only use the pubspec core X.Y.Z (+N build); carrier version is the full
+# plugin version plus -app (e.g. plugin 3.2.1-alpha.1 -> App 3.2.1+24 -> carrier 3.2.1-alpha.1-app).
+# A prerelease plugin must be published with an explicit tag (alpha) and must not move latest.
 # Run after: flutter build apk --release
 #   -CheckOnly [-DistDir <dir>] : only run the offline carrier publish preflight
 #                                 (no build, never runs npm publish).
@@ -18,10 +21,21 @@ $ErrorActionPreference = 'Stop'
 $appDir = Split-Path -Parent $PSScriptRoot   # dsh-mobile-app/
 $repoDir = Split-Path -Parent $appDir        # repo root
 
+function Get-PluginPublishTag([string]$Version) {
+    $match = [regex]::Match($Version, '^(\d+\.\d+\.\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$')
+    if (-not $match.Success) { throw "Invalid plugin version for npm dist-tag: $Version" }
+    if (-not $match.Groups[2].Success) { return 'latest' }
+    $tag = ($match.Groups[2].Value -split '\.')[0]
+    if ($tag -match '^\d+(?:\.\d+)*$') { return 'prerelease' }
+    return $tag
+}
+
 if ($DrillOnly) {
     $drillDir = if ($DistDir) { $DistDir } else { Join-Path $appDir 'dist' }
-    Write-Output ("Release drill only (no build, no npm publish): " + $drillDir)
-    node (Join-Path $PSScriptRoot '../../tools/npm-drill.mjs') --dist $drillDir --phases all
+    $drillPkg = Get-Content (Join-Path $repoDir 'package.json') -Raw | ConvertFrom-Json
+    $drillPluginTag = Get-PluginPublishTag ([string]$drillPkg.version)
+    Write-Output ("Release drill only (no build, no npm publish): " + $drillDir + " (plugin tag: " + $drillPluginTag + ")")
+    node (Join-Path $PSScriptRoot '../../tools/npm-drill.mjs') --dist $drillDir --phases all --plugin-tag $drillPluginTag
     exit $LASTEXITCODE
 }
 
@@ -44,6 +58,22 @@ $ver = $versionMatch.Groups[1].Value
 $buildText = $versionMatch.Groups[2].Value
 $buildNumber = [long]::Parse($buildText)
 $fullVersion = "$ver+$buildText"
+
+# Plugin version (root package.json) may be a prerelease; App/APK stay on the core X.Y.Z.
+$pluginPkg = Get-Content (Join-Path $repoDir 'package.json') -Raw | ConvertFrom-Json
+$pluginVersion = [string]$pluginPkg.version
+$pluginMatch = [regex]::Match($pluginVersion, '^(\d+\.\d+\.\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$')
+if (-not $pluginMatch.Success) {
+    Write-Error "Cannot parse plugin version (expected X.Y.Z or X.Y.Z-prerelease) from package.json: $pluginVersion"
+    exit 1
+}
+$pluginCore = $pluginMatch.Groups[1].Value
+$pluginPrerelease = $pluginMatch.Groups[2].Value
+if ($pluginCore -ne $ver) {
+    Write-Error "App core ($ver) must match plugin core ($pluginCore); plugin=$pluginVersion pubspec=$fullVersion"
+    exit 1
+}
+$pluginTag = Get-PluginPublishTag $pluginVersion
 
 if ($env:MANIFEST_VERSION) {
     if ($env:ALLOW_TEST_MANIFEST_VERSION -ne '1') {
@@ -82,10 +112,10 @@ try {
     Pop-Location
 }
 # 产物名由包名决定：带 scope 时是 `scope-name-ver.tgz`（斜杠换连字符），不能按固定名找。
-$packed = Join-Path $dist "dsh-mobile-remote-$ver.tgz"
-$tgzOut = Join-Path $dist "dsh-mobile-remote-v$ver.tgz"
+$packed = Join-Path $dist "marktrue-dsh-mobile-remote-$pluginVersion.tgz"
+$tgzOut = Join-Path $dist "dsh-mobile-remote-v$pluginVersion.tgz"
 if (-not (Test-Path $packed)) {
-    $candidate = Get-ChildItem -Path $dist -Filter "*-$ver.tgz" -ErrorAction SilentlyContinue |
+    $candidate = Get-ChildItem -Path $dist -Filter "*-$pluginVersion.tgz" -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if ($candidate) { $packed = $candidate.FullName }
 }
@@ -127,11 +157,22 @@ if ($env:MANIFEST_VERSION) {
     #   npm publish <dist>\<name>-X.Y.Z-app.tgz --tag app
     node (Join-Path $PSScriptRoot 'publish-carrier-check.mjs') $dist
     if ($LASTEXITCODE -ne 0) { Write-Error "carrier publish preflight failed"; exit 1 }
+
+    # Manual publish plan (never executed by this script): carrier first (tag app), then plugin
+    # with the explicit tag; prerelease tag must not move latest.
+    $record = Get-Content (Join-Path $dist 'app-carrier.json') -Raw | ConvertFrom-Json
+    $carrierTgz = Join-Path $dist ([string]$record.file)
+    $prereleaseNote = if ($pluginTag -eq 'latest') { '' } else { '   # prerelease: does not move latest' }
+    Write-Output ''
+    Write-Output 'Publish plan (NOT executed by this script):'
+    Write-Output ("  1) carrier : npm publish `"$carrierTgz`" --tag app")
+    Write-Output ("  2) plugin  : npm publish `"$tgzOut`" --tag $pluginTag$prereleaseNote")
+    Write-Output ("  plugin tag : $pluginTag ; carrier tag: app ; App/APK core: $ver ; build: $buildText")
 }
 
 if ($Drill) {
     # Explicit -Drill: full release drill after build; failure blocks the release (fail-closed).
-    node (Join-Path $PSScriptRoot '../../tools/npm-drill.mjs') --dist $dist --phases all
+    node (Join-Path $PSScriptRoot '../../tools/npm-drill.mjs') --dist $dist --phases all --plugin-tag $pluginTag
     if ($LASTEXITCODE -ne 0) { Write-Error "release drill failed - blocking publish"; exit 1 }
 }
 

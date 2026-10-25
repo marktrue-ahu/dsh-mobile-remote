@@ -21,6 +21,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { pluginContentDigest } from "../../lib/plugin-content-digest.js";
+import { parsePluginVersion, parseVersion, pluginCoreVersion } from "./lib/release-checks.mjs";
 
 /** 清单 schema 版本；结构变化时递增。 */
 const MANIFEST_SCHEMA = 1;
@@ -86,8 +87,20 @@ try {
 	console.error(`Cannot read plugin version from ${path.join(pluginRoot, "package.json")}: ${e}`);
 	process.exit(1);
 }
-if (!/^\d+\.\d+\.\d+$/.test(pluginVersion)) {
-	console.error(`Plugin version must be X.Y.Z, got: ${pluginVersion}`);
+if (parsePluginVersion(pluginVersion) === null) {
+	console.error(`Plugin version must be X.Y.Z or X.Y.Z-prerelease, got: ${pluginVersion}`);
+	process.exit(1);
+}
+const pluginCore = pluginCoreVersion(pluginVersion);
+// App 版本仍是严格的 X.Y.Z+N（构建号属于 App），且核心版本必须与插件核心配对
+// （预发布插件 3.2.1-alpha.1 ↔ App 3.2.1+24，APK 文件名只用 core 3.2.1）。
+const parsedAppVersion = parseVersion(version);
+if (parsedAppVersion === null || parsedAppVersion.build === null) {
+	console.error(`App version must be X.Y.Z+BUILD, got: ${version}`);
+	process.exit(1);
+}
+if (parsedAppVersion.version !== pluginCore) {
+	console.error(`App version core ${parsedAppVersion.version} must match plugin core ${pluginCore} (plugin ${pluginVersion})`);
 	process.exit(1);
 }
 

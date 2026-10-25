@@ -22,13 +22,14 @@ export function utcStamp(date = new Date()) {
 	].join("");
 }
 
-export function createRunRecord({ versions, dist, registry, environment }) {
+export function createRunRecord({ versions, dist, registry, environment, pluginTag = "latest" }) {
 	const startedAt = new Date();
 	return {
 		schema: RUN_RECORD_SCHEMA,
 		tool: "npm-drill",
 		drillVersion: versions.pluginA,
 		carrierVersion: versions.carrierA,
+		pluginTag,
 		versions,
 		dist,
 		status: "RUNNING",
@@ -120,6 +121,7 @@ export function finalizeRecord(record, { runDir, keep, evidenceDir }) {
 export function printRunSummary(record) {
 	const reasons = record.reasons.length === 0 ? "none" : record.reasons.join(",");
 	console.log(`\nRESULT: ${record.status}`);
+	console.log(`PLUGIN_TAG: ${record.pluginTag ?? "latest"}`);
 	console.log(`REASONS: ${reasons}`);
 	console.log(`DURATION: ${(record.durationMs / 1000).toFixed(1)}s`);
 	console.log(`EVIDENCE: ${record.evidence.dir}`);

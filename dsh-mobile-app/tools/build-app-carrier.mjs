@@ -51,6 +51,9 @@ import {
 	objectPick,
 	packedFiles,
 	parseVersion,
+	parsePluginVersion,
+	pluginCoreVersion,
+	pluginPublishTag,
 	readApkBadging,
 	readJsonFile,
 	reportChecks,
@@ -192,7 +195,12 @@ function main() {
 	const pluginName = typeof rootPkg.name === "string" ? rootPkg.name : "";
 	const pluginVersion = typeof rootPkg.version === "string" ? rootPkg.version : "";
 	check("插件包名合法", /^(?:@[^/\s]+\/)?[^./\s][^/\s]*$/.test(pluginName), `name=${pluginName || "<缺失>"}`);
-	check("插件版本为 X.Y.Z（正式版插件不带 +N/-app）", /^\d+\.\d+\.\d+$/.test(pluginVersion), `version=${pluginVersion || "<缺失>"}`);
+	check(
+		"插件版本为 X.Y.Z 或 X.Y.Z-prerelease（不带 +N / -app；载体版本在此基础上追加 -app）",
+		parsePluginVersion(pluginVersion) !== null,
+		`version=${pluginVersion || "<缺失>"}${parsePluginVersion(pluginVersion)?.isPrerelease ? "（预发布）" : ""}`,
+	);
+	const pluginCore = pluginCoreVersion(pluginVersion);
 	// 主包必须精确声明载体别名（package.json 是发布产物的一部分，构建时即门禁）。
 	reportChecks(exactCarrierAliasChecks(rootPkg), check);
 	info(`精确载体别名为：${carrierDependencySpec(pluginName, pluginVersion)}`);
@@ -233,7 +241,8 @@ function main() {
 		const apkBaseName = path.basename(apkFile);
 		const filenameVersion = apkVersionFromFilename(apkBaseName);
 		check("APK 文件名符合发布产物约定 DSH-Remote-vX.Y.Z.apk", filenameVersion !== null, `--apk=${apkBaseName}`);
-		check("APK 文件名版本与插件版本配对", filenameVersion === pluginVersion, `文件名=${filenameVersion ?? "<不符合约定>"} 插件=${pluginVersion}`);
+		check("APK 文件名版本与插件版本配对", filenameVersion === pluginCore,
+			`文件名=${filenameVersion ?? "<不符合约定>"} 插件核心=${pluginCore || "<非法>"} 插件=${pluginVersion}`);
 
 		const badging = readApkBadging(apkFile);
 		let appVersion = "";
@@ -243,8 +252,8 @@ function main() {
 				true,
 				`versionName=${badging.versionName} versionCode=${badging.versionCode}（${badging.source}）`,
 			);
-			check("APK versionName 与插件版本严格配对", badging.versionName === pluginVersion,
-				`versionName=${badging.versionName} 插件=${pluginVersion}`);
+			check("APK versionName 与插件版本严格配对", badging.versionName === pluginCore,
+				`versionName=${badging.versionName} 插件核心=${pluginCore || "<非法>"} 插件=${pluginVersion}`);
 			check("APK versionCode 为正整数（真实递增构建号保留）", /^[1-9]\d*$/.test(badging.versionCode),
 				`versionCode=${badging.versionCode}`);
 			appVersion = `${badging.versionName}+${badging.versionCode}`;
@@ -268,8 +277,8 @@ function main() {
 
 		const parsedApp = parseVersion(appVersion);
 		check("app.version 形如 X.Y.Z+N（保留真实构建号）", parsedApp !== null && parsedApp.build !== null, `app.version=${appVersion}`);
-		check("app.version 语义版本与插件版本严格配对", parsedApp?.version === pluginVersion,
-			`app=${parsedApp?.version ?? "<无法解析>"} 插件=${pluginVersion}`);
+		check("app.version 语义版本与插件版本严格配对", parsedApp?.version === pluginCore,
+			`app=${parsedApp?.version ?? "<无法解析>"} 插件核心=${pluginCore || "<非法>"} 插件=${pluginVersion}`);
 		check("app.version 与 APK 文件名版本一致", parsedApp?.version === filenameVersion,
 			`app=${parsedApp?.version ?? "<无法解析>"} 文件名=${filenameVersion ?? "<不符合约定>"}`);
 		if (fail > 0) return finish();
@@ -425,12 +434,15 @@ function main() {
 				`exit ${verify.status}`);
 
 			console.log("");
+			const pluginTag = pluginPublishTag(pluginVersion);
 			console.log("Artifacts:");
 			console.log(`  manifest : ${manifestFile}`);
 			console.log(`  carrier  : ${carrierFile} (${carrierStat.size} B, sha256 ${record.sha256})`);
 			console.log(`  record   : ${recordFile}`);
-			console.log(`  版本配对 : ${pluginName}@${pluginVersion} ↔ @${appCarrierVersion}`);
-			console.log(`  发布命令 : npm publish ${carrierFile} --tag app   # 本工具绝不执行；dist-tag 固定 app`);
+			console.log(`  版本配对 : ${pluginName}@${pluginVersion} ↔ @${appCarrierVersion}（App core=${pluginCore}）`);
+			console.log(`  主插件发布 : npm publish ${tgzFile} --tag ${pluginTag}`
+				+ `${pluginTag === "latest" ? "   # 稳定版：随 latest" : "   # 预发布：显式 alpha，不移动 latest"}`);
+			console.log(`  载体发布   : npm publish ${carrierFile} --tag app   # 本工具绝不执行；dist-tag 固定 app`);
 			info("未向任何 registry 发布（仅 npm pack 本地打包）；发布顺序由发布流程保证：先载体后主包");
 			info("发布前预检：node dsh-mobile-app/tools/publish-carrier-check.mjs <dist目录>（离线，不发布）");
 		} finally {

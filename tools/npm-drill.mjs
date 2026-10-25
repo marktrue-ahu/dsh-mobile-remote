@@ -70,7 +70,9 @@ import {
 } from "./lib/npm-drill/report.mjs";
 import { REASONS } from "./lib/npm-drill/reasons.mjs";
 import { REGISTRY_PHASES, prepareProjection, PHASES } from "./lib/npm-drill/phases.mjs";
-import { createDrillVersions, validateDrillVersions } from "./lib/npm-drill/versions.mjs";
+import {
+	DEFAULT_PLUGIN_TAG, createDrillVersions, isValidDistTag, validateDrillVersions,
+} from "./lib/npm-drill/versions.mjs";
 
 const TOOLS_DIR = path.dirname(fileURLToPath(import.meta.url));
 // 演练属于**插件发布**（tools/ 侧）：从仓库根 tools/npm-drill.mjs 运行，仓库根在上层。
@@ -90,6 +92,8 @@ const HELP_TEXT = `npm-drill — 发版演练（本地 registry，全程不接�
                       preflight 是离线阶段（不需要 registry）；其余阶段需要 Verdaccio
   --registry <url>    复用已有 registry（跳过启动正常实例；低上限失败实例仍本机启动）
                       只从用户 npmrc 迁移**该地址**凭据；路由由专用配置固定（见下）
+  --plugin-tag <tag>  主插件发布 dist-tag（默认 latest；预发布版本用 alpha，载体恒 app，
+                      用 alpha 时断言 latest 不被本次预发布移动）
   --keep              保留演练现场（工作目录 / registry 存储 / 全部日志）
   --build             演练前先运行发布构建（dsh-mobile-app/tools/package-release.sh）
   -h, --help          打印本帮助并退出 0
@@ -121,6 +125,7 @@ const HELP_TEXT = `npm-drill — 发版演练（本地 registry，全程不接�
   node tools/npm-drill.mjs --dist dsh-mobile-app/dist
   node tools/npm-drill.mjs --dist dsh-mobile-app/dist --phases preflight
   node tools/npm-drill.mjs --dist dsh-mobile-app/dist --phases publish,install --keep
+  node tools/npm-drill.mjs --dist dsh-mobile-app/dist --plugin-tag alpha   # 预发布演练
 `;
 
 class DrillSetupError extends Error {
@@ -140,7 +145,10 @@ class AbortRun extends Error {
 }
 
 function parseArgs(argv) {
-	const args = { dist: "", phases: "all", registry: "", keep: false, build: false, help: false, unknown: [] };
+	const args = {
+		dist: "", phases: "all", registry: "", pluginTag: DEFAULT_PLUGIN_TAG,
+		keep: false, build: false, help: false, unknown: [],
+	};
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
 		if (arg === "-h" || arg === "--help") {
@@ -149,13 +157,14 @@ function parseArgs(argv) {
 			args.keep = true;
 		} else if (arg === "--build") {
 			args.build = true;
-		} else if (["--dist", "--phases", "--registry"].includes(arg)) {
+		} else if (["--dist", "--phases", "--registry", "--plugin-tag"].includes(arg)) {
 			const value = argv[++i];
 			if (value === undefined || value.startsWith("--")) {
 				args.unknown.push(`${arg}（缺少取值）`);
 				continue;
 			}
-			args[arg.slice(2)] = value;
+			if (arg === "--plugin-tag") args.pluginTag = value;
+			else args[arg.slice(2)] = value;
 		} else {
 			args.unknown.push(arg);
 		}
@@ -487,6 +496,15 @@ async function main() {
 		return 1;
 	}
 	const selected = phaseSelection.selected;
+	// --plugin-tag：不能是 semver 版本/range（npm 会拒绝这种 dist-tag）；默认 latest 保持稳定路径。
+	if (!isValidDistTag(options.pluginTag)) {
+		printCliFailure({
+			title: "主插件 dist-tag 合法（不能是 semver 版本号/range；如 alpha/latest）",
+			reason: REASONS.CLI_INVALID_ARGUMENT,
+			detail: `--plugin-tag ${options.pluginTag}`,
+		});
+		return 1;
+	}
 
 	// 版本与运行目录（任何失败都要能落到证据目录）。
 	const versions = createDrillVersions();
@@ -497,6 +515,7 @@ async function main() {
 	const dist = options.dist !== "" ? path.resolve(options.dist) : path.join(REPO_ROOT, "dsh-mobile-app", "dist");
 	const ctx = {
 		options,
+		pluginTag: options.pluginTag,
 		versions,
 		dist,
 		runDir,
@@ -574,7 +593,7 @@ async function main() {
 	ctx.assets = readDistAssets(dist);
 
 	const environment = await runEnvToolVersions(ctx);
-	const record = createRunRecord({ versions, dist, registry: null, environment });
+	const record = createRunRecord({ versions, dist, registry: null, environment, pluginTag: options.pluginTag });
 	let abort = false;
 
 	try {
