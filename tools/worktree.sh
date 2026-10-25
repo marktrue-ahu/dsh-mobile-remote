@@ -11,14 +11,15 @@
 #   tools/worktree.sh verify                   # 当前树：仅干净树验证，报告原子落盘
 #   tools/worktree.sh verify-baseline <issue>  # 临时检出登记基线，同环境复跑门禁留证
 #   tools/worktree.sh deliver                  # 当前树：必须有对应 SHA 的验证/批准例外证据
-#   tools/worktree.sh integrate <issue>        # 只合并已交付且 SHA 未变的任务
-#   tools/worktree.sh cleanup <issue> <PR>     # 核验 PR 已合并且 head SHA 一致后清理
+#   tools/worktree.sh integrate <issue> <PR>   # PR 合入 develop 后，核验并快进本地 develop
+#   tools/worktree.sh cleanup <issue> <PR>     # 核验 develop PR/head/merge SHA 后清理
 #   tools/worktree.sh authorize <issue> <动作> <批准理由> # 记录人工批准意向并绑定当前 SHA
 #   tools/worktree.sh authorize-exception <issue> <sha> <门禁> <基线报告> <批准理由>
 #   tools/worktree.sh status [issue|--all]     # 查看任务登记与授权
 #
 # 环境变量（一般不设）：
-#   DSH_WT_MAIN          主目录（默认：git 报告的 main worktree）
+#   DSH_WT_MAIN          主仓库工作树（默认：git 报告的 main worktree；分支必须是 develop）
+#   DSH_WT_GITHUB_REPO   PR 所属 GitHub 仓库（默认 marktrue-ahu/dsh-mobile-remote）
 #   DSH_WT_ROOT          新工作树存放目录（默认 <主目录父级>/dsh-mobile-remote-worktrees）
 #   DSH_WT_STATE         运行状态目录（默认 ~/.local/state/dsh-mobile-remote-workflow）
 #   DSH_WT_ALLOW_SYNTHETIC=1  允许合成门禁（仅供 tools/worktree-selftest.sh 使用）
@@ -236,10 +237,10 @@ path,issue,short,branch,wt,kind,baseline,writer=a[0:8]
 depends_on=(a[8] if len(a)>8 else "")
 depends_sha=(a[9] if len(a)>9 else "")
 doc={"issue":issue,"short":short,"branch":branch,"path":wt,"kind":kind,
-     "baseline":baseline,"baseline_ref":"main","writer":writer,"role":"implementer",
+     "baseline":baseline,"baseline_ref":"develop","writer":writer,"role":"implementer",
      "created_at":datetime.datetime.now().strftime("%F %T"),"status":"creating","authorizations":{}}
 if depends_on:
-    # 依赖分支例外：审计记录，说明本分支不是从 main 直接开出来的。
+    # 依赖分支例外：审计记录，说明本分支不是直接从 develop 开出来的。
     doc["depends_on"]=depends_on; doc["depends_on_sha"]=depends_sha
 directory=os.path.dirname(path)
 fd,tmp=tempfile.mkstemp(prefix="."+os.path.basename(path)+".",suffix=".tmp",dir=directory)
@@ -383,16 +384,16 @@ require_wrapup_or_writer() { # <issue> <worktree> <branch> <op>
   return 0
 }
 
-# 分支是否**已经完全并入上游 main**：以"相对上游 main 的独有提交数为 0"判定内容归宿，
-# 而不是比对文件名、也不要求 SHA 相等（合流方式不同时 SHA 不会相等）。
-upstream_main_contains_branch() { # <branch> <expected tip>
-  local branch="$1" head="$2" upstream="github/main" tip unique
-  gitq -C "$MAIN_DIR" rev-parse --verify -q "$upstream" >/dev/null 2>&1 || {
-    warn "本地没有 $upstream 引用；无法核验上游包含性"; return 1; }
-  tip="$(gitq -C "$MAIN_DIR" rev-parse "refs/heads/$branch" 2>/dev/null)"
-  [ "$tip" = "$head" ] || { warn "分支 $branch 的 tip 与预期不符（期望 ${head:0:12}）"; return 1; }
-  unique="$(gitq -C "$MAIN_DIR" rev-list --count "$upstream..$branch" 2>/dev/null)"
-  [ "$unique" = "0" ] || { warn "分支 $branch 相对 $upstream 仍有 $unique 个独有提交；拒绝清理"; return 1; }
+# PR 的 merge commit（merge/squash/rebase merge 均可）是否已进入 GitHub develop。
+github_develop_contains_commit() { # <PR merge commit SHA>
+  local commit="$1" upstream="github/develop"
+  [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { warn "PR merge SHA 格式无效"; return 1; }
+  gitq fetch --quiet github '+refs/heads/develop:refs/remotes/github/develop' >/dev/null 2>&1 || {
+    warn "无法 fetch github/develop；拒绝认定 PR 内容已进入集成主线"; return 1; }
+  gitq rev-parse --verify -q "$upstream^{commit}" >/dev/null 2>&1 || {
+    warn "本地没有 $upstream 引用；无法核验 PR merge SHA"; return 1; }
+  gitq merge-base --is-ancestor "$commit" "$upstream" || {
+    warn "PR merge commit ${commit:0:12} 尚未进入 $upstream"; return 1; }
   return 0
 }
 
@@ -547,55 +548,55 @@ cmd_create() {
   gitq show-ref --verify --quiet "refs/heads/$branch" && die "分支 $branch 已存在"
   [ -e "$path" ] && die "路径已存在：$path"
 
-  # 基线：main 必须与 github/main 同步（不自动快进，避免静默改变基线）。
-  # 注意：baseline 始终指上游 main 的 SHA——verify-baseline 与红灯例外都以它为准，
-  # 这样「这个红灯是不是上游本来就有的」才问得成立。--base 只改变建树起点。
-  gitq fetch --quiet github 2>/dev/null || die "无法 fetch github/main，不能证明基线是最新；create 已停止"
-  local main_sha gh_sha
-  main_sha="$(gitq rev-parse main)"
-  gh_sha="$(gitq rev-parse --verify github/main 2>/dev/null)" || die "缺少 github/main 远端跟踪引用；拒绝猜测基线"
-  if [ "$main_sha" != "$gh_sha" ]; then
-    warn "本地 main ($(gitq rev-parse --short main)) 与 github/main ($(gitq rev-parse --short github/main)) 不一致"
-    die "先按「上游同步」把 main 快进到 github/main，再建树（避免用陈旧基线开工）"
+  # feature/fix 的 PR 目标是 GitHub develop；建树时要求本地主线与该目标完全同步，
+  # 避免把未推送提交暗中夹进 PR。main 仍是上游镜像，不作为功能分支基线。
+  gitq fetch --quiet --prune github '+refs/heads/develop:refs/remotes/github/develop' 2>/dev/null || die "无法 fetch github/develop，不能证明集成基线是最新；create 已停止"
+  local develop_sha gh_sha
+  develop_sha="$(gitq rev-parse develop)"
+  gh_sha="$(gitq rev-parse --verify github/develop 2>/dev/null)" || die "缺少 github/develop 远端跟踪引用；拒绝猜测基线"
+  if [ "$develop_sha" != "$gh_sha" ]; then
+    warn "本地 develop ($(gitq rev-parse --short develop)) 与 github/develop ($(gitq rev-parse --short github/develop)) 不一致"
+    die "先经 PR/集成把 develop 同步到 github/develop，再建功能树"
   fi
 
-  # 建树起点：默认 main；--base 时用依赖分支的当前 SHA（登记为依赖分支例外）。
-  local start_sha="$main_sha" base_depends_on="" base_depends_sha=""
+  # 建树起点：默认 develop；--base 时用依赖分支的当前 SHA（登记为依赖分支例外）。
+  local start_sha="$develop_sha" base_depends_on="" base_depends_sha=""
   if [ -n "$base_ref" ]; then
     base_depends_sha="$(gitq rev-parse --verify "refs/heads/$base_ref^{commit}" 2>/dev/null)" || \
       die "依赖分支不存在：$base_ref"
     start_sha="$base_depends_sha"
     base_depends_on="$base_ref"
     warn "以依赖分支为基线：$base_ref@$(gitq rev-parse --short "$base_depends_sha")"
-    warn "本分支的上游 PR 会夹带该分支相对 main 的全部改动；这是用户显式批准的例外"
-    if gitq merge-base --is-ancestor "$base_depends_sha" "$main_sha"; then
-      die "依赖分支 $base_ref 已在 main 上，无需 --base；请直接从不带 --base 建树"
+    warn "本分支的 develop PR 会夹带依赖分支相对 develop 的全部改动；这是用户显式批准的例外"
+    if gitq merge-base --is-ancestor "$base_depends_sha" "$develop_sha"; then
+      die "依赖分支 $base_ref 已在 develop 上，无需 --base；请直接从不带 --base 建树"
     fi
   fi
 
-  # 基线不得携带禁止进入功能分支的文件。同时检查基线（main）与实际起点（可能含依赖分支）。
-  local hit="" check_ref
-  for check_ref in "$main_sha" "$start_sha"; do
+  # develop 已可合法包含上游决策文档；禁止的是功能分支相对 develop 新增/修改这些路径。
+  # 仅检查 --base 依赖分支带来的差异，普通工作树起点与 develop 相同，无差异可审。
+  local hit=""
+  if [ "$start_sha" != "$develop_sha" ]; then
     for p in "${FORBIDDEN_PATHS[@]}"; do
-      if gitq ls-tree -r --name-only "$check_ref" -- "$p" | grep -q .; then
+      if gitq diff --name-only "$develop_sha" "$start_sha" -- "$p" | grep -q .; then
         case " $hit " in *" $p "*) ;; *) hit="$hit $p" ;; esac
       fi
     done
-  done
+  fi
   if [ -n "$hit" ]; then
-    warn "基线/起点已跟踪这些文件：$hit"
-    die "它们不应随功能分支进入上游 PR。请用户决定如何处理（删除/迁移）后再建树"
+    warn "依赖分支相对 develop 修改了禁止路径：$hit"
+    die "这些规则/决策文件不得混入功能 PR；请先将依赖分支处理为 develop 的既有内容"
   fi
 
-  info "创建 $branch → $path（基线 main@$(gitq rev-parse --short main)，起点 $(gitq rev-parse --short "$start_sha")）"
+  info "创建 $branch → $path（基线 develop@$(gitq rev-parse --short "$develop_sha")，起点 $(gitq rev-parse --short "$start_sha")）"
   # 先原子保留 issue 登记，其他 create 在同 issue 锁下只能看到 creating 并拒绝重入。
-  json_create_task "$task" "$issue" "$short" "$branch" "$path" "$kind" "$main_sha" "$writer" "$base_depends_on" "$base_depends_sha" || die "无法原子登记 issue #$issue"
+  json_create_task "$task" "$issue" "$short" "$branch" "$path" "$kind" "$develop_sha" "$writer" "$base_depends_on" "$base_depends_sha" || die "无法原子登记 issue #$issue"
   if ! gitq worktree add -b "$branch" "$path" "$start_sha" >/dev/null; then
     rm -f "$task"
     die "git worktree add 失败；已撤销本次任务登记"
   fi
   json_set "$task" status created || die "工作树已创建，但任务状态写入失败；保留现场并停止"
-  audit create "issue=$issue branch=$branch path=$path baseline=$(gitq rev-parse --short main) start=$(gitq rev-parse --short "$start_sha") depends_on=${base_depends_on:-none}"
+  audit create "issue=$issue branch=$branch path=$path baseline=$(gitq rev-parse --short "$develop_sha") start=$(gitq rev-parse --short "$start_sha") depends_on=${base_depends_on:-none}"
   ok "已建树并登记：issue #$issue（写入者 $writer）"
   info "下一步：cd $path && $SCRIPT_PATH init"
   task_lock_release
@@ -631,9 +632,9 @@ cmd_init() {
   fi
 
   # 环境：agent 的非交互 shell 不带镜像变量，这里补上。
-  # ⚠ 关键：**必须跟随 pubspec.lock 记录的源**，不能无条件强制镜像。
-  # 功能分支从 main 开，main 的 lock 记的是 pub.dev；若用镜像跑 pub get，pub 会重写 lock
-  # 的每个 url（实测 143 行，还夹带包版本升级），直接污染 PR。缓存里两种源都有，跟随即可。
+  # ⚠ 关键：**必须跟随 develop 的 pubspec.lock 记录的源**，不能无条件强制镜像。
+  # 若用与 lock 不同的镜像跑 pub get，pub 会重写 lock 的每个 url（实测 143 行，还夹带包版本升级），
+  # 直接污染 develop PR。缓存里两种源都有，跟随即可。
   export PUB_CACHE="${PUB_CACHE:-$REAL_HOME/.pub-cache}"
   export PATH="/home/mark/sdk/flutter/bin:/home/mark/sdk/jdk17/bin:$PATH"
   export JAVA_HOME="${JAVA_HOME:-/home/mark/sdk/jdk17}"
@@ -957,10 +958,11 @@ cmd_deliver() {
 
   local leaks=""
   for p in "${FORBIDDEN_PATHS[@]}"; do
-    gitq -C "$wt" ls-tree -r --name-only HEAD -- "$p" | grep -q . && leaks="$leaks $p"
+    gitq -C "$wt" diff --name-only "$baseline" "$head" -- "$p" | grep -q . && leaks="$leaks $p"
   done
-  [ -n "$leaks" ] && die "提交里出现了不应进入上游的文件：$leaks（请从提交中移除）"
-  behind="$(gitq -C "$wt" rev-list --count "HEAD..main" 2>/dev/null || echo '?')"
+  [ -n "$leaks" ] && die "功能分支相对 develop 修改了不应进入 feature PR 的文件：$leaks（请从提交中移除）"
+  gitq -C "$wt" fetch --quiet github develop >/dev/null 2>&1 || true
+  behind="$(gitq -C "$wt" rev-list --count "HEAD..github/develop" 2>/dev/null || echo '?')"
 
   local verified_sha failed_sha failed_gates exc_sha exc_gates exc_baseline_report exc_baseline_sha baseline_gates report_path verification_state baseline_state report_fails baseline_report_fails report_kinds baseline_kinds
   verified_sha="$(json_get "$task" last_verified_sha)"
@@ -1023,12 +1025,12 @@ cmd_deliver() {
   summary_tmp="$(mktemp "$REPORTS_DIR/.$issue-delivery.XXXXXX.tmp")" || die "无法创建交付摘要临时文件"
   {
     printf '# 交付摘要：issue #%s\n\n' "$issue"
-    printf -- '- 分支：`%s`\n- 工作树：`%s`\n- 基线：`%s`（%s）\n- 提交：`%s`（共 %s 个）\n- 落后 main：%s 个提交\n- 验证报告：`%s`\n- 写入者：%s\n- 门禁结果：%s\n\n## 提交列表\n\n' \
+    printf -- '- 分支：`%s`\n- 工作树：`%s`\n- 基线：`%s`（%s）\n- 提交：`%s`（共 %s 个）\n- 落后 develop：%s 个提交\n- 验证报告：`%s`\n- 写入者：%s\n- 门禁结果：%s\n\n## 提交列表\n\n' \
       "$branch" "$wt" "$baseline" "$(json_get "$task" baseline_ref)" "$head" "$count" "$behind" "$report_path" "$(json_get "$task" writer)" "$report_kinds"
     printf '%s\n' "$commit_list" | sed 's/^/- /'
     # 依赖分支例外必须在交付摘要里可见，否则审阅者不知道 PR 里为什么多了别的分支的改动。
     if [ -n "$(json_get "$task" depends_on)" ]; then
-      printf '\n## ⚠ 依赖分支例外\n\n本分支基于 `%s@%s`（用户显式批准），并非直接从 main 开出。\n上游 PR 会夹带该分支相对 main 的全部改动。\n' \
+      printf '\n## ⚠ 依赖分支例外\n\n本分支基于 `%s@%s`（用户显式批准），并非直接从 develop 开出。\ndevelop PR 会夹带该分支相对 develop 的全部改动。\n' \
         "$(json_get "$task" depends_on)" "$(json_get "$task" depends_on_sha)"
     fi
     if [ "$using_exception" = "1" ]; then
@@ -1048,15 +1050,17 @@ cmd_deliver() {
   json_set "$task" delivered_sha "$head" || die "无法记录交付 SHA"
   audit deliver "issue=$issue sha=$head_short commits=$count"
   ok "交付记录已原子生成：$summary"
-  [ "$behind" != "0" ] && [ "$behind" != "?" ] && warn "分支落后 main $behind 个提交；rebase 需用户批准"
+  [ "$behind" != "0" ] && [ "$behind" != "?" ] && warn "分支落后 github/develop $behind 个提交；rebase 需用户批准"
   info "下一步：取得用户授权后推送双远端（tools/worktree.sh authorize $issue push <理由>）"
   task_lock_release
 }
 
 # ── integrate ──
 cmd_integrate() {
-  local issue="${1:-}"; [ -n "$issue" ] || die "用法：tools/worktree.sh integrate <issue>"
+  local issue="${1:-}" pr="${2:-}"
+  [ -n "$issue" ] && [ -n "$pr" ] || die "用法：tools/worktree.sh integrate <issue> <已合入 develop 的 PR>"
   [[ "$issue" =~ ^[1-9][0-9]{0,9}$ ]] || die "issue 必须是正整数"
+  [[ "$pr" =~ ^[1-9][0-9]{0,8}$ ]] || die "PR 编号必须是正整数"
   require_role_integrator
   require_task "$issue"
   task_lock_acquire "$issue"
@@ -1071,8 +1075,8 @@ cmd_integrate() {
   [ "$(gitq -C "$path" rev-parse --abbrev-ref HEAD)" = "$branch" ] || die "功能树当前分支不等于登记分支 $branch"
   branch_sha="$(gitq -C "$path" rev-parse HEAD)"
   [ "$branch_sha" = "$delivered_sha" ] && [ "$(branch_head "$branch")" = "$delivered_sha" ] || \
-    die "分支 HEAD 已从交付 SHA 改变；重新 verify/deliver 并重新授权"
-  task_has_valid_gate_evidence "$task" "$delivered_sha" || die "交付 SHA 缺少有效验证证据或已批准例外；拒绝合并"
+    die "分支 HEAD 已从交付 SHA 改变；重新 verify/deliver 并为新 SHA 提 PR"
+  task_has_valid_gate_evidence "$task" "$delivered_sha" || die "交付 SHA 缺少有效验证证据或已批准例外；拒绝 integrate"
   require_authorization "$issue" integrate "$delivered_sha"
   require_clean_tree "$path" "integrate（功能树）"
 
@@ -1083,71 +1087,88 @@ cmd_integrate() {
   [ "$(current_branch)" = "develop" ] || die "主目录必须固定在 develop"
   require_clean_tree "$MAIN_DIR" "integrate（主目录）"
   local develop_before; develop_before="$(gitq rev-parse HEAD)"
+  gitq fetch --quiet github '+refs/heads/develop:refs/remotes/github/develop' || die "无法更新 github/develop；PR 集成已停止"
+  local github_develop_sha; github_develop_sha="$(gitq rev-parse --verify github/develop^{commit} 2>/dev/null)" || die "缺少 github/develop；拒绝集成"
+  gitq merge-base --is-ancestor "$develop_before" "$github_develop_sha" || \
+    die "本地 develop 与 github/develop 已分叉；先人工核对，拒绝改写历史"
 
-  info "合并已交付 SHA $delivered_sha（$branch）→ develop（--no-ff）"
-  # Merge the immutable, authorized SHA rather than re-resolving the mutable branch ref.
-  if ! gitq merge --no-ff --no-edit "$delivered_sha" >/dev/null; then
-    warn "合并出现冲突——已在主目录停下，冲突文件："
-    gitq diff --name-only --diff-filter=U | sed 's/^/    /' >&2
-    die "机械性冲突可自行解决并复测；涉及语义请用户批准取舍。禁止整块 ours/theirs"
-  fi
-  local merge_sha; merge_sha="$(gitq rev-parse HEAD)"
-  ok "已合并：$(gitq log --oneline -1)"
+  github_pr_is_merged "$pr" "$delivered_sha" "$branch" || die "PR #$pr 未合入 GitHub develop，或 head SHA 与交付提交不符"
+  local pr_merge_sha="$PR_MERGE_SHA"
+  gitq merge-base --is-ancestor "$pr_merge_sha" "$github_develop_sha" || \
+    die "PR #$pr 的 merge commit 不在 github/develop；拒绝快进本地 develop"
+  [ "$(branch_head "$branch")" = "$delivered_sha" ] || die "PR 核验期间功能分支变化；拒绝集成"
 
-  info "合并后集成门禁（功能分支绿灯不替代 develop 门禁）"
+  info "PR #$pr 已合入 GitHub develop；仅 fast-forward 本地 develop（不重复本地 merge）"
+  gitq merge --ff-only "$github_develop_sha" >/dev/null || die "本地 develop 无法 fast-forward 到 github/develop"
+  local integrated_sha; integrated_sha="$(gitq rev-parse HEAD)"
+  [ "$integrated_sha" = "$github_develop_sha" ] || die "本地 develop 快进目标与已核验远端 SHA 不符"
+
+  info "PR 合并后的 develop 集成门禁（功能分支绿灯不替代 develop 门禁）"
   require_real_gates_context
-  local report="$REPORTS_DIR/$issue-integration-${merge_sha:0:12}.md" report_tmp synthetic
+  local report="$REPORTS_DIR/$issue-integration-${integrated_sha:0:12}.md" report_tmp synthetic
   report_tmp="$(mktemp "$REPORTS_DIR/.$issue-integration.XXXXXX.tmp")" || die "无法创建集成报告临时文件"
   if synthetic_gate_allowed; then synthetic=1; else synthetic=0; fi
   local gate_out="" rc=0
   gate_out="$(run_gates "$MAIN_DIR" "$report_tmp" "$synthetic")" || rc=$?
-  if [ "$rc" -ne 0 ] || [ "$(gitq rev-parse HEAD)" != "$merge_sha" ] || [ -n "$(gitq status --porcelain)" ]; then
+  if [ "$rc" -ne 0 ] || [ "$(gitq rev-parse HEAD)" != "$integrated_sha" ] || [ -n "$(gitq status --porcelain)" ]; then
     rm -f "$report_tmp"
-    audit integrate "issue=$issue merge=$merge_sha result=fail"
-    die "集成门禁失败或 develop 在门禁期间变化；develop 已包含合并 $merge_sha，暂停发布并人工处理"
+    audit integrate "issue=$issue pr=$pr develop=$integrated_sha result=fail"
+    die "develop 集成门禁失败或主目录在门禁期间变化；PR 已在 GitHub 合入，本地 develop 已快进，暂停后续操作"
   fi
   [ ! -d "$report" ] && [ ! -L "$report" ] || { rm -f "$report_tmp"; die "集成报告目标异常，状态未更新"; }
   mv -f "$report_tmp" "$report" || { rm -f "$report_tmp"; die "集成报告发布失败，状态未更新"; }
   [ -f "$report" ] || die "集成报告缺失，拒绝标记 integrated"
-  # 集成报告同样必须结构完整且真跑过全部门禁。
   local gate_mode; if [ "$synthetic" = "1" ]; then gate_mode=synthetic; else gate_mode=required; fi
   report_validate "$report" "$gate_mode" || die "集成报告结构不完整，拒绝标记 integrated"
   report_gate_query "$report" "$gate_mode" all-pass || die "集成报告未包含全部必需门禁通过结果，拒绝标记 integrated"
   [ "$(gitq -C "$path" rev-parse HEAD)" = "$delivered_sha" ] && [ "$(branch_head "$branch")" = "$delivered_sha" ] || \
-    die "功能分支在集成期间变化；develop 只合入已批准 SHA $delivered_sha，任务未标记 integrated"
-  json_set "$task" integrated_sha "$merge_sha" || die "无法记录集成 SHA"
+    die "功能分支在集成期间变化；已合入的是交付 SHA $delivered_sha，任务未标记 integrated"
+  json_set "$task" integrated_sha "$integrated_sha" || die "无法记录集成 SHA"
+  json_set "$task" integrated_pr "$pr" || die "无法记录集成 PR"
+  json_set "$task" pr_merge_sha "$pr_merge_sha" || die "无法记录 PR merge SHA"
   json_set "$task" integrated_at "$(date '+%F %T')" || die "无法记录集成时间"
   json_set "$task" status integrated || die "无法记录集成状态"
-  audit integrate "issue=$issue develop_before=$develop_before merge=$merge_sha result=pass"
-  ok "集成完成并通过门禁：$report"
+  audit integrate "issue=$issue pr=$pr develop_before=$develop_before develop=$integrated_sha pr_merge=$pr_merge_sha result=pass"
+  ok "PR #$pr 已核验合入 develop，本地 fast-forward 并通过门禁：$report"
+  info "GitLab origin/develop 镜像推送仍需单独取得 push 授权；本命令不会自动推送"
   flock -u 6 2>/dev/null || true; exec 6>&-
   task_lock_release
 }
 
+PR_MERGE_SHA=""
 github_pr_is_merged() { # <PR number> <delivered SHA> <branch>
-  local pr="$1" expected_sha="$2" branch="$3" repo="${DSH_WT_UPSTREAM_REPO:-201222-L/dsh-mobile-remote}" payload
+  local pr="$1" expected_sha="$2" branch="$3" repo="${DSH_WT_GITHUB_REPO:-marktrue-ahu/dsh-mobile-remote}" payload merge_sha
+  PR_MERGE_SHA=""
   [[ "$pr" =~ ^[1-9][0-9]{0,8}$ ]] || { warn "PR 编号必须是正整数"; return 1; }
   if [ "${DSH_WT_ALLOW_SYNTHETIC:-0}" = "1" ] && [ -n "${DSH_WT_TEST_MERGED_PR:-}" ]; then
-    if [ "$DSH_WT_TEST_MERGED_PR" = "$pr:$expected_sha:$branch" ]; then
-      warn "selftest 合成已合并 PR 核验"; return 0
+    local test_pr test_sha test_branch test_base test_merge
+    IFS=: read -r test_pr test_sha test_branch test_base test_merge <<< "$DSH_WT_TEST_MERGED_PR"
+    if [ "$test_pr" = "$pr" ] && [ "$test_sha" = "$expected_sha" ] && \
+       [ "$test_branch" = "$branch" ] && [ "$test_base" = "develop" ] && \
+       [[ "$test_merge" =~ ^[0-9a-f]{40}$ ]]; then
+      PR_MERGE_SHA="$test_merge"
+      warn "selftest 合成已合入 develop 的 PR #$pr"
+      return 0
     fi
-    warn "selftest 合成 PR 的 SHA/分支不匹配"; return 1
+    warn "selftest 合成 PR 的 base/head SHA/分支/merge SHA 不匹配"; return 1
   fi
-  [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { warn "DSH_WT_UPSTREAM_REPO 格式无效"; return 1; }
+  [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { warn "DSH_WT_GITHUB_REPO 格式无效"; return 1; }
   command -v curl >/dev/null 2>&1 || { warn "需要 curl 才能核验 GitHub PR 合并状态"; return 1; }
   payload="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
     -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$repo/pulls/$pr")" || {
-      warn "无法读取 $repo PR #$pr；拒绝清理"; return 1;
+      warn "无法读取 $repo PR #$pr；拒绝继续"; return 1;
     }
-  printf '%s' "$payload" | python3 -c 'import json,sys
+  merge_sha="$(printf '%s' "$payload" | python3 -c 'import json,re,sys
 p=json.load(sys.stdin); expected,branch=sys.argv[1:3]
 valid=(p.get("merged_at") is not None and p.get("state")=="closed" and
-       p.get("base",{}).get("ref")=="main" and
+       p.get("base",{}).get("ref")=="develop" and
        p.get("head",{}).get("ref")==branch and
        p.get("head",{}).get("sha")==expected)
-if not valid:
- print("PR 未合并到 main，或 PR head ref/SHA 与已交付分支不匹配",file=sys.stderr); raise SystemExit(1)' \
-    "$expected_sha" "$branch"
+sha=p.get("merge_commit_sha")
+if not valid or not isinstance(sha,str) or not re.fullmatch(r"[0-9a-f]{40}",sha):
+ print("PR 未合入 develop，或 PR base/head SHA 与交付分支不匹配",file=sys.stderr); raise SystemExit(1)
+print(sha)' "$expected_sha" "$branch")" || return 1
+  PR_MERGE_SHA="$merge_sha"
 }
 
 # ── cleanup ──
@@ -1162,29 +1183,22 @@ cmd_cleanup() {
   [ "$(current_branch)" = "develop" ] || die "cleanup 需要主目录固定在 develop"
   require_clean_tree "$MAIN_DIR" "cleanup（主目录）"
   local task; task="$(task_file "$issue")"
-  local branch path status delivered_sha branch_sha remote remote_sha delete_scope cleanup_sha drift
+  local branch path status delivered_sha branch_sha remote remote_sha delete_scope cleanup_sha pr_merge_sha integrated_pr
   branch="$(json_get "$task" branch)"; path="$(json_get "$task" path)"
   status="$(json_get "$task" status)"; delivered_sha="$(json_get "$task" delivered_sha)"
+  integrated_pr="$(json_get "$task" integrated_pr)"
   case "$status" in integrated|cleaned) ;; *) die "任务状态为 $status；cleanup 仅接受已集成任务" ;; esac
   [ -n "$delivered_sha" ] || die "缺少 delivered_sha，拒绝清理"
+  [ "$pr" = "$integrated_pr" ] || die "cleanup PR #$pr 与实际集成 PR #${integrated_pr:-missing} 不符"
   branch_sha="$(branch_head "$branch")"
-  cleanup_sha="$delivered_sha"; drift=0
-  if [ "$branch_sha" != "$delivered_sha" ]; then
-    # 交付之后分支又前进了，而上游合并走的正是**当前 HEAD**（例如复核补正在集成之后才落地）。
-    # 这不是"删掉与已交付不同的内容"：证据换成更强的一条——上游自己的 PR 记录
-    # （要求 PR 已并入 main 且 head.sha == 当前分支 HEAD）**加上**该分支相对上游 main
-    # 的独有提交数为 0。两者都成立，等价于"上游拿走的正好是这棵树里的东西"。
-    info "分支 HEAD（${branch_sha:0:12}）与登记 delivered_sha（${delivered_sha:0:12}）不同：改用上游 PR 记录 + 上游包含性核验"
-    upstream_main_contains_branch "$branch" "$branch_sha" || die "分支未完全并入上游 main；拒绝清理"
-    require_authorization "$issue" cleanup "$branch_sha"
-    github_pr_is_merged "$pr" "$branch_sha" "$branch" || die "PR 合并证据未通过核验（要求已并入 main 且 head.sha == 当前分支 HEAD）；未删除任何内容"
-    cleanup_sha="$branch_sha"; drift=1
-  else
-    require_authorization "$issue" cleanup "$delivered_sha"
-    github_pr_is_merged "$pr" "$delivered_sha" "$branch" || die "PR 合并证据未通过核验；未删除任何内容"
-  fi
-  branch_sha="$(branch_head "$branch")"
-  [ "$branch_sha" = "$cleanup_sha" ] || die "PR 核验期间分支 SHA 变化；拒绝清理"
+  [ "$branch_sha" = "$delivered_sha" ] || die "分支在集成后又前进；请对新 SHA 重新验证并通过新 PR 集成后再清理"
+  require_authorization "$issue" cleanup "$delivered_sha"
+  github_pr_is_merged "$pr" "$delivered_sha" "$branch" || die "PR 未合入 GitHub develop，或 head SHA 与交付 SHA 不匹配；拒绝清理"
+  pr_merge_sha="$PR_MERGE_SHA"
+  [ "$pr_merge_sha" = "$(json_get "$task" pr_merge_sha)" ] || die "PR merge SHA 与 integrate 记录不符；拒绝清理"
+  github_develop_contains_commit "$pr_merge_sha" || die "PR merge commit 不在 github/develop；拒绝清理"
+  cleanup_sha="$branch_sha"
+  [ "$(branch_head "$branch")" = "$cleanup_sha" ] || die "PR 核验期间分支 SHA 变化；拒绝清理"
   if [ -d "$path" ]; then
     [ "$(gitq -C "$path" rev-parse --abbrev-ref HEAD)" = "$branch" ] || die "工作树分支与登记不符"
     [ "$(gitq -C "$path" rev-parse HEAD)" = "$cleanup_sha" ] || die "工作树 HEAD 与核验 SHA 不符"
@@ -1195,10 +1209,7 @@ cmd_cleanup() {
   # 在 branch-delete 之前先持久化清理事实；若状态盘写失败，仍保留本地分支。
   json_set "$task" cleanup_pr "$pr" || die "无法记录已核验 PR；保留分支"
   json_set "$task" cleanup_sha "$cleanup_sha" >/dev/null 2>&1 || true
-  if [ "$drift" = "1" ]; then
-    json_set "$task" cleanup_delivered_sha "$delivered_sha" >/dev/null 2>&1 || true
-    audit cleanup-drift "issue=$issue pr=$pr delivered=${delivered_sha:0:12} merged=${cleanup_sha:0:12} by=$WHOAMI_ID"
-  fi
+  json_set "$task" cleanup_pr_merge_sha "$pr_merge_sha" >/dev/null 2>&1 || true
   json_set "$task" status cleaned || die "无法记录清理状态；保留分支"
   json_set "$task" cleaned_at "$(date '+%F %T')" || die "无法记录清理时间；保留分支"
 
@@ -1255,13 +1266,8 @@ cmd_authorize() {
     integrate) [ "$status" = "delivered" ] && [ "$delivered" = "$scope" ] || die "integrate 授权仅能绑定已交付的当前 SHA" ;;
     cleanup|branch-delete)
       [[ "$status" = integrated || "$status" = cleaned ]] || die "$action 授权仅能绑定已集成/已清理的任务"
-      if [ "$delivered" != "$scope" ]; then
-        # 交付之后分支又前进（复核补正在集成后落地）：只有当该分支**已经完全并入上游 main**
-        # 时，才允许把授权绑到当前 HEAD。判据与 cleanup 用的那条一致，避免"授权登记"与
-        # "清理核验"两处对同一情形给出不同答案。
-        upstream_main_contains_branch "$branch" "$scope" || \
-          die "分支与已交付 SHA 不同且未完全并入上游 main；拒绝登记 $action 授权"
-      fi
+      [ "$delivered" = "$scope" ] || \
+        die "分支在集成后又前进；请为新 SHA 重新验证并通过 PR 集成后再授权清理/删除"
       ;;
   esac
   python3 - "$task" "$action" "$scope" "$note" "$WHOAMI_ID" <<'PY' | atomic_json_write "$task"
@@ -1482,8 +1488,8 @@ usage() {
   tools/worktree.sh verify                   # 当前树：干净树跑门禁，原子写证据
   tools/worktree.sh verify-baseline <issue>  # 登记的基线 SHA 同环境复跑门禁留证
   tools/worktree.sh deliver                  # 必须有对应当前 SHA 的验证/批准例外证据
-  tools/worktree.sh integrate <issue>        # 只合并已交付且 SHA 未变化的任务
-  tools/worktree.sh cleanup <issue> <PR>     # 核验上游 PR 合并和 head SHA 后清理
+  tools/worktree.sh integrate <issue> <PR>   # PR 合入 GitHub develop 后，核验并快进本地 develop
+  tools/worktree.sh cleanup <issue> <PR>     # 核验 PR base/head/merge SHA 后清理工作树
   tools/worktree.sh authorize <issue> <动作> <批准理由>
                                              # 记录人工批准意向，绑定当前分支 SHA
   tools/worktree.sh authorize-exception <issue> <提交> <失败门禁> <基线报告> <批准理由>
@@ -1493,8 +1499,9 @@ usage() {
 授权动作：push force-push rebase integrate cleanup branch-delete release deploy restart takeover
 
 环境变量（一般不设）：
-  DSH_WT_ROLE=integrator    以集成/发布执行者身份运行（integrate 必需）
-  DSH_WT_MAIN               主目录（默认：git 报告的 main worktree）
+  DSH_WT_ROLE=integrator    以集成/发布执行者身份运行（integrate/cleanup 必需）
+  DSH_WT_MAIN               主仓库工作树（默认：git 报告的 main worktree；分支必须是 develop）
+  DSH_WT_GITHUB_REPO        develop PR 所属 GitHub 仓库（默认 marktrue-ahu/dsh-mobile-remote）
   DSH_WT_ROOT               新工作树存放目录（默认 <主目录父级>/dsh-mobile-remote-worktrees）
   DSH_WT_STATE              运行状态目录（默认 ~/.local/state/dsh-mobile-remote-workflow）
   DSH_WT_ALLOW_SYNTHETIC=1  允许合成门禁（仅供 tools/worktree-selftest.sh 使用）

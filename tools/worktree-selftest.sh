@@ -36,14 +36,14 @@ slot_is_locked() { # exclusive try fails while any shared/exclusive holder owns 
   return 0
 }
 
-# ── 夹具：临时克隆 + 本地 main/github-main 引用 ──
+# ── 夹具：临时克隆 + main 上游镜像与 github/develop PR 目标 ──
 CLONE="$TMP/repo"
 git clone --no-hardlinks --quiet "$REPO_SRC" "$CLONE" || { say "克隆失败"; exit 1; }
 cd "$CLONE"
 git fetch --quiet origin 'refs/heads/*:refs/remotes/origin/*' 2>/dev/null || true
 MAIN_SHA="$(git rev-parse origin/main 2>/dev/null || git rev-parse origin/develop)"
 git branch -f main "$MAIN_SHA" >/dev/null
-git update-ref refs/remotes/github/main "$MAIN_SHA"   # 模拟 github/main（create 会比对）
+git update-ref refs/remotes/github/main "$MAIN_SHA"   # 模拟 main 上游镜像；create 不再以它为基线
 git checkout --quiet develop
 
 # 假 github 远端：本地裸仓库，让 create 的 `git fetch github` 离线且可控
@@ -58,20 +58,18 @@ cp -p "$REPO_SRC/tools/worktree.sh" "$REPO_SRC/tools/worktree-selftest.sh" "$CLO
 git add tools/worktree.sh tools/worktree-selftest.sh >/dev/null 2>&1
 git -c user.email=selftest@local -c user.name=selftest commit -qm "test: selftest fixture" >/dev/null 2>&1
 
-# main 必须来自真正的 origin/main（不含 AGENTS/CONTEXT/决策文档），
-# 再把工具提交上去，模拟"工具已在 develop/main 版本化"。
+# main 始终只是 origin/main 的镜像；生命周期工具只从 develop 版本化与运行。
 if git rev-parse --verify --quiet origin/main >/dev/null; then
   git checkout --quiet -B main origin/main
-  cp -p "$REPO_SRC/tools/worktree.sh" "$REPO_SRC/tools/worktree-selftest.sh" "$CLONE/tools/"
-  git add tools/worktree.sh tools/worktree-selftest.sh >/dev/null 2>&1
-  git -c user.email=selftest@local -c user.name=selftest commit -qm "chore(tools): selftest fixture on main" >/dev/null 2>&1
 else
   git branch -f main develop >/dev/null
 fi
 git checkout --quiet develop
 git push --quiet "$GITHUB_BARE" main:refs/heads/main
+git push --quiet "$GITHUB_BARE" develop:refs/heads/develop
 git fetch --quiet github
 MAIN_SHA="$(git rev-parse main)"
+DEVELOP_SHA="$(git rev-parse develop)"
 
 # 自测用状态目录/工作树目录：全部隔离在 TMP，不碰真实状态
 export DSH_WT_MAIN="$CLONE"
@@ -83,7 +81,7 @@ export DSH_SESSION_ID="selftest-writer"
 WT="$CLONE/tools/worktree.sh"
 
 say "worktree.sh 自测（临时克隆：$CLONE）"
-say "基线 main = $(git rev-parse --short main)"
+say "feature 基线 develop = $(git rev-parse --short develop)"
 
 section "create 输入边界与并发登记"
 INJECTION_MARKER="$TMP/python-injection-ran"
@@ -110,21 +108,33 @@ WT1="$DSH_WT_ROOT/issue-900-selftest-one"
 [ -d "$WT1" ] && { PASS=$((PASS+1)); say "  PASS  工作树目录已创建"; } || { FAIL=$((FAIL+1)); say "  FAIL  工作树目录缺失"; }
 [ "$(git -C "$WT1" rev-parse --abbrev-ref HEAD)" = "feature/selftest-one" ] \
   && { PASS=$((PASS+1)); say "  PASS  分支名正确"; } || { FAIL=$((FAIL+1)); say "  FAIL  分支名错误"; }
-# 无 --base 时不得出现依赖字段：普通任务不能被误标为"依赖分支例外"。
+[ "$(git -C "$WT1" rev-parse HEAD)" = "$DEVELOP_SHA" ] \
+  && { PASS=$((PASS+1)); say "  PASS  功能分支从 develop 起步"; } || { FAIL=$((FAIL+1)); say "  FAIL  功能分支未从 develop 起步"; }
+python3 - "$DSH_WT_STATE/tasks/900.json" "$DEVELOP_SHA" <<'PY'
+import json,sys
+task,sha=sys.argv[1:3]
+data=json.load(open(task))
+assert data.get("baseline")==sha, data
+assert data.get("baseline_ref")=="develop", data
+PY
+[ "$?" -eq 0 ] && { PASS=$((PASS+1)); say "  PASS  任务基线登记为 develop"; } || { FAIL=$((FAIL+1)); say "  FAIL  任务基线未登记 develop"; }
+# 无 --base 时不得出现依赖字段：普通任务不能被误标为"依赖分支例外".
 run "无 --base 时不登记依赖分支" 0 python3 -c '
 import json,sys
 d=json.load(open(sys.argv[1])); assert "depends_on" not in d, d' "$DSH_WT_STATE/tasks/900.json"
 
-section "规则入口不得落入工作树"
+section "develop 基线决策文件继承，但 feature PR 不得改动它们"
+run "develop 基线确实含决策文档（用例非空跑）" 0 bash -c 'git -C "$1" ls-tree -r --name-only "$2" -- AGENTS.md CONTEXT.md docs/adr docs/agents docs/design | grep -q .' _ "$CLONE" "$DEVELOP_SHA"
 for f in AGENTS.md AGENT-RULES.md CONTEXT.md docs/adr docs/agents docs/design; do
-  [ -e "$WT1/$f" ] && { FAIL=$((FAIL+1)); say "  FAIL  $f 出现在新工作树里"; } \
-                   || { PASS=$((PASS+1)); say "  PASS  $f 未落入工作树"; }
+  git -C "$WT1" diff --quiet "$DEVELOP_SHA" HEAD -- "$f" \
+    && { PASS=$((PASS+1)); say "  PASS  feature diff 未改动 $f"; } \
+    || { FAIL=$((FAIL+1)); say "  FAIL  feature diff 改动了 $f"; }
 done
 
 section "依赖分支例外（--base）"
-# 造一个「未上游化的依赖分支」：从 main 开分支并加一个提交，模拟 issue #14 的情形。
+# 造一个「未合入 develop 的依赖分支」：从 develop 开分支并加一个提交，模拟 issue #14 的情形。
 DEP_BRANCH="feature/dep-probe"
-git -C "$CLONE" branch -f "$DEP_BRANCH" main >/dev/null 2>&1
+git -C "$CLONE" branch -f "$DEP_BRANCH" develop >/dev/null 2>&1
 DEP_WT="$TMP/depbuild"
 git -C "$CLONE" worktree add -q "$DEP_WT" "$DEP_BRANCH" >/dev/null 2>&1
 echo "dep-marker" > "$DEP_WT/dep-only.txt"
@@ -135,7 +145,7 @@ DEP_SHA="$(git -C "$CLONE" rev-parse "$DEP_BRANCH")"
 run "--base 指向不存在的分支被拒" fail bash "$WT" create 890 nobase --base feature/does-not-exist
 run "--base 拒绝非分支形式的取值" fail bash "$WT" create 890 badbase --base main
 run "--base 拒绝任意 rev（防绕过）" fail bash "$WT" create 890 revbase --base "$DEP_SHA"
-run "--base 已在 main 上的分支被拒" fail bash "$WT" create 890 ancestor --base feature/selftest-one
+run "--base 已在 develop 上的分支被拒" fail bash "$WT" create 890 ancestor --base feature/selftest-one
 run "--base 建树成功" 0 bash "$WT" create 891 baseprobe --base "$DEP_BRANCH"
 WT_BASE="$DSH_WT_ROOT/issue-891-baseprobe"
 [ "$(git -C "$WT_BASE" rev-parse HEAD)" = "$DEP_SHA" ] \
@@ -144,16 +154,16 @@ WT_BASE="$DSH_WT_ROOT/issue-891-baseprobe"
 [ -f "$WT_BASE/dep-only.txt" ] \
   && { PASS=$((PASS+1)); say "  PASS  依赖分支的文件确实存在于新树（用例非空跑）"; } \
   || { FAIL=$((FAIL+1)); say "  FAIL  依赖分支内容缺失"; }
-# 关键语义：baseline 仍指上游 main，依赖分支另记。
+# 关键语义：baseline 指创建工作树时的 develop，依赖分支另记。
 TASK_BASE="$DSH_WT_STATE/tasks/891.json"
-python3 - "$TASK_BASE" "$(git -C "$CLONE" rev-parse main)" "$DEP_BRANCH" "$DEP_SHA" <<'PY' \
-  && { PASS=$((PASS+1)); say "  PASS  baseline 仍指上游 main，并登记依赖分支与其 SHA"; } \
+python3 - "$TASK_BASE" "$DEVELOP_SHA" "$DEP_BRANCH" "$DEP_SHA" <<'PY' \
+  && { PASS=$((PASS+1)); say "  PASS  baseline 指向 develop，并登记依赖分支与其 SHA"; } \
   || { FAIL=$((FAIL+1)); say "  FAIL  baseline/依赖分支登记不正确"; }
 import json,sys
-p,main_sha,dep,dep_sha=sys.argv[1:5]
+p,develop_sha,dep,dep_sha=sys.argv[1:5]
 d=json.load(open(p))
-assert d.get("baseline")==main_sha, ("baseline 不是 main", d.get("baseline"), main_sha)
-assert d.get("baseline_ref")=="main", d.get("baseline_ref")
+assert d.get("baseline")==develop_sha, ("baseline 不是 develop", d.get("baseline"), develop_sha)
+assert d.get("baseline_ref")=="develop", d.get("baseline_ref")
 assert d.get("depends_on")==dep, d.get("depends_on")
 assert d.get("depends_on_sha")==dep_sha, d.get("depends_on_sha")
 PY
@@ -248,7 +258,7 @@ TRUNC_REPORT="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["
 cp "$TRUNC_REPORT" "$TMP/report.bak"
 printf -- '- 提交：`%s`\n' "$TRUNC_SHA" > "$TRUNC_REPORT"
 run "报告被截断后 deliver 必须被拒" fail bash "$WT" deliver
-run "报告被截断后 integrate 必须被拒" fail env DSH_WT_ROLE=integrator bash "$WT" integrate 900
+run "报告被截断后 integrate 必须被拒" fail env DSH_WT_ROLE=integrator bash "$WT" integrate 900 777
 # 把必需门禁结果伪造成全 PASS 但仍缺结构/或缺项，同样拒绝。
 python3 - "$TRUNC_REPORT" "$TRUNC_SHA" <<'PY'
 import json,sys
@@ -270,7 +280,7 @@ PY
 run "伪造 skipped 冒充通过的报告被拒" fail bash "$WT" deliver
 cp "$TMP/report.bak" "$TRUNC_REPORT"
 # 本节的提交是为了验证证据绑定；恢复基线状态，让后续"相对基线无提交"的用例成立。
-git -C "$WT1" reset --hard -q "$MAIN_SHA"
+git -C "$WT1" reset --hard -q "$DEVELOP_SHA"
 run "恢复基线后相对基线无提交" fail bash "$WT" deliver
 
 section "verify 脏树、原子报告与 deliver"
@@ -280,7 +290,7 @@ git add -A >/dev/null 2>&1
 git -c user.email=t@t -c user.name=t commit -qm "test: selftest commit" >/dev/null 2>&1
 CURRENT_SHA="$(git -C "$WT1" rev-parse --short=12 HEAD)"
 DELIVERY_SHORT="$(git -C "$WT1" rev-parse --short HEAD)"
-run "确认已产生提交" 0 bash -c '[ "$(git -C "$1" rev-parse HEAD)" != "$2" ]' _ "$WT1" "$MAIN_SHA"
+run "确认已产生提交" 0 bash -c '[ "$(git -C "$1" rev-parse HEAD)" != "$2" ]' _ "$WT1" "$DEVELOP_SHA"
 run "有提交但未验证时 deliver 被拒（必须带证据）" fail bash "$WT" deliver
 mv "$DSH_WT_STATE/reports" "$DSH_WT_STATE/reports.saved"
 printf 'block report directory creation\\n' >"$DSH_WT_STATE/reports"
@@ -396,8 +406,8 @@ with open(p,"w",encoding="utf-8") as f:
 PY
 }
 make_report "$SKIP_CURRENT" "$SKIP_SHA" skipped
-make_report "$SKIP_BASELINE" "$(git -C "$WT1" rev-parse "$MAIN_SHA" 2>/dev/null || git -C "$CLONE" rev-parse main)" executed
-python3 - "$DSH_WT_STATE/tasks/900.json" "$SKIP_CURRENT" "$SKIP_BASELINE" "$(git -C "$CLONE" rev-parse main)" <<'PY'
+make_report "$SKIP_BASELINE" "$DEVELOP_SHA" executed
+python3 - "$DSH_WT_STATE/tasks/900.json" "$SKIP_CURRENT" "$SKIP_BASELINE" "$DEVELOP_SHA" <<'PY'
 import json,sys
 p,cur,base,bsha=sys.argv[1:5]
 with open(p,encoding="utf-8") as f: d=json.load(f)
@@ -451,53 +461,63 @@ run "恢复后提交无例外也能交付" 0 bash "$WT" deliver
 section "脏树守卫"
 echo "dirty" >> README.md
 run "脏树 deliver 被拒" fail bash "$WT" deliver
-run "脏树 integrator 合并被拒" fail env DSH_WT_ROLE=integrator bash "$WT" integrate 900
+run "脏树 integrator 合并被拒" fail env DSH_WT_ROLE=integrator bash "$WT" integrate 900 777
 git checkout -- README.md
 
 section "禁带文件泄漏检查"
 mkdir -p docs/adr && echo "secret" > docs/adr/9999-leak.md
 git add -A >/dev/null 2>&1 && git -c user.email=t@t -c user.name=t commit -qm "docs: leak"
 run "提交里含 docs/adr 时 deliver 被拒" fail bash "$WT" deliver
-git rm -rq docs/adr && git -c user.email=t@t -c user.name=t commit -qm "revert: leak"
+git rm -q docs/adr/9999-leak.md && git -c user.email=t@t -c user.name=t commit -qm "revert: leak"
 
-section "集成只接受最新已交付 SHA 与匹配授权"
+section "PR 合入 develop 后才 integrate；本地只快进到远端 develop"
 cd "$WT1"
-run "基于旧 delivered_sha 的分支更新不能直接 integrate" fail env DSH_WT_ROLE=integrator bash "$WT" integrate 900
+run "integrate 必须提供 PR 编号" fail env DSH_WT_ROLE=integrator bash "$WT" integrate 900
 run "修复后的分支提交重新 verify" 0 bash "$WT" verify
 run "deliver 更新到当前 SHA" 0 bash "$WT" deliver
 DELIVERED_SHA="$(git -C "$WT1" rev-parse HEAD)"
 cd "$CLONE"
-run "非集成角色 integrate 被拒" fail bash "$WT" integrate 900
-run "集成角色但无授权被拒" fail env DSH_WT_ROLE=integrator bash "$WT" integrate 900
-run "登记 integrate 授权" 0 env DSH_WT_ROLE=integrator bash "$WT" authorize 900 integrate "用户批准集成此 SHA"
+run "非集成角色 integrate 被拒" fail bash "$WT" integrate 900 777
+run "集成角色但无授权被拒" fail env DSH_WT_ROLE=integrator bash "$WT" integrate 900 777
+run "登记 integrate 授权" 0 env DSH_WT_ROLE=integrator bash "$WT" authorize 900 integrate "用户批准同步已合并 PR"
 cd "$WT1"
 git -c user.email=t@t -c user.name=t commit --allow-empty -qm "test: advance after authorization"
 cd "$CLONE"
-run "授权后分支 SHA 变化不能 integrate" fail env DSH_WT_ROLE=integrator bash "$WT" integrate 900
+run "授权后分支 SHA 变化不能 integrate" fail env DSH_WT_ROLE=integrator DSH_WT_TEST_MERGED_PR="777:$DELIVERED_SHA:feature/selftest-one:develop:$DELIVERED_SHA" bash "$WT" integrate 900 777
 cd "$WT1"
 run "新 SHA verify/deliver" 0 bash "$WT" verify
 run "新 SHA deliver" 0 bash "$WT" deliver
 DELIVERED_SHA="$(git -C "$WT1" rev-parse HEAD)"
 cd "$CLONE"
-run "旧 SHA 授权不能用于新 SHA" fail env DSH_WT_ROLE=integrator bash "$WT" integrate 900
+run "旧 SHA 授权不能用于新 SHA" fail env DSH_WT_ROLE=integrator DSH_WT_TEST_MERGED_PR="777:$DELIVERED_SHA:feature/selftest-one:develop:$DELIVERED_SHA" bash "$WT" integrate 900 777
 run "为新 SHA 登记 integrate 授权" 0 env DSH_WT_ROLE=integrator bash "$WT" authorize 900 integrate "用户批准最新交付 SHA"
-run "集成执行者合并精确交付分支并跑门禁" 0 env DSH_WT_ROLE=integrator bash "$WT" integrate 900
-run "develop 已含已交付分支提交" 0 bash -c 'git -C "$1" merge-base --is-ancestor feature/selftest-one develop' _ "$CLONE"
+run "PR base 不是 develop 时拒绝 integrate" fail env DSH_WT_ROLE=integrator DSH_WT_TEST_MERGED_PR="777:$DELIVERED_SHA:feature/selftest-one:main:$DELIVERED_SHA" bash "$WT" integrate 900 777
+
+# 模拟 GitHub PR merge commit：远端 develop 前进，本地 develop 保持旧 tip，integrate 必须只做 fast-forward。
+PR_BASE_SHA="$(git -C "$CLONE" rev-parse develop)"
+git -C "$CLONE" merge --no-ff --no-edit feature/selftest-one >/dev/null
+git -C "$CLONE" push --quiet --force "$GITHUB_BARE" develop:refs/heads/develop
+PR_MERGE_SHA="$(git -C "$CLONE" rev-parse HEAD)"
+git -C "$CLONE" reset --hard --quiet "$PR_BASE_SHA"
+git -C "$CLONE" fetch --quiet github develop
+PR_FAKE="777:$DELIVERED_SHA:feature/selftest-one:develop:$PR_MERGE_SHA"
+run "集成执行者核验已合入 PR、快进 develop 并跑门禁" 0 env DSH_WT_ROLE=integrator DSH_WT_TEST_MERGED_PR="$PR_FAKE" bash "$WT" integrate 900 777
+run "develop 已含 PR merge commit 与交付分支" 0 bash -c 'git -C "$1" merge-base --is-ancestor "$2" develop && git -C "$1" merge-base --is-ancestor feature/selftest-one develop' _ "$CLONE" "$PR_MERGE_SHA"
+DEVELOP_SHA="$(git -C "$CLONE" rev-parse develop)"
 
 section "cleanup 要求已合并且 head SHA 匹配的 PR"
 run "无授权 cleanup 被拒" fail env DSH_WT_ROLE=integrator bash "$WT" cleanup 900 777
 run "登记 cleanup 授权" 0 env DSH_WT_ROLE=integrator bash "$WT" authorize 900 cleanup "用户批准清理已合并 PR"
-run "PR head SHA 不匹配时不删工作树" fail env DSH_WT_ROLE=integrator DSH_WT_TEST_MERGED_PR="777:wrong-sha:feature/selftest-one" bash "$WT" cleanup 900 777
+run "PR head SHA 不匹配时不删工作树" fail env DSH_WT_ROLE=integrator DSH_WT_TEST_MERGED_PR="777:wrong-sha:feature/selftest-one:develop:$PR_MERGE_SHA" bash "$WT" cleanup 900 777
 [ -d "$WT1" ] && { PASS=$((PASS+1)); say "  PASS  PR 证据不匹配时工作树保留"; } || { FAIL=$((FAIL+1)); say "  FAIL  PR 不匹配却删除工作树"; }
-# 交付之后分支又前进（复核补正常在集成之后落地）：此时证据换成「上游 PR 记录 + 上游包含性」。
-# 安全方向：上游 main 还没包含该分支时，即使 PR 记录匹配也必须拒绝。
+# 交付后分支若再前进，旧 delivered_sha/PR 证据不覆盖新提交；必须重新验证并走新 PR。
 git -C "$WT1" commit --allow-empty -qm "test: drift after delivery"
 DRIFT_SHA="$(git -C "$WT1" rev-parse HEAD)"
 run "漂移且上游未包含时拒绝登记 cleanup 授权" fail env DSH_WT_ROLE=integrator bash "$WT" authorize 900 cleanup "试图把授权绑到漂移 SHA"
-run "交付后分支前进但上游未包含 → 拒绝清理" fail env DSH_WT_ROLE=integrator DSH_WT_TEST_MERGED_PR="777:$DRIFT_SHA:feature/selftest-one" bash "$WT" cleanup 900 777
+run "交付后分支前进但上游未包含 → 拒绝清理" fail env DSH_WT_ROLE=integrator DSH_WT_TEST_MERGED_PR="777:$DRIFT_SHA:feature/selftest-one:develop:$DRIFT_SHA" bash "$WT" cleanup 900 777
 [ -d "$WT1" ] && { PASS=$((PASS+1)); say "  PASS  上游未包含时工作树保留"; } || { FAIL=$((FAIL+1)); say "  FAIL  上游未包含却删除工作树"; }
 git -C "$WT1" reset --hard --quiet "$DELIVERED_SHA"
-run "核验合并 PR 后 cleanup 成功" 0 env DSH_WT_ROLE=integrator DSH_WT_TEST_MERGED_PR="777:$DELIVERED_SHA:feature/selftest-one" bash "$WT" cleanup 900 777
+run "核验合并 PR 后 cleanup 成功" 0 env DSH_WT_ROLE=integrator DSH_WT_TEST_MERGED_PR="$PR_FAKE" bash "$WT" cleanup 900 777
 [ -d "$WT1" ] && { FAIL=$((FAIL+1)); say "  FAIL  工作树仍在"; } || { PASS=$((PASS+1)); say "  PASS  工作树已移除"; }
 if git -C "$CLONE" show-ref --verify --quiet refs/heads/feature/selftest-one; then
   PASS=$((PASS+1)); say "  PASS  未授权 branch-delete 时保留本地分支"
@@ -505,31 +525,40 @@ else
   FAIL=$((FAIL+1)); say "  FAIL  未授权时分支被删除"
 fi
 
-section "基线含禁带文件时拒绝建树"
+section "develop 基线文件可继承，但 feature PR 不得修改规则文档"
 cd "$CLONE"
-git checkout --quiet -B leaky-main main
+git checkout --quiet -B leaky-develop develop
 printf 'x\n' > AGENT-RULES.md
-# AGENT-RULES.md 在本机被 gitignore，必须 -f 才能真的进入基线提交（否则用例是空跑）
-run "把 AGENT-RULES.md 强加进基线提交" 0 bash -c 'cd "$1" && git add -f AGENT-RULES.md && git -c user.email=t@t -c user.name=t commit -qm "chore: leak base"' _ "$CLONE"
-run "确认基线确实带上了该文件" 0 bash -c 'cd "$1" && git ls-tree -r --name-only leaky-main -- AGENT-RULES.md | grep -q AGENT-RULES.md' _ "$CLONE"
-git branch -f main leaky-main >/dev/null
-git push --quiet --force "$GITHUB_BARE" leaky-main:refs/heads/main
+# AGENT-RULES.md 在本机被 gitignore，必须 -f 才能真的进入 develop 基线提交（否则用例是空跑）
+run "把 AGENT-RULES.md 加入测试 develop 基线" 0 bash -c 'cd "$1" && git add -f AGENT-RULES.md && git -c user.email=t@t -c user.name=t commit -qm "chore: add rules to develop fixture"' _ "$CLONE"
+git checkout --quiet develop
+git reset --hard --quiet leaky-develop
+DEVELOP_SHA="$(git rev-parse develop)"
+git push --quiet --force "$GITHUB_BARE" develop:refs/heads/develop
+git fetch --quiet github
+run "develop 基线已有 Agent-Rules 时仍允许从 develop 建树" 0 bash "$WT" create 902 rules-base
+WT_RULES="$DSH_WT_ROOT/issue-902-rules-base"
+[ "$(git -C "$WT_RULES" rev-parse HEAD)" = "$DEVELOP_SHA" ] \
+  && { PASS=$((PASS+1)); say "  PASS  rules-base 从当前 develop 起步"; } \
+  || { FAIL=$((FAIL+1)); say "  FAIL  rules-base 起点不是 develop"; }
+[ -f "$WT_RULES/AGENT-RULES.md" ] \
+  && { PASS=$((PASS+1)); say "  PASS  develop 已有的 Agent-Rules 被继承"; } \
+  || { FAIL=$((FAIL+1)); say "  FAIL  develop 的 Agent-Rules 未被继承"; }
+printf 'feature-change\n' >> "$WT_RULES/AGENT-RULES.md"
+git -C "$WT_RULES" add -f AGENT-RULES.md >/dev/null 2>&1
+git -C "$WT_RULES" -c user.email=t@t -c user.name=t commit -qm "test: modify inherited agent rules"
+run "feature PR 修改继承的 Agent-Rules 被拒" fail bash -c 'cd "$1" && bash "$2" deliver' _ "$WT_RULES" "$WT_RULES/tools/worktree.sh"
+
+section "本地 develop 与 github/develop 不一致时拒绝建树"
+git checkout --quiet -b github-develop-advanced develop
+git -c user.email=t@t -c user.name=t commit --allow-empty -qm "test: advance github develop only"
+git push --quiet --force "$GITHUB_BARE" github-develop-advanced:refs/heads/develop
 git fetch --quiet github
 git checkout --quiet develop
-run "基线含 AGENT-RULES.md → create 被拒" fail bash "$WT" create 902 leaky-base
-run "被拒后没有留下工作树" fail bash -c '[ -d "$1" ]' _ "$DSH_WT_ROOT/issue-902-leaky-base"
-git branch -f main "$MAIN_SHA" >/dev/null
-git branch -D leaky-main >/dev/null 2>&1
-git push --quiet --force "$GITHUB_BARE" main:refs/heads/main
+run "本地 develop 落后 github/develop → create 被拒" fail bash "$WT" create 903 stale-base
+git push --quiet --force "$GITHUB_BARE" develop:refs/heads/develop
 git fetch --quiet github
-
-section "main 与 github/main 不一致时拒绝建树"
-# github/main 推进到 develop，制造 main 落后
-git push --quiet --force "$GITHUB_BARE" develop:refs/heads/main
-git fetch --quiet github
-run "main 落后 github/main → create 被拒" fail bash "$WT" create 903 stale-base
-git push --quiet --force "$GITHUB_BARE" main:refs/heads/main
-git fetch --quiet github
+git branch -D github-develop-advanced >/dev/null 2>&1
 
 section "结果"
 say "通过 $PASS / 失败 $FAIL"
