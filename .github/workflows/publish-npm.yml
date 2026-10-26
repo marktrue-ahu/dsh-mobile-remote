@@ -218,6 +218,7 @@ jobs:
           env \
             -u DSH_PROFILE -u DSH_PROFILE_DIR -u DSH_SESSION_ID \
             -u DSH_SHELL -u DSH_WEB_URL -u DSH_WEB_FOREGROUND -u INVOCATION_ID \
+            -u ANDROID_HOME -u ANDROID_SDK_ROOT -u ANDROID_SDK_HOME \
             -u NPM_TOKEN -u NODE_AUTH_TOKEN \
             -u NPM_CONFIG_USERCONFIG -u npm_config_userconfig \
             -u NPM_CONFIG_REGISTRY -u npm_config_registry \
