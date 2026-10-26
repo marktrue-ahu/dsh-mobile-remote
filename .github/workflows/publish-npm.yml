@@ -120,6 +120,22 @@ jobs:
           [[ -n "$plugin_tag" ]] || { echo '::error::Could not derive plugin dist-tag.'; exit 1; }
           carrier_version="${plugin_version}-app"
 
+          latest_log="$RUNNER_TEMP/npm-latest-before.log"
+          if npm view "$PACKAGE_NAME@latest" version --json --prefer-online \
+            --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" > "$latest_log" 2>&1; then
+            latest_version="$(jq -r '.' "$latest_log")"
+          elif grep -q 'E404' "$latest_log"; then
+            latest_version=""
+          else
+            code="$(sed -n 's/^npm error code //p' "$latest_log" | head -1)"
+            echo "::error::Could not read npm latest (code=${code:-unknown})."
+            exit 1
+          fi
+          if [[ "$plugin_tag" != "latest" && -z "$latest_version" ]]; then
+            echo '::error::A prerelease cannot run without an existing latest baseline; set the tag policy explicitly first.'
+            exit 1
+          fi
+
           # Refuse to roll a dist-tag backward. Compare against the current version on
           # the channel this release will update (latest for stable, alpha/beta/etc. for prerelease).
           channel_log="$RUNNER_TEMP/npm-channel-${plugin_tag}.log"
