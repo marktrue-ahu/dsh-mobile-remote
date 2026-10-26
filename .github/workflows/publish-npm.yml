@@ -16,7 +16,7 @@ concurrency:
 jobs:
   publish:
     name: Build, verify, and publish npm packages
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: npm-publish
     timeout-minutes: 120
 
