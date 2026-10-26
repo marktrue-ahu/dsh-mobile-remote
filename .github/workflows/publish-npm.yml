@@ -197,13 +197,19 @@ jobs:
           set -euo pipefail
           gate_home="$(mktemp -d)"
           trap 'rm -rf "$gate_home"' EXIT
-          HOME="$gate_home" \
-          DSH_HOME="$gate_home/.dsh" \
-          XDG_CONFIG_HOME="$gate_home/.config" \
-          XDG_CACHE_HOME="$gate_home/.cache" \
-          XDG_DATA_HOME="$gate_home/.local/share" \
-          npm_config_cache="$gate_home/.npm-cache" \
-          node --test test/*.mjs
+          env \
+            -u DSH_PROFILE -u DSH_PROFILE_DIR -u DSH_SESSION_ID \
+            -u DSH_SHELL -u DSH_WEB_URL -u DSH_WEB_FOREGROUND -u INVOCATION_ID \
+            -u NPM_TOKEN -u NODE_AUTH_TOKEN \
+            -u NPM_CONFIG_USERCONFIG -u npm_config_userconfig \
+            -u NPM_CONFIG_REGISTRY -u npm_config_registry \
+            HOME="$gate_home" \
+            DSH_HOME="$gate_home/.dsh" \
+            XDG_CONFIG_HOME="$gate_home/.config" \
+            XDG_CACHE_HOME="$gate_home/.cache" \
+            XDG_DATA_HOME="$gate_home/.local/share" \
+            npm_config_cache="$gate_home/.npm-cache" \
+            node --test test/*.mjs
 
       - name: Run Flutter analysis and tests
         working-directory: dsh-mobile-app
