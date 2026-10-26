@@ -14,6 +14,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import { pluginContentDigest } from "../lib/plugin-content-digest.js";
+import { buildIsolatedUserConfig, verifyRegistryScope, writeEmptyGlobalConfig } from "../tools/lib/npm-drill/registry.mjs";
+import { isolatedEnv } from "../tools/lib/npm-drill/process.mjs";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const CLI = join(ROOT, "tools", "npm-drill.mjs");
@@ -392,6 +394,36 @@ test("R2 负向：源清单内容标识错误（真实插件摘要不符）→ �
 		assert.equal(runs[0].record.phases.some((phase) => phase.name === "setup"), false, "不得进入投影/registry 阶段");
 	} finally {
 		await rm(workRoot, { recursive: true, force: true });
+	}
+});
+
+test("registry self-check ignores an ancestor project .npmrc", async () => {
+	const scratch = await mkdtemp(join(tmpdir(), "npm-drill-ancestor-npmrc-"));
+	try {
+		const home = join(scratch, "home");
+		await mkdir(home, { recursive: true });
+		await writeFile(join(home, "package.json"), `${JSON.stringify({ name: "npm-drill-home-project", private: true }, null, 2)}\n`);
+		await writeFile(join(home, ".npmrc"), [
+			`prefix=${join(home, ".npm-global")}`,
+			"registry=https://registry.npmmirror.com/",
+			"@marktrue:registry=https://registry.npmmirror.com/",
+			"",
+		].join("\n"));
+		const runDir = join(home, ".dsh", "mobile-remote", "drill", "registry-check");
+		const registryUrl = "http://127.0.0.1:4879/";
+		const pluginName = "@marktrue/dsh-mobile-remote";
+		const built = buildIsolatedUserConfig({ runDir, label: "normal", registryUrl, pluginName });
+		const globalconfig = writeEmptyGlobalConfig({ runDir, label: "normal" });
+		const check = await verifyRegistryScope({
+			registryUrl,
+			userconfig: built.path,
+			globalconfig,
+			pluginName,
+			env: isolatedEnv({ home: join(home, ".dsh") }),
+		});
+		assert.equal(check.ok, true, check.detail);
+	} finally {
+		await rm(scratch, { recursive: true, force: true });
 	}
 });
 
