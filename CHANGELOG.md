@@ -1,5 +1,12 @@
 # Changelog
 
+## v3.2.1-alpha.3（2026-10-26）— Android release 签名密钥迁移
+
+> 插件 `3.2.1-alpha.3` / App `3.2.1+25` / 载体 `3.2.1-alpha.3-app`。插件更新 `alpha` dist-tag；`latest` 保持在 alpha1。
+
+- APK 使用新的 Android release keystore 重新构建，并在发布前校验签名证书指纹。
+- 签名证书与 alpha1/alpha2 不同：安装 alpha3 前必须卸载旧 App 后重装；卸载可能清除本机 App 数据。
+
 ## v3.2.1-alpha.2（2026-10-26）— Trusted Publisher 自动发布预演
 
 > 插件 `3.2.1-alpha.2` / App `3.2.1+24` / 载体 `3.2.1-alpha.2-app`。插件更新 `alpha` dist-tag；`latest` 保持在 alpha1。
