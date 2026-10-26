@@ -123,6 +123,29 @@ run "无 --base 时不登记依赖分支" 0 python3 -c '
 import json,sys
 d=json.load(open(sys.argv[1])); assert "depends_on" not in d, d' "$DSH_WT_STATE/tasks/900.json"
 
+section "upstream-main target 从 main 镜像建干净分支"
+run "create 接受 --target upstream-main" 0 bash "$WT" create 904 upstream-probe --target upstream-main
+WT_UPSTREAM="$DSH_WT_ROOT/issue-904-upstream-probe"
+if [ -d "$WT_UPSTREAM" ]; then
+  [ "$(git -C "$WT_UPSTREAM" rev-parse --abbrev-ref HEAD)" = "upstream/upstream-probe" ] \
+    && { PASS=$((PASS+1)); say "  PASS  上游分支使用 upstream/* 前缀"; } \
+    || { FAIL=$((FAIL+1)); say "  FAIL  上游分支前缀错误"; }
+  [ "$(git -C "$WT_UPSTREAM" rev-parse HEAD)" = "$MAIN_SHA" ] \
+    && { PASS=$((PASS+1)); say "  PASS  上游分支从 main 镜像起步"; } \
+    || { FAIL=$((FAIL+1)); say "  FAIL  上游分支没有从 main 镜像起步"; }
+  python3 - "$DSH_WT_STATE/tasks/904.json" "$MAIN_SHA" <<'PY'
+import json,sys
+task,sha=sys.argv[1:3]
+data=json.load(open(task))
+assert data.get("target")=="upstream-main", data
+assert data.get("baseline")==sha and data.get("baseline_ref")=="main", data
+PY
+  [ "$?" -eq 0 ] && { PASS=$((PASS+1)); say "  PASS  上游任务登记 main 基线与目标"; } || { FAIL=$((FAIL+1)); say "  FAIL  上游任务元数据不正确"; }
+else
+  FAIL=$((FAIL+1)); say "  FAIL  upstream-main 工作树未创建";
+fi
+run "upstream-main 禁止依赖 develop feature 分支" fail bash "$WT" create 905 unsafe-base --target upstream-main --base feature/selftest-one
+
 section "develop 基线决策文件继承，但 feature PR 不得改动它们"
 run "develop 基线确实含决策文档（用例非空跑）" 0 bash -c 'git -C "$1" ls-tree -r --name-only "$2" -- AGENTS.md CONTEXT.md docs/adr docs/agents docs/design | grep -q .' _ "$CLONE" "$DEVELOP_SHA"
 for f in AGENTS.md AGENT-RULES.md CONTEXT.md docs/adr docs/agents docs/design; do
@@ -524,6 +547,38 @@ if git -C "$CLONE" show-ref --verify --quiet refs/heads/feature/selftest-one; th
 else
   FAIL=$((FAIL+1)); say "  FAIL  未授权时分支被删除"
 fi
+
+section "upstream-main PR merge 更新 main 镜像但不改 develop"
+cd "$WT_UPSTREAM"
+printf 'upstream contribution\n' > upstream-contribution.txt
+git add upstream-contribution.txt >/dev/null 2>&1
+git -c user.email=t@t -c user.name=t commit -qm "feat: upstream contribution fixture"
+run "upstream-main 分支 verify" 0 bash "$WT" verify
+run "upstream-main 分支 deliver" 0 bash "$WT" deliver
+UPSTREAM_DELIVERED_SHA="$(git rev-parse HEAD)"
+cd "$CLONE"
+UPSTREAM_DEVELOP_BEFORE="$(git rev-parse develop)"
+run "授权 upstream-main integrate" 0 env DSH_WT_ROLE=integrator bash "$WT" authorize 904 integrate "用户批准核验 upstream main PR"
+UPSTREAM_MAIN_BASE="$(git rev-parse main)"
+git checkout --quiet -b simulate-upstream-pr "$UPSTREAM_MAIN_BASE"
+git merge --no-ff --no-edit upstream/upstream-probe >/dev/null
+git push --quiet --force "$GITHUB_BARE" simulate-upstream-pr:refs/heads/main
+UPSTREAM_PR_MERGE_SHA="$(git rev-parse HEAD)"
+git checkout --quiet develop
+git branch -D simulate-upstream-pr >/dev/null 2>&1
+git fetch --quiet github main
+UPSTREAM_PR_FAKE="904:$UPSTREAM_DELIVERED_SHA:upstream/upstream-probe:main:$UPSTREAM_PR_MERGE_SHA"
+run "upstream-main PR merge 后只快进本地 main" 0 env DSH_WT_ROLE=integrator DSH_WT_TEST_MERGED_PR="$UPSTREAM_PR_FAKE" bash "$WT" integrate 904 904
+[ "$(git rev-parse main)" = "$UPSTREAM_PR_MERGE_SHA" ] \
+  && { PASS=$((PASS+1)); say "  PASS  本地 main mirror 已快进到 PR merge"; } \
+  || { FAIL=$((FAIL+1)); say "  FAIL  本地 main mirror 未到 PR merge"; }
+[ "$(git rev-parse develop)" = "$UPSTREAM_DEVELOP_BEFORE" ] \
+  && { PASS=$((PASS+1)); say "  PASS  upstream-main integrate 未改动 develop"; } \
+  || { FAIL=$((FAIL+1)); say "  FAIL  upstream-main integrate 改动了 develop"; }
+run "授权 upstream-main cleanup" 0 env DSH_WT_ROLE=integrator bash "$WT" authorize 904 cleanup "用户批准清理已合入上游的工作树"
+run "核验 upstream-main PR 后 cleanup 成功" 0 env DSH_WT_ROLE=integrator DSH_WT_TEST_MERGED_PR="$UPSTREAM_PR_FAKE" bash "$WT" cleanup 904 904
+[ -d "$WT_UPSTREAM" ] && { FAIL=$((FAIL+1)); say "  FAIL  upstream 工作树仍在"; } || { PASS=$((PASS+1)); say "  PASS  upstream 工作树已清理"; }
+run "origin/main 镜像未同步时拒绝新 upstream 工作树" fail bash "$WT" create 906 stale-origin --target upstream-main
 
 section "develop 基线文件可继承，但 feature PR 不得修改规则文档"
 cd "$CLONE"
