@@ -62,12 +62,14 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # Alpha.3 migrates from the legacy debug key to the configured release key,
+      # so it must build a fresh APK instead of reusing alpha.2's carrier.
       - name: Set up Android SDK
-        if: ${{ !contains(github.ref_name, '-') }}
+        if: ${{ !contains(github.ref_name, '-') || github.ref_name == 'v3.2.1-alpha.3' }}
         uses: android-actions/setup-android@v3
 
       - name: Install Android build tools
-        if: ${{ !contains(github.ref_name, '-') }}
+        if: ${{ !contains(github.ref_name, '-') || github.ref_name == 'v3.2.1-alpha.3' }}
         run: sdkmanager 'platform-tools' 'platforms;android-36' 'build-tools;36.0.0'
 
       - name: Set up Flutter
@@ -237,9 +239,10 @@ jobs:
           flutter test --no-pub
 
       # key.properties and the keystore are intentionally not committed.
-      # Configure these GitHub Actions secrets with the same key used by existing APKs.
+      # Stable releases and alpha.3 use the configured release key; alpha.3 is the
+      # one-time signing migration from the legacy debug-signed prerelease APKs.
       - name: Configure Android signing key
-        if: env.PLUGIN_TAG == 'latest'
+        if: env.PLUGIN_TAG == 'latest' || github.ref_name == 'v3.2.1-alpha.3'
         shell: bash
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -263,12 +266,12 @@ jobs:
           EOF
 
       - name: Build signed Android APK
-        if: env.PLUGIN_TAG == 'latest'
+        if: env.PLUGIN_TAG == 'latest' || github.ref_name == 'v3.2.1-alpha.3'
         working-directory: dsh-mobile-app
         run: flutter build apk --release --no-pub
 
       - name: Verify APK signing certificate
-        if: env.PLUGIN_TAG == 'latest'
+        if: env.PLUGIN_TAG == 'latest' || github.ref_name == 'v3.2.1-alpha.3'
         env:
           EXPECTED_ANDROID_CERT_SHA256: ${{ vars.ANDROID_CERT_SHA256 }}
         run: |
@@ -284,10 +287,10 @@ jobs:
             exit 1
           fi
 
-      # Plugin-only prereleases reuse the previous published carrier APK. This preserves
-      # the existing Android signature/build number and avoids rebuilding an unchanged app.
+      # Plugin-only prereleases reuse the previous published carrier APK. Alpha.3 is
+      # excluded because it rebuilds with the new release key and incremented build number.
       - name: Reuse previous carrier APK for prerelease
-        if: env.PLUGIN_TAG != 'latest'
+        if: env.PLUGIN_TAG != 'latest' && github.ref_name != 'v3.2.1-alpha.3'
         shell: bash
         env:
           REGISTRY: https://registry.npmjs.org/
