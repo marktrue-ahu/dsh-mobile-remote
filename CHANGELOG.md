@@ -1,5 +1,12 @@
 # Changelog
 
+## v3.2.1-alpha.2（2026-10-26）— Trusted Publisher 自动发布预演
+
+> 插件 `3.2.1-alpha.2` / App `3.2.1+24` / 载体 `3.2.1-alpha.2-app`。插件更新 `alpha` dist-tag；`latest` 保持在 alpha1。
+
+- 接入 GitHub Actions OIDC 自动构建与 npm 发布。
+- App 未变，carrier 复用 alpha1 的已发布 APK（`3.2.1+24`），仅更新插件配对信息。
+
 ## v3.2.1-alpha.1（2026-10-24）— Desktop 连接、版本偏斜与 npm 载体预发布
 
 > 插件 `3.2.1-alpha.1` / App `3.2.1+24` / 载体 `3.2.1-alpha.1-app`。主插件发布到 npm `alpha` dist-tag；不移动 `latest`。
