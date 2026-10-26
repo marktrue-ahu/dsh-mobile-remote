@@ -1,0 +1,442 @@
+name: Publish npm release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build, verify, and publish npm packages
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out tagged release
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Ensure tag commit belongs to a release branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin '+refs/heads/release/*:refs/remotes/origin/release/*' --no-tags
+          release_refs="$(git branch -r --contains "$GITHUB_SHA" --format='%(refname:short)' | grep -E '^origin/release/' || true)"
+          if [[ -z "$release_refs" ]]; then
+            echo '::error::Version tags must point to a commit contained in a release/* branch.'
+            exit 1
+          fi
+          printf 'Release branch ancestry verified: %s\n' "$release_refs"
+
+      - name: Set up Node for npm Trusted Publishing
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org/'
+          package-manager-cache: false
+
+      # npm dist-tag OIDC support requires npm >= 11.21.0. No NPM_TOKEN is used.
+      - name: Pin npm CLI
+        run: npm install --global npm@11.21.0 --registry https://registry.npmjs.org/
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: '11.22.0'
+          run_install: false
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build tools
+        run: sdkmanager 'platform-tools' 'platforms;android-36' 'build-tools;36.0.0'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.1'
+          channel: stable
+          cache: true
+
+      - name: Validate tag and version pairing
+        shell: bash
+        env:
+          REGISTRY: https://registry.npmjs.org/
+          PACKAGE_NAME: '@marktrue/dsh-mobile-remote'
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REF_TYPE:-}" == "tag" ]] || {
+            echo '::error::This workflow only publishes version tags.'
+            exit 1
+          }
+
+          plugin_version="$(node -p "require('./package.json').version")"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [[ "$plugin_version" != "$tag_version" ]]; then
+            echo "::error::Git tag ($tag_version) must equal package.json version ($plugin_version)."
+            exit 1
+          fi
+          if [[ ! "$plugin_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "::error::Invalid npm plugin version: $plugin_version"
+            exit 1
+          fi
+
+          app_version="$(sed -nE 's/^version:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+\+[0-9]+)([[:space:]]+#.*)?[[:space:]]*$/\1/p' dsh-mobile-app/pubspec.yaml | head -1)"
+          app_core="${app_version%+*}"
+          plugin_core="${plugin_version%%-*}"
+          if [[ -z "$app_version" || "$app_core" != "$plugin_core" ]]; then
+            echo "::error::App version ($app_version) must use plugin core $plugin_core."
+            exit 1
+          fi
+
+          # Keep tag derivation identical to the packaging/drill tooling in the tagged commit.
+          plugin_tag="$(node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            import { pluginPublishTag } from "./dsh-mobile-app/tools/lib/release-checks.mjs";
+            const version = JSON.parse(readFileSync("./package.json", "utf8")).version;
+            const tag = pluginPublishTag(version);
+            if (!tag) process.exit(1);
+            process.stdout.write(tag);
+          ')"
+          [[ -n "$plugin_tag" ]] || { echo '::error::Could not derive plugin dist-tag.'; exit 1; }
+          carrier_version="${plugin_version}-app"
+
+          # Refuse to roll a dist-tag backward. Compare against the current version on
+          # the channel this release will update (latest for stable, alpha/beta/etc. for prerelease).
+          channel_log="$RUNNER_TEMP/npm-channel-${plugin_tag}.log"
+          if npm view "$PACKAGE_NAME@$plugin_tag" version --json --prefer-online \
+            --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" > "$channel_log" 2>&1; then
+            channel_version="$(jq -r '.' "$channel_log")"
+            node --input-type=module -e '
+            const [candidateText, currentText] = process.argv.slice(1);
+            const parse = (version) => {
+              const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.exec(version);
+              if (!match) throw new Error(`Invalid SemVer: ${version}`);
+              return { core: match.slice(1, 4).map(BigInt), pre: match[4] ? match[4].split(".") : [] };
+            };
+            const compare = (a, b) => {
+              for (let i = 0; i < 3; i++) if (a.core[i] !== b.core[i]) return a.core[i] < b.core[i] ? -1 : 1;
+              if (!a.pre.length || !b.pre.length) return a.pre.length === b.pre.length ? 0 : (a.pre.length ? -1 : 1);
+              for (let i = 0; i < Math.max(a.pre.length, b.pre.length); i++) {
+                if (a.pre[i] === undefined || b.pre[i] === undefined) return a.pre[i] === b.pre[i] ? 0 : (a.pre[i] === undefined ? -1 : 1);
+                if (a.pre[i] === b.pre[i]) continue;
+                const an = /^\d+$/.test(a.pre[i]), bn = /^\d+$/.test(b.pre[i]);
+                if (an && bn) return BigInt(a.pre[i]) < BigInt(b.pre[i]) ? -1 : 1;
+                if (an !== bn) return an ? -1 : 1;
+                return a.pre[i] < b.pre[i] ? -1 : 1;
+              }
+              return 0;
+            };
+            if (compare(parse(candidateText), parse(currentText)) <= 0) {
+              console.error(`Refusing ${candidateText}: ${currentText} is already on this dist-tag.`);
+              process.exit(1);
+            }
+            ' "$plugin_version" "$channel_version"
+          else
+            if ! grep -q 'E404' "$channel_log"; then
+              code="$(sed -n 's/^npm error code //p' "$channel_log" | head -1)"
+              echo "::error::Could not read npm dist-tag $plugin_tag (code=${code:-unknown})."
+              exit 1
+            fi
+          fi
+
+          check_unpublished() {
+            local version="$1"
+            local log="$RUNNER_TEMP/npm-view-${version}.log"
+            if npm view "$PACKAGE_NAME@$version" version --json --prefer-online \
+              --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" > "$log" 2>&1; then
+              echo "::error::Version $version already exists on npm; refusing to republish."
+              exit 1
+            fi
+            if ! grep -q 'E404' "$log"; then
+              code="$(sed -n 's/^npm error code //p' "$log" | head -1)"
+              echo "::error::Could not verify that $version is unused (npm view code=${code:-unknown})."
+              exit 1
+            fi
+          }
+          check_unpublished "$plugin_version"
+          check_unpublished "$carrier_version"
+
+          {
+            echo "PLUGIN_VERSION=$plugin_version"
+            echo "PLUGIN_TAG=$plugin_tag"
+            echo "APP_VERSION=$app_version"
+            echo "CARRIER_VERSION=$carrier_version"
+            echo "LATEST_BEFORE=$latest_version"
+          } >> "$GITHUB_ENV"
+
+      # The project has bundleDependencies (qrcode); use an npm-flat node_modules tree
+      # because npm pack cannot reliably bundle from pnpm's symlinked node_modules layout.
+      - name: Install root package dependencies for npm pack
+        run: npm install --no-save --package-lock=false --ignore-scripts --omit=optional --registry https://registry.npmjs.org/
+
+      - name: Install Flutter dependencies
+        working-directory: dsh-mobile-app
+        run: flutter pub get --enforce-lockfile
+
+      - name: Run Node tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          gate_home="$(mktemp -d)"
+          trap 'rm -rf "$gate_home"' EXIT
+          HOME="$gate_home" \
+          DSH_HOME="$gate_home/.dsh" \
+          XDG_CONFIG_HOME="$gate_home/.config" \
+          XDG_CACHE_HOME="$gate_home/.cache" \
+          XDG_DATA_HOME="$gate_home/.local/share" \
+          npm_config_cache="$gate_home/.npm-cache" \
+          node --test test/*.mjs
+
+      - name: Run Flutter analysis and tests
+        working-directory: dsh-mobile-app
+        run: |
+          flutter analyze --no-pub --no-fatal-infos
+          flutter test --no-pub
+
+      # key.properties and the keystore are intentionally not committed.
+      # Configure these GitHub Actions secrets with the same key used by existing APKs.
+      - name: Configure Android signing key
+        if: env.PLUGIN_TAG == 'latest'
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${ANDROID_KEYSTORE_BASE64:?Set the ANDROID_KEYSTORE_BASE64 GitHub secret}"
+          : "${ANDROID_KEYSTORE_PASSWORD:?Set the ANDROID_KEYSTORE_PASSWORD GitHub secret}"
+          : "${ANDROID_KEY_ALIAS:?Set the ANDROID_KEY_ALIAS GitHub secret}"
+          : "${ANDROID_KEY_PASSWORD:?Set the ANDROID_KEY_PASSWORD GitHub secret}"
+          umask 077
+          mkdir -p dsh-mobile-app/android/app
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > dsh-mobile-app/android/app/dsh-release.jks
+          cat > dsh-mobile-app/android/key.properties <<EOF
+          storePassword=${ANDROID_KEYSTORE_PASSWORD}
+          keyPassword=${ANDROID_KEY_PASSWORD}
+          keyAlias=${ANDROID_KEY_ALIAS}
+          storeFile=app/dsh-release.jks
+          EOF
+
+      - name: Build signed Android APK
+        if: env.PLUGIN_TAG == 'latest'
+        working-directory: dsh-mobile-app
+        run: flutter build apk --release --no-pub
+
+      - name: Verify APK signing certificate
+        if: env.PLUGIN_TAG == 'latest'
+        env:
+          EXPECTED_ANDROID_CERT_SHA256: ${{ vars.ANDROID_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          : "${EXPECTED_ANDROID_CERT_SHA256:?Set the ANDROID_CERT_SHA256 repository variable}"
+          apk='dsh-mobile-app/build/app/outputs/flutter-apk/app-release.apk'
+          apksigner="$(printf '%s\n' "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)"
+          test -x "$apksigner"
+          actual="$("$apksigner" verify --print-certs "$apk" 2>&1 | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -1 | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+          expected="$(printf '%s' "$EXPECTED_ANDROID_CERT_SHA256" | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+          if [[ -z "$actual" || "$actual" != "$expected" ]]; then
+            echo '::error::APK signing certificate does not match ANDROID_CERT_SHA256.'
+            exit 1
+          fi
+
+      # Plugin-only prereleases reuse the previous published carrier APK. This preserves
+      # the existing Android signature/build number and avoids rebuilding an unchanged app.
+      - name: Reuse previous carrier APK for prerelease
+        if: env.PLUGIN_TAG != 'latest'
+        shell: bash
+        env:
+          REGISTRY: https://registry.npmjs.org/
+          PACKAGE_NAME: '@marktrue/dsh-mobile-remote'
+        run: |
+          set -euo pipefail
+          previous_carrier_version="$(npm view "$PACKAGE_NAME" dist-tags.app --json --prefer-online \
+            --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" | jq -r '.')"
+          if [[ -z "$previous_carrier_version" || "$previous_carrier_version" == "null" ]]; then
+            echo '::error::No existing app-tagged carrier is available to reuse for this prerelease.'
+            exit 1
+          fi
+          scratch="$(mktemp -d "$RUNNER_TEMP/previous-carrier.XXXXXX")"
+          trap 'rm -rf "$scratch"' EXIT
+          pack_json="$(npm pack "$PACKAGE_NAME@$previous_carrier_version" --pack-destination "$scratch" --json \
+            --registry "$REGISTRY" --@marktrue:registry="$REGISTRY")"
+          tarball="$(printf '%s' "$pack_json" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s)[0].filename))')"
+          tarball_path="$scratch/$tarball"
+          manifest="$(tar -xzOf "$tarball_path" package/manifest.json)"
+          previous_app_version="$(printf '%s' "$manifest" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).app.version))')"
+          app_file="$(printf '%s' "$manifest" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).app.file))')"
+          expected_app_file="DSH-Remote-v${APP_VERSION%%+*}.apk"
+          if [[ "$previous_app_version" != "$APP_VERSION" || "$app_file" != "$expected_app_file" ]]; then
+            echo "::error::Previous carrier App ($previous_app_version/$app_file) does not match this release ($APP_VERSION/$expected_app_file). Build a new signed APK instead."
+            exit 1
+          fi
+          mkdir -p dsh-mobile-app/build/app/outputs/flutter-apk
+          tar -xzOf "$tarball_path" "package/$app_file" > dsh-mobile-app/build/app/outputs/flutter-apk/app-release.apk
+          test -s dsh-mobile-app/build/app/outputs/flutter-apk/app-release.apk
+          echo "Reused App $APP_VERSION from carrier $previous_carrier_version."
+
+      - name: Install Verdaccio for the isolated release drill
+        run: npm install --global verdaccio@6.10.6 --registry https://registry.npmjs.org/
+
+      - name: Build paired artifacts and run local release drill
+        run: bash dsh-mobile-app/tools/package-release.sh --drill
+
+      - name: Publish carrier (app tag)
+        shell: bash
+        env:
+          REGISTRY: https://registry.npmjs.org/
+          PACKAGE_NAME: '@marktrue/dsh-mobile-remote'
+        run: |
+          set -euo pipefail
+          carrier_file="dsh-mobile-app/dist/$(node -p "require('./dsh-mobile-app/dist/app-carrier.json').file")"
+          test -s "$carrier_file"
+          publish_log="$RUNNER_TEMP/npm-publish-carrier.log"
+          set +e
+          npm publish "$carrier_file" \
+            --tag app --access public \
+            --registry "$REGISTRY" \
+            --@marktrue:registry="$REGISTRY" > "$publish_log" 2>&1
+          publish_status=$?
+          set -e
+          if [[ "$publish_status" -ne 0 ]]; then
+            code="$(sed -n 's/^npm error code //p' "$publish_log" | head -1)"
+            if [[ "$code" == "E409" ]]; then
+              echo '::warning::npm reports a staged/conflicting carrier version; polling visibility without republishing.'
+            else
+              echo "::error::Carrier publish failed (npm code=${code:-unknown}); see runner-local npm log."
+              exit "$publish_status"
+            fi
+          fi
+
+          # npm can stage/process a successful publish. Poll; never retry the PUT.
+          for attempt in $(seq 1 90); do
+            if npm view "$PACKAGE_NAME@$CARRIER_VERSION" version --json --prefer-online \
+              --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" >/dev/null 2>&1; then
+              echo "Carrier $CARRIER_VERSION is visible on npmjs."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo '::error::Carrier is not visible after 15 minutes; inspect npm staged status instead of republishing.'
+          exit 1
+
+      - name: Publish plugin (computed release channel)
+        shell: bash
+        env:
+          REGISTRY: https://registry.npmjs.org/
+          PACKAGE_NAME: '@marktrue/dsh-mobile-remote'
+        run: |
+          set -euo pipefail
+          plugin_file="dsh-mobile-app/dist/dsh-mobile-remote-v${PLUGIN_VERSION}.tgz"
+          test -s "$plugin_file"
+          # An app-tag publish must not move latest during a prerelease.
+          if [[ "$PLUGIN_TAG" != "latest" ]]; then
+            latest_now="$(npm view "$PACKAGE_NAME" dist-tags.latest --json --prefer-online \
+              --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" | jq -r '.')"
+            if [[ "$latest_now" != "$LATEST_BEFORE" ]]; then
+              echo "::error::Carrier publish changed latest ($LATEST_BEFORE -> $latest_now); stopping before plugin publish."
+              exit 1
+            fi
+          fi
+
+          publish_log="$RUNNER_TEMP/npm-publish-plugin.log"
+          set +e
+          npm publish "$plugin_file" \
+            --tag "$PLUGIN_TAG" --access public \
+            --registry "$REGISTRY" \
+            --@marktrue:registry="$REGISTRY" > "$publish_log" 2>&1
+          publish_status=$?
+          set -e
+          if [[ "$publish_status" -ne 0 ]]; then
+            code="$(sed -n 's/^npm error code //p' "$publish_log" | head -1)"
+            if [[ "$code" == "E409" ]]; then
+              echo '::warning::npm reports a staged/conflicting plugin version; polling visibility without republishing.'
+            else
+              echo "::error::Plugin publish failed (npm code=${code:-unknown}); see runner-local npm log."
+              exit "$publish_status"
+            fi
+          fi
+
+          for attempt in $(seq 1 90); do
+            if npm view "$PACKAGE_NAME@$PLUGIN_VERSION" version --json --prefer-online \
+              --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" >/dev/null 2>&1; then
+              echo "Plugin $PLUGIN_VERSION is visible on npmjs."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo '::error::Plugin is not visible after 15 minutes; inspect npm staged status instead of republishing.'
+          exit 1
+
+      - name: Set and verify plugin channel and app tags
+        shell: bash
+        env:
+          REGISTRY: https://registry.npmjs.org/
+          PACKAGE_NAME: '@marktrue/dsh-mobile-remote'
+        run: |
+          set -euo pipefail
+          npm dist-tag add "$PACKAGE_NAME@$PLUGIN_VERSION" "$PLUGIN_TAG" \
+            --registry "$REGISTRY" --@marktrue:registry="$REGISTRY"
+          npm dist-tag add "$PACKAGE_NAME@$CARRIER_VERSION" app \
+            --registry "$REGISTRY" --@marktrue:registry="$REGISTRY"
+          npm view "$PACKAGE_NAME" dist-tags --json --prefer-online \
+            --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" > "$RUNNER_TEMP/dist-tags.json"
+          node -e '
+            const tags = require(process.argv[1]);
+            const channel = process.env.PLUGIN_TAG;
+            const latestBefore = process.env.LATEST_BEFORE ?? "";
+            const latestNow = tags.latest ?? "";
+            if (tags[channel] !== process.env.PLUGIN_VERSION || tags.app !== process.env.CARRIER_VERSION) {
+              console.error(JSON.stringify(tags)); process.exit(1);
+            }
+            if (channel === "latest") {
+              if (latestNow !== process.env.PLUGIN_VERSION) {
+                console.error(`stable release did not move latest: ${JSON.stringify(tags)}`); process.exit(1);
+              }
+            } else if (latestNow !== latestBefore) {
+              console.error(`prerelease moved latest (${latestBefore || "<unset>"} -> ${latestNow || "<unset>"})`);
+              process.exit(1);
+            }
+            console.log(JSON.stringify(tags));
+          ' "$RUNNER_TEMP/dist-tags.json"
+
+      - name: Verify published tarball integrity
+        shell: bash
+        env:
+          REGISTRY: https://registry.npmjs.org/
+          PACKAGE_NAME: '@marktrue/dsh-mobile-remote'
+        run: |
+          set -euo pipefail
+          plugin_file="dsh-mobile-app/dist/dsh-mobile-remote-v${PLUGIN_VERSION}.tgz"
+          carrier_file="dsh-mobile-app/dist/$(node -p "require('./dsh-mobile-app/dist/app-carrier.json').file")"
+          for item in "${PLUGIN_VERSION}:$plugin_file" "${CARRIER_VERSION}:$carrier_file"; do
+            version="${item%%:*}"
+            file="${item#*:}"
+            local_integrity="sha512-$(node -e 'const fs=require("fs"),c=require("crypto");process.stdout.write(c.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"))' "$file")"
+            remote_integrity="$(npm view "$PACKAGE_NAME@$version" dist.integrity --json --prefer-online \
+              --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" | jq -r '.')"
+            if [[ "$local_integrity" != "$remote_integrity" ]]; then
+              echo "::error::Integrity mismatch for $version"
+              exit 1
+            fi
+          done
+          echo 'Published plugin and carrier integrity matches local dist.'

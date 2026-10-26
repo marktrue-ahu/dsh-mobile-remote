@@ -149,6 +149,22 @@ export function writeEmptyGlobalConfig({ runDir, label }) {
 	return file;
 }
 
+/**
+ * npm finds project .npmrc by walking upward from cwd. Keep config probes and publishes
+ * under a synthetic project root so a caller's $HOME/package.json/.npmrc cannot override
+ * the isolated userconfig (e.g. a local prefix/npmmirror setting).
+ */
+function isolatedNpmProjectCwd(userconfig) {
+	if (userconfig === "") return process.cwd();
+	const cwd = path.join(path.dirname(userconfig), "config-probe");
+	ensureDir(cwd);
+	const packageJson = path.join(cwd, "package.json");
+	if (!existsFile(packageJson)) {
+		writeTextFile(packageJson, `${JSON.stringify({ name: "npm-drill-config-probe", private: true }, null, 2)}\n`);
+	}
+	return cwd;
+}
+
 function unquoteNpmValue(value) {
 	const text = String(value ?? "").trim();
 	if (text.length >= 2 && ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'")))) {
@@ -174,8 +190,8 @@ export async function verifyRegistryScope({ registryUrl, userconfig, globalconfi
 		const result = await runCommand({
 			command: "npm",
 			args: argsFor(key),
-			// 用专用配置所在目录作为 cwd，避免项目级 .npmrc 覆盖 scoped registry 路由。
-			cwd: path.dirname(userconfig),
+			// 用独立的临时 package root 作为 cwd，避免向上发现调用方项目的 .npmrc。
+			cwd: isolatedNpmProjectCwd(userconfig),
 			env: runEnv,
 			logFile,
 			timeoutMs: 30_000,
@@ -428,7 +444,7 @@ export async function npmPublish({
 	const pinned = scope === "" ? "" : `--${scope}:registry=${normalizeRegistryUrl(registryUrl)}`;
 	return runCommand({
 		command: "npm",
-		cwd: userconfig !== "" ? path.dirname(userconfig) : process.cwd(),
+		cwd: isolatedNpmProjectCwd(userconfig),
 		args: [
 			"publish", tarball,
 			"--registry", registryUrl,
