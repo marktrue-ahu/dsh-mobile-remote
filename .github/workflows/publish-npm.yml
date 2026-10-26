@@ -124,8 +124,8 @@ jobs:
           if npm view "$PACKAGE_NAME@$plugin_tag" version --json --prefer-online \
             --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" > "$channel_log" 2>&1; then
             channel_version="$(jq -r '.' "$channel_log")"
-            node --input-type=module - "$plugin_version" "$channel_version" <<'NODE'
-            const [candidateText, currentText] = process.argv.slice(2);
+            node --input-type=module -e '
+            const [candidateText, currentText] = process.argv.slice(1);
             const parse = (version) => {
               const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.exec(version);
               if (!match) throw new Error(`Invalid SemVer: ${version}`);
@@ -148,7 +148,7 @@ jobs:
               console.error(`Refusing ${candidateText}: ${currentText} is already on this dist-tag.`);
               process.exit(1);
             }
-            NODE
+            ' "$plugin_version" "$channel_version"
           else
             if ! grep -q 'E404' "$channel_log"; then
               code="$(sed -n 's/^npm error code //p' "$channel_log" | head -1)"
@@ -179,6 +179,7 @@ jobs:
             echo "PLUGIN_TAG=$plugin_tag"
             echo "APP_VERSION=$app_version"
             echo "CARRIER_VERSION=$carrier_version"
+            echo "LATEST_BEFORE=$latest_version"
           } >> "$GITHUB_ENV"
 
       # The project has bundleDependencies (qrcode); use an npm-flat node_modules tree
@@ -213,6 +214,7 @@ jobs:
       # key.properties and the keystore are intentionally not committed.
       # Configure these GitHub Actions secrets with the same key used by existing APKs.
       - name: Configure Android signing key
+        if: env.PLUGIN_TAG == 'latest'
         shell: bash
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -236,10 +238,12 @@ jobs:
           EOF
 
       - name: Build signed Android APK
+        if: env.PLUGIN_TAG == 'latest'
         working-directory: dsh-mobile-app
         run: flutter build apk --release --no-pub
 
       - name: Verify APK signing certificate
+        if: env.PLUGIN_TAG == 'latest'
         env:
           EXPECTED_ANDROID_CERT_SHA256: ${{ vars.ANDROID_CERT_SHA256 }}
         run: |
@@ -254,6 +258,41 @@ jobs:
             echo '::error::APK signing certificate does not match ANDROID_CERT_SHA256.'
             exit 1
           fi
+
+      # Plugin-only prereleases reuse the previous published carrier APK. This preserves
+      # the existing Android signature/build number and avoids rebuilding an unchanged app.
+      - name: Reuse previous carrier APK for prerelease
+        if: env.PLUGIN_TAG != 'latest'
+        shell: bash
+        env:
+          REGISTRY: https://registry.npmjs.org/
+          PACKAGE_NAME: '@marktrue/dsh-mobile-remote'
+        run: |
+          set -euo pipefail
+          previous_carrier_version="$(npm view "$PACKAGE_NAME" dist-tags.app --json --prefer-online \
+            --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" | jq -r '.')"
+          if [[ -z "$previous_carrier_version" || "$previous_carrier_version" == "null" ]]; then
+            echo '::error::No existing app-tagged carrier is available to reuse for this prerelease.'
+            exit 1
+          fi
+          scratch="$(mktemp -d "$RUNNER_TEMP/previous-carrier.XXXXXX")"
+          trap 'rm -rf "$scratch"' EXIT
+          pack_json="$(npm pack "$PACKAGE_NAME@$previous_carrier_version" --pack-destination "$scratch" --json \
+            --registry "$REGISTRY" --@marktrue:registry="$REGISTRY")"
+          tarball="$(printf '%s' "$pack_json" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s)[0].filename))')"
+          tarball_path="$scratch/$tarball"
+          manifest="$(tar -xzOf "$tarball_path" package/manifest.json)"
+          previous_app_version="$(printf '%s' "$manifest" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).app.version))')"
+          app_file="$(printf '%s' "$manifest" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).app.file))')"
+          expected_app_file="DSH-Remote-v${APP_VERSION%%+*}.apk"
+          if [[ "$previous_app_version" != "$APP_VERSION" || "$app_file" != "$expected_app_file" ]]; then
+            echo "::error::Previous carrier App ($previous_app_version/$app_file) does not match this release ($APP_VERSION/$expected_app_file). Build a new signed APK instead."
+            exit 1
+          fi
+          mkdir -p dsh-mobile-app/build/app/outputs/flutter-apk
+          tar -xzOf "$tarball_path" "package/$app_file" > dsh-mobile-app/build/app/outputs/flutter-apk/app-release.apk
+          test -s dsh-mobile-app/build/app/outputs/flutter-apk/app-release.apk
+          echo "Reused App $APP_VERSION from carrier $previous_carrier_version."
 
       - name: Install Verdaccio for the isolated release drill
         run: npm install --global verdaccio@6.10.6 --registry https://registry.npmjs.org/
@@ -309,19 +348,15 @@ jobs:
           set -euo pipefail
           plugin_file="dsh-mobile-app/dist/dsh-mobile-remote-v${PLUGIN_VERSION}.tgz"
           test -s "$plugin_file"
-          # Snapshot immediately before plugin publish; alpha/beta must leave latest unchanged.
-          latest_log="$RUNNER_TEMP/npm-dist-tags-before-plugin.log"
-          if npm view "$PACKAGE_NAME" dist-tags --json --prefer-online \
-            --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" > "$latest_log" 2>&1; then
-            latest_before="$(jq -r '.latest // ""' "$latest_log")"
-          elif grep -q 'E404' "$latest_log"; then
-            latest_before=""
-          else
-            code="$(sed -n 's/^npm error code //p' "$latest_log" | head -1)"
-            echo "::error::Could not read the current latest dist-tag (npm code=${code:-unknown})."
-            exit 1
+          # An app-tag publish must not move latest during a prerelease.
+          if [[ "$PLUGIN_TAG" != "latest" ]]; then
+            latest_now="$(npm view "$PACKAGE_NAME" dist-tags.latest --json --prefer-online \
+              --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" | jq -r '.')"
+            if [[ "$latest_now" != "$LATEST_BEFORE" ]]; then
+              echo "::error::Carrier publish changed latest ($LATEST_BEFORE -> $latest_now); stopping before plugin publish."
+              exit 1
+            fi
           fi
-          echo "LATEST_BEFORE=$latest_before" >> "$GITHUB_ENV"
 
           publish_log="$RUNNER_TEMP/npm-publish-plugin.log"
           set +e
