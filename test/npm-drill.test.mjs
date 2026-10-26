@@ -28,7 +28,10 @@ const TOOL_PATH = (process.env.PATH ?? "").split(":")
 
 /** 让夹具构建与演练子进程使用确定性的工具链（不含 Android aapt，避免假 APK 被实读）。 */
 function toolEnv(extra = {}) {
-	return { ...process.env, PATH: TOOL_PATH, HOME: extra.HOME ?? process.env.HOME, ...extra };
+	const env = { ...process.env, PATH: TOOL_PATH, HOME: extra.HOME ?? process.env.HOME, ...extra };
+	// Android SDK may still be discoverable directly from these variables even when PATH is filtered.
+	for (const key of ["ANDROID_HOME", "ANDROID_SDK_ROOT", "ANDROID_SDK_HOME"]) delete env[key];
+	return env;
 }
 
 async function exists(file) {
