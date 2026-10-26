@@ -63,9 +63,11 @@ jobs:
           java-version: '17'
 
       - name: Set up Android SDK
+        if: ${{ !contains(github.ref_name, '-') }}
         uses: android-actions/setup-android@v3
 
       - name: Install Android build tools
+        if: ${{ !contains(github.ref_name, '-') }}
         run: sdkmanager 'platform-tools' 'platforms;android-36' 'build-tools;36.0.0'
 
       - name: Set up Flutter
