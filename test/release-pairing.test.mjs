@@ -816,3 +816,19 @@ test("预发布核心版本不配对被拒：App core 必须等于插件 core（
 		await rm(f.base, { recursive: true, force: true });
 	}
 });
+
+test("npm publish workflow routes prereleases to their channel without moving latest", async () => {
+	const workflow = await readFile(join(ROOT, ".github", "workflows", "publish-npm.yml"), "utf8");
+	assert.match(workflow, /npm publish "\$plugin_file"[\s\S]*?--tag "\$PLUGIN_TAG"/,
+		"plugin publish must use the tag derived by pluginPublishTag");
+	assert.match(workflow, /npm dist-tag add "\$PACKAGE_NAME@\$\{?PLUGIN_VERSION\}?" "\$PLUGIN_TAG"/,
+		"dist-tag update must use the same dynamic channel");
+	const pluginStepStart = workflow.indexOf("- name: Publish plugin (computed release channel)");
+	const channelStepStart = workflow.indexOf("- name: Set and verify plugin channel and app tags");
+	assert.ok(pluginStepStart >= 0 && channelStepStart > pluginStepStart, "plugin publish steps must be ordered");
+	const pluginStep = workflow.slice(pluginStepStart, channelStepStart);
+	assert.match(pluginStep, /LATEST_BEFORE=/, "snapshot latest immediately before plugin publication");
+	assert.doesNotMatch(workflow, /--tag latest/, "publish must not hardcode latest");
+	assert.doesNotMatch(workflow, /npm dist-tag add "\$PACKAGE_NAME@\$\{?PLUGIN_VERSION\}?" latest/,
+		"latest must not be moved unconditionally");
+});

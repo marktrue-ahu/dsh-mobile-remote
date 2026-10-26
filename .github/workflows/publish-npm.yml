@@ -300,7 +300,7 @@ jobs:
           echo '::error::Carrier is not visible after 15 minutes; inspect npm staged status instead of republishing.'
           exit 1
 
-      - name: Publish plugin (stable latest tag)
+      - name: Publish plugin (computed release channel)
         shell: bash
         env:
           REGISTRY: https://registry.npmjs.org/
@@ -309,10 +309,24 @@ jobs:
           set -euo pipefail
           plugin_file="dsh-mobile-app/dist/dsh-mobile-remote-v${PLUGIN_VERSION}.tgz"
           test -s "$plugin_file"
+          # Snapshot immediately before plugin publish; alpha/beta must leave latest unchanged.
+          latest_log="$RUNNER_TEMP/npm-dist-tags-before-plugin.log"
+          if npm view "$PACKAGE_NAME" dist-tags --json --prefer-online \
+            --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" > "$latest_log" 2>&1; then
+            latest_before="$(jq -r '.latest // ""' "$latest_log")"
+          elif grep -q 'E404' "$latest_log"; then
+            latest_before=""
+          else
+            code="$(sed -n 's/^npm error code //p' "$latest_log" | head -1)"
+            echo "::error::Could not read the current latest dist-tag (npm code=${code:-unknown})."
+            exit 1
+          fi
+          echo "LATEST_BEFORE=$latest_before" >> "$GITHUB_ENV"
+
           publish_log="$RUNNER_TEMP/npm-publish-plugin.log"
           set +e
           npm publish "$plugin_file" \
-            --tag latest --access public \
+            --tag "$PLUGIN_TAG" --access public \
             --registry "$REGISTRY" \
             --@marktrue:registry="$REGISTRY" > "$publish_log" 2>&1
           publish_status=$?
@@ -338,14 +352,14 @@ jobs:
           echo '::error::Plugin is not visible after 15 minutes; inspect npm staged status instead of republishing.'
           exit 1
 
-      - name: Set and verify latest plugin tag
+      - name: Set and verify plugin channel and app tags
         shell: bash
         env:
           REGISTRY: https://registry.npmjs.org/
           PACKAGE_NAME: '@marktrue/dsh-mobile-remote'
         run: |
           set -euo pipefail
-          npm dist-tag add "$PACKAGE_NAME@$PLUGIN_VERSION" latest \
+          npm dist-tag add "$PACKAGE_NAME@$PLUGIN_VERSION" "$PLUGIN_TAG" \
             --registry "$REGISTRY" --@marktrue:registry="$REGISTRY"
           npm dist-tag add "$PACKAGE_NAME@$CARRIER_VERSION" app \
             --registry "$REGISTRY" --@marktrue:registry="$REGISTRY"
@@ -353,8 +367,19 @@ jobs:
             --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" > "$RUNNER_TEMP/dist-tags.json"
           node -e '
             const tags = require(process.argv[1]);
-            if (tags.latest !== process.env.PLUGIN_VERSION || tags.app !== process.env.CARRIER_VERSION) {
+            const channel = process.env.PLUGIN_TAG;
+            const latestBefore = process.env.LATEST_BEFORE ?? "";
+            const latestNow = tags.latest ?? "";
+            if (tags[channel] !== process.env.PLUGIN_VERSION || tags.app !== process.env.CARRIER_VERSION) {
               console.error(JSON.stringify(tags)); process.exit(1);
+            }
+            if (channel === "latest") {
+              if (latestNow !== process.env.PLUGIN_VERSION) {
+                console.error(`stable release did not move latest: ${JSON.stringify(tags)}`); process.exit(1);
+              }
+            } else if (latestNow !== latestBefore) {
+              console.error(`prerelease moved latest (${latestBefore || "<unset>"} -> ${latestNow || "<unset>"})`);
+              process.exit(1);
             }
             console.log(JSON.stringify(tags));
           ' "$RUNNER_TEMP/dist-tags.json"
