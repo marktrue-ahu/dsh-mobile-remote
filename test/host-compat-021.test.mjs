@@ -340,7 +340,7 @@ test("0.2.1：$events 开流收到 connection.createPeer 造的活 Peer（第 4 
 	try {
 		assert.ok(await h.until(() => h.seen.wire !== null), "approvalMode=both 应尝试开 $events 流");
 		assert.equal(h.seen.wire.endpoint, "$events");
-		assert.equal(h.seen.wire.uplink, undefined, "第 3 位必须仍是 uplink");
+		assert.ok(h.seen.wire.uplink?.[Symbol.asyncIterator], "第 3 位必须是 uplink（异步迭代器；宿主可能对它调用 return()）");
 		const peer = h.seen.wire.peer;
 		assert.ok(peer, "0.2.1 上第 4 位 peer 必填：漏传会让宿主 assertPeerLive 抛 TypeError");
 		assert.equal(peer.principal?.kind, "owner");

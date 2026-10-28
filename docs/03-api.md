@@ -119,7 +119,7 @@
 }
 ```
 
-- `urls`：按优先级排列——首个非 internal IPv4（含蒲公英/Tailscale 等虚拟组网段）在前，loopback 最后；`port` 来自 `ctx.webServer.port`。v3.0.0：`lanBridge` 监听成功时首选地址为桥地址（`http://<IP>:<lanBridge.port>`，端口默认 3080），回环 webserver 地址仅作本机自连兜底。
+- `urls`：按优先级排列——默认「局域网私有地址优先」（`10./192.168.x` → `172.16-31` → Tailscale CGNAT `100.64/10` → 其他），首个非 internal IPv4 在前，loopback 最后；**仅当机器上没有任何局域网私有地址时**，才把 Tailscale CGNAT 提到最前（issue #49，避免校园网/热点等场景选出不可达地址）；`port` 来自 `ctx.webServer.port`。v3.0.0：`lanBridge` 监听成功时首选地址为桥地址（`http://<IP>:<lanBridge.port>`，端口默认 3080），回环 webserver 地址仅作本机自连兜底。
 - `agents[].status`：`"running" | "idle"`（映射自 agent 状态与最近事件推断）。
 - `capabilities.turnOutline`：轮次大纲能力位（轮次导航）。宿主**真的注册了** `turnOutline` 投影单元、且投影感知观察面（`sessionQuery.observeSession`）可用时，返回 `{ "version": 1, "supported": true, "unloaded": true, "truncated": true }`——`unloaded` 表示未加载轮次也可跳转、`truncated` 表示超过体积上限会显式截断；否则返回 `{ "version": 1, "supported": false }`。**不按宿主版本号推断**：旧宿主/裁剪宿主显式声明不支持，App 据此退回「只用已加载轮次」的降级行为。SSE hello 的同名字段与该处**同判据、同形状**（见 §3.6 与 §6.18）。
 - 未认证：`401`（见通用约定）。

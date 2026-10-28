@@ -823,11 +823,16 @@ test("npm publish workflow routes prereleases to their channel without moving la
 		"plugin publish must use the tag derived by pluginPublishTag");
 	assert.match(workflow, /npm dist-tag add "\$PACKAGE_NAME@\$\{?PLUGIN_VERSION\}?" "\$PLUGIN_TAG"/,
 		"dist-tag update must use the same dynamic channel");
+	const latestSnapshot = workflow.indexOf('echo "LATEST_BEFORE=$latest_version"');
 	const pluginStepStart = workflow.indexOf("- name: Publish plugin (computed release channel)");
 	const channelStepStart = workflow.indexOf("- name: Set and verify plugin channel and app tags");
+	assert.ok(latestSnapshot >= 0 && latestSnapshot < pluginStepStart, "snapshot latest before publishing the carrier or plugin");
 	assert.ok(pluginStepStart >= 0 && channelStepStart > pluginStepStart, "plugin publish steps must be ordered");
 	const pluginStep = workflow.slice(pluginStepStart, channelStepStart);
-	assert.match(pluginStep, /LATEST_BEFORE=/, "snapshot latest immediately before plugin publication");
+	assert.match(pluginStep, /latest_now="\$\(npm view "\$PACKAGE_NAME" dist-tags\.latest/,
+		"re-read latest immediately before plugin publication");
+	assert.match(pluginStep, /if \[\[ "\$latest_now" != "\$LATEST_BEFORE" \]\]/,
+		"stop if the carrier publish moved latest");
 	assert.doesNotMatch(workflow, /--tag latest/, "publish must not hardcode latest");
 	assert.doesNotMatch(workflow, /npm dist-tag add "\$PACKAGE_NAME@\$\{?PLUGIN_VERSION\}?" latest/,
 		"latest must not be moved unconditionally");

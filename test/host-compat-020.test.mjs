@@ -348,7 +348,7 @@ test("0.2.x：事件流的取消信号落在第 5 位（传错位会让通道永
 		const args = h.seen.wireStreamArgs[0];
 		assert.equal(args.endpoint, "$events");
 		assert.ok(args.signal instanceof AbortSignal, "signal 必须真的传进去；为 undefined 时宿主会在 AbortSignal.any 抛错");
-		assert.equal(args.uplink, undefined, "第 3 位必须是 uplink（0.2.x 语义），不能把信号塞在这里");
+		assert.ok(args.uplink?.[Symbol.asyncIterator], "第 3 位必须是 uplink（异步迭代器；宿主可能对它调用 return()），不能把信号塞在这里");
 	} finally { h.clean(); }
 });
 
