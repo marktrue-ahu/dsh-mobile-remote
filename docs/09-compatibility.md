@@ -15,11 +15,11 @@
 | 桌面端 DSH（Harness） | 插件不按宿主版本号硬拦截；可用性取决于宿主提供的 Remote RPC、事件桥等接口。诊断提供 `services` / `checks`，**并自 v3.1.6 起提供宿主能力三态报告**（`checks.hostCapabilities` 的 `ok`/`drift`/`missing` 与 `checks.hostGeneration`）；仍**不返回宿主版本号**，因此不要把插件版本推断为宿主能力。见 §2.6；**`0.2.1` 起进程内网关调用强制显式 Peer，由 §2.7 适配（issue #34）** |
 | dsh-mobile-remote 插件 | **v3.1.5**；`/m/api/diagnostics` 提供 `services` / `checks`，并提供 `/m/api/account-usage` |
 | 手机 App（Android） | v3.1.5（与插件同版本便于配对；不同版本按 API 增量兼容）；Android 7.0+、64 位机型 |
-| 字段级兼容（v3.1.0） | `reasoning`/`title` 为纯增量字段：新插件+旧 App 无影响（忽略新字段）；新 App+旧插件自动回退（不渲染折叠块 / 悬浮球标题兜底短码）——任意组合均可使用 |
+| 字段级兼容（v3.1.0） | `reasoning`/`title` 为纯增量字段：新插件+旧 App 无影响（忽略新字段）；新 App+旧插件自动回退（不渲染折叠块 / 桌面宠物标题兜底短码）——任意组合均可使用 |
 | 字段级兼容（v3.1.1） | `/m/api/directories` 根视图新增 `sep`（服务端路径分隔符）；新插件+旧 App 忽略该字段即可（旧 App 在 WSL 上仍按 `\` 拼接，由服务端`normalizeServerPath` 归一化兜底，浏览/建夹/建会话均可用）；新 App+旧插件缺少 `sep` 时按根视图推断分隔符——任意组合均可使用 |
 | 字段级兼容（v3.1.3） | `/m/api/diagnostics` 增加审批策略与远程事件桥状态（`checks.approvalMode` / `checks.remoteEvents`）；旧版 App 忽略新增字段，不受影响 |
 | 用量与额度（v3.1.5） | 新插件+新 App 通过 `/m/api/account-usage` 显示 DeepSeek/Codex/OpenCode Go；旧 App 忽略新端点。新 App+旧插件进入该入口会显示“电脑端插件版本过旧”，不影响其它功能；升级插件后无需重新配置凭据 |
-| 悬浮球面板用量与额度（v3.1.5，ADR 0008） | 新 App+新插件：面板展开时按需展示三来源区块（金额行文字 + 配额行细条/颜色），整块可点进详情页。新 App+旧插件：区块整体降级为原有单行余额（点击仍=去充值），其余面板功能不受影响；旧 App 忽略新端点。无新增服务端契约 |
+| 桌面宠物面板用量与额度（沿用 ADR 0008） | 新 App+新插件：桌面宠物面板展开时按需展示三来源区块（金额行文字 + 配额行细条/颜色），整块可点进详情页。新 App+旧插件：区块整体降级为原有单行余额（点击仍=去充值），其余面板功能不受影响；旧 App 忽略新端点。无新增服务端契约 |
 | Flutter 构建环境 | Flutter 3.35+（Dart SDK ^3.13） |
 
 **声明式兼容范围（`peerDependencies`）**：`@deepseek-ai/dsh-{credentials,llm,sandbox-policy,scope}` 声明 `>=0.1.0-rc.6 <0.3.0`。宿主 `@deepseek-ai/dsh-app-boot` 的 `evaluatePluginCompatibility()` 用 `semver.satisfies(runtimeVersion, range, { includePrerelease: true })` 判定（**prerelease 参与比较**），因此该范围同时覆盖 `0.1.x`、`0.2.0-rc.*` 与 `0.2.x` 正式版，而 `0.3.0+` 会被判为不兼容。上界**只用于声明可安装边界**，功能路径仍按能力探测（ADR 0017），不按版本号做功能门禁。

@@ -743,6 +743,9 @@ class AppStore extends ChangeNotifier {
     _pluginUpdateTimer = null;
     await _persistPrefs(_kPluginUpdateJournal, '');
   }
+  int petHeight = 96; // 宠物画布高度 dp（56~160）
+  bool petReducedMotion = false; // 减少动态：静态姿势
+  bool petEdgeHide = true; // 贴边 5 秒后自动躲藏/虚化
 
   /// 已注册工作区（PC 端 workspaceRegistry）：[{id, path, title}]。
   List<Map<String, dynamic>> workspaces = [];
@@ -909,6 +912,9 @@ class AppStore extends ChangeNotifier {
   static const _kFloating = 'dsh_mr_floating';
   static const _kUpdateSource = 'dsh_mr_update_source';
   static const _kPluginUpdateJournal = 'dsh_mr_plugin_update_journal';
+  static const _kPetHeight = 'dsh_mr_pet_height';
+  static const _kPetReducedMotion = 'dsh_mr_pet_reduced_motion';
+  static const _kPetEdgeHide = 'dsh_mr_pet_edge_hide';
   static const _kGitTabs = 'dsh_mr_git_tabs';
   static const _kConversationActionOrder = 'dsh_mr_conversation_action_order';
 
@@ -955,6 +961,9 @@ class AppStore extends ChangeNotifier {
     _updateBootstrapCallback = () => unawaited(resumePluginUpdate());
     api.onBootstrapAbsorbed = _updateBootstrapCallback;
     if (pluginUpdateJournal != null) _armPluginUpdateTimer();
+    petHeight = (prefs.getInt(_kPetHeight) ?? 96).clamp(56, 160).toInt();
+    petReducedMotion = prefs.getBool(_kPetReducedMotion) ?? false;
+    petEdgeHide = prefs.getBool(_kPetEdgeHide) ?? true;
     gitTabs = List.unmodifiable(_defaultGitTabs);
     try {
       final raw = prefs.getString(_kGitTabs);
@@ -1151,7 +1160,7 @@ class AppStore extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// App 启动自动恢复悬浮球（v2.7.2）：上次开启过且服务没在跑 → 自动拉起。
+  /// App 启动自动恢复桌面宠物（沿用旧悬浮球恢复逻辑）：上次开启过且服务没在跑 → 自动拉起。
   /// 悬浮窗权限被撤销（罕见）时不强启，等用户到设置页重新开启。
   Future<void> restoreFloating() async {
     if (!floatingEnabled) return;
@@ -1160,8 +1169,40 @@ class AppStore extends ChangeNotifier {
     // v2.7.2 review(M7)：异步恢复期间用户可能已关掉开关（stop 与 start 竞态），复查一次
     if (!floatingEnabled) return;
     await Floating.start();
-    // 服务是新起的，需要把余额预警配置补给它
+    // 服务是新起的，补宠物配置与余额预警
+    await _syncPetConfig();
     unawaited(Floating.setBalanceAlert(balanceAlert, balanceThreshold));
+  }
+
+  /// 宠物大小/减少动态/贴边躲藏：持久化后实时同步原生服务。
+  Future<void> setPetHeight(int v) async {
+    petHeight = v.clamp(56, 160).toInt();
+    notifyListeners();
+    await _persistPrefs(_kPetHeight, petHeight);
+    await _syncPetConfig();
+  }
+
+  Future<void> setPetReducedMotion(bool v) async {
+    petReducedMotion = v;
+    notifyListeners();
+    await _persistPrefs(_kPetReducedMotion, v);
+    await _syncPetConfig();
+  }
+
+  Future<void> setPetEdgeHide(bool v) async {
+    petEdgeHide = v;
+    notifyListeners();
+    await _persistPrefs(_kPetEdgeHide, v);
+    await _syncPetConfig();
+  }
+
+  Future<void> _syncPetConfig() async {
+    if (!floatingEnabled) return;
+    await Floating.setPetConfig(
+      height: petHeight,
+      reducedMotion: petReducedMotion,
+      edgeHide: petEdgeHide,
+    );
   }
 
   /// 余额预警阈值（元），持久化并同步悬浮球（悬浮球的判定完全以 App 端设置为依据）。
