@@ -1298,21 +1298,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
           ),
           _row(
-            leading: const Icon(Icons.storage_outlined),
-            title: L10n.t('更新源', 'Update source'),
-            // App receives fixed download URLs projected by the host; it never fetches GitHub directly.
-            sub: store.updateSource == 'host'
-                ? L10n.t('主机 updateDir 人工目录', 'host updateDir (manual)')
-                : L10n.t('自动（电脑端检查结果）', 'Automatic (desktop check)'),
-            trailing: Text(
-              store.updateSource == 'host'
-                  ? L10n.t('主机目录 ▸', 'Host dir ▸')
-                  : L10n.t('自动 ▸', 'Auto ▸'),
-              style: TextStyle(fontSize: 12, color: brand),
-            ),
-            onTap: _pickUpdateSource,
-          ),
-          _row(
             leading: const Icon(Icons.auto_awesome_outlined),
             title: L10n.t('角色素材', 'Character assets'),
             sub: L10n.t(
