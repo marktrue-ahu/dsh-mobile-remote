@@ -1,7 +1,13 @@
+import 'dart:convert';
+
+import 'package:dsh_mobile_app/api.dart';
+import 'package:dsh_mobile_app/plugin_update_status.dart';
 import 'package:dsh_mobile_app/screens/settings_screen.dart';
 import 'package:dsh_mobile_app/store.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
@@ -126,5 +132,71 @@ void main() {
       '图谱',
     ]);
     expect(rows.last.value, isFalse);
+  });
+
+  testWidgets('shows logs for a desktop-started host transaction', (
+    tester,
+  ) async {
+    final requestedOpIds = <String>[];
+    final api = Api(
+      client: MockClient((request) async {
+        if (request.url.path.endsWith('/api/plugin-update/log')) {
+          requestedOpIds.add(request.url.queryParameters['opId'] ?? '');
+          return http.Response(
+            jsonEncode({
+              'ok': true,
+              'opId': 'desktop-op',
+              'phase': 'installing',
+              'events': [
+                {
+                  'seq': 1,
+                  'stage': 'install',
+                  'stream': 'stdout',
+                  'text': 'pnpm install output',
+                },
+              ],
+            }),
+            200,
+          );
+        }
+        return http.Response('{}', 200);
+      }),
+    )..baseUrl = 'https://desktop.example';
+    api.pluginUpdate = PluginUpdateStatus.fromJson({
+      'state': 'restarting',
+      'transaction': {
+        'opId': 'desktop-op',
+        'phase': 'installing',
+        'targetVersion': '3.2.2-alpha.2',
+        'targetContentSha256': List.filled(64, 'b').join(),
+        'targetAppVersion': '3.2.2+27',
+      },
+    });
+    final store = AppStore(apiClient: api);
+    addTearDown(store.dispose);
+    await store.loadPrefs();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SettingsScreen(store: store, onReconfigure: () async {}),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final logTitle = find.text('插件更新日志');
+    await tester.scrollUntilVisible(
+      logTitle,
+      240,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.drag(find.byType(Scrollable).first, const Offset(0, -240));
+    await tester.pumpAndSettle();
+    await tester.tap(logTitle);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+
+    expect(requestedOpIds, contains('desktop-op'));
+    expect(find.text('pnpm install output'), findsOneWidget);
   });
 }

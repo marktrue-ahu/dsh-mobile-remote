@@ -349,3 +349,38 @@ test("W3-a：下载 tab ready→unavailable 刷新迁移清空旧下载二维码
 	assert.equal(downloadOnly.download.ready, true, "控制连接不可用不得误伤下载码");
 	assert.ok(!downloadOnly.download.qrSrc.includes("auth-token-unavailable"));
 });
+
+test("plugin update UI model exposes confirmed App build or explicit legacy preparation", () => {
+	const modern = client.buildPluginUpdateModel({
+		state: "update-available",
+		canSelfUpdate: true,
+		candidate: {
+			plugin: { version: "3.2.2-alpha.1" },
+			carrier: { appVersion: "3.2.2+26", legacyMetadataMissing: false },
+		},
+	});
+	assert.equal(modern.hasUpdate, true);
+	assert.equal(modern.pluginVersion, "3.2.2-alpha.1");
+	assert.equal(modern.appVersion, "3.2.2+26");
+	assert.equal(modern.needsPreparation, false);
+
+	const legacy = client.buildPluginUpdateModel({
+		state: "update-available",
+		canSelfUpdate: true,
+		candidate: {
+			plugin: { version: "3.2.2-alpha.1" },
+			carrier: { appVersion: null, legacyMetadataMissing: true },
+		},
+	});
+	assert.equal(legacy.hasUpdate, true);
+	assert.equal(legacy.appVersion, "");
+	assert.equal(legacy.needsPreparation, true);
+
+	const resumed = client.buildPluginUpdateModel({
+		state: "update-available",
+		candidate: legacy.candidate,
+		transaction: { targetAppVersion: "3.2.2+26" },
+	});
+	assert.equal(resumed.appVersion, "3.2.2+26");
+	assert.equal(resumed.needsPreparation, false, "a prepared active transaction already has an authoritative App build");
+});

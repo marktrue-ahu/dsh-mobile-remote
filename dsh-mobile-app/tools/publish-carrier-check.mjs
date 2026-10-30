@@ -359,6 +359,8 @@ function main() {
 			mainPkg,
 			expectedName: typeof mainPkg.name === "string" ? mainPkg.name : "",
 			expectedVersion: expectedCarrierVersion,
+			expectedAppVersion: manifest.app?.version ?? "",
+			expectedPluginContentSha256: manifest.plugin?.contentSha256 ?? "",
 			expectedFiles,
 		}), "carrier-publish-metadata-invalid");
 		if (list.ok) {

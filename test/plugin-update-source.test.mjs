@@ -9,6 +9,7 @@ import {
 	checkForUpdate,
 	fetchReleaseManifest,
 	resolveManifestSource,
+	resolvePluginUpdateSource,
 	synthesizeFromGithubRelease,
 	UPSTREAM_MANIFEST_URL,
 } from "../lib/plugin-self-update.js";
@@ -31,6 +32,25 @@ const manifestDoc = ({ version = "3.3.0", contentSha256 = HASH_B } = {}) => ({
 	plugin: { version, file: `dsh-mobile-remote-v${version}.tgz`, url: `https://example.com/${version}.tgz`, size: 10, sha256: HASH_A, contentSha256 },
 });
 
+const NPM_PACKAGE_NAME = "@marktrue/dsh-mobile-remote";
+function fakeNpmPackageView({ version, appVersion, contentSha256 = HASH_B } = {}) {
+	const carrierVersion = `${version}-app`;
+	const core = version.split("-")[0];
+	const sri = text => `sha512-${Buffer.from(text).toString("base64")}`;
+	const docs = new Map([
+		[NPM_PACKAGE_NAME, { "dist-tags": { latest: version, alpha: version, app: carrierVersion } }],
+		[`${NPM_PACKAGE_NAME}@${version}`, {
+			version, dist: { integrity: sri("plugin") },
+			optionalDependencies: { "@marktrue/dsh-mobile-remote-app": `npm:${NPM_PACKAGE_NAME}@${carrierVersion}` },
+		}],
+		[`${NPM_PACKAGE_NAME}@${carrierVersion}`, {
+			version: carrierVersion, appVersion: appVersion ?? `${core}+50`, pluginContentSha256: contentSha256,
+			dist: { integrity: sri("carrier") },
+		}],
+	]);
+	return async spec => docs.get(spec) ?? null;
+}
+
 test("resolveManifestSource：off / upstream / 自定义 https / 非法值四态分明", () => {
 	assert.equal(resolveManifestSource("").kind, UPDATE_SOURCE_KIND.OFF);
 	assert.equal(resolveManifestSource("off").kind, UPDATE_SOURCE_KIND.OFF);
@@ -46,6 +66,14 @@ test("resolveManifestSource：off / upstream / 自定义 https / 非法值四态
 
 	assert.equal(resolveManifestSource("http://insecure.host/m.json").kind, UPDATE_SOURCE_KIND.INVALID);
 	assert.equal(resolveManifestSource("ftp://x/m.json").kind, UPDATE_SOURCE_KIND.INVALID);
+});
+
+test("plugin update source is NPM-only; old non-off source values migrate to npm", () => {
+	assert.equal(resolvePluginUpdateSource("npm").kind, UPDATE_SOURCE_KIND.NPM);
+	assert.equal(resolvePluginUpdateSource("off").kind, UPDATE_SOURCE_KIND.OFF);
+	assert.equal(resolvePluginUpdateSource("upstream").kind, UPDATE_SOURCE_KIND.NPM);
+	assert.equal(resolvePluginUpdateSource("https://legacy.example/manifest.json").kind, UPDATE_SOURCE_KIND.NPM);
+	assert.equal(resolvePluginUpdateSource("ftp://invalid.example/manifest.json").kind, UPDATE_SOURCE_KIND.INVALID);
 });
 
 test("fetchReleaseManifest：upstream 有清单资产时直接用清单", async () => {
@@ -119,52 +147,91 @@ test("checkForUpdate：off 不检查；非法来源如实报不可用", async ()
 	assert.equal(invalid.reason, "update-source-invalid");
 });
 
-test("checkForUpdate：取不到清单 → unavailable（不猜、不改动）", async () => {
+test("checkForUpdate: registry 查询失败时返回不可用且不暴露 npm stderr", async () => {
 	const r = await checkForUpdate({
-		configValue: "https://my.host/m.json",
-		fetchImpl: fakeFetch({}),
-		localVersion: "3.2.0",
+		configValue: "npm",
+		packageName: NPM_PACKAGE_NAME,
+		localVersion: "3.2.1",
+		npmPackageView: async () => { throw new Error("auth token=secret-private-value"); },
 	});
 	assert.equal(r.state, UPDATE_CHECK_STATE.UNAVAILABLE);
-	assert.match(r.reason, /manifest-http-404/);
+	assert.equal(r.reason, "npm-registry-unavailable");
+	assert.equal(JSON.stringify(r).includes("secret-private-value"), false);
 });
 
-test("checkForUpdate：内容标识一致 → 已是最新（即使版本号不同）", async () => {
+test("checkForUpdate: 内容标识相同即已是最新（即使 NPM 版本更新）", async () => {
 	const r = await checkForUpdate({
-		configValue: "https://my.host/m.json",
-		fetchImpl: fakeFetch({ "https://my.host/m.json": { json: manifestDoc({ version: "3.3.0", contentSha256: HASH_B }) } }),
+		configValue: "npm",
+		packageName: NPM_PACKAGE_NAME,
 		localVersion: "3.2.0",
 		localContentSha256: HASH_B,
+		npmPackageView: fakeNpmPackageView({ version: "3.3.0", contentSha256: HASH_B }),
 	});
 	assert.equal(r.state, UPDATE_CHECK_STATE.UP_TO_DATE);
 	assert.equal(r.reason, "content-identical");
 });
 
-test("checkForUpdate：版本号相同、内容不同 → 应更新（版本比较看不见的形态）", async () => {
+test("checkForUpdate: 同版本内容标识变化 fail-closed", async () => {
 	const r = await checkForUpdate({
-		configValue: "https://my.host/m.json",
-		fetchImpl: fakeFetch({ "https://my.host/m.json": { json: manifestDoc({ version: "3.2.0", contentSha256: HASH_B }) } }),
+		configValue: "npm",
+		packageName: NPM_PACKAGE_NAME,
 		localVersion: "3.2.0",
 		localContentSha256: HASH_A,
+		npmPackageView: fakeNpmPackageView({ version: "3.2.0", contentSha256: HASH_B }),
 	});
-	assert.equal(r.state, UPDATE_CHECK_STATE.UPDATE_AVAILABLE);
-	assert.equal(r.reason, "content-differs-same-version");
+	assert.equal(r.state, UPDATE_CHECK_STATE.UNAVAILABLE);
+	assert.equal(r.reason, "npm-version-content-mismatch");
 });
 
-test("checkForUpdate：上游合成来源无内容标识 → 版本比较兜底，并标注 synthesized", async () => {
-	const upstream = resolveManifestSource("upstream");
+test("checkForUpdate: legacy upstream 配置迁移到 NPM 检查，不再访问 GitHub", async () => {
+	let calls = 0;
 	const r = await checkForUpdate({
 		configValue: "upstream",
-		fetchImpl: fakeFetch({
-			[upstream.api]: {
-				json: { tag_name: "v3.3.0", assets: [{ name: "dsh-mobile-remote-v3.3.0.tgz", size: 10, digest: `sha256:${HASH_A}`, browser_download_url: "https://x/p.tgz" }] },
-			},
-		}),
+		packageName: NPM_PACKAGE_NAME,
 		localVersion: "3.2.0",
-		localContentSha256: HASH_B,
+		localContentSha256: HASH_A,
+		npmPackageView: async (spec) => { calls += 1; return fakeNpmPackageView({ version: "3.3.0" })(spec); },
 	});
 	assert.equal(r.state, UPDATE_CHECK_STATE.UPDATE_AVAILABLE);
-	assert.equal(r.reason, "version-newer-no-content-digest");
-	assert.equal(r.synthesized, true);
-	assert.equal(r.remote.version, "3.3.0");
+	assert.equal(r.source, "npm");
+	assert.equal(r.candidate.plugin.version, "3.3.0");
+	assert.equal(calls, 3);
+});
+
+test("checkForUpdate: NPM uses installed prerelease channel and returns a sanitized exact pair", async () => {
+	const packageName = "@marktrue/dsh-mobile-remote";
+	const pluginVersion = "3.2.2-alpha.1";
+	const carrierVersion = "3.2.2-alpha.1-app";
+	const calls = [];
+	const documents = new Map([
+		[packageName, { "dist-tags": { latest: "3.2.1-alpha.3", alpha: pluginVersion, app: "3.2.3-alpha.1-app" } }],
+		[`${packageName}@${pluginVersion}`, {
+			version: pluginVersion,
+			dist: { integrity: `sha512-${Buffer.from("plugin").toString("base64")}` },
+			optionalDependencies: {
+				"@marktrue/dsh-mobile-remote-app": `npm:${packageName}@${carrierVersion}`,
+			},
+		}],
+		[`${packageName}@${carrierVersion}`, {
+			version: carrierVersion,
+			appVersion: "3.2.2+26",
+			dist: { integrity: `sha512-${Buffer.from("carrier").toString("base64")}` },
+		}],
+	]);
+	const npmPackageView = async (spec) => { calls.push(spec); return documents.get(spec) ?? null; };
+	const r = await checkForUpdate({
+		configValue: "npm",
+		packageName,
+		localVersion: "3.2.1-alpha.3",
+		localContentSha256: HASH_A,
+		npmPackageView,
+	});
+	assert.equal(r.state, UPDATE_CHECK_STATE.UPDATE_AVAILABLE);
+	assert.equal(r.source, "npm");
+	assert.equal(r.candidate.channel, "alpha");
+	assert.equal(r.candidate.plugin.version, pluginVersion);
+	assert.equal(r.candidate.carrier.version, carrierVersion);
+	assert.equal(r.candidate.carrier.appVersion, "3.2.2+26");
+	assert.equal(JSON.stringify(r).includes("registry.example"), false);
+	assert.deepEqual(calls, [packageName, `${packageName}@${pluginVersion}`, `${packageName}@${carrierVersion}`]);
 });
