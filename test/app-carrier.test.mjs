@@ -223,6 +223,29 @@ test("闭包排除：prerelease 插件与载体按全字串配对通过后仍从
 	assert.equal(exclusion.apk.sha256, sha256(APK_BYTES));
 });
 
+test("carrier packument App version metadata 与清单不符时拒绝；缺失字段兼容旧载体", (t) => {
+	const mismatched = fixture(t, {
+		rawCarrierPackage: JSON.stringify({ name: PLUGIN_NAME, version: CARRIER_VERSION, dsh: { appCarrier: true }, appVersion: "3.2.0+99" }),
+	});
+	const bad = discoverAppCarrier({ pluginRoot: mismatched.pluginRoot, dshHome: mismatched.dshHome });
+	assert.equal(bad.status, APP_CARRIER_STATUS.MISMATCH);
+	assert.equal(bad.reason, "carrier-app-version-metadata-mismatch");
+
+	const badContent = fixture(t, {
+		rawCarrierPackage: JSON.stringify({ name: PLUGIN_NAME, version: CARRIER_VERSION, dsh: { appCarrier: true }, appVersion: `${PLUGIN_VERSION}+42`, pluginContentSha256: "f".repeat(64) }),
+	});
+	const badDigest = discoverAppCarrier({ pluginRoot: badContent.pluginRoot, dshHome: badContent.dshHome });
+	assert.equal(badDigest.status, APP_CARRIER_STATUS.MISMATCH);
+	assert.equal(badDigest.reason, "carrier-plugin-content-sha256-metadata-mismatch");
+
+	const legacy = fixture(t, {
+		rawCarrierPackage: JSON.stringify({ name: PLUGIN_NAME, version: CARRIER_VERSION, dsh: { appCarrier: true } }),
+	});
+	const old = discoverAppCarrier({ pluginRoot: legacy.pluginRoot, dshHome: legacy.dshHome });
+	assert.equal(old.ok, true, old.reason);
+	assert.equal(old.manifest.appVersion, `${PLUGIN_VERSION}+42`);
+});
+
 test("pnpm sibling 作用域找到并校验随包载体：身份、清单、APK 全部通过", (t) => {
 	const f = fixture(t);
 	const result = discoverAppCarrier({ pluginRoot: f.pluginRoot, dshHome: f.dshHome });

@@ -350,9 +350,7 @@ class Api implements GitReadApi {
     turnOutlineCapabilities = capabilities is Map
         ? TurnOutlineCapabilities.fromJson(
             capabilities['turnOutline'] is Map
-                ? Map<String, dynamic>.from(
-                    capabilities['turnOutline'] as Map,
-                  )
+                ? Map<String, dynamic>.from(capabilities['turnOutline'] as Map)
                 : null,
           )
         : const TurnOutlineCapabilities();
@@ -400,7 +398,9 @@ class Api implements GitReadApi {
   /// 重新读取电脑端当前状态（下载前 / 拉起安装器前的复核，§5.9）。
   ///
   /// 失败会抛 [ApiException]：调用方必须据此**拒绝继续**，不能靠旧缓存证明启动安装。
-  Future<void> refreshUpdateState({Duration timeout = const Duration(seconds: 8)}) async {
+  Future<void> refreshUpdateState({
+    Duration timeout = const Duration(seconds: 8),
+  }) async {
     final d = await getJson('/api/bootstrap', timeout: timeout);
     absorbUpdateState(d);
   }
@@ -564,8 +564,9 @@ class Api implements GitReadApi {
   }
 
   // ── 业务接口 ──
-  Future<Catalog> catalog({bool refresh = false}) async =>
-      Catalog.fromJson(await getJson(refresh ? '/api/catalog?refresh=1' : '/api/catalog'));
+  Future<Catalog> catalog({bool refresh = false}) async => Catalog.fromJson(
+    await getJson(refresh ? '/api/catalog?refresh=1' : '/api/catalog'),
+  );
   Future<SessionConfig> sessionConfig(
     String sessionId,
   ) async => SessionConfig.fromJson(
@@ -590,25 +591,41 @@ class Api implements GitReadApi {
 
   /// Only the trusted host artifact routes may receive the host token, never external URLs.
   Map<String, String> artifactHeaders(Uri uri) {
-    final mount = path == '/' || path.isEmpty ? '/m' : path.replaceFirst(RegExp(r'/$'), '');
+    final mount = path == '/' || path.isEmpty
+        ? '/m'
+        : path.replaceFirst(RegExp(r'/$'), '');
     // baseUrl 可能为空（绝对 URL 候选）：这时没有"本机 origin"可言，绝不带口令。
     final origin = baseUrl.isEmpty ? null : Uri.tryParse(baseUrl);
-    final sameOrigin = origin != null && origin.hasScheme && uri.origin == origin.origin;
-    return {'User-Agent': 'dsh-mobile-remote-app',
-      if (sameOrigin && uri.path.startsWith('$mount/api/update/') && token.isNotEmpty) 'x-mobile-token': token};
+    final sameOrigin =
+        origin != null && origin.hasScheme && uri.origin == origin.origin;
+    return {
+      'User-Agent': 'dsh-mobile-remote-app',
+      if (sameOrigin &&
+          uri.path.startsWith('$mount/api/update/') &&
+          token.isNotEmpty)
+        'x-mobile-token': token,
+    };
   }
 
   Future<Map<String, dynamic>> getAbsoluteJson(String url) async {
     var uri = Uri.parse(url);
     for (var redirects = 0; redirects <= 5; redirects++) {
       final localOrigin = baseUrl.isEmpty ? null : Uri.tryParse(baseUrl);
-      final isLocalHttp = localOrigin != null && localOrigin.hasScheme && uri.scheme == 'http' && uri.origin == localOrigin.origin;
-      if (uri.host.isEmpty || uri.userInfo.isNotEmpty || (uri.scheme != 'https' && !isLocalHttp)) {
+      final isLocalHttp =
+          localOrigin != null &&
+          localOrigin.hasScheme &&
+          uri.scheme == 'http' &&
+          uri.origin == localOrigin.origin;
+      if (uri.host.isEmpty ||
+          uri.userInfo.isNotEmpty ||
+          (uri.scheme != 'https' && !isLocalHttp)) {
         throw ApiException('不安全的清单 URL');
       }
       final request = http.Request('GET', uri)..followRedirects = false;
       request.headers.addAll(artifactHeaders(uri));
-      final response = await _client.send(request).timeout(const Duration(seconds: 15));
+      final response = await _client
+          .send(request)
+          .timeout(const Duration(seconds: 15));
       if (const {301, 302, 303, 307, 308}.contains(response.statusCode)) {
         final next = response.headers['location'];
         await response.stream.drain<void>();
@@ -621,15 +638,34 @@ class Api implements GitReadApi {
     throw ApiException('清单重定向次数过多');
   }
 
-  /// 触发**电脑端插件自更新**（ADR 0019：手机可独立触发，不需要坐到电脑前）。
-  /// 返回 `{action, opId?, check?}`；服务端**先应答、再后台推进**，因此超时不代表没开始
-  /// ——带同一个 [opId] 重试是幂等的，重连后凭它查询同一事务（评审 R6/R10）。
-  Future<Map<String, dynamic>> triggerPluginUpdate({String opId = ''}) =>
-      postJson(
-        '/api/plugin-update',
-        <String, dynamic>{if (opId.isNotEmpty) 'opId': opId},
-        timeout: const Duration(seconds: 15),
-      );
+  /// Read the host-selected plugin/carrier candidate. The phone never contacts npm.
+  Future<Map<String, dynamic>> checkPluginUpdate() =>
+      getJson('/api/plugin-update/check');
+
+  /// Resolve legacy candidate metadata before asking for final update confirmation.
+  Future<Map<String, dynamic>> preparePluginUpdate({required String opId}) =>
+      postJson('/api/plugin-update/prepare', {
+        'opId': opId,
+      }, timeout: const Duration(minutes: 5));
+
+  /// Authenticated sanitized progress log for one idempotent update operation.
+  Future<Map<String, dynamic>> pluginUpdateLog({
+    required String opId,
+    int afterSeq = 0,
+  }) => getJson(
+    '/api/plugin-update/log?opId=${Uri.encodeQueryComponent(opId)}&afterSeq=$afterSeq',
+  );
+
+  /// Trigger desktop plugin update. Retries retain [opId] and optional prepare proof.
+  Future<Map<String, dynamic>> triggerPluginUpdate({
+    String opId = '',
+    String? targetVersion,
+    String? prepareId,
+  }) => postJson('/api/plugin-update', <String, dynamic>{
+    if (opId.isNotEmpty) 'opId': opId,
+    if (targetVersion != null) 'targetVersion': targetVersion,
+    if (prepareId != null) 'prepareId': prepareId,
+  }, timeout: const Duration(seconds: 15));
 
   // ── v2.6：模型提供商（与 PC 端 设置→模型 同一配置通道） ──
   /// 提供商列表（含 dormant 未激活项、baseURL、密钥状态）。

@@ -12,12 +12,30 @@ const AUTH_TOKEN = 'fixture-admission-token';
 const home = mkdtempSync(join(tmpdir(), 'update-admission-'));
 process.env.HOME = home;
 const { apply } = await import('../lib/index.js');
+const { appendOperationLog } = await import('../lib/plugin-update-log.js');
 const { readTransaction, transactionFile, readLock, updateLockPath, releaseLock, finishOwnedTerminal } = await import('../lib/plugin-update-transaction.js');
 const manifest = {
   schema: 1,
   app: { version: '3.3.0+70', file: 'app.apk', size: 3, sha256: 'a'.repeat(64), url: 'https://release.test/app-70.apk' },
   plugin: { version: '3.3.0', file: 'plugin.tgz', size: 3, sha256: 'b'.repeat(64), contentSha256: 'c'.repeat(64), url: 'https://release.test/plugin-70.tgz' },
 };
+const NPM_PACKAGE_NAME = '@marktrue/dsh-mobile-remote';
+const NPM_PLUGIN_VERSION = '3.3.0-alpha.1';
+const NPM_CARRIER_VERSION = `${NPM_PLUGIN_VERSION}-app`;
+const NPM_DOCS = new Map([
+  [NPM_PACKAGE_NAME, { 'dist-tags': { latest: '3.2.1-alpha.1', alpha: NPM_PLUGIN_VERSION, app: NPM_CARRIER_VERSION } }],
+  [`${NPM_PACKAGE_NAME}@${NPM_PLUGIN_VERSION}`, {
+    version: NPM_PLUGIN_VERSION,
+    dist: { integrity: `sha512-${Buffer.from('plugin').toString('base64')}` },
+    contentSha256: 'c'.repeat(64),
+    optionalDependencies: { '@marktrue/dsh-mobile-remote-app': `npm:${NPM_PACKAGE_NAME}@${NPM_CARRIER_VERSION}` },
+  }],
+  [`${NPM_PACKAGE_NAME}@${NPM_CARRIER_VERSION}`, {
+    version: NPM_CARRIER_VERSION, appVersion: '3.3.0+70', pluginContentSha256: 'c'.repeat(64),
+    dist: { integrity: `sha512-${Buffer.from('carrier').toString('base64')}` },
+  }],
+]);
+const npmPackageView = async spec => NPM_DOCS.get(spec) ?? null;
 let installed = 0;
 let jobs = [];
 const fetchImpl = async () => new Response(JSON.stringify(manifest), { headers: { 'content-type': 'application/json' } });
@@ -39,19 +57,19 @@ function harness(options = {}) {
   };
   const config = {
     path: '/m', authToken: AUTH_TOKEN, cookieName: 'token', trustedHosts: [], sessionTtlMs: 60000,
-    rechargeUrl: '', updateDir: '', pluginUpdateManifest: 'https://release.test/manifest.json', updateProfileDir: profile,
+    rechargeUrl: '', updateDir: '', pluginUpdateManifest: 'npm', updateProfileDir: profile,
     maxConnections: 16, pushUrls: [], pushCooldownMs: 60000, doneGraceMs: 1000, pushContent: 'minimal',
     rateLimit: { maxFailures: 10, windowMs: 60000, blockMs: 60000 }, lanBridge: { enabled: false, host: '127.0.0.1', port: 39401 }, ...options.config,
   };
   const { pluginUpdates: pluginOverrides = {}, ...restOptions } = options;
-  apply(ctx, config, { ...restOptions, pluginUpdates: { fetchImpl, restartForm: () => 'web-foreground',
+  apply(ctx, config, { ...restOptions, pluginUpdates: { fetchImpl, npmPackageView, restartForm: () => 'web-foreground',
     schedule: fn => jobs.push(fn), runSelfUpdate: async () => { installed++; return { ok: true }; },
     ...(restOptions.persist ? { persist: restOptions.persist } : {}), ...pluginOverrides } });
   return { route: routes.find(r => r.kind === 'prefix' && /\/api$/.test(r.path)), mount: config.path, home: testHome, logs, dispose: () => cleanup?.(), profile };
 }
 async function request(route, body, path = '/m/api/plugin-update', headers = {}) {
   const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);
-  Object.assign(req, { method: path.endsWith('bootstrap') || path.includes('/update/') ? 'GET' : 'POST', url: path, headers: { host: '127.0.0.1:39401', 'x-mobile-token': AUTH_TOKEN, ...headers }, socket: { remoteAddress: '127.0.0.1' } });
+  Object.assign(req, { method: path.endsWith('bootstrap') || path.endsWith('/plugin-update/check') || path.includes('/plugin-update/log') || path.includes('/update/') ? 'GET' : 'POST', url: path, headers: { host: '127.0.0.1:39401', 'x-mobile-token': AUTH_TOKEN, ...headers }, socket: { remoteAddress: '127.0.0.1' } });
   const chunks = [];
   const res = new Writable({ write(chunk, _, cb) { chunks.push(Buffer.from(chunk)); cb(); } });
   res.writeHead = (status) => { res.statusCode = status; return res; };
@@ -60,7 +78,8 @@ async function request(route, body, path = '/m/api/plugin-update', headers = {})
   return { status: res.statusCode, body: json, bytes };
 }
 
-test('C1: actual update-available handler persists release before accepted; retry starts one worker', async () => {
+test('C1: actual NPM update-available handler freezes candidate before accepted; retry starts one worker', async () => {
+  const jobsBefore = jobs.length;
   const h = harness(); const savedFetch = global.fetch; global.fetch = fetchImpl;
   try {
     const r = await request(h.route, { opId: 'request-accepted' });
@@ -68,16 +87,288 @@ test('C1: actual update-available handler persists release before accepted; retr
     assert.equal(r.body.action, 'accepted');
     const tx = readTransaction(transactionFile(home));
     assert.equal(tx.opId, r.body.opId);
-    assert.deepEqual(tx.release.app, manifest.app);
-    assert.equal(jobs.length, 1); assert.equal(installed, 0);
+    assert.equal(tx.release, null);
+    assert.equal(tx.npmCandidate.plugin.version, NPM_PLUGIN_VERSION);
+    assert.equal(tx.npmCandidate.carrier.appVersion, '3.3.0+70');
+    assert.equal(jobs.length, jobsBefore + 1); assert.equal(installed, 0);
     const again = await request(h.route, { opId: 'request-accepted' });
-    assert.equal(again.body.opId, tx.opId); assert.equal(jobs.length, 1);
+    assert.equal(again.body.opId, tx.opId); assert.equal(jobs.length, jobsBefore + 1);
     const busy = await request(h.route, { opId: 'different-request' });
     assert.equal(busy.status, 409); assert.equal(busy.body.transaction.opId, tx.opId);
     // Reads remain responsive while the scheduled install has not even run.
     const boot = await request(h.route, undefined, '/m/api/bootstrap');
     assert.equal(boot.status, 200, JSON.stringify({ body: boot.body, logs: h.logs.slice(-4) }));
   } finally { global.fetch = savedFetch; const holder = readLock(updateLockPath(home)); if (holder) { const tx = readTransaction(transactionFile(home)); const { writeOwnedTransaction } = await import('../lib/plugin-update-transaction.js'); writeOwnedTransaction(transactionFile(home), { ...tx, phase: 'failed' }, { lockPath: updateLockPath(home), lease: holder }); releaseLock(updateLockPath(home), holder); } h.dispose(); }
+});
+
+test('NPM read-only check returns a sanitized candidate without scheduling installation', async () => {
+  const packageName = '@marktrue/dsh-mobile-remote';
+  const pluginVersion = '3.2.2-alpha.2';
+  const carrierVersion = `${pluginVersion}-app`;
+  const docs = new Map([
+    [packageName, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, app: carrierVersion } }],
+    [`${packageName}@${pluginVersion}`, {
+      version: pluginVersion,
+      dist: { integrity: `sha512-${Buffer.from('plugin').toString('base64')}` },
+      optionalDependencies: { '@marktrue/dsh-mobile-remote-app': `npm:${packageName}@${carrierVersion}` },
+    }],
+    [`${packageName}@${carrierVersion}`, {
+      version: carrierVersion, appVersion: '3.2.2+26',
+      dist: { integrity: `sha512-${Buffer.from('carrier').toString('base64')}` },
+    }],
+  ]);
+  const npmPackageView = async (spec) => docs.get(spec) ?? null;
+  const h = harness({ config: { pluginUpdateManifest: 'npm' }, pluginUpdates: { npmPackageView } });
+  const pkgBefore = readFileSync(join(h.profile, 'package.json'), 'utf8');
+  const jobsBefore = jobs.length, installedBefore = installed;
+  try {
+    const r = await request(h.route, undefined, '/m/api/plugin-update/check');
+    assert.equal(r.status, 200, JSON.stringify({ body: r.body, logs: h.logs }));
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.pluginUpdate.source, 'npm');
+    assert.equal(r.body.pluginUpdate.state, 'update-available');
+    assert.equal(r.body.pluginUpdate.candidate.plugin.version, pluginVersion);
+    assert.equal(r.body.pluginUpdate.candidate.carrier.appVersion, '3.2.2+26');
+    assert.equal(JSON.stringify(r.body).includes('dist.tarball'), false);
+    assert.equal(JSON.stringify(r.body).includes(AUTH_TOKEN), false);
+    assert.equal(readFileSync(join(h.profile, 'package.json'), 'utf8'), pkgBefore);
+    assert.equal(jobs.length, jobsBefore);
+    assert.equal(installed, installedBefore);
+  } finally { h.dispose(); }
+});
+
+test('NPM POST rejects a candidate that changed after the user confirmed its version', async () => {
+  const testHome = mkdtempSync(join(tmpdir(), 'update-npm-version-confirm-'));
+  const h = harness({ homeDir: testHome });
+  const jobsBefore = jobs.length;
+  try {
+    const r = await request(h.route, { opId: 'confirmed-wrong-version', targetVersion: '0.0.0' });
+    assert.equal(r.status, 409, JSON.stringify(r.body));
+    assert.equal(r.body.error, 'candidate-changed');
+    assert.equal(r.body.check.candidate.plugin.version, NPM_PLUGIN_VERSION);
+    assert.equal(readTransaction(transactionFile(testHome)), null);
+    assert.equal(jobs.length, jobsBefore);
+  } finally { h.dispose(); }
+});
+
+test('NPM POST freezes the exact candidate and gives it to the async worker', async () => {
+  const oldHome = process.env.HOME;
+  const testHome = mkdtempSync(join(tmpdir(), 'update-npm-submit-'));
+  const packageName = '@marktrue/dsh-mobile-remote';
+  const pluginVersion = '3.2.2-alpha.2';
+  const carrierVersion = `${pluginVersion}-app`;
+  const docs = new Map([
+    [packageName, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, app: carrierVersion } }],
+    [`${packageName}@${pluginVersion}`, {
+      version: pluginVersion,
+      dist: { integrity: `sha512-${Buffer.from('plugin').toString('base64')}` },
+      optionalDependencies: { '@marktrue/dsh-mobile-remote-app': `npm:${packageName}@${carrierVersion}` },
+    }],
+    [`${packageName}@${carrierVersion}`, {
+      version: carrierVersion, appVersion: '3.2.2+26', pluginContentSha256: 'b'.repeat(64),
+      dist: { integrity: `sha512-${Buffer.from('carrier').toString('base64')}` },
+    }],
+  ]);
+  let workerArgs = null;
+  const jobsBefore = jobs.length;
+  const h = harness({
+    homeDir: testHome,
+    config: { pluginUpdateManifest: 'npm' },
+    pluginUpdates: {
+      npmPackageView: async (spec) => docs.get(spec) ?? null,
+      runSelfUpdate: async (args) => { workerArgs = args; return { ok: true }; },
+    },
+  });
+  try {
+    const r = await request(h.route, { opId: 'npm-candidate-accepted' });
+    assert.equal(r.status, 200, JSON.stringify({ body: r.body, logs: h.logs }));
+    assert.equal(r.body.action, 'accepted');
+    assert.equal(r.body.transaction.targetAppVersion, '3.2.2+26');
+    const tx = readTransaction(transactionFile(testHome));
+    assert.equal(tx.targetVersion, pluginVersion);
+    assert.equal(tx.npmCandidate.plugin.version, pluginVersion);
+    assert.equal(tx.npmCandidate.carrier.version, carrierVersion);
+    assert.equal(tx.release, null);
+    const scheduled = jobs.splice(jobsBefore);
+    assert.equal(scheduled.length, 1);
+    await scheduled[0]();
+    assert.equal(workerArgs.npmCandidate.plugin.version, pluginVersion);
+    assert.equal(workerArgs.plugin.version, pluginVersion);
+  } finally {
+    const holder = readLock(updateLockPath(testHome));
+    if (holder) {
+      const tx = readTransaction(transactionFile(testHome));
+      const { writeOwnedTransaction } = await import('../lib/plugin-update-transaction.js');
+      writeOwnedTransaction(transactionFile(testHome), { ...tx, phase: 'failed' }, { lockPath: updateLockPath(testHome), lease: holder });
+      releaseLock(updateLockPath(testHome), holder);
+    }
+    jobs.splice(jobsBefore);
+    h.dispose();
+    process.env.HOME = oldHome;
+  }
+});
+
+test('legacy carrier metadata triggers preparation before any profile mutation', async () => {
+  const testHome = mkdtempSync(join(tmpdir(), 'update-legacy-prepare-'));
+  const pluginVersion = '3.2.2-alpha.2';
+  const carrierVersion = `${pluginVersion}-app`;
+  const docs = new Map([
+    [NPM_PACKAGE_NAME, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, app: carrierVersion } }],
+    [`${NPM_PACKAGE_NAME}@${pluginVersion}`, {
+      version: pluginVersion,
+      dist: { integrity: `sha512-${Buffer.from('plugin').toString('base64')}` },
+      optionalDependencies: { '@marktrue/dsh-mobile-remote-app': `npm:${NPM_PACKAGE_NAME}@${carrierVersion}` },
+    }],
+    [`${NPM_PACKAGE_NAME}@${carrierVersion}`, {
+      version: carrierVersion,
+      dist: { integrity: `sha512-${Buffer.from('carrier').toString('base64')}` },
+    }],
+  ]);
+  const h = harness({ homeDir: testHome, pluginUpdates: { npmPackageView: async spec => docs.get(spec) ?? null } });
+  const profileBefore = readFileSync(join(h.profile, 'package.json'), 'utf8');
+  const jobsBefore = jobs.length;
+  try {
+    const r = await request(h.route, { opId: 'legacy-needs-prepare' });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.equal(r.body.action, 'prepare-required');
+    assert.equal(r.body.check.candidate.carrier.legacyMetadataMissing, true);
+    assert.equal(readTransaction(transactionFile(testHome)), null);
+    assert.equal(readFileSync(join(h.profile, 'package.json'), 'utf8'), profileBefore);
+    assert.equal(jobs.length, jobsBefore);
+  } finally { h.dispose(); }
+});
+
+test('legacy NPM prepare reveals the carrier build before the final update confirmation', async () => {
+  const oldHome = process.env.HOME;
+  const testHome = mkdtempSync(join(tmpdir(), 'update-legacy-confirm-'));
+  const pluginVersion = '3.2.2-alpha.2';
+  const carrierVersion = `${pluginVersion}-app`;
+  const docs = new Map([
+    [NPM_PACKAGE_NAME, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, app: carrierVersion } }],
+    [`${NPM_PACKAGE_NAME}@${pluginVersion}`, {
+      version: pluginVersion,
+      dist: { integrity: `sha512-${Buffer.from('plugin').toString('base64')}` },
+      optionalDependencies: { '@marktrue/dsh-mobile-remote-app': `npm:${NPM_PACKAGE_NAME}@${carrierVersion}` },
+    }],
+    [`${NPM_PACKAGE_NAME}@${carrierVersion}`, {
+      version: carrierVersion,
+      dist: { integrity: `sha512-${Buffer.from('carrier').toString('base64')}` },
+    }],
+  ]);
+  const preparedDigest = 'd'.repeat(64);
+  let workerArgs = null;
+  const jobsBefore = jobs.length;
+  const h = harness({
+    homeDir: testHome,
+    config: { pluginUpdateManifest: 'npm' },
+    pluginUpdates: {
+      npmPackageView: async spec => docs.get(spec) ?? null,
+      prepareNpmArtifacts: async ({ workDir }) => ({
+        ok: true, workDir,
+        pluginPackageDir: join(workDir, 'plugin-package'),
+        carrierPackageDir: join(workDir, 'carrier-package'),
+        pluginTgzPath: join(workDir, 'plugin.tgz'),
+        carrierTgzPath: join(workDir, 'carrier.tgz'),
+        pluginContentSha256: preparedDigest,
+        carrierAppVersion: '3.2.2+26',
+        manifest: { schema: 1, app: { version: '3.2.2+26' }, plugin: { version: pluginVersion, contentSha256: preparedDigest } },
+      }),
+      runSelfUpdate: async args => { workerArgs = args; return { ok: true }; },
+    },
+  });
+  const profileBefore = readFileSync(join(h.profile, 'package.json'), 'utf8');
+  try {
+    const prepared = await request(h.route, { opId: 'legacy-final-confirm' }, '/m/api/plugin-update/prepare');
+    assert.equal(prepared.status, 200, JSON.stringify(prepared.body));
+    assert.equal(prepared.body.action, 'prepared');
+    assert.equal(prepared.body.candidate.carrier.appVersion, '3.2.2+26');
+    assert.equal(prepared.body.candidate.carrier.legacyMetadataMissing, false);
+    assert.equal(readTransaction(transactionFile(testHome)), null);
+    assert.equal(readFileSync(join(h.profile, 'package.json'), 'utf8'), profileBefore);
+    assert.equal(jobs.length, jobsBefore);
+
+    const accepted = await request(h.route, { opId: 'legacy-final-confirm', prepareId: prepared.body.prepareId });
+    assert.equal(accepted.status, 200, JSON.stringify(accepted.body));
+    assert.equal(accepted.body.action, 'accepted');
+    const tx = readTransaction(transactionFile(testHome));
+    assert.equal(tx.npmCandidate.carrier.appVersion, '3.2.2+26');
+    assert.equal(tx.npmCandidate.plugin.contentSha256, preparedDigest);
+    assert.equal(readFileSync(join(h.profile, 'package.json'), 'utf8'), profileBefore, 'profile is unchanged until the async confirmed worker runs');
+    const scheduled = jobs.splice(jobsBefore);
+    assert.equal(scheduled.length, 1);
+    await scheduled[0]();
+    assert.equal(workerArgs.preparedNpmArtifacts.pluginContentSha256, preparedDigest);
+  } finally {
+    const holder = readLock(updateLockPath(testHome));
+    if (holder) {
+      const tx = readTransaction(transactionFile(testHome));
+      const { writeOwnedTransaction } = await import('../lib/plugin-update-transaction.js');
+      writeOwnedTransaction(transactionFile(testHome), { ...tx, phase: 'failed' }, { lockPath: updateLockPath(testHome), lease: holder });
+      releaseLock(updateLockPath(testHome), holder);
+    }
+    jobs.splice(jobsBefore);
+    h.dispose();
+    process.env.HOME = oldHome;
+  }
+});
+
+test('authenticated log replay returns live pnpm output sanitized by operation ID', async () => {
+  const oldHome = process.env.HOME;
+  const testHome = mkdtempSync(join(tmpdir(), 'update-log-replay-'));
+  const opId = 'npm-log-replay';
+  const jobsBefore = jobs.length;
+  let h = harness({
+    homeDir: testHome,
+    pluginUpdates: {
+      runSelfUpdate: async args => {
+        args.onStep('install');
+        args.onOutput('stdout', 'pnpm install started\n');
+        args.onOutput('stderr', 'Authorization: Bearer hidden-install-token\n');
+        return { ok: true };
+      },
+    },
+  });
+  let hAfterRestart = null;
+  try {
+    const accepted = await request(h.route, { opId });
+    assert.equal(accepted.status, 200, JSON.stringify(accepted.body));
+    const scheduled = jobs.splice(jobsBefore);
+    assert.equal(scheduled.length, 1);
+    await scheduled[0]();
+
+    const replay = await request(h.route, undefined, `/m/api/plugin-update/log?opId=${opId}&afterSeq=0`);
+    assert.equal(replay.status, 200, JSON.stringify(replay.body));
+    assert.equal(replay.body.opId, opId);
+    assert.ok(replay.body.events.some(event => event.stream === 'stdout' && event.text.includes('pnpm install started')));
+    const serialized = JSON.stringify(replay.body.events);
+    assert.equal(serialized.includes('hidden-install-token'), false);
+    assert.equal(serialized.includes('Authorization: Bearer'), false);
+    assert.equal(serialized.includes('[REDACTED]'), true);
+    const tx = readTransaction(transactionFile(testHome));
+    appendOperationLog({ home: testHome, generation: tx.lease.generation, stage: 'supervisor', text: 'health confirmation complete', redactPaths: [testHome] });
+
+    h.dispose(); h = null;
+    hAfterRestart = harness({ homeDir: testHome });
+    const replayAfterRestart = await request(hAfterRestart.route, undefined, `/m/api/plugin-update/log?opId=${opId}&afterSeq=0`);
+    assert.equal(replayAfterRestart.status, 200, JSON.stringify(replayAfterRestart.body));
+    assert.ok(replayAfterRestart.body.events.some(event => event.text.includes('pnpm install started')));
+    assert.ok(replayAfterRestart.body.events.some(event => event.stage === 'supervisor' && event.text.includes('health confirmation complete')));
+
+    const unauthorized = await request(hAfterRestart.route, undefined, `/m/api/plugin-update/log?opId=${opId}`, { 'x-mobile-token': '' });
+    assert.equal(unauthorized.status, 401);
+  } finally {
+    const holder = readLock(updateLockPath(testHome));
+    if (holder) {
+      const tx = readTransaction(transactionFile(testHome));
+      const { writeOwnedTransaction } = await import('../lib/plugin-update-transaction.js');
+      writeOwnedTransaction(transactionFile(testHome), { ...tx, phase: 'failed' }, { lockPath: updateLockPath(testHome), lease: holder });
+      releaseLock(updateLockPath(testHome), holder);
+    }
+    jobs.splice(jobsBefore);
+    h?.dispose();
+    hAfterRestart?.dispose();
+    process.env.HOME = oldHome;
+  }
 });
 
 test('C1: failed admission persistence releases lease without scheduling a worker', async () => {
@@ -158,7 +449,7 @@ test('W1: actual protected host producer feeds manifest and tgz consumers', asyn
   } finally { h.dispose(); }
 });
 
-test('E2: phone POST accepted returns a phone-reachable fixed APK route, not the host loopback locator', async () => {
+test('E2: phone POST accepted returns the NPM candidate without registry or loopback URLs', async () => {
   const dir = join(home, 'e2-artifacts'); mkdirSync(dir);
   const apk = Buffer.from('apk'), tgz = Buffer.from('tgz');
   const digest = b => hashOf('sha256').update(b).digest('hex');
@@ -185,12 +476,12 @@ test('E2: phone POST accepted returns a phone-reachable fixed APK route, not the
   try {
     const r = await request(h.route, { opId: 'phone-request' }, '/m/api/plugin-update', { host: '192.0.2.9:39401', 'x-mobile-token': token });
     assert.equal(r.status, 200, JSON.stringify(r.body));
-    const release = r.body.check.release;
-    assert.equal(release.app.url, 'http://192.0.2.9:39401/m/api/update/apk', '返回给手机的必须是手机可达地址');
-    assert.equal(release.plugin.url, 'http://192.0.2.9:39401/m/api/update/plugin');
-    assert.equal(release.app.url.includes('127.0.0.1'), false);
-    assert.equal(release.app.sha256, digest(apk), '固定发布身份不得改写');
-    assert.equal(release.app.size, apk.length);
+    const candidate = r.body.check.candidate;
+    assert.equal(r.body.check.source, 'npm');
+    assert.equal(candidate.plugin.version, NPM_PLUGIN_VERSION);
+    assert.equal(candidate.carrier.appVersion, '3.3.0+70');
+    assert.equal(JSON.stringify(r.body).includes('127.0.0.1'), false, 'NPM candidate response must not expose local source URLs');
+    assert.equal(JSON.stringify(r.body).includes('dist.tarball'), false, 'NPM packument URLs stay host-side');
     // 独立 HOME：无需清理别人的状态，但收敛自己的在飞事务更干净
     const holder = readLock(updateLockPath(testHome));
     if (holder) {
@@ -200,7 +491,7 @@ test('E2: phone POST accepted returns a phone-reachable fixed APK route, not the
   } finally { h.dispose(); }
 });
 
-test('E3: non-default mount path keeps credentials on the host loopback fetch', async () => {
+test('E3: non-default mount path accepts NPM updates without leaking host URLs', async () => {
   const dir = join(home, 'e3-artifacts'); mkdirSync(dir);
   const apk = Buffer.from('apk'), tgz = Buffer.from('tgz');
   const digest = b => hashOf('sha256').update(b).digest('hex');
@@ -225,90 +516,61 @@ test('E3: non-default mount path keeps credentials on the host loopback fetch', 
   try {
     const r = await request(h.route, { opId: 'phone-path' }, `${h.mount}/api/plugin-update`, { host: '192.0.2.9:39401', 'x-mobile-token': token });
     assert.equal(r.status, 200, JSON.stringify(r.body));
-    assert.equal(r.body.action, 'accepted', `非默认挂载路径不得因缺 basePath 被剥凭据：${JSON.stringify(r.body.check)}`);
-    assert.equal(r.body.check.release.app.url, 'http://192.0.2.9:39401/phone/api/update/apk');
+    assert.equal(r.body.action, 'accepted', `非默认挂载路径仍应接受 NPM 更新事务：${JSON.stringify(r.body.check)}`);
+    assert.equal(r.body.check.source, 'npm');
+    assert.equal(r.body.check.candidate.plugin.version, NPM_PLUGIN_VERSION);
+    assert.equal(JSON.stringify(r.body).includes('127.0.0.1'), false, 'NPM update status must not project local URLs');
   } finally { h.dispose(); }
 });
 
-test('F1: queued worker keeps the internal loopback locator while public views stay phone-reachable', async () => {
-  const { pluginContentDigest } = await import('../lib/plugin-content-digest.js');
-  const { writeFileSync: writeSync } = await import('node:fs');
-  const dir = join(home, 'f1-artifacts'); mkdirSync(dir);
-  const apk = Buffer.from('apk'), tgz = Buffer.from('tgz-bytes');
-  const digest = b => hashOf('sha256').update(b).digest('hex');
-  // 真实 worker 会复算解包内容标识：夹具的 contentSha256 必须与 stub runTar 产出的内容一致
-  const staged = join(home, 'f1-staged'); mkdirSync(join(staged, 'lib'), { recursive: true });
-  writeSync(join(staged, 'package.json'), JSON.stringify({ name: 'dsh-mobile-remote', version: '3.3.0' }));
-  writeSync(join(staged, 'lib', 'index.js'), "export const v = 'new';\n");
-  const contentSha256 = pluginContentDigest(staged);
-  const installedRoot = join(home, 'f1-installed'); mkdirSync(join(installedRoot, 'lib'), { recursive: true });
-  writeSync(join(installedRoot, 'package.json'), JSON.stringify({ name: 'dsh-mobile-remote', version: '3.2.0' }));
-  writeSync(join(installedRoot, 'lib', 'index.js'), "export const v = 'old';\n");
-  writeFileSync(join(dir, 'app.apk'), apk); writeFileSync(join(dir, 'plugin.tgz'), tgz);
-  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ schema: 1, version: '3.3.0+70', apk: 'app.apk', size: apk.length, sha256: digest(apk),
-    app: { version: '3.3.0+70', file: 'app.apk', size: apk.length, sha256: digest(apk) },
-    plugin: { version: '3.3.0', file: 'plugin.tgz', size: tgz.length, sha256: digest(tgz), contentSha256 } }));
-  const token = 'fixture-only-token';
-  const seen = [];
-  let h;
+test('F1: NPM candidate projection never leaks packument tarball URLs or registry credentials', async () => {
   const f1Home = mkdtempSync(join(tmpdir(), 'f1-home-'));
-  h = harness({
+  const secretUrl = 'http://private-registry.example/package.tgz?token=should-not-leak';
+  const packageView = async (spec) => {
+    if (spec === NPM_PACKAGE_NAME) return { 'dist-tags': { latest: NPM_PLUGIN_VERSION, alpha: NPM_PLUGIN_VERSION, app: NPM_CARRIER_VERSION } };
+    if (spec === `${NPM_PACKAGE_NAME}@${NPM_PLUGIN_VERSION}`) return {
+      version: NPM_PLUGIN_VERSION,
+      dist: { integrity: `sha512-${Buffer.from('plugin').toString('base64')}`, tarball: secretUrl },
+      optionalDependencies: { '@marktrue/dsh-mobile-remote-app': `npm:${NPM_PACKAGE_NAME}@${NPM_CARRIER_VERSION}` },
+    };
+    if (spec === `${NPM_PACKAGE_NAME}@${NPM_CARRIER_VERSION}`) return {
+      version: NPM_CARRIER_VERSION, appVersion: '3.3.0+70', pluginContentSha256: 'c'.repeat(64),
+      dist: { integrity: `sha512-${Buffer.from('carrier').toString('base64')}`, tarball: secretUrl },
+    };
+    return null;
+  };
+  const h = harness({
     homeDir: f1Home,
     webServerHost: '192.0.2.9',
-    config: { updateDir: dir, authToken: token, trustedHosts: ['192.0.2.9'],
-      pluginUpdateManifest: 'http://127.0.0.1:39401/m/api/update/manifest' },
-    pluginUpdates: {
-      // 真的排队执行 worker（默认 harness 只收集不执行）
-      schedule: fn => setImmediate(fn),
-      // 用**真实** runSelfUpdate（harness 默认 stub 只返回 ok、不推进事务，测不到下载与凭据）
-      runSelfUpdate: (opts) => import('../lib/plugin-self-update.js').then(m => m.runSelfUpdate(opts)),
-      // 真实 worker 走这里取清单与包；记录是否带了回环凭据
-      fetchImpl: async (url, opts) => {
-        seen.push({ url, token: opts?.headers?.['x-mobile-token'] });
-        const reply = await request(h.route, undefined, new URL(url).pathname, { host: '127.0.0.1:39401', ...(opts?.headers ?? {}) });
-        return new Response(reply.bytes, { status: reply.status });
-      },
-      workerOptions: {
-        installedRoot, pluginRoot: installedRoot,
-        freezeImpl: () => ({ ok: true, entry: '/fixture' }),
-        spawnArmedImpl: () => ({ ok: true, mode: 'fixture' }),
-        awaitReadyImpl: async () => ({ ok: true, ready: { pid: process.pid } }),
-        runInstall: async () => ({ ok: true }),
-        runTar: async (_tgz, dest) => {
-          mkdirSync(join(dest, 'package', 'lib'), { recursive: true });
-          writeSync(join(dest, 'package', 'package.json'), JSON.stringify({ name: 'dsh-mobile-remote', version: '3.3.0' }));
-          writeSync(join(dest, 'package', 'lib', 'index.js'), "export const v = 'new';\n");
-          return { ok: true };
-        },
-      },
-    },
+    config: { authToken: 'fixture-only-token', trustedHosts: ['192.0.2.9'], pluginUpdateManifest: 'npm' },
+    pluginUpdates: { npmPackageView: packageView },
   });
   try {
-    const headers = { host: '192.0.2.9:39401', 'x-mobile-token': token };
-    const accepted = await request(h.route, { opId: 'f1-phone' }, '/m/api/plugin-update', headers);
+    const headers = { host: '192.0.2.9:39401', 'x-mobile-token': 'fixture-only-token' };
+    const check = await request(h.route, undefined, '/m/api/plugin-update/check', headers);
+    assert.equal(check.status, 200, JSON.stringify(check.body));
+    assert.equal(check.body.pluginUpdate.candidate.plugin.version, NPM_PLUGIN_VERSION);
+    const serializedCheck = JSON.stringify(check.body);
+    assert.equal(serializedCheck.includes(secretUrl), false);
+    assert.equal(serializedCheck.includes('should-not-leak'), false);
+
+    const accepted = await request(h.route, { opId: 'f1-npm' }, '/m/api/plugin-update', headers);
     assert.equal(accepted.status, 200, JSON.stringify(accepted.body));
-    assert.equal(accepted.body.check.release.app.url, 'http://192.0.2.9:39401/m/api/update/apk');
-    // 让排队 worker 真的跑完（轮询而非固定等待）
-    let persisted = readTransaction(transactionFile(f1Home));
-    for (let i = 0; i < 60 && persisted?.phase === 'staging'; i++) {
-      await new Promise(r => setTimeout(r, 50));
-      persisted = readTransaction(transactionFile(f1Home));
-    }
-    assert.equal(persisted.phase, 'restart-pending', `worker 必须成功落位：${JSON.stringify({ result: persisted.result, logs: h.logs.slice(-5) })}`);
-    assert.equal(persisted.release.plugin.url, 'http://127.0.0.1:39401/m/api/update/plugin', '内部事务必须保留回环 locator');
-    assert.equal(persisted.release.app.url, 'http://127.0.0.1:39401/m/api/update/apk');
-    assert.ok(seen.some(s => s.url.includes('127.0.0.1') && s.token === token), 'worker 必须带回环凭据读受保护产物');
-    // 公开出口（bootstrap）仍必须是手机可达视图，且身份固定
-    const boot = await request(h.route, undefined, '/m/api/bootstrap', headers);
-    const pub = boot.body.pluginUpdate.transaction.release;
-    assert.equal(pub.app.url, 'http://192.0.2.9:39401/m/api/update/apk');
-    assert.equal(pub.plugin.url, 'http://192.0.2.9:39401/m/api/update/plugin');
-    assert.equal(pub.app.sha256, digest(apk));
-    assert.equal(pub.plugin.contentSha256, contentSha256);
+    const tx = readTransaction(transactionFile(f1Home));
+    assert.equal(tx.npmCandidate.plugin.version, NPM_PLUGIN_VERSION);
+    const serializedTx = JSON.stringify(tx);
+    assert.equal(serializedTx.includes(secretUrl), false);
+    assert.equal(serializedTx.includes('should-not-leak'), false);
+  } finally {
     const holder = readLock(updateLockPath(f1Home));
-    if (holder) finishOwnedTerminal(transactionFile(f1Home), { phase: 'failed', result: { ok: false, reason: 'fixture-done' }, expectedPhases: ['restart-pending'] },
-      { lockPath: updateLockPath(f1Home), lease: holder, currentFile: transactionFile(f1Home) });
-  } finally { h.dispose(); }
+    if (holder) {
+      const tx = readTransaction(transactionFile(f1Home));
+      const { writeOwnedTransaction } = await import('../lib/plugin-update-transaction.js');
+      writeOwnedTransaction(transactionFile(f1Home), { ...tx, phase: 'failed' }, { lockPath: updateLockPath(f1Home), lease: holder });
+      releaseLock(updateLockPath(f1Home), holder);
+    }
+    h.dispose();
+  }
 });
 
 test('W1/T16: public manifest URL never uses a Host/trustedHosts port that is not a real listener', async () => {

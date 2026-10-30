@@ -86,7 +86,6 @@ void main() {
     final store = AppStore(apiClient: client, localVersion: () async => parseAppVersion('3.2.0+44'));
     addTearDown(store.dispose);
     await store.loadPrefs();
-    await store.setUpdateSource('host');
     client.absorbBootstrap(await client.getJson('/api/bootstrap'));
 
     final outcome = await Updater.check(store);

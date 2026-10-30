@@ -32,8 +32,10 @@ Future<bool> ensurePluginAlignedFirst(BuildContext context, AppStore store, [Upd
       return false;
     case 'plugin-update-failed':
     case 'plugin-update-available':
-      final go = await _confirmPluginFirst(context);
-      if (go == true) await store.beginPluginUpdate();
+      showToast(context, L10n.t(
+        '请先在设置页检查电脑端插件目标版本并确认更新',
+        'First check and confirm the desktop plugin target in Settings',
+      ));
       return false;
     case 'plugin-update-guidance':
       showToast(context, L10n.t('电脑端插件需按指引更新（设置页可见）', 'Desktop plugin needs a manual update — see Settings'));
@@ -71,21 +73,6 @@ Future<bool> _stuckUpdateExit(BuildContext context, AppStore store) async {
   await store.cancelUpdateAndRecheck();
   return true;
 }
-
-Future<bool?> _confirmPluginFirst(BuildContext context) => showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text(L10n.t('先更新电脑端插件', 'Update the desktop plugin first')),
-        content: Text(L10n.t(
-          '电脑端插件有新版本。先把插件更新好，再更新 App，否则新 App 需要的新端点会缺失。',
-          'A newer desktop plugin is available. Update it before the app, otherwise endpoints the new app needs will be missing.',
-        )),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text(L10n.t('稍后', 'Later'))),
-          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: Text(L10n.t('先更新插件', 'Update plugin'))),
-        ],
-      ),
-    );
 
 Future<void> runUpdateFlow(
   BuildContext context,
@@ -127,7 +114,6 @@ Future<bool?> _confirmDialog(BuildContext context, UpdateCandidate c) {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           _kv(L10n.t('版本', 'Version'), c.version),
-          _kv(L10n.t('来源', 'Source'), c.source),
           _kv(L10n.t('大小', 'Size'), size),
           if (c.notes != null && c.notes!.isNotEmpty) ...[
             const SizedBox(height: 8),
