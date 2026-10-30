@@ -128,9 +128,9 @@ function request(route, { url, headers = {}, method = "GET" }) {
 	}));
 }
 
-async function withHarness(callback, over = {}) {
+async function withHarness(callback, over = {}, runtime = {}) {
 	const harness = createContext();
-	apply(harness.ctx, config(over));
+	apply(harness.ctx, config(over), runtime);
 	try {
 		return await callback({ ...harness, api: apiRouteOf(harness.routes) });
 	} finally {
@@ -271,7 +271,7 @@ test("POST /plugin-update：拿不到 profile 目录 → 409，绝不动文件�
 		const r = await request(api, { url: "/m/api/plugin-update", method: "POST" });
 		assert.equal(r.status, 409);
 		assert.equal(r.json().error, "profile-not-found");
-	}, { pluginUpdateManifest: "https://my.host/update/manifest.json" });
+	}, { pluginUpdateManifest: "https://my.host/update/manifest.json" }, { pluginUpdates: { profileDir: "" } });
 });
 
 test("POST /plugin-update：本机形态不支持自重启 → 409（在做任何改动之前就拒绝）", async () => {

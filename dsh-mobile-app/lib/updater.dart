@@ -175,20 +175,13 @@ class Updater {
       return store.checkFixedAppUpdate(journal.release);
     }
 
-    final preferHostManifest = store.updateSource == 'host';
-    if (preferHostManifest) {
-      final fromManifest = await _checkHostManifest(store);
-      if (fromManifest != null) return fromManifest;
-    }
-    // 新流程权威来源：宿主下发的 currentRelease / updateTarget（GitHub/HTTPS 来源也由宿主投影）。
+    // Only host-provided fixed release snapshots are trusted. There is no source preference
+    // and no direct GitHub lookup; the old host manifest remains a host-owned compatibility path.
     final pointer = store.hostReleasePointer;
     if (pointer != null) return store.checkFixedAppUpdate(pointer.release);
-    if (!preferHostManifest) {
-      // 旧宿主兼容：主机目录里的完整 schema 1 清单（地址同样由宿主投影）。
-      final fromManifest = await _checkHostManifest(store);
-      if (fromManifest != null) return fromManifest;
-    }
-    return UpdateCheckOutcome(verdict: UpdateVerdict.upToDate, error: _noFixedReleaseMessage(store.updateSource));
+    final fromManifest = await _checkHostManifest(store);
+    if (fromManifest != null) return fromManifest;
+    return UpdateCheckOutcome(verdict: UpdateVerdict.upToDate, error: _noFixedReleaseMessage());
   }
 
   /// 主机目录清单（人工区 / 旧宿主兼容）。返回 null = 旧宿主没有可用清单，交给上层兜底。
@@ -216,13 +209,8 @@ class Updater {
     }
   }
 
-  static String _noFixedReleaseMessage(String source) {
-    if (source == 'host') {
-      return '电脑端没有可用的固定发布（updateDir 未配置或清单不完整）；请检查电脑端插件与更新目录，或用连接页二维码重扫一次';
-    }
-    return '新版 App 统一从电脑端固定目标下载（不再直连 GitHub）；电脑端尚未下发可用的固定发布。'
-        '请在电脑上更新插件，或用电脑连接页的二维码重新扫码连接后重试；旧组合仍可继续使用';
-  }
+  static String _noFixedReleaseMessage() =>
+      '电脑端尚未下发可用的固定 App 发布；请检查电脑端插件与更新目录，或用连接页二维码重扫一次';
 
   static Future<UpdateCandidate?> _candidateFromHost(Api client) async {
     final d = await client.updateManifest();

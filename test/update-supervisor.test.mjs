@@ -101,12 +101,14 @@ test("新版本健康 → SETTLED 并释放锁", async () => {
 	try {
 		const file = await writeTx(base);
 		assert.equal(readLock(updateLockPath(base)).opId, readTransaction(file).opId);
+		const supervisorLogs = [];
 		const r = await superviseUpdate({
 			stateFile: file,
 			waitForHost: async () => ({ ok: true, matched: "content" }),
 			restart: () => ({ ok: true }),
-			log: () => {},
+			log: message => supervisorLogs.push(message),
 		});
+		assert.ok(supervisorLogs.some(message => message.includes("candidate plugin health confirmed")));
 		assert.equal(r.phase, TRANSACTION_PHASE.SETTLED);
 		assert.equal(r.result.ok, true);
 		assert.equal(readLock(updateLockPath(base)), null, "终态必须释放锁");

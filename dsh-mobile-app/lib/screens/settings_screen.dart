@@ -12,6 +12,7 @@ import '../l10n.dart';
 import '../logger.dart';
 import '../models.dart';
 import '../plugin_update_resume.dart';
+import '../plugin_update_log.dart';
 import '../store.dart';
 import '../theme.dart';
 import '../toast.dart';
@@ -23,6 +24,88 @@ import '../version_alignment.dart';
 import 'sheets.dart';
 import 'providers_screen.dart';
 import 'usage_screen.dart';
+
+class _PluginUpdateLogPanel extends StatefulWidget {
+  const _PluginUpdateLogPanel({
+    super.key,
+    required this.opId,
+    required this.client,
+  });
+  final String opId;
+  final Api client;
+  @override
+  State<_PluginUpdateLogPanel> createState() => _PluginUpdateLogPanelState();
+}
+
+class _PluginUpdateLogPanelState extends State<_PluginUpdateLogPanel> {
+  Timer? _timer;
+  int _cursor = 0;
+  final List<PluginUpdateLogLine> _lines = [];
+  String _phase = '';
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _poll();
+    _timer = Timer.periodic(const Duration(seconds: 3), (_) => _poll());
+  }
+
+  Future<void> _poll() async {
+    try {
+      final data = await widget.client.pluginUpdateLog(
+        opId: widget.opId,
+        afterSeq: _cursor,
+      );
+      if (!mounted || !PluginUpdateLog.matchesOperation(data, widget.opId))
+        return;
+      final page = PluginUpdateLog.fromJson(data);
+      setState(() {
+        _phase = page.phase;
+        _lines.addAll(page.lines.where((line) => line.seq > _cursor));
+        if (page.cursor > _cursor) _cursor = page.cursor;
+        if (_lines.length > 100) _lines.removeRange(0, _lines.length - 100);
+        _loading = false;
+      });
+    } catch (_) {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          '${L10n.t('操作', 'Operation')}: ${widget.opId} · ${_phase.isEmpty ? L10n.t('等待日志', 'waiting for logs') : _phase}',
+          style: TextStyle(fontSize: 11, color: DshColors.ink3(context)),
+        ),
+        const SizedBox(height: 6),
+        ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 180),
+          child: SingleChildScrollView(
+            child: SelectableText(
+              _lines.isEmpty
+                  ? (_loading
+                        ? L10n.t('正在读取…', 'Loading…')
+                        : L10n.t('暂无进度日志', 'No progress lines yet'))
+                  : _lines.map((line) => line.text).join('\n'),
+              style: const TextStyle(fontSize: 11, fontFamily: 'monospace'),
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
+}
 
 class SettingsScreen extends StatefulWidget {
   final AppStore store;
@@ -1124,45 +1207,94 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     }
                   },
             trailing: store.updateCandidate != null
-                ? Icon(Icons.brightness_1, size: 9, color: DshColors.danger(context))
+                ? Icon(
+                    Icons.brightness_1,
+                    size: 9,
+                    color: DshColors.danger(context),
+                  )
                 : (store.alignment.needsAttention
-                    ? Icon(Icons.brightness_1, size: 9, color: DshColors.danger(context))
-                    : null),
+                      ? Icon(
+                          Icons.brightness_1,
+                          size: 9,
+                          color: DshColors.danger(context),
+                        )
+                      : null),
           ),
           // 插件更新入口由**内容状态**驱动（评审 R11）：同版本不同内容时也必须能操作，
           // 而不是只看版本号对齐。不能自更新的形态给出**对应那一条**可复制指引。
           // 有进行中的记录时可点开「处理」：取消旧目标并按电脑端当前状态重新检查（F13）。
-          if (api.pluginUpdate.contentUpdateAvailable || store.pluginUpdateJournal != null)
+          if (api.pluginUpdate.contentUpdateAvailable ||
+              store.pluginUpdateJournal != null)
             _row(
               leading: const Icon(Icons.desktop_windows_outlined),
               title: L10n.t('更新电脑端插件', 'Update desktop plugin'),
               sub: store.pluginUpdateJournal != null
                   ? _journalSub(store)
                   : api.pluginUpdate.canSelfUpdate
-                      ? L10n.t('电脑端插件有新版本：可在这里直接触发更新',
-                          'A newer desktop plugin is available — trigger the update here')
-                      : L10n.t('电脑端插件有新版本：本机形态需按指引更新',
-                          'A newer desktop plugin is available — follow the guide for your install'),
+                  ? L10n.t(
+                      '电脑端插件有新版本：可在这里直接触发更新',
+                      'A newer desktop plugin is available — trigger the update here',
+                    )
+                  : L10n.t(
+                      '电脑端插件有新版本：本机形态需按指引更新',
+                      'A newer desktop plugin is available — follow the guide for your install',
+                    ),
               onTap: store.pluginUpdateJournal != null
                   ? () => unawaited(_updateJournalActions(store))
-                  : (api.pluginUpdate.canSelfUpdate ? _triggerPluginUpdate : _showPluginUpdateGuidance),
+                  : (api.pluginUpdate.canSelfUpdate
+                        ? _triggerPluginUpdate
+                        : _showPluginUpdateGuidance),
               trailing: store.pluginUpdateJournal == null
                   ? Text(
-                      api.pluginUpdate.canSelfUpdate ? L10n.t('更新 ▸', 'Update ▸') : L10n.t('指引 ▸', 'Guide ▸'),
-                      style: TextStyle(fontSize: 12, color: brand))
-                  : Text(L10n.t('处理 ▸', 'Manage ▸'), style: TextStyle(fontSize: 12, color: brand)),
+                      api.pluginUpdate.canSelfUpdate
+                          ? L10n.t('更新 ▸', 'Update ▸')
+                          : L10n.t('指引 ▸', 'Guide ▸'),
+                      style: TextStyle(fontSize: 12, color: brand),
+                    )
+                  : Text(
+                      L10n.t('处理 ▸', 'Manage ▸'),
+                      style: TextStyle(fontSize: 12, color: brand),
+                    ),
+            ),
+          if (store.pluginUpdateLogOpId.isNotEmpty)
+            Card(
+              child: ExpansionTile(
+                leading: const Icon(Icons.terminal),
+                title: Text(L10n.t('插件更新日志', 'Plugin update log')),
+                subtitle: Text(
+                  L10n.t(
+                    '查看电脑端返回的脱敏进度',
+                    'View sanitized progress from the host',
+                  ),
+                ),
+                children: [
+                  _PluginUpdateLogPanel(
+                    key: ValueKey(store.pluginUpdateLogOpId),
+                    opId: store.pluginUpdateLogOpId,
+                    client: store.api,
+                  ),
+                ],
+              ),
             ),
           _row(
             leading: const Icon(Icons.sync_outlined),
-            title: L10n.t('检查更新', 'Check for updates'),
+            title: L10n.t('检查 App 更新', 'Check App updates'),
             sub: store.updateChecking
                 ? L10n.t('检查中…', 'Checking…')
-                : L10n.t('检查电脑端固定发布 / 主机目录是否有新版本',
-                    'Check the desktop fixed release / host directory for updates'),
+                : L10n.t(
+                    '检查电脑端提供的固定 App 发布',
+                    'Check host-provided fixed App releases',
+                  ),
             trailing: TextButton(
-              onPressed: store.updateChecking || _updateFlowBusy ? null : _checkUpdate,
-              child: Text(store.updateChecking ? L10n.t('检查中…', 'Checking…') : L10n.t('检查 ▸', 'Check ▸'),
-                  style: TextStyle(fontSize: 12, color: brand)),
+              onPressed: store.updateChecking || _updateFlowBusy
+                  ? null
+                  : _checkUpdate,
+              child: Text(
+                store.updateChecking
+                    ? L10n.t('检查中…', 'Checking…')
+                    : L10n.t('检查 ▸', 'Check ▸'),
+                style: TextStyle(fontSize: 12, color: brand),
+              ),
             ),
           ),
           _row(
@@ -1296,14 +1428,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     child: Row(
                       children: [
                         Expanded(
-                          child: SelectableText(c, style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
+                          child: SelectableText(
+                            c,
+                            style: const TextStyle(
+                              fontFamily: 'monospace',
+                              fontSize: 12,
+                            ),
+                          ),
                         ),
                         TextButton(
                           onPressed: () async {
                             await Clipboard.setData(ClipboardData(text: c));
-                            if (ctx.mounted) showToast(ctx, L10n.t('已复制', 'Copied'));
+                            if (ctx.mounted)
+                              showToast(ctx, L10n.t('已复制', 'Copied'));
                           },
-                          child: Text(L10n.t('复制', 'Copy'), style: const TextStyle(fontSize: 12)),
+                          child: Text(
+                            L10n.t('复制', 'Copy'),
+                            style: const TextStyle(fontSize: 12),
+                          ),
                         ),
                       ],
                     ),
@@ -1313,7 +1455,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: Text(L10n.t('关闭', 'Close'))),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text(L10n.t('关闭', 'Close')),
+          ),
         ],
       ),
     );
@@ -1321,78 +1466,304 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   /// 在手机上触发电脑端插件更新。
   ///
-  /// 只做一次确认弹窗（说明"宿主会重启、连接会短暂断开"），**不要求用户再到电脑上确认**——
-  /// 那正是 ADR 0019 的产品取舍。真正的下载/安装/重启都在电脑侧完成。
-  Future<void> _triggerPluginUpdate() async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text(L10n.t('更新电脑端插件？', 'Update desktop plugin?')),
-        content: Text(L10n.t(
-          '电脑上的插件会被替换为最新版，并且宿主会重启——连接会短暂断开，这是正常过程。',
-          'The plugin on your computer will be replaced with the latest version and the host will restart. '
-              'The connection drops briefly; that is expected.',
-        )),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: Text(L10n.t('取消', 'Cancel')),
+  /// Legacy prepare 可在确认前查询候选，但不启动最终插件更新 POST。prepare 失败后
+  /// 保留同一 opId；prepareId 与目标版本持久化后，重启 App 仍会先显示最终确认。
+  Future<void> _triggerPluginUpdate({
+    String? retryPrepareOpId,
+    PluginUpdateJournal? preparedJournal,
+  }) async {
+    final store = widget.store;
+    var opId = '';
+    var pluginVersion = '';
+    var targetAppVersion = '';
+    var targetContentSha256 = '';
+    String? prepareId;
+    var legacy = false;
+    try {
+      if (preparedJournal != null &&
+          preparedJournal.phase == UpdatePhase.pluginPrepared) {
+        opId = preparedJournal.opId;
+        pluginVersion = preparedJournal.targetVersion;
+        targetAppVersion = preparedJournal.appVersion;
+        targetContentSha256 = preparedJournal.targetContentSha256;
+        prepareId = preparedJournal.prepareId;
+        legacy = true;
+      } else if (retryPrepareOpId != null) {
+        final pending = store.pluginUpdateJournal;
+        if (pending == null ||
+            !pending.isPreparationPhase ||
+            pending.opId != retryPrepareOpId) {
+          return;
+        }
+        opId = pending.opId;
+        legacy = true;
+        final prepared = await store.preparePluginUpdate(opId: opId);
+        final current = store.pluginUpdateJournal;
+        if ((prepared['action'] != 'prepared' &&
+                prepared['action'] != 'confirmation-required') ||
+            current?.prepareId == null) {
+          if (mounted) {
+            showToast(
+              context,
+              store.pluginUpdateNotice ??
+                  L10n.t('无法准备插件更新', 'Could not prepare plugin update'),
+            );
+          }
+          return;
+        }
+        pluginVersion = current!.targetVersion;
+        targetAppVersion = current.appVersion;
+        targetContentSha256 = current.targetContentSha256;
+        prepareId = current.prepareId;
+      } else {
+        final response = await store.api.checkPluginUpdate();
+        if (!mounted) return;
+        final update = response['pluginUpdate'];
+        final candidate = update is Map ? update['candidate'] : null;
+        final state = update is Map ? update['state'] : null;
+        if (candidate is! Map || state != 'update-available') {
+          showToast(
+            context,
+            L10n.t('没有可更新的插件候选', 'No plugin update candidate is available'),
+          );
+          return;
+        }
+        final carrier = candidate['carrier'] is Map
+            ? candidate['carrier'] as Map
+            : const {};
+        final plugin = candidate['plugin'] is Map
+            ? candidate['plugin'] as Map
+            : const {};
+        pluginVersion = (plugin['version'] ?? carrier['version'] ?? '')
+            .toString();
+        targetContentSha256 = (plugin['contentSha256'] ?? '')
+            .toString()
+            .trim()
+            .toLowerCase();
+        targetAppVersion = (carrier['appVersion'] ?? '').toString();
+        legacy = carrier['legacyMetadataMissing'] == true;
+        opId = genRequestId();
+        if (legacy) {
+          final prepared = await store.preparePluginUpdate(
+            opId: opId,
+            candidate: Map<String, dynamic>.from(candidate),
+          );
+          final current = store.pluginUpdateJournal;
+          if ((prepared['action'] != 'prepared' &&
+                  prepared['action'] != 'confirmation-required') ||
+              current?.prepareId == null) {
+            if (mounted) {
+              showToast(
+                context,
+                store.pluginUpdateNotice ??
+                    L10n.t('无法准备插件更新', 'Could not prepare plugin update'),
+              );
+            }
+            return;
+          }
+          opId = current!.opId;
+          pluginVersion = current.targetVersion;
+          targetAppVersion = current.appVersion;
+          targetContentSha256 = current.targetContentSha256;
+          prepareId = current.prepareId;
+        }
+      }
+      if (pluginVersion.isEmpty ||
+          targetAppVersion.isEmpty ||
+          (legacy && prepareId == null)) {
+        if (legacy && opId.isNotEmpty) {
+          await store.abandonPluginUpdatePreparation(opId);
+        }
+        if (!mounted) return;
+        showToast(
+          context,
+          L10n.t(
+            '更新候选缺少插件或 App 目标版本',
+            'Update candidate is missing a plugin or App target version',
           ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: Text(L10n.t('开始更新', 'Update')),
+        );
+        return;
+      }
+      if (!mounted) return;
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: Text(L10n.t('更新电脑端插件？', 'Update desktop plugin?')),
+          content: Text(
+            L10n.t(
+              '插件目标版本：$pluginVersion\nApp 目标版本：$targetAppVersion\n电脑端宿主会重启，连接会短暂断开。',
+              'Plugin target: $pluginVersion\nApp target: $targetAppVersion\nThe desktop host restarts and the connection briefly drops.',
+            ),
           ),
-        ],
-      ),
-    );
-    if (confirmed != true || !mounted) return;
-    await widget.store.beginPluginUpdate();
-    if (!mounted) return;
-    final notice = widget.store.pluginUpdateNotice;
-    if (notice != null) showToast(context, notice);
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: Text(L10n.t('取消', 'Cancel')),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: Text(L10n.t('开始更新', 'Update')),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !mounted) {
+        if (legacy) await store.abandonPluginUpdatePreparation(opId);
+        return;
+      }
+      await store.beginPluginUpdate(
+        opId: opId,
+        targetVersion: pluginVersion,
+        targetContentSha256: targetContentSha256,
+        targetAppVersion: targetAppVersion,
+        prepareId: prepareId,
+      );
+      if (!mounted) return;
+      final notice = store.pluginUpdateNotice;
+      if (notice != null) showToast(context, notice);
+    } catch (error) {
+      if (mounted) showToast(context, store.pluginUpdateNotice ?? '$error');
+    }
   }
 
   /// 进行中记录的状态说明（不同阶段该做什么不同）。
   String _journalSub(AppStore store) {
     return switch (store.pluginUpdateJournal?.phase) {
-      UpdatePhase.appPending => L10n.t('电脑端插件已确认；App 更新待安装/待核验',
-          'Desktop plugin confirmed; the app update is pending install/verification'),
-      UpdatePhase.pluginConfirmed => L10n.t('电脑端插件已更新；正在确定 App 目标…',
-          'Desktop plugin updated; resolving the app target…'),
-      UpdatePhase.pluginRetry => L10n.t('上次更新未确认；可重试，或取消并重新检查',
-          'Last update was not confirmed; retry, or cancel and re-check'),
-      _ => L10n.t('等待电脑端完成更新并重启…', 'Waiting for the desktop plugin to restart…'),
+      UpdatePhase.pluginPreparePending => L10n.t(
+        '正在准备插件候选；尚未提交安装',
+        'Preparing the plugin candidate; installation has not been submitted',
+      ),
+      UpdatePhase.pluginPrepareRetry => L10n.t(
+        '准备结果未确认；可用同一操作编号重试',
+        'Prepare result is unknown; retry reuses the same operation id',
+      ),
+      UpdatePhase.pluginPrepared => L10n.t(
+        '插件与 App 目标已固定；等待最终确认',
+        'Plugin and App targets are fixed; waiting for final confirmation',
+      ),
+      UpdatePhase.appPending => L10n.t(
+        '电脑端插件已确认；App 更新待安装/待核验',
+        'Desktop plugin confirmed; the app update is pending install/verification',
+      ),
+      UpdatePhase.pluginConfirmed => L10n.t(
+        '电脑端插件已更新；正在确定 App 目标…',
+        'Desktop plugin updated; resolving the app target…',
+      ),
+      UpdatePhase.pluginRetry => L10n.t(
+        '上次更新未确认；可重试，或取消并重新检查',
+        'Last update was not confirmed; retry, or cancel and re-check',
+      ),
+      _ => L10n.t(
+        '等待电脑端完成更新并重启…',
+        'Waiting for the desktop plugin to restart…',
+      ),
     };
   }
 
-  /// 接续记录的出口（F13）：长时间没有成功证明时，允许取消旧目标并按当前状态重查。
+  /// 接续记录的出口：prepare 尚未 admission 时可同 opId 重试或安全取消；
+  /// 已准备候选时回到最终确认，不提前发更新 POST。
   Future<void> _updateJournalActions(AppStore store) async {
+    final journal = store.pluginUpdateJournal;
+    if (journal == null) return;
+    final prepared =
+        journal.phase == UpdatePhase.pluginPrepared &&
+        journal.prepareId != null &&
+        journal.prepareId!.isNotEmpty;
+    final preparing = journal.isPreparationPhase;
     final choice = await showModalBottomSheet<String>(
       context: context,
       builder: (ctx) => SafeArea(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(20, 14, 20, 6),
-            child: Text(L10n.t('处理进行中的更新', 'Manage pending update'),
-                style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700)),
-          ),
-          ListTile(
-            title: Text(L10n.t('继续等待', 'Keep waiting')),
-            subtitle: Text(L10n.t('重连后会自动确认；不会先装 App',
-                'It continues automatically after reconnecting and never installs the app first')),
-            onTap: () => Navigator.of(ctx).pop('wait'),
-          ),
-          ListTile(
-            title: Text(L10n.t('取消并重新检查', 'Cancel and re-check')),
-            subtitle: Text(L10n.t('清除本地旧目标，按电脑端当前状态重新检查；不会自动降级 App',
-                'Clears the local old target and re-checks the current desktop state; the app is never downgraded')),
-            onTap: () => Navigator.of(ctx).pop('recheck'),
-          ),
-          const SizedBox(height: 8),
-        ]),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 14, 20, 6),
+              child: Text(
+                L10n.t('处理进行中的更新', 'Manage pending update'),
+                style: const TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+            if (prepared)
+              ListTile(
+                title: Text(L10n.t('继续确认并更新', 'Review and continue update')),
+                subtitle: Text(
+                  L10n.t(
+                    '沿用已准备的目标与操作编号；确认前不会安装',
+                    'Keeps the prepared target and operation id; nothing installs before confirmation',
+                  ),
+                ),
+                onTap: () => Navigator.of(ctx).pop('confirm-prepared'),
+              )
+            else if (preparing)
+              ListTile(
+                title: Text(L10n.t('重试准备', 'Retry preparation')),
+                subtitle: Text(
+                  L10n.t(
+                    '使用同一操作编号安全重试；不会开始安装',
+                    'Retries with the same operation id; installation does not start',
+                  ),
+                ),
+                onTap: () => Navigator.of(ctx).pop('retry-prepare'),
+              )
+            else
+              ListTile(
+                title: Text(L10n.t('继续等待', 'Keep waiting')),
+                subtitle: Text(
+                  L10n.t(
+                    '重连后会自动确认；不会先装 App',
+                    'It continues automatically after reconnecting and never installs the app first',
+                  ),
+                ),
+                onTap: () => Navigator.of(ctx).pop('wait'),
+              ),
+            ListTile(
+              title: Text(
+                preparing
+                    ? L10n.t('取消准备', 'Cancel preparation')
+                    : L10n.t('取消并重新检查', 'Cancel and re-check'),
+              ),
+              subtitle: Text(
+                preparing
+                    ? L10n.t(
+                        '清除未提交的本地准备记录；不会触发插件更新',
+                        'Clears the unsubmitted local preparation; no plugin update is triggered',
+                      )
+                    : L10n.t(
+                        '清除本地旧目标，按电脑端当前状态重新检查；不会自动降级 App',
+                        'Clears the local old target and re-checks the current desktop state; the app is never downgraded',
+                      ),
+              ),
+              onTap: () =>
+                  Navigator.of(ctx)
+                      .pop(preparing ? 'cancel-prepare' : 'recheck'),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
       ),
     );
-    if (choice != 'recheck' || !mounted) return;
+    if (!mounted) return;
+    if (choice == 'retry-prepare') {
+      await _triggerPluginUpdate(retryPrepareOpId: journal.opId);
+      return;
+    }
+    if (choice == 'confirm-prepared') {
+      await _triggerPluginUpdate(preparedJournal: journal);
+      return;
+    }
+    if (choice == 'cancel-prepare') {
+      await store.abandonPluginUpdatePreparation(journal.opId);
+      if (mounted)
+        showToast(
+          context,
+          L10n.t('已取消插件更新准备', 'Plugin update preparation cancelled'),
+        );
+      return;
+    }
+    if (choice != 'recheck') return;
     await store.cancelUpdateAndRecheck();
     if (!mounted) return;
     final notice = store.pluginUpdateNotice;
@@ -1404,8 +1775,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (api.pluginVersion.isEmpty) return '';
     return switch (widget.store.alignment.state) {
       AlignmentState.ok => '',
-      AlignmentState.appOutdated => ' · ${L10n.t('App 需更新', 'App needs update')}',
-      AlignmentState.pluginOutdated => ' · ${L10n.t('插件需更新', 'plugin needs update')}',
+      AlignmentState.appOutdated =>
+        ' · ${L10n.t('App 需更新', 'App needs update')}',
+      AlignmentState.pluginOutdated =>
+        ' · ${L10n.t('插件需更新', 'plugin needs update')}',
       AlignmentState.unknown => ' · ${L10n.t('对齐无法判定', 'alignment unknown')}',
     };
   }
@@ -1591,43 +1964,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
         if (mounted) setState(() {});
         break;
       case UpdateVerdict.upToDate:
-        showToast(context, outcome.error ?? L10n.t('已是最新版本', 'Already up to date'));
+        showToast(
+          context,
+          outcome.error ?? L10n.t('已是最新版本', 'Already up to date'),
+        );
         break;
       case UpdateVerdict.remoteOlder:
-        showToast(context, L10n.t('更新源版本低于当前版本，已忽略', 'Update source is older than current — ignored'));
+        showToast(
+          context,
+          L10n.t(
+            '电脑端固定发布低于当前版本，已忽略',
+            'Host fixed release is older than current — ignored',
+          ),
+        );
         break;
     }
-  }
-
-  Future<void> _pickUpdateSource() async {
-    final choice = await showModalBottomSheet<String>(
-      context: context,
-      builder: (ctx) => SafeArea(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(20, 14, 20, 6),
-            child: Text(L10n.t('选择更新源', 'Choose update source'),
-                style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700)),
-          ),
-          for (final item in [
-            // 来源接线（F04/F19）：App 不再直连 GitHub；两种来源都只下载电脑端投影的固定地址。
-            ('github', L10n.t('自动（电脑端检查结果）', 'Automatic (desktop check)'),
-                L10n.t('由电脑端插件的更新检查来源决定；App 统一从电脑端固定目标下载',
-                    'Decided by the desktop plugin update source; the app always downloads the desktop fixed target')),
-            ('host', L10n.t('主机 updateDir 人工目录', 'Host updateDir (manual)'),
-                L10n.t('电脑端 updateDir 里人工放置的完整清单', 'A complete manifest placed manually in the host updateDir')),
-          ])
-            ListTile(
-              title: Text(item.$2),
-              subtitle: Text(item.$3),
-              trailing: widget.store.updateSource == item.$1 ? const Icon(Icons.check) : null,
-              onTap: () => Navigator.of(ctx).pop(item.$1),
-            ),
-          const SizedBox(height: 8),
-        ]),
-      ),
-    );
-    if (choice != null) await widget.store.setUpdateSource(choice);
   }
 
   /// 应用日志：查看 / 复制 / 清空
