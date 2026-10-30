@@ -1298,17 +1298,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
           ),
           _row(
-            leading: const Icon(Icons.storage_outlined),
-            title: L10n.t('更新源', 'Update source'),
-            // 来源接线（F04/F19）：App 不再直连 GitHub；两种来源都由电脑端投影固定下载地址。
-            sub: store.updateSource == 'host'
-                ? L10n.t('主机 updateDir 人工目录', 'host updateDir (manual)')
-                : L10n.t('自动（电脑端检查结果）', 'Automatic (desktop check)'),
-            trailing: Text(store.updateSource == 'host' ? L10n.t('主机目录 ▸', 'Host dir ▸') : L10n.t('自动 ▸', 'Auto ▸'),
-                style: TextStyle(fontSize: 12, color: brand)),
-            onTap: _pickUpdateSource,
-          ),
-          _row(
             leading: const Icon(Icons.monitor_heart_outlined),
             title: L10n.t('环境诊断', 'Diagnostics'),
             sub: _diagLoaded
