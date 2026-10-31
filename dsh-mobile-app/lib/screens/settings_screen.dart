@@ -12,6 +12,7 @@ import '../l10n.dart';
 import '../logger.dart';
 import '../models.dart';
 import '../plugin_update_resume.dart';
+import '../plugin_update_log.dart';
 import '../plugin_update_status.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -24,6 +25,160 @@ import '../version_alignment.dart';
 import 'sheets.dart';
 import 'providers_screen.dart';
 import 'usage_screen.dart';
+
+/// 失败原因的稳定码 → 可读文案（未知码原样显示，绝不隐藏）。
+String _pluginUpdateFailureReasonText(String reason) {
+  const known = <String, String>{
+    'npm-carrier-plugin-identity-mismatch': '载体清单与 NPM 包身份不一致（版本/大小校验失败）',
+    'npm-carrier-manifest-unreadable': '载体清单不可读',
+    'npm-carrier-extract-failed': '载体解包失败',
+    'npm-plugin-tarball-sha256-mismatch': '插件 tarball 字节哈希与载体清单不一致',
+    'npm-plugin-content-sha256-mismatch': '插件内容标识与载体清单不一致',
+    'npm-packument-content-sha256-mismatch': 'NPM 包内容与载体清单不一致',
+    'npm-packument-app-version-mismatch': 'NPM 包 App build 与载体清单不一致',
+    'npm-pack-failed': '宿主机 npm pack 下载插件/载体失败',
+    'npm-pack-integrity-mismatch': 'npm pack 产物完整性不符（registry 返回异常）',
+    'npm-pack-metadata-mismatch': 'npm pack 返回的包版本/完整性不符',
+    'npm-pack-tarball-missing': 'npm pack 产物缺失',
+    'install-failed': 'pnpm 安装失败',
+    'health-check-failed': '新插件健康检查失败，已回滚',
+    'rollback-failed': '回滚失败，需要人工处理',
+    'restart-unsupported': '宿主形态不支持自动重启',
+  };
+  return known[reason] != null ? '${known[reason]}（$reason）' : reason;
+}
+
+class _PluginUpdateDetailsPanel extends StatefulWidget {
+  const _PluginUpdateDetailsPanel({
+    super.key,
+    required this.checkLines,
+    required this.opId,
+    required this.client,
+    this.transaction,
+  });
+  final List<String> checkLines;
+  final String opId;
+  final Api client;
+  final PluginTransaction? transaction;
+  @override
+  State<_PluginUpdateDetailsPanel> createState() =>
+      _PluginUpdateDetailsPanelState();
+}
+
+class _PluginUpdateDetailsPanelState extends State<_PluginUpdateDetailsPanel> {
+  Timer? _timer;
+  int _cursor = 0;
+  final List<PluginUpdateLogLine> _installLines = [];
+  String _phase = '';
+  bool _loading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.opId.isNotEmpty) {
+      _loading = true;
+      _poll();
+      _timer = Timer.periodic(const Duration(seconds: 3), (_) => _poll());
+    }
+  }
+
+  Future<void> _poll() async {
+    try {
+      final data = await widget.client.pluginUpdateLog(
+        opId: widget.opId,
+        afterSeq: _cursor,
+      );
+      if (!mounted || !PluginUpdateLog.matchesOperation(data, widget.opId)) {
+        return;
+      }
+      final page = PluginUpdateLog.fromJson(data);
+      setState(() {
+        _phase = page.phase;
+        _installLines.addAll(page.lines.where((line) => line.seq > _cursor));
+        if (page.cursor > _cursor) _cursor = page.cursor;
+        if (_installLines.length > 400) {
+          _installLines.removeRange(0, _installLines.length - 400);
+        }
+        _loading = false;
+      });
+      if (const {'settled', 'failed', 'rolled-back'}.contains(page.phase)) {
+        _timer?.cancel();
+        _timer = null;
+      }
+    } catch (_) {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  String get _combinedText {
+    final lines = <String>[...widget.checkLines];
+    if (_installLines.isNotEmpty) {
+      lines.add('# 安装详情（宿主 pnpm 输出，已脱敏）');
+      lines.addAll(_installLines.map((line) => line.text));
+    }
+    final reason = widget.transaction?.reason ?? '';
+    if (reason.isNotEmpty) {
+      final phase = widget.transaction?.phase ?? 'failed';
+      lines.add('# 安装结果：$phase · 原因：${_pluginUpdateFailureReasonText(reason)}');
+    }
+    return lines.join('\n');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = _combinedText;
+    final summary = widget.opId.isEmpty
+        ? L10n.t('最近一次检查', 'Last check')
+        : '${L10n.t('操作', 'Operation')}: ${widget.opId} · ${_phase.isEmpty ? L10n.t('等待日志', 'waiting for logs') : _phase}';
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text(
+          summary,
+          textAlign: TextAlign.center,
+          style: TextStyle(fontSize: 11, color: DshColors.ink3(context)),
+        ),
+        const SizedBox(height: 8),
+        ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 360),
+          child: SingleChildScrollView(
+            child: SelectableText(
+              text.isEmpty
+                  ? (_loading
+                        ? L10n.t('正在读取…', 'Loading…')
+                        : L10n.t('（暂无更新详情）', '(No update details)'))
+                  : text,
+              style: TextStyle(
+                fontSize: 11.5,
+                height: 1.6,
+                color: DshColors.ink(context),
+                fontFamily: 'monospace',
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        FilledButton.icon(
+          onPressed: text.isEmpty ? null : () => _copy(text),
+          icon: const Icon(Icons.copy),
+          label: Text(L10n.t('复制', 'Copy')),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _copy(String text) async {
+    await Clipboard.setData(ClipboardData(text: text));
+    if (mounted) showToast(context, L10n.t('已复制', 'Copied'));
+  }
+}
 
 class SettingsScreen extends StatefulWidget {
   final AppStore store;
@@ -1222,17 +1377,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     style: TextStyle(fontSize: 12, color: brand),
                   ),
           ),
-          if (store.api.pluginUpdate.checkLog.isNotEmpty)
+          if (store.api.pluginUpdate.checkLog.isNotEmpty ||
+              store.pluginUpdateLogOpId.isNotEmpty)
             _row(
               leading: const Icon(Icons.receipt_long_outlined),
-              title: L10n.t('插件更新检查详情', 'Plugin update check details'),
+              title: L10n.t('插件更新详情', 'Plugin update details'),
               sub: L10n.t(
-                '最近一次检查的 npm 查询与结果',
-                'npm queries and results from the last check',
+                '检查结果与安装进度（脱敏）',
+                'Check results and install progress (sanitized)',
               ),
               trailing: TextButton(
-                onPressed: () =>
-                    _openPluginUpdateCheckLog(store.api.pluginUpdate.checkLog),
+                onPressed: _openPluginUpdateDetails,
                 child: Text(
                   L10n.t('查看 ▸', 'View ▸'),
                   style: TextStyle(fontSize: 12, color: brand),
@@ -2006,28 +2161,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   /// 最近一次插件更新检查的脱敏诊断：与桌面端「检查详情」显示同一份内容。
-  void _openPluginUpdateCheckLog(List<String> lines) {
-    final text = lines.join('\n');
-    showSheet(context, L10n.t('插件更新检查详情', 'Plugin update check details'), [
-      ConstrainedBox(
-        constraints: const BoxConstraints(maxHeight: 320),
-        child: SingleChildScrollView(
-          child: SelectableText(
-            text.isEmpty ? L10n.t('（暂无检查日志）', '(No check log)') : text,
-            style: TextStyle(
-              fontSize: 11.5,
-              height: 1.6,
-              color: DshColors.ink(context),
-              fontFamily: 'monospace',
-            ),
-          ),
-        ),
-      ),
-      const SizedBox(height: 12),
-      FilledButton.icon(
-        onPressed: text.isEmpty ? null : () => _copy(text),
-        icon: const Icon(Icons.copy),
-        label: Text(L10n.t('复制', 'Copy')),
+  /// 插件更新详情：检查诊断 + 安装进度合并展示（与桌面端同一份内容）。
+  void _openPluginUpdateDetails() {
+    final store = widget.store;
+    final checkLines = store.api.pluginUpdate.checkLog;
+    final opId = store.pluginUpdateLogOpId;
+    if (checkLines.isEmpty && opId.isEmpty) return;
+    showSheet(context, L10n.t('插件更新详情', 'Plugin update details'), [
+      _PluginUpdateDetailsPanel(
+        key: ValueKey('plugin-update-details-$opId'),
+        checkLines: checkLines,
+        opId: opId,
+        client: store.api,
+        transaction: store.api.pluginUpdate.transaction,
       ),
     ]);
   }
