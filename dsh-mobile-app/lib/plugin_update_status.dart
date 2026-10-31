@@ -11,7 +11,12 @@ import 'update_core.dart';
 
 /// 不能自更新时给电脑端操作指引（只含**与实际安装方式对应**的那一条）。
 class PluginUpdateGuidance {
-  const PluginUpdateGuidance({required this.mode, required this.summary, required this.steps, required this.commands});
+  const PluginUpdateGuidance({
+    required this.mode,
+    required this.summary,
+    required this.steps,
+    required this.commands,
+  });
 
   /// `auto`（可自行完成）或 `guidance`（只能给指引）。
   final String mode;
@@ -24,8 +29,12 @@ class PluginUpdateGuidance {
     return PluginUpdateGuidance(
       mode: (json['mode'] as String?) ?? '',
       summary: (json['summary'] as String?) ?? '',
-      steps: ((json['steps'] as List?) ?? const []).whereType<String>().toList(),
-      commands: ((json['commands'] as List?) ?? const []).whereType<String>().toList(),
+      steps: ((json['steps'] as List?) ?? const [])
+          .whereType<String>()
+          .toList(),
+      commands: ((json['commands'] as List?) ?? const [])
+          .whereType<String>()
+          .toList(),
     );
   }
 }
@@ -43,19 +52,21 @@ class PluginUpdateStatus {
     required this.remoteVersion,
     required this.remoteContentSha256,
     this.release,
+    this.checkLog = const [],
   });
 
   const PluginUpdateStatus.unknown()
-      : state = 'unknown',
-        reason = 'not-checked',
-        installShape = '',
-        restartForm = '',
-        canSelfUpdate = false,
-        guidance = null,
-        transaction = null,
-        remoteVersion = '',
-        remoteContentSha256 = '',
-        release = null;
+    : state = 'unknown',
+      reason = 'not-checked',
+      installShape = '',
+      restartForm = '',
+      canSelfUpdate = false,
+      guidance = null,
+      transaction = null,
+      remoteVersion = '',
+      remoteContentSha256 = '',
+      release = null,
+      checkLog = const [];
 
   /// 检查结论：`up-to-date` / `update-available` / `local-ahead` / `unavailable` / `disabled` / `unknown`。
   final String state;
@@ -68,7 +79,11 @@ class PluginUpdateStatus {
   final String remoteVersion;
   final String remoteContentSha256;
   final ReleaseSnapshot? release;
-  bool get retryableFailure => state == 'update-failed' ||
+
+  /// 最近一次检查的脱敏诊断（npm 查询命令与结果），与桌面端显示同一份内容。
+  final List<String> checkLog;
+  bool get retryableFailure =>
+      state == 'update-failed' ||
       const {'failed', 'rolled-back'}.contains(transaction?.phase);
 
   /// 内容状态说"有新版"——这是更新动作的唯一依据（不是版本号对齐）。
@@ -80,6 +95,18 @@ class PluginUpdateStatus {
   /// 明确的"没有新版"。
   bool get upToDate => state == 'up-to-date' || state == 'local-ahead';
 
+  static List<String> _checkLogFromJson(Object? value) {
+    if (value is! List) return const [];
+    final lines = value
+        .whereType<String>()
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .toList();
+    return List.unmodifiable(
+      lines.length > 40 ? lines.sublist(lines.length - 40) : lines,
+    );
+  }
+
   static PluginUpdateStatus fromJson(Object? json) {
     if (json is! Map) return const PluginUpdateStatus.unknown();
     final remote = json['remote'];
@@ -90,10 +117,19 @@ class PluginUpdateStatus {
       restartForm: (json['restartForm'] as String?) ?? '',
       canSelfUpdate: json['canSelfUpdate'] == true,
       guidance: PluginUpdateGuidance.fromJson(json['guidance']),
-      transaction: PluginTransaction.fromJson(json['transaction'] is Map ? Map<String, dynamic>.from(json['transaction'] as Map) : null),
-      remoteVersion: remote is Map ? ((remote['version'] as String?) ?? '') : '',
-      remoteContentSha256: remote is Map ? ((remote['contentSha256'] as String?) ?? '') : '',
+      transaction: PluginTransaction.fromJson(
+        json['transaction'] is Map
+            ? Map<String, dynamic>.from(json['transaction'] as Map)
+            : null,
+      ),
+      remoteVersion: remote is Map
+          ? ((remote['version'] as String?) ?? '')
+          : '',
+      remoteContentSha256: remote is Map
+          ? ((remote['contentSha256'] as String?) ?? '')
+          : '',
       release: ReleaseSnapshot.fromJson(json['release']),
+      checkLog: _checkLogFromJson(json['checkLog']),
     );
   }
 }

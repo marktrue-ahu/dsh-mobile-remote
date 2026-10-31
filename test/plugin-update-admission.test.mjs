@@ -134,6 +134,32 @@ test('NPM read-only check returns a sanitized candidate without scheduling insta
     assert.equal(readFileSync(join(h.profile, 'package.json'), 'utf8'), pkgBefore);
     assert.equal(jobs.length, jobsBefore);
     assert.equal(installed, installedBefore);
+    // 检查日志与手机端一致：可展开的诊断行，但不泄露 registry URL/凭据。
+    assert.ok(Array.isArray(r.body.pluginUpdate.checkLog), 'check response must include a check log');
+    assert.ok(r.body.pluginUpdate.checkLog.some((line) => line.includes('npm view')), JSON.stringify(r.body.pluginUpdate.checkLog));
+    assert.equal(r.body.pluginUpdate.checkLog.some((line) => /https?:\/\//.test(line)), false);
+  } finally { h.dispose(); }
+});
+
+test('NPM check log explains a failed metadata query without leaking registry details', async () => {
+  const packageName = '@marktrue/dsh-mobile-remote';
+  const pluginVersion = '3.2.2-alpha.1';
+  const npmPackageView = async (spec) => {
+    if (spec === packageName) return { 'dist-tags': { alpha: pluginVersion } };
+    throw new Error('npm-view-failed');
+  };
+  const h = harness({ config: { pluginUpdateManifest: 'npm' }, pluginUpdates: { npmPackageView } });
+  try {
+    const r = await request(h.route, undefined, '/m/api/plugin-update/check');
+    assert.equal(r.status, 200, JSON.stringify({ body: r.body, logs: h.logs }));
+    assert.equal(r.body.pluginUpdate.state, 'unavailable');
+    assert.equal(r.body.pluginUpdate.reason, 'npm-plugin-metadata-unavailable');
+    const log = r.body.pluginUpdate.checkLog;
+    assert.ok(Array.isArray(log));
+    assert.ok(log.some((line) => line.includes(`$ npm view ${packageName}@${pluginVersion} --json`)), JSON.stringify(log));
+    assert.ok(log.some((line) => line.includes('→ 失败：npm-registry-unavailable')), JSON.stringify(log));
+    assert.ok(log.some((line) => line.includes('检查失败：npm-plugin-metadata-unavailable')), JSON.stringify(log));
+    assert.equal(log.some((line) => /https?:\/\//.test(line)), false);
   } finally { h.dispose(); }
 });
 

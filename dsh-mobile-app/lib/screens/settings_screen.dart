@@ -1218,7 +1218,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             title: L10n.t('版本', 'Version'),
             sub:
                 'App v${_appVersion.isEmpty ? '…' : _appVersion}'
-                ' · ${L10n.t('插件', 'plugin')} v${api.pluginVersion.isEmpty ? '…' : api.pluginVersion}'
+                ' · ${L10n.t('插件', 'plugin')} v${store.api.pluginVersion.isEmpty ? '…' : store.api.pluginVersion}'
                 '${_alignmentNote()}'
                 '${store.updateCandidate != null ? ' · ${L10n.t('有新版本', 'update available')} ${store.updateCandidate!.version}' : ''}',
             onTap: store.updateCandidate == null
@@ -1252,12 +1252,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
             title: L10n.t('更新电脑端插件', 'Update desktop plugin'),
             sub: store.pluginUpdateJournal != null
                 ? _journalSub(store)
-                : !api.pluginUpdate.contentUpdateAvailable
+                : !store.api.pluginUpdate.contentUpdateAvailable
                 ? L10n.t(
                     '检查电脑端插件是否有可用更新',
                     'Check the desktop plugin for updates',
                   )
-                : api.pluginUpdate.canSelfUpdate
+                : store.api.pluginUpdate.canSelfUpdate
                 ? L10n.t(
                     '电脑端插件有新版本：可在这里直接触发更新',
                     'A newer desktop plugin is available — trigger the update here',
@@ -1268,15 +1268,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
             onTap: store.pluginUpdateJournal != null
                 ? () => unawaited(_updateJournalActions(store))
-                : (!api.pluginUpdate.contentUpdateAvailable ||
-                          api.pluginUpdate.canSelfUpdate
+                : (!store.api.pluginUpdate.contentUpdateAvailable ||
+                          store.api.pluginUpdate.canSelfUpdate
                       ? _triggerPluginUpdate
                       : _showPluginUpdateGuidance),
             trailing: store.pluginUpdateJournal == null
                 ? Text(
-                    !api.pluginUpdate.contentUpdateAvailable
+                    !store.api.pluginUpdate.contentUpdateAvailable
                         ? L10n.t('检查 ▸', 'Check ▸')
-                        : api.pluginUpdate.canSelfUpdate
+                        : store.api.pluginUpdate.canSelfUpdate
                         ? L10n.t('更新 ▸', 'Update ▸')
                         : L10n.t('指引 ▸', 'Guide ▸'),
                     style: TextStyle(fontSize: 12, color: brand),
@@ -1297,6 +1297,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
               trailing: TextButton(
                 onPressed: () =>
                     _openPluginUpdateLog(store.pluginUpdateLogOpId),
+                child: Text(
+                  L10n.t('查看 ▸', 'View ▸'),
+                  style: TextStyle(fontSize: 12, color: brand),
+                ),
+              ),
+            ),
+          if (store.api.pluginUpdate.checkLog.isNotEmpty)
+            _row(
+              leading: const Icon(Icons.receipt_long_outlined),
+              title: L10n.t('插件更新检查详情', 'Plugin update check details'),
+              sub: L10n.t(
+                '最近一次检查的 npm 查询与结果',
+                'npm queries and results from the last check',
+              ),
+              trailing: TextButton(
+                onPressed: () =>
+                    _openPluginUpdateCheckLog(store.api.pluginUpdate.checkLog),
                 child: Text(
                   L10n.t('查看 ▸', 'View ▸'),
                   style: TextStyle(fontSize: 12, color: brand),
@@ -1422,8 +1439,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   /// 不能自更新时展示**与实际安装方式对应的那一条**指引（可复制），而不是先诱导点"一键更新"。
   Future<void> _showPluginUpdateGuidance() async {
-    final g = api.pluginUpdate.guidance;
-    final shape = api.pluginUpdate.installShape;
+    final g = widget.store.api.pluginUpdate.guidance;
+    final shape = widget.store.api.pluginUpdate.installShape;
     final lines = <String>[
       if (g != null && g.summary.isNotEmpty) g.summary,
       if (g != null) ...g.steps.map((s) => '· $s'),
@@ -1818,7 +1835,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   /// 版本行的对齐尾注：未连接不判定；对齐时不加噪声；失配时说清**该动哪一端**。
   String _alignmentNote() {
-    if (api.pluginVersion.isEmpty) return '';
+    if (widget.store.api.pluginVersion.isEmpty) return '';
     return switch (widget.store.alignment.state) {
       AlignmentState.ok => '',
       AlignmentState.appOutdated =>
@@ -2046,6 +2063,33 @@ class _SettingsScreenState extends State<SettingsScreen> {
         );
         break;
     }
+  }
+
+  /// 最近一次插件更新检查的脱敏诊断：与桌面端「检查详情」显示同一份内容。
+  void _openPluginUpdateCheckLog(List<String> lines) {
+    final text = lines.join('\n');
+    showSheet(context, L10n.t('插件更新检查详情', 'Plugin update check details'), [
+      ConstrainedBox(
+        constraints: const BoxConstraints(maxHeight: 320),
+        child: SingleChildScrollView(
+          child: SelectableText(
+            text.isEmpty ? L10n.t('（暂无检查日志）', '(No check log)') : text,
+            style: TextStyle(
+              fontSize: 11.5,
+              height: 1.6,
+              color: DshColors.ink(context),
+              fontFamily: 'monospace',
+            ),
+          ),
+        ),
+      ),
+      const SizedBox(height: 12),
+      FilledButton.icon(
+        onPressed: text.isEmpty ? null : () => _copy(text),
+        icon: const Icon(Icons.copy),
+        label: Text(L10n.t('复制', 'Copy')),
+      ),
+    ]);
   }
 
   /// Open the host-owned update log in the same bottom sheet as the App log.

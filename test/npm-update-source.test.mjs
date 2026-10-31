@@ -184,3 +184,55 @@ test("accepts the flat dist-tags map that real `npm view … dist-tags --json` p
 	assert.equal(result.plugin.version, PLUGIN_VERSION);
 	assert.equal(result.carrier.version, CARRIER_VERSION);
 });
+
+
+test("records a sanitized, bounded check log without registry URLs", async () => {
+	const log = [];
+	const failed = await resolveNpmUpdateCandidate({
+		packageName: PACKAGE_NAME,
+		localVersion: PLUGIN_VERSION,
+		packageView: async (spec) => {
+			if (spec === PACKAGE_NAME) return { alpha: PLUGIN_VERSION };
+			throw new Error("npm-view-failed");
+		},
+		log,
+	});
+	assert.equal(failed.ok, false);
+	assert.equal(failed.reason, "npm-plugin-metadata-unavailable");
+	assert.ok(
+		log.some((line) => line.includes(`$ npm view ${PACKAGE_NAME}@${PLUGIN_VERSION} --json`)),
+		`检查日志应记录失败的 npm 命令：${JSON.stringify(log)}`,
+	);
+	assert.ok(log.some((line) => line.includes("→ 失败：npm-registry-unavailable")), JSON.stringify(log));
+	assert.ok(log.some((line) => line.includes("→ alpha=" + PLUGIN_VERSION)));
+	assert.ok(log.every((line) => !/https?:\/\//.test(line)), "日志不得包含 registry URL");
+	assert.ok(log.every((line) => line.length <= 241), "单行日志必须有长度上限");
+
+	const docs = new Map([
+		[PACKAGE_NAME, { latest: "3.2.1-alpha.3", alpha: PLUGIN_VERSION }],
+		[`${PACKAGE_NAME}@${PLUGIN_VERSION}`, {
+			version: PLUGIN_VERSION,
+			dist: { integrity: PLUGIN_INTEGRITY },
+			optionalDependencies: {
+				"@marktrue/dsh-mobile-remote-app": `npm:${PACKAGE_NAME}@${CARRIER_VERSION}`,
+			},
+		}],
+		[`${PACKAGE_NAME}@${CARRIER_VERSION}`, {
+			version: CARRIER_VERSION,
+			appVersion: "3.2.2+26",
+			pluginContentSha256: "b".repeat(64),
+			dist: { integrity: CARRIER_INTEGRITY },
+		}],
+	]);
+	const successLog = [];
+	const success = await resolveNpmUpdateCandidate({
+		packageName: PACKAGE_NAME,
+		localVersion: PLUGIN_VERSION,
+		packageView: async (spec) => docs.get(spec) ?? null,
+		log: successLog,
+	});
+	assert.equal(success.ok, true);
+	assert.ok(successLog.some((line) => line.includes(`$ npm view ${PACKAGE_NAME}@${PLUGIN_VERSION} --json`)));
+	assert.ok(successLog.some((line) => line.includes("→ 插件 v" + PLUGIN_VERSION)));
+	assert.ok(successLog.some((line) => line.includes(`→ 载体 v${CARRIER_VERSION} · App build 3.2.2+26`)), JSON.stringify(successLog));
+});
