@@ -13,28 +13,58 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-const pluginHash = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
-const apkHash = 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc';
-const oldHash = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+const pluginHash =
+    'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+const apkHash =
+    'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc';
+const oldHash =
+    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const hostBase = 'http://192.168.1.5:3080';
 const mount = '/m';
 
 Map<String, dynamic> releaseJson({String version = '3.3.0+55'}) => {
-      'schema': 1,
-      'manifestUrl': '$hostBase$mount/api/update/manifest',
-      'app': {'version': version, 'file': 'app.apk', 'size': 4096, 'sha256': apkHash,
-        'url': '$hostBase$mount/api/update/apk?release=r1&sha256=$apkHash'},
-      'plugin': {'version': '3.3.0', 'file': 'plugin.tgz', 'size': 2048, 'sha256': oldHash,
-        'contentSha256': pluginHash, 'url': '$hostBase$mount/api/update/plugin'},
-    };
+  'schema': 1,
+  'manifestUrl': '$hostBase$mount/api/update/manifest',
+  'app': {
+    'version': version,
+    'file': 'app.apk',
+    'size': 4096,
+    'sha256': apkHash,
+    'url': '$hostBase$mount/api/update/apk?release=r1&sha256=$apkHash',
+  },
+  'plugin': {
+    'version': '3.3.0',
+    'file': 'plugin.tgz',
+    'size': 2048,
+    'sha256': oldHash,
+    'contentSha256': pluginHash,
+    'url': '$hostBase$mount/api/update/plugin',
+  },
+};
 
-Map<String, dynamic> healthJson({String state = 'confirmed', String running = pluginHash,
-    String instanceId = 'inst-1'}) => {
-      'state': state,
-      'runningContentSha256': running,
-      'instanceId': instanceId,
-      'transaction': {'opId': 'op-1', 'generation': 1},
-    };
+Map<String, dynamic> healthJson({
+  String state = 'confirmed',
+  String running = pluginHash,
+  String instanceId = 'inst-1',
+}) => {
+  'state': state,
+  'runningContentSha256': running,
+  'instanceId': instanceId,
+  'transaction': {'opId': 'op-1', 'generation': 1},
+};
+
+Map<String, dynamic> failedTransaction({
+  String targetContentSha256 = oldHash,
+}) => {
+  'opId': 'op-old-failed',
+  'phase': 'failed',
+  'targetVersion': '3.2.2-alpha.6',
+  'targetContentSha256': targetContentSha256,
+  'targetAppVersion': '3.2.2+30',
+  'rolledBack': false,
+  'attempts': 0,
+  'result': {'ok': false, 'reason': 'npm-carrier-plugin-identity-mismatch'},
+};
 
 Map<String, dynamic> bootstrapJson({
   String state = 'up-to-date',
@@ -46,26 +76,31 @@ Map<String, dynamic> bootstrapJson({
   String loaded = pluginHash,
   String instanceId = 'inst-1',
 }) => {
-      'plugin': {'version': '3.3.0', 'contentSha256': loaded, 'instanceId': instanceId},
-      'pluginUpdate': {
-        'state': state,
-        'canSelfUpdate': true,
-        'release': ?release,
-        'transaction': transaction,
-      },
-      'currentRelease': currentRelease ?? {'releaseId': 'r1', 'release': releaseJson()},
-      'currentReleaseHealth': health ?? healthJson(),
-      'appArtifact': appArtifact,
-    };
+  'plugin': {
+    'version': '3.3.0',
+    'contentSha256': loaded,
+    'instanceId': instanceId,
+  },
+  'pluginUpdate': {
+    'state': state,
+    'canSelfUpdate': true,
+    'release': ?release,
+    'transaction': transaction,
+  },
+  'currentRelease':
+      currentRelease ?? {'releaseId': 'r1', 'release': releaseJson()},
+  'currentReleaseHealth': health ?? healthJson(),
+  'appArtifact': appArtifact,
+};
 
 AppStore storeFor(Api client, {int Function()? onInstall}) => AppStore(
-      apiClient: client,
-      localVersion: () async => parseAppVersion('3.2.0+44'),
-      installer: (candidate, {onProgress, onStage, cancel}) async {
-        onInstall?.call();
-        return null;
-      },
-    );
+  apiClient: client,
+  localVersion: () async => parseAppVersion('3.2.0+44'),
+  installer: (candidate, {onProgress, onStage, cancel}) async {
+    onInstall?.call();
+    return null;
+  },
+);
 
 Future<Api> absorb(Api client) async {
   client.absorbBootstrap(await client.getJson('/api/bootstrap'));
@@ -79,8 +114,9 @@ void main() {
   test('F14: 远端检查 disabled，但本地当前发布完整且健康 → 仍允许本地 App 安装', () async {
     final data = bootstrapJson(state: 'disabled');
     var installs = 0;
-    final client = Api(client: MockClient((_) async => http.Response(jsonEncode(data), 200)))
-      ..baseUrl = hostBase;
+    final client = Api(
+      client: MockClient((_) async => http.Response(jsonEncode(data), 200)),
+    )..baseUrl = hostBase;
     final store = storeFor(client, onInstall: () => installs++);
     addTearDown(store.dispose);
     await store.loadPrefs();
@@ -89,8 +125,11 @@ void main() {
     final outcome = await Updater.check(store);
     expect(outcome.error, isNull);
     final candidate = outcome.candidate!;
-    expect(store.appUpdateGate(candidate).allowed, isTrue,
-        reason: '本地配对已验证且健康时，外部检查 off/failed 不得否定本地 App 安装');
+    expect(
+      store.appUpdateGate(candidate).allowed,
+      isTrue,
+      reason: '本地配对已验证且健康时，外部检查 off/failed 不得否定本地 App 安装',
+    );
 
     final result = await store.installAppUpdate(candidate);
     expect(result, isNull);
@@ -103,10 +142,18 @@ void main() {
       ('waiting', 'plugin-transaction-pending'),
       ('failed', 'plugin-update-failed'),
     ]) {
-      final client = Api(client: MockClient((_) async => http.Response(jsonEncode(
-        bootstrapJson(health: healthJson(state: scenario.$1)),
-      ), 200)))..baseUrl = hostBase;
-      final store = AppStore(apiClient: client, localVersion: () async => parseAppVersion('3.2.0+44'));
+      final client = Api(
+        client: MockClient(
+          (_) async => http.Response(
+            jsonEncode(bootstrapJson(health: healthJson(state: scenario.$1))),
+            200,
+          ),
+        ),
+      )..baseUrl = hostBase;
+      final store = AppStore(
+        apiClient: client,
+        localVersion: () async => parseAppVersion('3.2.0+44'),
+      );
       addTearDown(store.dispose);
       await store.loadPrefs();
       await absorb(client);
@@ -121,17 +168,27 @@ void main() {
   test('健康结果里的运行内容/服务实例与当前实例不符 → 门禁拒绝（旧健康结论不能冒充）', () async {
     for (final data in [
       bootstrapJson(health: healthJson(running: oldHash)),
-      bootstrapJson(instanceId: 'inst-2', health: healthJson(instanceId: 'inst-1')),
+      bootstrapJson(
+        instanceId: 'inst-2',
+        health: healthJson(instanceId: 'inst-1'),
+      ),
     ]) {
-      final client = Api(client: MockClient((_) async => http.Response(jsonEncode(data), 200)))
-        ..baseUrl = hostBase;
-      final store = AppStore(apiClient: client, localVersion: () async => parseAppVersion('3.2.0+44'));
+      final client = Api(
+        client: MockClient((_) async => http.Response(jsonEncode(data), 200)),
+      )..baseUrl = hostBase;
+      final store = AppStore(
+        apiClient: client,
+        localVersion: () async => parseAppVersion('3.2.0+44'),
+      );
       addTearDown(store.dispose);
       await store.loadPrefs();
       await absorb(client);
       final candidate = ReleaseSnapshot.fromJson(releaseJson())!.candidate;
-      expect(store.appUpdateGate(candidate).allowed, isFalse,
-          reason: '运行内容/实例不一致时不能复用旧健康结论');
+      expect(
+        store.appUpdateGate(candidate).allowed,
+        isFalse,
+        reason: '运行内容/实例不一致时不能复用旧健康结论',
+      );
     }
   });
 
@@ -139,11 +196,16 @@ void main() {
     var calls = 0;
     var installs = 0;
     final data = bootstrapJson();
-    final client = Api(client: MockClient((_) async {
-      calls++;
-      if (calls == 1) return http.Response(jsonEncode(data), 200);
-      return http.Response(jsonEncode({'error': 'internal', 'detail': 'boom'}), 500);
-    }))..baseUrl = hostBase;
+    final client = Api(
+      client: MockClient((_) async {
+        calls++;
+        if (calls == 1) return http.Response(jsonEncode(data), 200);
+        return http.Response(
+          jsonEncode({'error': 'internal', 'detail': 'boom'}),
+          500,
+        );
+      }),
+    )..baseUrl = hostBase;
     final store = storeFor(client, onInstall: () => installs++);
     addTearDown(store.dispose);
     await store.loadPrefs();
@@ -160,13 +222,20 @@ void main() {
     var calls = 0;
     var installs = 0;
     final healthy = bootstrapJson();
-    final inFlight = bootstrapJson(transaction: {
-      'opId': 'op-new', 'phase': 'staging', 'targetContentSha256': pluginHash, 'rolledBack': false,
-    });
-    final client = Api(client: MockClient((_) async {
-      calls++;
-      return http.Response(jsonEncode(calls == 1 ? healthy : inFlight), 200);
-    }))..baseUrl = hostBase;
+    final inFlight = bootstrapJson(
+      transaction: {
+        'opId': 'op-new',
+        'phase': 'staging',
+        'targetContentSha256': pluginHash,
+        'rolledBack': false,
+      },
+    );
+    final client = Api(
+      client: MockClient((_) async {
+        calls++;
+        return http.Response(jsonEncode(calls == 1 ? healthy : inFlight), 200);
+      }),
+    )..baseUrl = hostBase;
     final store = storeFor(client, onInstall: () => installs++);
     addTearDown(store.dispose);
     await store.loadPrefs();
@@ -179,10 +248,22 @@ void main() {
   });
 
   test('F16: appArtifact=mismatch 时停在校验阶段，不给候选', () async {
-    final client = Api(client: MockClient((_) async => http.Response(jsonEncode(
-      bootstrapJson(appArtifact: {'state': 'mismatch', 'reason': 'app-hash-mismatch'}),
-    ), 200)))..baseUrl = hostBase;
-    final store = AppStore(apiClient: client, localVersion: () async => parseAppVersion('3.2.0+44'));
+    final client = Api(
+      client: MockClient(
+        (_) async => http.Response(
+          jsonEncode(
+            bootstrapJson(
+              appArtifact: {'state': 'mismatch', 'reason': 'app-hash-mismatch'},
+            ),
+          ),
+          200,
+        ),
+      ),
+    )..baseUrl = hostBase;
+    final store = AppStore(
+      apiClient: client,
+      localVersion: () async => parseAppVersion('3.2.0+44'),
+    );
     addTearDown(store.dispose);
     await store.loadPrefs();
     await absorb(client);
@@ -191,5 +272,115 @@ void main() {
     expect(outcome.candidate, isNull);
     expect(outcome.error, contains('不一致'));
     expect(outcome.error, contains('app-hash-mismatch'));
+  });
+
+  test('历史失败事务已被运行内容覆盖 → App 更新门禁放行（不再提示先确认插件目标）', () async {
+    final client = Api(
+      client: MockClient(
+        (_) async => http.Response(
+          jsonEncode(
+            bootstrapJson(
+              transaction: failedTransaction(),
+              health: healthJson(),
+            ),
+          ),
+          200,
+        ),
+      ),
+    )..baseUrl = hostBase;
+    final store = AppStore(
+      apiClient: client,
+      localVersion: () async => parseAppVersion('3.2.0+44'),
+    );
+    addTearDown(store.dispose);
+    await store.loadPrefs();
+    await absorb(client);
+
+    final candidate = ReleaseSnapshot.fromJson(releaseJson())!.candidate;
+    final gate = store.appUpdateGate(candidate);
+    expect(gate.allowed, isTrue, reason: '运行内容=固定发布内容时，历史失败事务不能永久挡住 App 更新');
+  });
+
+  test('旧宿主仍报 health failed，但历史失败事务目标已被运行内容覆盖 → 放行', () async {
+    final client = Api(
+      client: MockClient(
+        (_) async => http.Response(
+          jsonEncode(
+            bootstrapJson(
+              transaction: failedTransaction(),
+              health: healthJson(state: 'failed'),
+            ),
+          ),
+          200,
+        ),
+      ),
+    )..baseUrl = hostBase;
+    final store = AppStore(
+      apiClient: client,
+      localVersion: () async => parseAppVersion('3.2.0+44'),
+    );
+    addTearDown(store.dispose);
+    await store.loadPrefs();
+    await absorb(client);
+
+    final candidate = ReleaseSnapshot.fromJson(releaseJson())!.candidate;
+    expect(store.appUpdateGate(candidate).allowed, isTrue);
+  });
+
+  test('失败事务的目标内容仍等于运行内容 / 非终态事务 → 继续拒绝 App 更新', () async {
+    // 运行内容 ≠ 固定发布内容：仍以“插件需先更新”拒绝。
+    final staleClient = Api(
+      client: MockClient(
+        (_) async => http.Response(
+          jsonEncode(
+            bootstrapJson(
+              transaction: failedTransaction(),
+              loaded: oldHash,
+              health: healthJson(running: oldHash),
+            ),
+          ),
+          200,
+        ),
+      ),
+    )..baseUrl = hostBase;
+    final staleStore = AppStore(
+      apiClient: staleClient,
+      localVersion: () async => parseAppVersion('3.2.0+44'),
+    );
+    addTearDown(staleStore.dispose);
+    await staleStore.loadPrefs();
+    await absorb(staleClient);
+    final candidate = ReleaseSnapshot.fromJson(releaseJson())!.candidate;
+    final staleGate = staleStore.appUpdateGate(candidate);
+    expect(staleGate.allowed, isFalse);
+    expect(staleGate.reason, 'plugin-update-available');
+
+    // 非终态事务仍按“更新进行中”拒绝。
+    final pending = Map<String, dynamic>.from(failedTransaction())
+      ..['phase'] = 'installing'
+      ..['result'] = null;
+    final pendingClient = Api(
+      client: MockClient(
+        (_) async => http.Response(
+          jsonEncode(
+            bootstrapJson(
+              transaction: pending,
+              health: healthJson(state: 'waiting'),
+            ),
+          ),
+          200,
+        ),
+      ),
+    )..baseUrl = hostBase;
+    final pendingStore = AppStore(
+      apiClient: pendingClient,
+      localVersion: () async => parseAppVersion('3.2.0+44'),
+    );
+    addTearDown(pendingStore.dispose);
+    await pendingStore.loadPrefs();
+    await absorb(pendingClient);
+    final pendingGate = pendingStore.appUpdateGate(candidate);
+    expect(pendingGate.allowed, isFalse);
+    expect(pendingGate.reason, 'plugin-transaction-pending');
   });
 }
