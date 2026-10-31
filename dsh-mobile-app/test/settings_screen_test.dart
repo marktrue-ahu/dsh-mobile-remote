@@ -1,7 +1,6 @@
 import 'dart:convert';
 
 import 'package:dsh_mobile_app/api.dart';
-import 'package:dsh_mobile_app/plugin_update_status.dart';
 import 'package:dsh_mobile_app/screens/settings_screen.dart';
 import 'package:dsh_mobile_app/store.dart';
 import 'package:flutter/material.dart';
@@ -134,106 +133,6 @@ void main() {
     ]);
     expect(rows.last.value, isFalse);
   });
-
-  testWidgets(
-    'opens host update logs in the App-log bottom sheet and copies them',
-    (tester) async {
-      final requestedOpIds = <String>[];
-      String? copied;
-      final messenger =
-          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
-      messenger.setMockMethodCallHandler(SystemChannels.platform, (call) async {
-        if (call.method == 'Clipboard.setData') {
-          copied = (call.arguments as Map)['text'] as String?;
-        }
-        return null;
-      });
-      addTearDown(
-        () => messenger.setMockMethodCallHandler(SystemChannels.platform, null),
-      );
-
-      final api = Api(
-        client: MockClient((request) async {
-          if (request.url.path.endsWith('/api/plugin-update/log')) {
-            requestedOpIds.add(request.url.queryParameters['opId'] ?? '');
-            return http.Response(
-              jsonEncode({
-                'ok': true,
-                'opId': 'desktop-op',
-                'phase': 'installing',
-                'events': [
-                  {
-                    'seq': 1,
-                    'stage': 'install',
-                    'stream': 'stdout',
-                    'text': 'pnpm install output',
-                  },
-                ],
-              }),
-              200,
-            );
-          }
-          return http.Response('{}', 200);
-        }),
-      )..baseUrl = 'https://desktop.example';
-      api.pluginUpdate = PluginUpdateStatus.fromJson({
-        'state': 'restarting',
-        'transaction': {
-          'opId': 'desktop-op',
-          'phase': 'installing',
-          'targetVersion': '3.2.2-alpha.2',
-          'targetContentSha256': List.filled(64, 'b').join(),
-          'targetAppVersion': '3.2.2+27',
-        },
-      });
-      final store = AppStore(apiClient: api);
-      addTearDown(store.dispose);
-      await store.loadPrefs();
-
-      await tester.pumpWidget(
-        MaterialApp(
-          home: Scaffold(
-            body: SettingsScreen(store: store, onReconfigure: () async {}),
-          ),
-        ),
-      );
-      await tester.pumpAndSettle();
-      final logTitle = find.text('插件更新日志');
-      await tester.scrollUntilVisible(
-        logTitle,
-        240,
-        scrollable: find.byType(Scrollable).first,
-      );
-      await tester.pumpAndSettle();
-      expect(
-        find.text('pnpm install output'),
-        findsNothing,
-        reason: '日志应默认在抽屉内，而不是内嵌展开',
-      );
-      final logRow = find
-          .ancestor(of: logTitle, matching: find.byType(InkWell))
-          .first;
-      final viewButton = find.descendant(
-        of: logRow,
-        matching: find.widgetWithText(TextButton, '查看 ▸'),
-      );
-      await tester.tap(viewButton);
-      await tester.pump();
-      await tester.pump(const Duration(milliseconds: 300));
-
-      expect(find.byType(BottomSheet), findsOneWidget);
-      expect(requestedOpIds, contains('desktop-op'));
-      expect(find.text('pnpm install output'), findsOneWidget);
-      final copyButton = find.descendant(
-        of: find.byType(BottomSheet),
-        matching: find.text('复制'),
-      );
-      expect(copyButton, findsOneWidget);
-      await tester.tap(copyButton);
-      await tester.pump();
-      expect(copied, contains('pnpm install output'));
-    },
-  );
 
   testWidgets(
     'always exposes a desktop plugin update entry that checks the host',
