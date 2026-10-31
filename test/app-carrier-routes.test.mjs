@@ -442,6 +442,44 @@ test("匿名下载与登录限流是独立资源桶（互不消耗/重置）", a
 	});
 });
 
+test("历史失败事务：目标内容被运行内容覆盖后不再永久报 failed，匹配时仍如实报 failed", async () => {
+	const txFile = join(testHome, ".dsh", "mobile-remote", "plugin-update-transaction.json");
+	const writeFailedTx = async (targetContentSha256) => {
+		await mkdir(join(testHome, ".dsh", "mobile-remote"), { recursive: true });
+		await writeFile(txFile, JSON.stringify({
+			opId: "00000000-0000-4000-8000-000000000001",
+			phase: "failed",
+			targetVersion: "3.2.0",
+			targetContentSha256,
+			rolledBack: false,
+			attempts: 0,
+			result: { ok: false, reason: "fixture-failed" },
+			startedAt: new Date().toISOString(),
+			lease: { generation: "00000000-0000-4000-8000-000000000002" },
+		}));
+	};
+	try {
+		await withStoreFixture({}, async (fixture) => {
+			await withHarness({ config: { updateDir: fixture.carrierDir, updateProfileDir: fixture.profileDir } }, async ({ api }) => {
+				// A) 该失败尝试的目标内容已被当前运行内容覆盖（例如随后手工升级）：健康结论回到当前发布判定。
+				await writeFailedTx("f".repeat(64));
+				const stale = await request(api, { url: "/m/api/bootstrap", headers: { "x-mobile-token": TOKEN } });
+				assert.equal(stale.status, 200);
+				assert.equal(stale.json().currentReleaseHealth.state, "confirmed", "历史失败不应永久污染健康结论");
+				assert.equal(stale.json().pluginUpdate.transaction.phase, "failed", "历史事务仍保留给详情页");
+
+				// B) 失败目标仍等于当前运行内容：继续如实报 failed。
+				await writeFailedTx(RUNNING_CONTENT);
+				const current = await request(api, { url: "/m/api/bootstrap", headers: { "x-mobile-token": TOKEN } });
+				assert.equal(current.status, 200);
+				assert.equal(current.json().currentReleaseHealth.state, "failed");
+			});
+		});
+	} finally {
+		await rm(txFile, { force: true });
+	}
+});
+
 test("bootstrap 四字段：currentRelease / currentReleaseHealth / updateTarget / appArtifact + 投影", async () => {
 	await withStoreFixture({}, async (fixture) => {
 		await withHarness({ config: { updateDir: fixture.carrierDir, updateProfileDir: fixture.profileDir } }, async ({ api }) => {

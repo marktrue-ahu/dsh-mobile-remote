@@ -306,13 +306,19 @@ class AppStore extends ChangeNotifier {
       );
     }
     final tx = st.transaction;
-    if (tx != null && (tx.phase != 'settled' || tx.rolledBack)) {
-      return UpdateGate(
-        false,
-        st.retryableFailure
-            ? 'plugin-update-failed'
-            : 'plugin-transaction-pending',
-      );
+    if (tx != null) {
+      // 终态失败/回滚且未处于回滚中：属于历史记录，由下面的“运行内容=固定发布”证明裁决；
+      // 否则会因一次早已被覆盖的失败永久挡住 App 更新。
+      final terminalHistorical =
+          !tx.rolledBack && const {'failed', 'rolled-back'}.contains(tx.phase);
+      if (!terminalHistorical && (tx.rolledBack || tx.phase != 'settled')) {
+        return UpdateGate(
+          false,
+          st.retryableFailure
+              ? 'plugin-update-failed'
+              : 'plugin-transaction-pending',
+        );
+      }
     }
     final selected = candidate ?? updateCandidate;
     final release =
@@ -336,6 +342,8 @@ class AppStore extends ChangeNotifier {
       );
     }
     if (!_pluginTargetHealthy(release)) {
+      // 历史失败事务已被当前运行内容覆盖时，不以它否决固定发布的健康安装。
+      if (_staleFailureProof(release)) return const UpdateGate(true, '');
       if (st.retryableFailure || api.currentReleaseHealth?.failed == true) {
         return const UpdateGate(false, 'plugin-update-failed');
       }
@@ -947,8 +955,26 @@ class AppStore extends ChangeNotifier {
     final tx = api.pluginUpdate.transaction;
     if (tx == null) return true; // 预装且已加载目标内容：无历史操作也算健康
     if (tx.rolledBack) return false;
-    if (tx.phase == 'settled') return true;
+    // 内容证明已在上方完成；历史终态失败/回滚记录不否定“运行内容 = 固定发布内容”。
+    if (const {'settled', 'failed', 'rolled-back'}.contains(tx.phase))
+      return true;
     return false; // 非终态：交给门禁的在飞分支处理
+  }
+
+  /// 终态失败事务是否已被当前运行内容覆盖（内容证明优先于历史失败记录）。
+  bool _staleFailureProof(ReleaseSnapshot release) {
+    final tx = api.pluginUpdate.transaction;
+    if (tx == null || tx.rolledBack) return false;
+    if (!const {'failed', 'rolled-back'}.contains(tx.phase)) return false;
+    final loaded = api.pluginContentSha256;
+    if (loaded.isEmpty || loaded != release.plugin.contentSha256) return false;
+    final health = api.currentReleaseHealth;
+    if (health != null &&
+        health.runningContentSha256.isNotEmpty &&
+        health.runningContentSha256 != loaded) {
+      return false;
+    }
+    return true;
   }
 
   /// 配对是否已被**明确打断**（回滚/失败/运行内容与快照不符且无在飞事务）。
