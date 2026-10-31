@@ -84,7 +84,10 @@ test("NPM artifact preparation checks tarball SRI, embedded pairing manifest, AP
 	const pluginVersion = "3.3.0-alpha.1";
 	const carrierVersion = `${pluginVersion}-app`;
 	const appVersion = "3.3.0+70";
+	// npm pack 规范化后的文件名（scope 前缀、无发布产物的 `-v`）
 	const pluginFilename = "marktrue-dsh-mobile-remote-3.3.0-alpha.1.tgz";
+	// 发布清单里记录的是发布产物名；两者不同是真实 NPM 路径的常态。
+	const releasePluginFilename = "dsh-mobile-remote-v3.3.0-alpha.1.tgz";
 	const carrierFilename = "marktrue-dsh-mobile-remote-3.3.0-alpha.1-app.tgz";
 	const apkName = "DSH-Remote-v3.3.0.apk";
 	const apkBytes = Buffer.from("fixture apk bytes");
@@ -110,7 +113,7 @@ test("NPM artifact preparation checks tarball SRI, embedded pairing manifest, AP
 			size: apkBytes.length,
 			sha256: createHash("sha256").update(apkBytes).digest("hex"),
 			app: { version: appVersion, file: apkName, size: apkBytes.length, sha256: createHash("sha256").update(apkBytes).digest("hex") },
-			plugin: { version: pluginVersion, file: pluginFilename, size: pluginBytes.length, sha256: pluginSha256, contentSha256: pluginContentSha256 },
+			plugin: { version: pluginVersion, file: releasePluginFilename, size: pluginBytes.length, sha256: pluginSha256, contentSha256: pluginContentSha256 },
 		};
 		await writeFile(join(carrierPackageDir, "manifest.json"), JSON.stringify(manifest));
 		await writeFile(join(carrierPackageDir, apkName), apkBytes);

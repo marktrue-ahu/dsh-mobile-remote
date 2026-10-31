@@ -626,3 +626,57 @@ test('W1/T16: public manifest URL never uses a Host/trustedHosts port that is no
     assert.equal(outsider.status, 403);
   } finally { h.dispose(); }
 });
+
+test('failed NPM update records the sanitized failure reason in the operation log', async () => {
+  const oldHome = process.env.HOME;
+  const testHome = mkdtempSync(join(tmpdir(), 'update-npm-failure-log-'));
+  const packageName = '@marktrue/dsh-mobile-remote';
+  const pluginVersion = '3.2.2-alpha.1';
+  const carrierVersion = `${pluginVersion}-app`;
+  const docs = new Map([
+    [packageName, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, app: carrierVersion } }],
+    [`${packageName}@${pluginVersion}`, {
+      version: pluginVersion,
+      dist: { integrity: `sha512-${Buffer.from('plugin').toString('base64')}` },
+      optionalDependencies: { '@marktrue/dsh-mobile-remote-app': `npm:${packageName}@${carrierVersion}` },
+    }],
+    [`${packageName}@${carrierVersion}`, {
+      version: carrierVersion, appVersion: '3.2.2+26', pluginContentSha256: 'b'.repeat(64),
+      dist: { integrity: `sha512-${Buffer.from('carrier').toString('base64')}` },
+    }],
+  ]);
+  const jobsBefore = jobs.length;
+  const h = harness({
+    homeDir: testHome,
+    config: { pluginUpdateManifest: 'npm' },
+    pluginUpdates: {
+      npmPackageView: async (spec) => docs.get(spec) ?? null,
+      runSelfUpdate: async () => ({ ok: false, error: 'npm-carrier-plugin-identity-mismatch' }),
+    },
+  });
+  try {
+    const accepted = await request(h.route, { opId: 'npm-failure-reason' });
+    assert.equal(accepted.status, 200, JSON.stringify({ body: accepted.body, logs: h.logs }));
+    assert.equal(accepted.body.action, 'accepted');
+    const scheduled = jobs.splice(jobsBefore);
+    assert.equal(scheduled.length, 1);
+    await scheduled[0]();
+    // 详情页直接读取该操作日志：必须能看见失败原因，而不是只有一句“看安装输出”。
+    const page = await request(h.route, undefined, '/m/api/plugin-update/log?opId=npm-failure-reason&afterSeq=0');
+    assert.equal(page.status, 200, JSON.stringify({ body: page.body, logs: h.logs }));
+    const texts = (page.body.events || []).map((event) => String(event.text || ''));
+    assert.ok(texts.some((text) => text.includes('npm-carrier-plugin-identity-mismatch')), JSON.stringify(texts));
+    assert.equal(texts.some((text) => /https?:\/\//.test(text)), false);
+  } finally {
+    const holder = readLock(updateLockPath(testHome));
+    if (holder) {
+      const tx = readTransaction(transactionFile(testHome));
+      const { writeOwnedTransaction } = await import('../lib/plugin-update-transaction.js');
+      writeOwnedTransaction(transactionFile(testHome), { ...tx, phase: 'failed' }, { lockPath: updateLockPath(testHome), lease: holder });
+      releaseLock(updateLockPath(testHome), holder);
+    }
+    jobs.splice(jobsBefore);
+    h.dispose();
+    process.env.HOME = oldHome;
+  }
+});
