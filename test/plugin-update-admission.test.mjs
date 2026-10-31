@@ -631,7 +631,8 @@ test('failed NPM update records the sanitized failure reason in the operation lo
   const oldHome = process.env.HOME;
   const testHome = mkdtempSync(join(tmpdir(), 'update-npm-failure-log-'));
   const packageName = '@marktrue/dsh-mobile-remote';
-  const pluginVersion = '3.2.2-alpha.1';
+  // 用与任何发布线无关的“更新版本”，避免测试依赖当前 package.json 的本机版本。
+  const pluginVersion = '3.3.0-alpha.1';
   const carrierVersion = `${pluginVersion}-app`;
   const docs = new Map([
     [packageName, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, app: carrierVersion } }],
@@ -641,7 +642,7 @@ test('failed NPM update records the sanitized failure reason in the operation lo
       optionalDependencies: { '@marktrue/dsh-mobile-remote-app': `npm:${packageName}@${carrierVersion}` },
     }],
     [`${packageName}@${carrierVersion}`, {
-      version: carrierVersion, appVersion: '3.2.2+26', pluginContentSha256: 'b'.repeat(64),
+      version: carrierVersion, appVersion: '3.3.0+70', pluginContentSha256: 'b'.repeat(64),
       dist: { integrity: `sha512-${Buffer.from('carrier').toString('base64')}` },
     }],
   ]);
