@@ -155,3 +155,32 @@ test("candidate resolution surfaces npm-client-unavailable instead of blaming th
 	assert.equal(result.ok, false);
 	assert.equal(result.reason, "npm-client-unavailable");
 });
+
+test("accepts the flat dist-tags map that real `npm view … dist-tags --json` prints", async () => {
+	// 回归：npm CLI 实际输出是标签映射本身（不是 {"dist-tags": …} 包装）。
+	// 旧实现只读 tags["dist-tags"]，导致真实宿主永远报 npm-channel-version-missing。
+	const packageDocs = new Map([
+		[PACKAGE_NAME, { latest: "3.2.1-alpha.3", alpha: PLUGIN_VERSION, app: "3.2.3-alpha.1-app" }],
+		[`${PACKAGE_NAME}@${PLUGIN_VERSION}`, {
+			version: PLUGIN_VERSION,
+			dist: { integrity: PLUGIN_INTEGRITY },
+			optionalDependencies: {
+				"@marktrue/dsh-mobile-remote-app": `npm:${PACKAGE_NAME}@${CARRIER_VERSION}`,
+			},
+		}],
+		[`${PACKAGE_NAME}@${CARRIER_VERSION}`, {
+			version: CARRIER_VERSION,
+			appVersion: "3.2.2+26",
+			pluginContentSha256: "b".repeat(64),
+			dist: { integrity: CARRIER_INTEGRITY },
+		}],
+	]);
+	const result = await resolveNpmUpdateCandidate({
+		packageName: PACKAGE_NAME,
+		localVersion: PLUGIN_VERSION,
+		packageView: async (spec) => packageDocs.get(spec) ?? null,
+	});
+	assert.equal(result.ok, true);
+	assert.equal(result.plugin.version, PLUGIN_VERSION);
+	assert.equal(result.carrier.version, CARRIER_VERSION);
+});
