@@ -2,6 +2,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { runCommand } from "../lib/plugin-self-update.js";
 
+test("runCommand routes Windows commands through the shell so npm.cmd/pnpm.cmd resolve", async () => {
+	// `cd` 是 shell 内建命令：只有 shell 为 true 时才能执行（Windows 上 .cmd 同理）。
+	const viaShell = await runCommand("cd", [], { platform: "win32", timeoutMs: 5_000 });
+	assert.equal(viaShell.ok, true, viaShell.error);
+	const direct = await runCommand("cd", [], { platform: "linux", timeoutMs: 5_000 });
+	assert.equal(direct.ok, false);
+});
+
 test("runCommand drains both streams, captures bounded tails, and forwards live chunks", async () => {
 	const chunks = [];
 	const childCode = [
