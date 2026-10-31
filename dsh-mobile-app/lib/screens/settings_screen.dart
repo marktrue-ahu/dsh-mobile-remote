@@ -13,6 +13,7 @@ import '../logger.dart';
 import '../models.dart';
 import '../plugin_update_resume.dart';
 import '../plugin_update_log.dart';
+import '../plugin_update_status.dart';
 import '../store.dart';
 import '../theme.dart';
 import '../toast.dart';
@@ -1242,42 +1243,49 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         )
                       : null),
           ),
-          // 插件更新入口由**内容状态**驱动（评审 R11）：同版本不同内容时也必须能操作，
-          // 而不是只看版本号对齐。不能自更新的形态给出**对应那一条**可复制指引。
-          // 有进行中的记录时可点开「处理」：取消旧目标并按电脑端当前状态重新检查（F13）。
-          if (api.pluginUpdate.contentUpdateAvailable ||
-              store.pluginUpdateJournal != null)
-            _row(
-              leading: const Icon(Icons.desktop_windows_outlined),
-              title: L10n.t('更新电脑端插件', 'Update desktop plugin'),
-              sub: store.pluginUpdateJournal != null
-                  ? _journalSub(store)
-                  : api.pluginUpdate.canSelfUpdate
-                  ? L10n.t(
-                      '电脑端插件有新版本：可在这里直接触发更新',
-                      'A newer desktop plugin is available — trigger the update here',
-                    )
-                  : L10n.t(
-                      '电脑端插件有新版本：本机形态需按指引更新',
-                      'A newer desktop plugin is available — follow the guide for your install',
-                    ),
-              onTap: store.pluginUpdateJournal != null
-                  ? () => unawaited(_updateJournalActions(store))
-                  : (api.pluginUpdate.canSelfUpdate
-                        ? _triggerPluginUpdate
-                        : _showPluginUpdateGuidance),
-              trailing: store.pluginUpdateJournal == null
-                  ? Text(
-                      api.pluginUpdate.canSelfUpdate
-                          ? L10n.t('更新 ▸', 'Update ▸')
-                          : L10n.t('指引 ▸', 'Guide ▸'),
-                      style: TextStyle(fontSize: 12, color: brand),
-                    )
-                  : Text(
-                      L10n.t('处理 ▸', 'Manage ▸'),
-                      style: TextStyle(fontSize: 12, color: brand),
-                    ),
-            ),
+          // 插件更新入口常驻（与桌面「连接移动端」页一致）：即使还不知道有没有新版，
+          // 手机也必须能主动触发宿主侧只读检查；有进行中的记录时可点开「处理」。
+          // 已知候选时按本机形态给「更新」/「指引」，未检查时给「检查」。
+          // 不能自更新的形态给出**对应那一条**可复制指引（评审 R11）。
+          _row(
+            leading: const Icon(Icons.desktop_windows_outlined),
+            title: L10n.t('更新电脑端插件', 'Update desktop plugin'),
+            sub: store.pluginUpdateJournal != null
+                ? _journalSub(store)
+                : !api.pluginUpdate.contentUpdateAvailable
+                ? L10n.t(
+                    '检查电脑端插件是否有可用更新',
+                    'Check the desktop plugin for updates',
+                  )
+                : api.pluginUpdate.canSelfUpdate
+                ? L10n.t(
+                    '电脑端插件有新版本：可在这里直接触发更新',
+                    'A newer desktop plugin is available — trigger the update here',
+                  )
+                : L10n.t(
+                    '电脑端插件有新版本：本机形态需按指引更新',
+                    'A newer desktop plugin is available — follow the guide for your install',
+                  ),
+            onTap: store.pluginUpdateJournal != null
+                ? () => unawaited(_updateJournalActions(store))
+                : (!api.pluginUpdate.contentUpdateAvailable ||
+                          api.pluginUpdate.canSelfUpdate
+                      ? _triggerPluginUpdate
+                      : _showPluginUpdateGuidance),
+            trailing: store.pluginUpdateJournal == null
+                ? Text(
+                    !api.pluginUpdate.contentUpdateAvailable
+                        ? L10n.t('检查 ▸', 'Check ▸')
+                        : api.pluginUpdate.canSelfUpdate
+                        ? L10n.t('更新 ▸', 'Update ▸')
+                        : L10n.t('指引 ▸', 'Guide ▸'),
+                    style: TextStyle(fontSize: 12, color: brand),
+                  )
+                : Text(
+                    L10n.t('处理 ▸', 'Manage ▸'),
+                    style: TextStyle(fontSize: 12, color: brand),
+                  ),
+          ),
           if (store.pluginUpdateLogOpId.isNotEmpty)
             _row(
               leading: const Icon(Icons.terminal),
@@ -1526,14 +1534,36 @@ class _SettingsScreenState extends State<SettingsScreen> {
       } else {
         final response = await store.api.checkPluginUpdate();
         if (!mounted) return;
+        final rawStatus = response['pluginUpdate'];
+        if (rawStatus is Map) {
+          // 检查结果也是最新状态：刷新后行文案/是否可自更新都跟着变。
+          store.api.pluginUpdate = PluginUpdateStatus.fromJson(
+            Map<String, dynamic>.from(rawStatus),
+          );
+          setState(() {});
+        }
         final update = response['pluginUpdate'];
         final candidate = update is Map ? update['candidate'] : null;
         final state = update is Map ? update['state'] : null;
         if (candidate is! Map || state != 'update-available') {
-          showToast(
-            context,
-            L10n.t('没有可更新的插件候选', 'No plugin update candidate is available'),
-          );
+          final reason = update is Map ? update['reason'] : null;
+          final text = switch (state) {
+            'up-to-date' || 'local-ahead' => L10n.t(
+              '电脑端插件已是最新',
+              'Desktop plugin is up to date',
+            ),
+            'disabled' => L10n.t(
+              '电脑端已停用插件自动更新',
+              'Automatic plugin updates are disabled on the desktop',
+            ),
+            _ =>
+              '${L10n.t('检查暂不可用：', 'Check unavailable: ')}${reason ?? state ?? 'unknown'}',
+          };
+          showToast(context, text);
+          return;
+        }
+        if (!store.api.pluginUpdate.canSelfUpdate) {
+          await _showPluginUpdateGuidance();
           return;
         }
         final carrier = candidate['carrier'] is Map

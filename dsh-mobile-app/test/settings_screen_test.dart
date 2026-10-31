@@ -234,4 +234,70 @@ void main() {
       expect(copied, contains('pnpm install output'));
     },
   );
+
+  testWidgets(
+    'always exposes a desktop plugin update entry that checks the host',
+    (tester) async {
+      final requestedPaths = <String>[];
+      final api = Api(
+        client: MockClient((request) async {
+          requestedPaths.add(request.url.path);
+          if (request.url.path.endsWith('/api/plugin-update/check')) {
+            return http.Response(
+              jsonEncode({
+                'ok': true,
+                'pluginUpdate': {
+                  'state': 'up-to-date',
+                  'reason': 'same-version-same-content',
+                  'canSelfUpdate': true,
+                  'installShape': 'npm',
+                  'restartForm': 'systemd',
+                  'transaction': null,
+                  'remote': {'version': '3.2.2-alpha.4'},
+                },
+              }),
+              200,
+            );
+          }
+          return http.Response('{}', 200);
+        }),
+      )..baseUrl = 'https://desktop.example';
+      final store = AppStore(apiClient: api);
+      addTearDown(store.dispose);
+      await store.loadPrefs();
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SettingsScreen(store: store, onReconfigure: () async {}),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final title = find.text('更新电脑端插件');
+      await tester.scrollUntilVisible(
+        title,
+        240,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.pumpAndSettle();
+      expect(title, findsOneWidget, reason: '未知是否有新版时也必须能触发检查');
+      final row = find
+          .ancestor(of: title, matching: find.byType(InkWell))
+          .first;
+      expect(
+        find.descendant(of: row, matching: find.text('检查 ▸')),
+        findsOneWidget,
+      );
+      await tester.tap(row);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+
+      expect(
+        requestedPaths.where((p) => p.endsWith('/api/plugin-update/check')),
+        isNotEmpty,
+      );
+      expect(find.text('电脑端插件已是最新'), findsOneWidget);
+    },
+  );
 }
