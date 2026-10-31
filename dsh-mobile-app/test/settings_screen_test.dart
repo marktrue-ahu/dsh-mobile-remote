@@ -239,23 +239,42 @@ void main() {
     'always exposes a desktop plugin update entry that checks the host',
     (tester) async {
       final requestedPaths = <String>[];
+      String? copied;
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(SystemChannels.platform, (call) async {
+        if (call.method == 'Clipboard.setData') {
+          copied = (call.arguments as Map)['text'] as String?;
+        }
+        return null;
+      });
+      addTearDown(
+        () => messenger.setMockMethodCallHandler(SystemChannels.platform, null),
+      );
       final api = Api(
         client: MockClient((request) async {
           requestedPaths.add(request.url.path);
           if (request.url.path.endsWith('/api/plugin-update/check')) {
-            return http.Response(
-              jsonEncode({
-                'ok': true,
-                'pluginUpdate': {
-                  'state': 'up-to-date',
-                  'reason': 'same-version-same-content',
-                  'canSelfUpdate': true,
-                  'installShape': 'npm',
-                  'restartForm': 'systemd',
-                  'transaction': null,
-                  'remote': {'version': '3.2.2-alpha.4'},
-                },
-              }),
+            return http.Response.bytes(
+              utf8.encode(
+                jsonEncode({
+                  'ok': true,
+                  'pluginUpdate': {
+                    'state': 'up-to-date',
+                    'reason': 'same-version-same-content',
+                    'canSelfUpdate': true,
+                    'installShape': 'npm',
+                    'restartForm': 'systemd',
+                    'transaction': null,
+                    'remote': {'version': '3.2.2-alpha.4'},
+                    'checkLog': [
+                      '# 本机版本 3.2.2-alpha.4 · NPM 通道 alpha',
+                      r'$ npm view @marktrue/dsh-mobile-remote dist-tags --json',
+                      '→ alpha=3.2.2-alpha.4',
+                    ],
+                  },
+                }),
+              ),
               200,
             );
           }
@@ -298,6 +317,32 @@ void main() {
         isNotEmpty,
       );
       expect(find.text('电脑端插件已是最新'), findsOneWidget);
+      // 检查详情：与桌面端一致，展示宿主的脱敏 npm 查询/结果，并可复制。
+      final detailsTitle = find.text('插件更新检查详情');
+      expect(detailsTitle, findsOneWidget);
+      await tester.scrollUntilVisible(
+        detailsTitle,
+        240,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.pumpAndSettle();
+      final detailsRow = find
+          .ancestor(of: detailsTitle, matching: find.byType(InkWell))
+          .first;
+      await tester.tap(
+        find.descendant(of: detailsRow, matching: find.text('查看 ▸')),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(find.textContaining(r'$ npm view'), findsOneWidget);
+      await tester.tap(
+        find.descendant(
+          of: find.byType(BottomSheet),
+          matching: find.text('复制'),
+        ),
+      );
+      await tester.pump();
+      expect(copied, contains(r'$ npm view @marktrue/dsh-mobile-remote'));
     },
   );
 }
