@@ -410,3 +410,27 @@ test("update check reasons distinguish a missing npm client from registry failur
 	assert.equal(client.updateCheckReasonText("candidate-changed"), "candidate-changed");
 	assert.equal(client.updateCheckReasonText(""), "registry-unavailable");
 });
+
+test("plugin update details merge check diagnostics, install output, and the failure reason", () => {
+	const model = client.buildPluginUpdateModel({
+		state: "unavailable",
+		reason: "update-failed",
+		checkLog: ["# 本机版本 3.2.1-alpha.3 · NPM 通道 alpha", "$ npm view @marktrue/dsh-mobile-remote dist-tags --json", "→ alpha=3.2.2-alpha.6"],
+		transaction: { phase: "failed", result: { ok: false, reason: "npm-carrier-plugin-identity-mismatch" } },
+	});
+	const lines = client.pluginUpdateDetailLines(model, [
+		{ stage: "staging", stream: "status", text: "NPM plugin update accepted" },
+		{ stage: "failed", stream: "status", text: "Plugin update failed: npm-carrier-plugin-identity-mismatch" },
+	]);
+	// 检查详情在前，安装详情在中，失败原因在最后且带可读文案。
+	assert.ok(lines[0].startsWith("# 本机版本"));
+	const installIndex = lines.indexOf("# 安装详情（宿主 pnpm 输出，已脱敏）");
+	const resultIndex = lines.findIndex((line) => line.startsWith("# 安装结果："));
+	assert.ok(installIndex > 0);
+	assert.ok(resultIndex > installIndex);
+	assert.match(lines[resultIndex], /载体清单与 NPM 包身份不一致/);
+	assert.match(lines[resultIndex], /npm-carrier-plugin-identity-mismatch/);
+	assert.ok(lines.some((line) => line.includes("[failed] Plugin update failed: npm-carrier-plugin-identity-mismatch")));
+	assert.match(client.updateFailureReasonText("install-failed"), /pnpm 安装失败/);
+	assert.equal(client.updateFailureReasonText("unknown-code"), "unknown-code");
+});
