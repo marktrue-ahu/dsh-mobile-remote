@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createNpmPackageView, resolveNpmUpdateCandidate } from "../lib/npm-update-source.js";
+import { createNpmPackageView, resolveNpmUpdateCandidate, runNpmView } from "../lib/npm-update-source.js";
 
 const PACKAGE_NAME = "@marktrue/dsh-mobile-remote";
 const PLUGIN_VERSION = "3.2.2-alpha.1";
@@ -95,7 +95,63 @@ test("npm view adapter follows the host config instead of overriding the registr
 	assert.equal(tags["dist-tags"].alpha, PLUGIN_VERSION);
 	assert.deepEqual(calls, [{
 		args: ["view", PACKAGE_NAME, "dist-tags", "--json"],
-		options: { cwd: "/dsh/profiles/web" },
+		options: { cwd: "/dsh/profiles/web", platform: process.platform },
 	}]);
 	assert.equal(calls[0].args.includes("--registry"), false, "npm must resolve scope/default registry from host configuration");
+});
+
+test("Windows: npm view runs through the shell and a missing npm client is reported distinctly", async () => {
+	const calls = [];
+	const okExec = (file, args, options, callback) => {
+		calls.push({ file, args, options });
+		callback(null, JSON.stringify({ "dist-tags": { alpha: PLUGIN_VERSION } }), "");
+	};
+	const ok = await runNpmView(["view", PACKAGE_NAME, "dist-tags", "--json"], {
+		cwd: "/dsh/profiles/desktop",
+		platform: "win32",
+		execFileImpl: okExec,
+	});
+	assert.equal(ok.ok, true);
+	assert.equal(calls[0].file, "npm");
+	assert.equal(calls[0].options.shell, true);
+	assert.equal(calls[0].options.cwd, "/dsh/profiles/desktop");
+
+	const missing = await runNpmView(["view", PACKAGE_NAME, "dist-tags", "--json"], {
+		platform: "win32",
+		execFileImpl: (file, args, options, callback) => callback(Object.assign(new Error("spawn npm ENOENT"), { code: "ENOENT" }), "", ""),
+	});
+	assert.deepEqual(missing, { ok: false, error: "npm-client-unavailable" });
+
+	// Windows shell 找不到命令时不是 ENOENT，而是 cmd 的「不是内部或外部命令」。
+	const notFound = await runNpmView(["view", PACKAGE_NAME, "dist-tags", "--json"], {
+		platform: "win32",
+		execFileImpl: (file, args, options, callback) => callback(
+			Object.assign(new Error("Command failed: npm view"), { code: 1 }),
+			"",
+			"'npm' \u4e0d\u662f\u5185\u90e8\u6216\u5916\u90e8\u547d\u4ee4\u3002",
+		),
+	});
+	assert.deepEqual(notFound, { ok: false, error: "npm-client-unavailable" });
+
+	const linuxOptions = [];
+	await runNpmView(["view", PACKAGE_NAME, "dist-tags", "--json"], {
+		platform: "linux",
+		execFileImpl: (file, args, options, callback) => {
+			linuxOptions.push(options);
+			callback(null, "{}", "");
+		},
+	});
+	assert.equal(linuxOptions[0].shell, undefined, "POSIX 直接 spawn，不经过 shell");
+});
+
+test("candidate resolution surfaces npm-client-unavailable instead of blaming the registry", async () => {
+	const result = await resolveNpmUpdateCandidate({
+		packageName: PACKAGE_NAME,
+		localVersion: "3.2.1-alpha.3",
+		packageView: async () => {
+			throw new Error("npm-client-unavailable");
+		},
+	});
+	assert.equal(result.ok, false);
+	assert.equal(result.reason, "npm-client-unavailable");
 });

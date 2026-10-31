@@ -384,3 +384,10 @@ test("plugin update UI model exposes confirmed App build or explicit legacy prep
 	assert.equal(resumed.appVersion, "3.2.2+26");
 	assert.equal(resumed.needsPreparation, false, "a prepared active transaction already has an authoritative App build");
 });
+
+test("update check reasons distinguish a missing npm client from registry failures", () => {
+	assert.match(client.updateCheckReasonText("npm-client-unavailable"), /npm/);
+	assert.match(client.updateCheckReasonText("npm-registry-unavailable"), /registry/);
+	assert.equal(client.updateCheckReasonText("candidate-changed"), "candidate-changed");
+	assert.equal(client.updateCheckReasonText(""), "registry-unavailable");
+});
