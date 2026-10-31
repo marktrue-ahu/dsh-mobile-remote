@@ -364,6 +364,25 @@ test("plugin update UI model exposes confirmed App build or explicit legacy prep
 	assert.equal(modern.appVersion, "3.2.2+26");
 	assert.equal(modern.needsPreparation, false);
 
+	// 检查详情：桌面与手机读同一份宿主 checkLog，按行投影、限长 40 行。
+	const withCheckLog = client.buildPluginUpdateModel({
+		state: "unavailable",
+		reason: "npm-plugin-metadata-unavailable",
+		checkLog: [
+			"# 本机版本 3.2.2-alpha.4 · NPM 通道 alpha",
+			"$ npm view @marktrue/dsh-mobile-remote dist-tags --json",
+			"→ alpha=3.2.2-alpha.4",
+			"$ npm view @marktrue/dsh-mobile-remote@3.2.2-alpha.4 --json",
+			"→ 失败：npm-registry-unavailable",
+			"   ",
+		],
+	});
+	assert.equal(withCheckLog.checkLog.length, 5);
+	assert.ok(withCheckLog.checkLog[1].startsWith("$ npm view"), "命令行走同一行投影");
+	assert.equal(withCheckLog.checkLog.includes(""), false);
+	assert.equal(client.pluginUpdateCheckLogLines({ checkLog: Array.from({ length: 50 }, (_, index) => "line-" + index) }).length, 40);
+	assert.match(client.updateCheckReasonText("npm-plugin-metadata-unavailable"), /检查日志/);
+
 	const legacy = client.buildPluginUpdateModel({
 		state: "update-available",
 		canSelfUpdate: true,
