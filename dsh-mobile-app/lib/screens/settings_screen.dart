@@ -12,7 +12,6 @@ import '../l10n.dart';
 import '../logger.dart';
 import '../models.dart';
 import '../plugin_update_resume.dart';
-import '../plugin_update_log.dart';
 import '../plugin_update_status.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -25,110 +24,6 @@ import '../version_alignment.dart';
 import 'sheets.dart';
 import 'providers_screen.dart';
 import 'usage_screen.dart';
-
-class _PluginUpdateLogPanel extends StatefulWidget {
-  const _PluginUpdateLogPanel({
-    super.key,
-    required this.opId,
-    required this.client,
-  });
-  final String opId;
-  final Api client;
-  @override
-  State<_PluginUpdateLogPanel> createState() => _PluginUpdateLogPanelState();
-}
-
-class _PluginUpdateLogPanelState extends State<_PluginUpdateLogPanel> {
-  Timer? _timer;
-  int _cursor = 0;
-  final List<PluginUpdateLogLine> _lines = [];
-  String _phase = '';
-  bool _loading = true;
-
-  @override
-  void initState() {
-    super.initState();
-    _poll();
-    _timer = Timer.periodic(const Duration(seconds: 3), (_) => _poll());
-  }
-
-  Future<void> _poll() async {
-    try {
-      final data = await widget.client.pluginUpdateLog(
-        opId: widget.opId,
-        afterSeq: _cursor,
-      );
-      if (!mounted || !PluginUpdateLog.matchesOperation(data, widget.opId))
-        return;
-      final page = PluginUpdateLog.fromJson(data);
-      setState(() {
-        _phase = page.phase;
-        _lines.addAll(page.lines.where((line) => line.seq > _cursor));
-        if (page.cursor > _cursor) _cursor = page.cursor;
-        if (_lines.length > 100) _lines.removeRange(0, _lines.length - 100);
-        _loading = false;
-      });
-      if (const {'settled', 'failed', 'rolled-back'}.contains(page.phase)) {
-        _timer?.cancel();
-        _timer = null;
-      }
-    } catch (_) {
-      if (mounted) setState(() => _loading = false);
-    }
-  }
-
-  @override
-  void dispose() {
-    _timer?.cancel();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final text = _lines.map((line) => line.text).join('\n');
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Text(
-          '${L10n.t('操作', 'Operation')}: ${widget.opId} · ${_phase.isEmpty ? L10n.t('等待日志', 'waiting for logs') : _phase}',
-          textAlign: TextAlign.center,
-          style: TextStyle(fontSize: 11, color: DshColors.ink3(context)),
-        ),
-        const SizedBox(height: 8),
-        ConstrainedBox(
-          constraints: const BoxConstraints(maxHeight: 320),
-          child: SingleChildScrollView(
-            child: SelectableText(
-              text.isEmpty
-                  ? (_loading
-                        ? L10n.t('正在读取…', 'Loading…')
-                        : L10n.t('（暂无日志）', '(No logs yet)'))
-                  : text,
-              style: TextStyle(
-                fontSize: 11.5,
-                height: 1.6,
-                color: DshColors.ink(context),
-                fontFamily: 'monospace',
-              ),
-            ),
-          ),
-        ),
-        const SizedBox(height: 12),
-        FilledButton.icon(
-          onPressed: text.isEmpty ? null : () => _copy(text),
-          icon: const Icon(Icons.copy),
-          label: Text(L10n.t('复制', 'Copy')),
-        ),
-      ],
-    );
-  }
-
-  Future<void> _copy(String text) async {
-    await Clipboard.setData(ClipboardData(text: text));
-    if (mounted) showToast(context, L10n.t('已复制', 'Copied'));
-  }
-}
 
 class SettingsScreen extends StatefulWidget {
   final AppStore store;
@@ -1286,23 +1181,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     style: TextStyle(fontSize: 12, color: brand),
                   ),
           ),
-          if (store.pluginUpdateLogOpId.isNotEmpty)
-            _row(
-              leading: const Icon(Icons.terminal),
-              title: L10n.t('插件更新日志', 'Plugin update log'),
-              sub: L10n.t(
-                '查看电脑端返回的脱敏进度',
-                'View sanitized progress from the host',
-              ),
-              trailing: TextButton(
-                onPressed: () =>
-                    _openPluginUpdateLog(store.pluginUpdateLogOpId),
-                child: Text(
-                  L10n.t('查看 ▸', 'View ▸'),
-                  style: TextStyle(fontSize: 12, color: brand),
-                ),
-              ),
-            ),
           if (store.api.pluginUpdate.checkLog.isNotEmpty)
             _row(
               leading: const Icon(Icons.receipt_long_outlined),
@@ -2059,18 +1937,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
         onPressed: text.isEmpty ? null : () => _copy(text),
         icon: const Icon(Icons.copy),
         label: Text(L10n.t('复制', 'Copy')),
-      ),
-    ]);
-  }
-
-  /// Open the host-owned update log in the same bottom sheet as the App log.
-  void _openPluginUpdateLog(String opId) {
-    if (opId.trim().isEmpty) return;
-    showSheet(context, L10n.t('插件更新日志', 'Plugin update log'), [
-      _PluginUpdateLogPanel(
-        key: ValueKey(opId),
-        opId: opId,
-        client: widget.store.api,
       ),
     ]);
   }
