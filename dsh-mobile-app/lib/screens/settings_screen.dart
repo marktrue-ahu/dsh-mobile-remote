@@ -67,6 +67,10 @@ class _PluginUpdateLogPanelState extends State<_PluginUpdateLogPanel> {
         if (_lines.length > 100) _lines.removeRange(0, _lines.length - 100);
         _loading = false;
       });
+      if (const {'settled', 'failed', 'rolled-back'}.contains(page.phase)) {
+        _timer?.cancel();
+        _timer = null;
+      }
     } catch (_) {
       if (mounted) setState(() => _loading = false);
     }
@@ -79,32 +83,50 @@ class _PluginUpdateLogPanelState extends State<_PluginUpdateLogPanel> {
   }
 
   @override
-  Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
+  Widget build(BuildContext context) {
+    final text = _lines.map((line) => line.text).join('\n');
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Text(
           '${L10n.t('操作', 'Operation')}: ${widget.opId} · ${_phase.isEmpty ? L10n.t('等待日志', 'waiting for logs') : _phase}',
+          textAlign: TextAlign.center,
           style: TextStyle(fontSize: 11, color: DshColors.ink3(context)),
         ),
-        const SizedBox(height: 6),
+        const SizedBox(height: 8),
         ConstrainedBox(
-          constraints: const BoxConstraints(maxHeight: 180),
+          constraints: const BoxConstraints(maxHeight: 320),
           child: SingleChildScrollView(
             child: SelectableText(
-              _lines.isEmpty
+              text.isEmpty
                   ? (_loading
                         ? L10n.t('正在读取…', 'Loading…')
-                        : L10n.t('暂无进度日志', 'No progress lines yet'))
-                  : _lines.map((line) => line.text).join('\n'),
-              style: const TextStyle(fontSize: 11, fontFamily: 'monospace'),
+                        : L10n.t('（暂无日志）', '(No logs yet)'))
+                  : text,
+              style: TextStyle(
+                fontSize: 11.5,
+                height: 1.6,
+                color: DshColors.ink(context),
+                fontFamily: 'monospace',
+              ),
             ),
           ),
         ),
+        const SizedBox(height: 12),
+        FilledButton.icon(
+          onPressed: text.isEmpty ? null : () => _copy(text),
+          icon: const Icon(Icons.copy),
+          label: Text(L10n.t('复制', 'Copy')),
+        ),
       ],
-    ),
-  );
+    );
+  }
+
+  Future<void> _copy(String text) async {
+    await Clipboard.setData(ClipboardData(text: text));
+    if (mounted) showToast(context, L10n.t('已复制', 'Copied'));
+  }
 }
 
 class SettingsScreen extends StatefulWidget {
@@ -1257,23 +1279,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     ),
             ),
           if (store.pluginUpdateLogOpId.isNotEmpty)
-            Card(
-              child: ExpansionTile(
-                leading: const Icon(Icons.terminal),
-                title: Text(L10n.t('插件更新日志', 'Plugin update log')),
-                subtitle: Text(
-                  L10n.t(
-                    '查看电脑端返回的脱敏进度',
-                    'View sanitized progress from the host',
-                  ),
+            _row(
+              leading: const Icon(Icons.terminal),
+              title: L10n.t('插件更新日志', 'Plugin update log'),
+              sub: L10n.t(
+                '查看电脑端返回的脱敏进度',
+                'View sanitized progress from the host',
+              ),
+              trailing: TextButton(
+                onPressed: () =>
+                    _openPluginUpdateLog(store.pluginUpdateLogOpId),
+                child: Text(
+                  L10n.t('查看 ▸', 'View ▸'),
+                  style: TextStyle(fontSize: 12, color: brand),
                 ),
-                children: [
-                  _PluginUpdateLogPanel(
-                    key: ValueKey(store.pluginUpdateLogOpId),
-                    opId: store.pluginUpdateLogOpId,
-                    client: store.api,
-                  ),
-                ],
               ),
             ),
           _row(
@@ -1997,6 +2016,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
         );
         break;
     }
+  }
+
+  /// Open the host-owned update log in the same bottom sheet as the App log.
+  void _openPluginUpdateLog(String opId) {
+    if (opId.trim().isEmpty) return;
+    showSheet(context, L10n.t('插件更新日志', 'Plugin update log'), [
+      _PluginUpdateLogPanel(
+        key: ValueKey(opId),
+        opId: opId,
+        client: widget.store.api,
+      ),
+    ]);
   }
 
   /// 应用日志：查看 / 复制 / 清空
