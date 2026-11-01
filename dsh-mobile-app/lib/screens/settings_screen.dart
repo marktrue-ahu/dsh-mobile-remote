@@ -213,6 +213,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String _progressLine = '';
   int _progressCursor = 0;
   String _lastProgressPhase = '';
+  DateTime? _progressTerminalAt;
+  bool _releaseReadyAnnounced = false;
 
   @override
   void initState() {
@@ -328,7 +330,35 @@ class _SettingsScreenState extends State<SettingsScreen> {
         }.contains(journal.phase)) {
       return true;
     }
-    return false;
+    // 插件已 settled，但宿主的固定 App 发布（载体导入）还没就绪：继续轮询等它可用。
+    return _awaitingHostRelease(store);
+  }
+
+  /// 宿主的固定 App 发布是否已可用（App 更新门禁真正需要的状态）。
+  bool _hostReleaseReady(AppStore store) {
+    final release =
+        store.hostReleasePointer?.release ?? store.api.currentRelease?.release;
+    if (release == null) return false;
+    if (release.plugin.contentSha256 != store.api.pluginContentSha256) {
+      return false;
+    }
+    final artifact = store.api.appArtifact;
+    return artifact == null || artifact.ok;
+  }
+
+  /// 事务已成功 settled，但载体/发布尚未可读（刚重启后导入需要一点时间）。
+  bool _awaitingHostRelease(AppStore store) {
+    final tx = store.api.pluginUpdate.transaction;
+    if (tx == null ||
+        tx.phase != 'settled' ||
+        tx.rolledBack ||
+        tx.resultOk == false) {
+      return false;
+    }
+    if (_hostReleaseReady(store)) return false;
+    final at = _progressTerminalAt;
+    return at != null &&
+        DateTime.now().toUtc().difference(at) < const Duration(seconds: 30);
   }
 
   void _syncUpdateProgressWatcher() {
@@ -365,6 +395,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _progressStage = '';
       _progressLine = '';
       _lastProgressPhase = '';
+      _progressTerminalAt = null;
+      _releaseReadyAnnounced = false;
     }
     if (opId.isNotEmpty) {
       try {
@@ -384,9 +416,29 @@ class _SettingsScreenState extends State<SettingsScreen> {
       } catch (_) {}
     }
     if (!mounted) return;
+    if (tx != null &&
+        tx.phase == 'settled' &&
+        !tx.rolledBack &&
+        tx.resultOk != false) {
+      _progressTerminalAt ??= DateTime.now().toUtc();
+    } else if (tx != null && (tx.phase == 'failed' || tx.rolledBack)) {
+      _progressTerminalAt = null;
+    }
     _syncUpdateProgressWatcher();
     setState(() {});
     _announceProgressTransition(tx);
+    if (_progressTerminalAt != null &&
+        !_releaseReadyAnnounced &&
+        _hostReleaseReady(store)) {
+      _releaseReadyAnnounced = true;
+      showToast(
+        context,
+        L10n.t(
+          '电脑端发布已就绪，可直接检查 App 更新',
+          'Host release is ready — you can check app updates now',
+        ),
+      );
+    }
   }
 
   void _announceProgressTransition(PluginTransaction? tx) {
@@ -521,9 +573,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (progress.failed) {
         failureReason = _pluginUpdateFailureReasonText(tx.reason ?? 'unknown');
       }
-      title = progress.terminal
-          ? (progress.failed ? '最近一次插件更新：失败' : '最近一次插件更新：完成')
-          : progress.stageText;
+      final awaitingRelease =
+          tx.phase == 'settled' &&
+          !tx.rolledBack &&
+          tx.resultOk != false &&
+          !_hostReleaseReady(store);
+      if (awaitingRelease) {
+        progress = const PluginUpdateProgressView(
+          step: 5,
+          stageText: '准备 App 发布',
+          terminal: false,
+          failed: false,
+        );
+        title = '插件更新完成，等待电脑端发布就绪…';
+      } else {
+        title = progress.terminal
+            ? (progress.failed ? '最近一次插件更新：失败' : '最近一次插件更新：完成')
+            : progress.stageText;
+      }
     } else {
       final phase = journal!.phase;
       if (phase == UpdatePhase.pluginPending) {
@@ -575,9 +642,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final elapsed = startedAt == null
         ? ''
         : _formatElapsed(DateTime.now().toUtc().difference(startedAt));
-    final detailLine = _progressLine.isNotEmpty
-        ? _progressLine
-        : (failureReason ?? progress.stageText);
+    final awaitingDetail =
+        tx != null &&
+        tx.phase == 'settled' &&
+        !tx.rolledBack &&
+        tx.resultOk != false &&
+        !_hostReleaseReady(store) &&
+        title.startsWith('插件更新完成，等待');
+    final detailLine = awaitingDetail
+        ? '正在导入/校验 App 载体，就绪后即可检查 App 更新…'
+        : (_progressLine.isNotEmpty
+              ? _progressLine
+              : (failureReason ?? progress.stageText));
 
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
@@ -2438,6 +2514,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (store.pluginUpdateJournal != null) {
       try {
         await store.resumePluginUpdate();
+      } catch (_) {}
+    }
+    if (!mounted) return;
+    // 刚完成插件更新时，宿主重启后载体的导入/校验可能还需要几秒：
+    // 先等固定发布就绪，避免用户马上点“检查 App 更新”却拿到“缺少固定发布快照”。
+    var waited = 0;
+    while (mounted &&
+        store.hostReleasePointer == null &&
+        store.api.pluginUpdate.upToDate &&
+        waited < 12) {
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      waited++;
+      try {
+        final data = await store.api.getJson('/api/bootstrap');
+        store.api.absorbBootstrap(data);
       } catch (_) {}
     }
     if (!mounted) return;
