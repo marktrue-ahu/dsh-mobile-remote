@@ -349,9 +349,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (!mounted) return;
     final store = widget.store;
     try {
+      // 用完整 bootstrap（不是只吸收更新字段）：这样会触发 store 的接续回调，
+      // 手机端由本次更新产生的 journal 能在卡片完成时同步推进，而不是等首页刷新。
+      final data = await store.api.getJson('/api/bootstrap');
+      store.api.absorbBootstrap(data);
+    } catch (_) {
       // 宿主重启期间会短暂失败：保留旧状态，等下一次轮询。
-      await store.api.refreshUpdateState();
-    } catch (_) {}
+    }
     final tx = store.api.pluginUpdate.transaction;
     final journal = store.pluginUpdateJournal;
     final opId = tx?.opId ?? journal?.opId ?? '';
@@ -2425,6 +2429,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _checkUpdate() async {
     final store = widget.store;
+    // 先把电脑端最新状态与手机端接续记录对齐：否则刚完成插件更新时，
+    // 本地 journal 仍停在“未确认”，会把 App 更新挡在门禁外。
+    try {
+      final data = await store.api.getJson('/api/bootstrap');
+      store.api.absorbBootstrap(data);
+    } catch (_) {}
+    if (store.pluginUpdateJournal != null) {
+      try {
+        await store.resumePluginUpdate();
+      } catch (_) {}
+    }
+    if (!mounted) return;
     // 两端编排（F8）：**唯一判据在 store.appUpdateGate()**，这里只是同一个门禁的入口
     store.updateChecking = true;
     if (mounted) setState(() {});
