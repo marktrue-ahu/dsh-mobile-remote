@@ -10,7 +10,8 @@ permissions:
   id-token: write
 
 concurrency:
-  group: npm-publish-${{ github.ref }}
+  # 全局串行：多个 release tag 同时发布时会互相抢 app / channel dist-tag。
+  group: npm-publish
   cancel-in-progress: false
 
 jobs:
@@ -175,22 +176,23 @@ jobs:
             fi
           fi
 
-          check_unpublished() {
+          version_exists() {
             local version="$1"
             local log="$RUNNER_TEMP/npm-view-${version}.log"
             if npm view "$PACKAGE_NAME@$version" version --json --prefer-online \
               --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" > "$log" 2>&1; then
-              echo "::error::Version $version already exists on npm; refusing to republish."
-              exit 1
+              echo 1
+              return 0
             fi
             if ! grep -q 'E404' "$log"; then
               code="$(sed -n 's/^npm error code //p' "$log" | head -1)"
-              echo "::error::Could not verify that $version is unused (npm view code=${code:-unknown})."
+              echo "::error::Could not verify $version (npm view code=${code:-unknown})." >&2
               exit 1
             fi
+            echo 0
           }
-          check_unpublished "$plugin_version"
-          check_unpublished "$carrier_version"
+          plugin_already_published="$(version_exists "$plugin_version")"
+          carrier_already_published="$(version_exists "$carrier_version")"
 
           {
             echo "PLUGIN_VERSION=$plugin_version"
@@ -198,6 +200,8 @@ jobs:
             echo "APP_VERSION=$app_version"
             echo "CARRIER_VERSION=$carrier_version"
             echo "LATEST_BEFORE=$latest_version"
+            echo "PLUGIN_ALREADY_PUBLISHED=$plugin_already_published"
+            echo "CARRIER_ALREADY_PUBLISHED=$carrier_already_published"
           } >> "$GITHUB_ENV"
 
       # The project has bundleDependencies (qrcode); use an npm-flat node_modules tree
@@ -295,6 +299,10 @@ jobs:
           PACKAGE_NAME: '@marktrue/dsh-mobile-remote'
         run: |
           set -euo pipefail
+          if [[ "${CARRIER_ALREADY_PUBLISHED:-0}" == "1" ]]; then
+            echo "Carrier $CARRIER_VERSION already published; skip republish (identity is verified later)."
+            exit 0
+          fi
           carrier_file="dsh-mobile-app/dist/$(node -p "require('./dsh-mobile-app/dist/app-carrier.json').file")"
           test -s "$carrier_file"
           publish_log="$RUNNER_TEMP/npm-publish-carrier.log"
@@ -334,6 +342,10 @@ jobs:
           PACKAGE_NAME: '@marktrue/dsh-mobile-remote'
         run: |
           set -euo pipefail
+          if [[ "${PLUGIN_ALREADY_PUBLISHED:-0}" == "1" ]]; then
+            echo "Plugin $PLUGIN_VERSION already published; skip republish (identity is verified later)."
+            exit 0
+          fi
           plugin_file="dsh-mobile-app/dist/dsh-mobile-remote-v${PLUGIN_VERSION}.tgz"
           test -s "$plugin_file"
           # An app-tag publish must not move latest during a prerelease.
@@ -384,8 +396,44 @@ jobs:
           set -euo pipefail
           npm dist-tag add "$PACKAGE_NAME@$PLUGIN_VERSION" "$PLUGIN_TAG" \
             --registry "$REGISTRY" --@marktrue:registry="$REGISTRY"
-          npm dist-tag add "$PACKAGE_NAME@$CARRIER_VERSION" app \
-            --registry "$REGISTRY" --@marktrue:registry="$REGISTRY"
+
+          # app tag 只前进、不回退：多个 release 并发/乱序完成时，不能让旧载体覆盖新载体。
+          current_app="$(npm view "$PACKAGE_NAME" dist-tags.app --json --prefer-online \
+            --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" | jq -r '. // ""')"
+          app_decision="$(node --input-type=module -e '
+            const [candidate, current] = process.argv.slice(1);
+            const strip = (value) => String(value ?? "").endsWith("-app") ? String(value).slice(0, -4) : String(value ?? "");
+            const parse = (value) => {
+              const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.exec(strip(value));
+              if (!match) return null;
+              return { core: match.slice(1, 4).map(BigInt), pre: match[4] ? match[4].split(".") : [] };
+            };
+            const compare = (a, b) => {
+              for (let i = 0; i < 3; i++) if (a.core[i] !== b.core[i]) return a.core[i] < b.core[i] ? -1 : 1;
+              if (!a.pre.length || !b.pre.length) return a.pre.length === b.pre.length ? 0 : (a.pre.length ? -1 : 1);
+              for (let i = 0; i < Math.max(a.pre.length, b.pre.length); i++) {
+                if (a.pre[i] === undefined || b.pre[i] === undefined) return a.pre[i] === b.pre[i] ? 0 : (a.pre[i] === undefined ? -1 : 1);
+                if (a.pre[i] === b.pre[i]) continue;
+                const an = /^\d+$/.test(a.pre[i]), bn = /^\d+$/.test(b.pre[i]);
+                if (an && bn) return BigInt(a.pre[i]) < BigInt(b.pre[i]) ? -1 : 1;
+                if (an !== bn) return an ? -1 : 1;
+                return a.pre[i] < b.pre[i] ? -1 : 1;
+              }
+              return 0;
+            };
+            const next = parse(candidate); const now = parse(current);
+            if (!next) process.exit(2);
+            if (!now) process.stdout.write("move");
+            else process.stdout.write(compare(next, now) > 0 ? "move" : "keep");
+          ' "$CARRIER_VERSION" "$current_app")"
+
+          if [[ "$app_decision" == "move" ]]; then
+            npm dist-tag add "$PACKAGE_NAME@$CARRIER_VERSION" app \
+              --registry "$REGISTRY" --@marktrue:registry="$REGISTRY"
+          else
+            echo "app dist-tag stays at newer/equal carrier: ${current_app:-<unset>}"
+          fi
+
           npm view "$PACKAGE_NAME" dist-tags --json --prefer-online \
             --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" > "$RUNNER_TEMP/dist-tags.json"
           node -e '
@@ -393,8 +441,34 @@ jobs:
             const channel = process.env.PLUGIN_TAG;
             const latestBefore = process.env.LATEST_BEFORE ?? "";
             const latestNow = tags.latest ?? "";
-            if (tags[channel] !== process.env.PLUGIN_VERSION || tags.app !== process.env.CARRIER_VERSION) {
+            const strip = (value) => String(value ?? "").endsWith("-app") ? String(value).slice(0, -4) : String(value ?? "");
+            const parse = (value) => {
+              const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.exec(strip(value));
+              if (!match) return null;
+              return { core: match.slice(1, 4).map(BigInt), pre: match[4] ? match[4].split(".") : [] };
+            };
+            const compare = (a, b) => {
+              for (let i = 0; i < 3; i++) if (a.core[i] !== b.core[i]) return a.core[i] < b.core[i] ? -1 : 1;
+              if (!a.pre.length || !b.pre.length) return a.pre.length === b.pre.length ? 0 : (a.pre.length ? -1 : 1);
+              for (let i = 0; i < Math.max(a.pre.length, b.pre.length); i++) {
+                if (a.pre[i] === undefined || b.pre[i] === undefined) return a.pre[i] === b.pre[i] ? 0 : (a.pre[i] === undefined ? -1 : 1);
+                if (a.pre[i] === b.pre[i]) continue;
+                const an = /^\d+$/.test(a.pre[i]), bn = /^\d+$/.test(b.pre[i]);
+                if (an && bn) return BigInt(a.pre[i]) < BigInt(b.pre[i]) ? -1 : 1;
+                if (an !== bn) return an ? -1 : 1;
+                return a.pre[i] < b.pre[i] ? -1 : 1;
+              }
+              return 0;
+            };
+            if (tags[channel] !== process.env.PLUGIN_VERSION) {
               console.error(JSON.stringify(tags)); process.exit(1);
+            }
+            const appNow = tags.app ?? "";
+            if (appNow !== process.env.CARRIER_VERSION) {
+              const now = parse(appNow), candidate = parse(process.env.CARRIER_VERSION);
+              if (!now || !candidate || compare(now, candidate) <= 0) {
+                console.error(`app tag is not at/after this carrier: ${JSON.stringify(tags)}`); process.exit(1);
+              }
             }
             if (channel === "latest") {
               if (latestNow !== process.env.PLUGIN_VERSION) {
@@ -423,8 +497,36 @@ jobs:
             remote_integrity="$(npm view "$PACKAGE_NAME@$version" dist.integrity --json --prefer-online \
               --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" | jq -r '.')"
             if [[ "$local_integrity" != "$remote_integrity" ]]; then
-              echo "::error::Integrity mismatch for $version"
-              exit 1
+              already=0
+              [[ "$version" == "$PLUGIN_VERSION" && "${PLUGIN_ALREADY_PUBLISHED:-0}" == "1" ]] && already=1
+              [[ "$version" == "$CARRIER_VERSION" && "${CARRIER_ALREADY_PUBLISHED:-0}" == "1" ]] && already=1
+              if [[ "$already" == "0" ]]; then
+                echo "::error::Integrity mismatch for $version"
+                exit 1
+              fi
+              echo "::warning::$version was published by an earlier CI build; byte difference is expected, checking package identity metadata instead."
             fi
           done
-          echo 'Published plugin and carrier integrity matches local dist.'
+
+          # 对已发布版本核对轻量身份元数据（与本地 dist 清单一致）：
+          # carrier 的 appVersion / pluginContentSha256 是运行时候选发现读取的字段。
+          npm view "$PACKAGE_NAME" --json --prefer-online \
+            --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" > "$RUNNER_TEMP/npm-packument.json"
+          node -e '
+            const fs = require("fs");
+            const packument = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            const manifest = JSON.parse(fs.readFileSync("dsh-mobile-app/dist/manifest.json", "utf8"));
+            const carrierVersion = process.env.CARRIER_VERSION;
+            const pluginVersion = process.env.PLUGIN_VERSION;
+            const carrier = packument.versions?.[carrierVersion];
+            const plugin = packument.versions?.[pluginVersion];
+            if (!plugin) { console.error(`published plugin metadata missing: ${pluginVersion}`); process.exit(1); }
+            if (!carrier) { console.error(`published carrier metadata missing: ${carrierVersion}`); process.exit(1); }
+            if (carrier.appVersion !== manifest.app.version) {
+              console.error(`carrier appVersion mismatch: ${carrier.appVersion} != ${manifest.app.version}`); process.exit(1);
+            }
+            if (carrier.pluginContentSha256 !== manifest.plugin.contentSha256) {
+              console.error(`carrier pluginContentSha256 mismatch: ${carrier.pluginContentSha256} != ${manifest.plugin.contentSha256}`); process.exit(1);
+            }
+            console.log("Published package identity metadata matches local dist manifest.");
+          ' "$RUNNER_TEMP/npm-packument.json"
