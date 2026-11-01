@@ -66,28 +66,22 @@ test('W4: credentials follow the exact mounted update paths only', async () => {
   assert.equal(seen[3].token, undefined, '归一化后不在允许集合内');
 });
 
-test('D5: Config accepts exactly what the resolver accepts (loopback http in, external http out)', async () => {
+test('D5: legacy source values never remain candidates; only NPM/off are effective', async () => {
   const { Config } = await import('../lib/index.js');
-  const { resolveManifestSource } = await import('../lib/plugin-self-update.js');
-  const allowed = [
+  const { resolvePluginUpdateSource, UPDATE_SOURCE_KIND } = await import('../lib/plugin-self-update.js');
+  const npmValues = [
+    'npm',
     'upstream',
-    'off',
     'https://release.test/manifest.json',
     'http://127.0.0.1:39403/m/api/update/manifest',
     'http://localhost:39403/m/api/update/manifest',
   ];
-  const rejected = ['http://external.test/m.json', 'ftp://x/m.json', 'not-a-url'];
-  for (const value of allowed) {
+  for (const value of npmValues) {
     assert.doesNotThrow(() => Config({ pluginUpdateManifest: value }), value);
-    assert.notEqual(resolveManifestSource(value).kind, 'invalid', value);
+    assert.equal(resolvePluginUpdateSource(value).kind, UPDATE_SOURCE_KIND.NPM, value);
   }
-  for (const value of rejected) {
-    assert.throws(() => Config({ pluginUpdateManifest: value }), value);
-    assert.equal(resolveManifestSource(value).kind, 'invalid', value);
-  }
-  // 畸形 https 两者都接受（真正的失败在 fetch 时 fail-closed）：要求的是**集合一致**，不是各自为政。
-  for (const value of ['https://[bad']) {
-    const configAccepts = (() => { try { Config({ pluginUpdateManifest: value }); return true; } catch { return false; } })();
-    assert.equal(configAccepts, resolveManifestSource(value).kind !== 'invalid', value);
+  assert.equal(resolvePluginUpdateSource('off').kind, UPDATE_SOURCE_KIND.OFF);
+  for (const value of ['http://external.test/m.json', 'ftp://x/m.json', 'not-a-url']) {
+    assert.equal(resolvePluginUpdateSource(value).kind, UPDATE_SOURCE_KIND.INVALID, value);
   }
 });

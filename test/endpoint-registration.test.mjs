@@ -82,6 +82,7 @@ test("bootstrap 的能力声明可被抽取，且不为空（能力判据有实�
 test("抽取容忍引号与空白差异（W2 的负向变异）", () => {
 	const variants = [
 		`if (rest === "/a") { if (requireGet(method, res)) return; }`,
+		`if (rest === "/a") { if (method !== "GET") return; }`,
 		`if (rest === '/a') { if (requireGet(method, res)) return; }`,
 		`if (rest==="/a") { if (requireGet(method, res)) return; }`,
 		`if ( rest === "/a" ) { if (requireGet(method, res)) return; }`,
@@ -137,9 +138,13 @@ test("#35 下载面鉴权属性：/update/apk 是唯一匿名例外，其余 upd
 	assert.deepEqual(anonymous, ["/update/apk"]);
 });
 
-test("本次新增的自更新端点已登记（含主机源下发插件包）", () => {
-	const paths = REGISTERED_ENDPOINTS.map((e) => e.path);
+test("本次新增的自更新端点已登记并保护 NPM check/prepare/log API", () => {
+	const byPath = new Map(REGISTERED_ENDPOINTS.map((entry) => [entry.path, entry]));
 	for (const p of ["/plugin-update", "/update/manifest", "/update/apk", "/update/plugin"]) {
-		assert.ok(paths.includes(p), `${p} 未登记`);
+		assert.ok(byPath.has(p), `${p} 未登记`);
+	}
+	for (const [path, methods] of [["/plugin-update/check", "GET"], ["/plugin-update/prepare", "POST"], ["/plugin-update/log", "GET"]]) {
+		assert.equal(byPath.get(path)?.methods, methods, `${path} method mismatch`);
+		assert.equal(byPath.get(path)?.auth, "required", `${path} must require mobile auth`);
 	}
 });

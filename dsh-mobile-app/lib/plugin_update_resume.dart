@@ -42,16 +42,26 @@ class PluginTransaction {
     required this.targetContentSha256,
     required this.rolledBack,
     required this.reason,
+    this.targetAppVersion = '',
     this.release,
+    this.startedAt,
+    this.resultOk,
   });
 
   final String opId;
   final String phase;
   final String targetVersion;
   final String targetContentSha256;
+  final String targetAppVersion;
   final bool rolledBack;
   final String? reason;
   final ReleaseSnapshot? release;
+
+  /// 事务开始时间（用于进度卡片展示已用时）。
+  final DateTime? startedAt;
+
+  /// 事务结果是否成功（result.ok）；未知为 null。
+  final bool? resultOk;
 
   static PluginTransaction? fromJson(Map<String, dynamic>? json) {
     if (json == null) return null;
@@ -62,16 +72,33 @@ class PluginTransaction {
       opId: (json['opId'] as String?) ?? '',
       phase: phase,
       targetVersion: (json['targetVersion'] as String?) ?? '',
-      targetContentSha256: ((json['targetContentSha256'] as String?) ?? '').toLowerCase(),
+      targetContentSha256: ((json['targetContentSha256'] as String?) ?? '')
+          .toLowerCase(),
+      targetAppVersion: (json['targetAppVersion'] as String?) ?? '',
       rolledBack: json['rolledBack'] == true,
       reason: result is Map ? (result['reason'] as String?) : null,
       release: ReleaseSnapshot.fromJson(json['release']),
+      startedAt: json['startedAt'] is String
+          ? DateTime.tryParse(json['startedAt'] as String)?.toUtc()
+          : null,
+      resultOk: result is Map && result['ok'] is bool
+          ? result['ok'] as bool
+          : null,
     );
   }
 }
 
 /// 两端更新的阶段（F9：**必须持久化**，否则 App 被系统杀掉后不知道走到哪一步）。
 class UpdatePhase {
+  /// Legacy prepare 已持久化，正在向宿主取得确认前的候选。
+  static const pluginPreparePending = 'plugin-prepare-pending';
+
+  /// Legacy prepare 成功；候选与 prepareId 已持久化，等待用户最终确认。
+  static const pluginPrepared = 'plugin-prepared';
+
+  /// Prepare 响应可能丢失；用同一 opId 重试 prepare，不生成新操作。
+  static const pluginPrepareRetry = 'plugin-prepare-retry';
+
   /// 已提交插件更新，等电脑端重启生效。
   static const pluginPending = 'plugin-pending';
 
@@ -99,17 +126,30 @@ class PluginUpdateJournal {
     this.phase = UpdatePhase.pluginPending,
     this.manifestUrl = '',
     this.appVersion = '',
+    this.prepareId,
+    this.carrierVersion = '',
     this.release,
     this.pluginVerified = false,
   });
 
   /// 固定下来的清单身份（F9）：两端必须用**同一份**清单，不能在 App 阶段
-  /// 因为用户改了更新源或上游发了新 Release 而"跨版本拼接"。
+  /// 因为上游发布变化而"跨版本拼接"。
   final String manifestUrl;
   final ReleaseSnapshot? release;
 
-  /// App 自身的目标版本（插件确认后填）。
+  /// App 自身的目标版本/build（候选准备成功后即持久化，最终确认前可恢复）。
   final String appVersion;
+
+  /// Legacy prepare 的不透明证明。只在最终更新 POST 前使用，不可从 UI 输入。
+  final String? prepareId;
+
+  /// 配对 carrier 的精确 npm 版本（仅供恢复确认文案/诊断）。
+  final String carrierVersion;
+
+  bool get isPreparationPhase =>
+      phase == UpdatePhase.pluginPreparePending ||
+      phase == UpdatePhase.pluginPrepared ||
+      phase == UpdatePhase.pluginPrepareRetry;
 
   /// 进入 appPending 时**插件目标已被确认健康**的持久证明（D1）。
   /// 让"插件本来就已预装、只需装 App"的用户不被自己的门禁锁死；真正的在飞/矛盾事务仍会拒绝。
@@ -135,34 +175,39 @@ class PluginUpdateJournal {
     String? phase,
     String? manifestUrl,
     String? appVersion,
+    String? prepareId,
+    String? carrierVersion,
     ReleaseSnapshot? release,
     bool? pluginVerified,
-  }) =>
-      PluginUpdateJournal(
-        opId: opId,
-        targetVersion: targetVersion ?? this.targetVersion,
-        targetContentSha256: targetContentSha256 ?? this.targetContentSha256,
-        startedAt: startedAt,
-        attempts: attempts,
-        phase: phase ?? this.phase,
-        manifestUrl: manifestUrl ?? this.manifestUrl,
-        appVersion: appVersion ?? this.appVersion,
-        release: release ?? this.release,
-        pluginVerified: pluginVerified ?? this.pluginVerified,
-      );
+  }) => PluginUpdateJournal(
+    opId: opId,
+    targetVersion: targetVersion ?? this.targetVersion,
+    targetContentSha256: targetContentSha256 ?? this.targetContentSha256,
+    startedAt: startedAt,
+    attempts: attempts,
+    phase: phase ?? this.phase,
+    manifestUrl: manifestUrl ?? this.manifestUrl,
+    appVersion: appVersion ?? this.appVersion,
+    prepareId: prepareId ?? this.prepareId,
+    carrierVersion: carrierVersion ?? this.carrierVersion,
+    release: release ?? this.release,
+    pluginVerified: pluginVerified ?? this.pluginVerified,
+  );
 
   Map<String, dynamic> toJson() => {
-        'opId': opId,
-        'targetVersion': targetVersion,
-        'targetContentSha256': targetContentSha256,
-        'startedAt': startedAt.toUtc().toIso8601String(),
-        'attempts': attempts,
-        'phase': phase,
-        'manifestUrl': manifestUrl,
-        'appVersion': appVersion,
-        'pluginVerified': pluginVerified,
-        if (release != null) 'release': release!.toJson(),
-      };
+    'opId': opId,
+    'targetVersion': targetVersion,
+    'targetContentSha256': targetContentSha256,
+    'startedAt': startedAt.toUtc().toIso8601String(),
+    'attempts': attempts,
+    'phase': phase,
+    'manifestUrl': manifestUrl,
+    'appVersion': appVersion,
+    if (prepareId != null && prepareId!.isNotEmpty) 'prepareId': prepareId,
+    'carrierVersion': carrierVersion,
+    'pluginVerified': pluginVerified,
+    if (release != null) 'release': release!.toJson(),
+  };
 
   static PluginUpdateJournal? fromJson(Map<String, dynamic>? json) {
     if (json == null) return null;
@@ -171,19 +216,86 @@ class PluginUpdateJournal {
     final at = DateTime.tryParse(started);
     if (at == null) return null;
     final attempts = json['attempts'];
+    final rawPrepareId = json['prepareId'];
+    final rawCarrierVersion = json['carrierVersion'];
     return PluginUpdateJournal(
       opId: (json['opId'] as String?) ?? '',
       targetVersion: (json['targetVersion'] as String?) ?? '',
-      targetContentSha256: ((json['targetContentSha256'] as String?) ?? '').toLowerCase(),
+      targetContentSha256: ((json['targetContentSha256'] as String?) ?? '')
+          .toLowerCase(),
       startedAt: at,
       attempts: attempts is int ? attempts : 0,
       phase: (json['phase'] as String?) ?? UpdatePhase.pluginPending,
       manifestUrl: (json['manifestUrl'] as String?) ?? '',
       appVersion: (json['appVersion'] as String?) ?? '',
+      prepareId: rawPrepareId is String && rawPrepareId.trim().isNotEmpty
+          ? rawPrepareId.trim()
+          : null,
+      carrierVersion: rawCarrierVersion is String ? rawCarrierVersion : '',
       pluginVerified: json['pluginVerified'] == true,
       release: ReleaseSnapshot.fromJson(json['release']),
     );
   }
+}
+
+/// Recover a fixed release only from host-owned pointers after the exact plugin
+/// transaction is settled. NPM-backed transactions may intentionally omit the
+/// normalized release snapshot; that does not permit looking up a moving tag or
+/// using an unrelated/latest release.
+ReleaseSnapshot? resolveHostReleaseForPluginUpdate({
+  required PluginUpdateJournal journal,
+  required PluginTransaction? transaction,
+  required String loadedContentSha256,
+  ReleasePointer? updateTarget,
+  ReleasePointer? currentRelease,
+}) {
+  final tx = transaction;
+  if (tx == null ||
+      journal.opId.isEmpty ||
+      tx.opId != journal.opId ||
+      tx.phase != 'settled' ||
+      tx.rolledBack) {
+    return null;
+  }
+
+  final targetVersion = tx.targetVersion.trim();
+  final targetHash = tx.targetContentSha256.trim().toLowerCase();
+  final journalVersion = journal.targetVersion.trim();
+  final journalHash = journal.targetContentSha256.trim().toLowerCase();
+  final loadedHash = loadedContentSha256.trim().toLowerCase();
+  if (targetVersion.isEmpty ||
+      targetHash.isEmpty ||
+      targetVersion != journalVersion ||
+      targetHash != journalHash ||
+      targetHash != loadedHash) {
+    return null;
+  }
+
+  final transactionAppVersion = tx.targetAppVersion.trim();
+  final journalAppVersion = journal.appVersion.trim();
+  if (transactionAppVersion.isNotEmpty &&
+      journalAppVersion.isNotEmpty &&
+      transactionAppVersion != journalAppVersion) {
+    return null;
+  }
+  final targetAppVersion = transactionAppVersion.isNotEmpty
+      ? transactionAppVersion
+      : journalAppVersion;
+  if (targetAppVersion.isEmpty) return null;
+
+  // The target pointer is preferred, but a stale/mismatched target must not
+  // hide an exact current-release pointer. Neither path consults a moving tag.
+  for (final pointer in [updateTarget, currentRelease]) {
+    final release = pointer?.release;
+    if (release == null ||
+        release.plugin.version != targetVersion ||
+        release.plugin.contentSha256.toLowerCase() != targetHash ||
+        release.app.version != targetAppVersion) {
+      continue;
+    }
+    return release;
+  }
+  return null;
 }
 
 /// 判定结果。
@@ -213,32 +325,54 @@ ResumeDecision decidePluginUpdateResume({
   required DateTime now,
   Duration timeout = const Duration(minutes: 5),
 }) {
-  if (journal == null) return const ResumeDecision(ResumeAction.none, 'no-journal');
+  if (journal == null) {
+    return const ResumeDecision(ResumeAction.none, 'no-journal');
+  }
 
   final loaded = loadedContentSha256.toLowerCase();
   ResumeDecision waitOrTimeout(String reason) {
     final elapsed = now.difference(journal.startedAt.toUtc());
-    if (elapsed > timeout) return const ResumeDecision(ResumeAction.timedOut, 'reconnect-timeout');
+    if (elapsed > timeout) {
+      return const ResumeDecision(ResumeAction.timedOut, 'reconnect-timeout');
+    }
     return ResumeDecision(ResumeAction.wait, reason);
   }
 
   // 有事务且身份一致：以事务为准（这才是"结果待确认"的权威来源）
-  if (transaction != null && journal.opId.isNotEmpty && transaction.opId == journal.opId) {
+  if (transaction != null &&
+      journal.opId.isNotEmpty &&
+      transaction.opId == journal.opId) {
     // F7：**正在回滚**时绝不能判成功——即使此刻跑着的内容恰好等于原目标（那是矛盾的中间态）
     if (transaction.rolledBack || transaction.phase == 'rolling-back') {
-      return const ResumeDecision(ResumeAction.rolledBack, 'transaction-rolling-back');
+      return const ResumeDecision(
+        ResumeAction.rolledBack,
+        'transaction-rolling-back',
+      );
     }
     switch (transaction.phase) {
       case 'settled':
-        final target = journal.release?.plugin.contentSha256 ?? journal.targetContentSha256;
-        if (target.isNotEmpty && loaded == target && transaction.targetContentSha256 == target) {
-          return const ResumeDecision(ResumeAction.completed, 'transaction-settled');
+        final target =
+            journal.release?.plugin.contentSha256 ??
+            journal.targetContentSha256;
+        if (target.isNotEmpty &&
+            loaded == target &&
+            transaction.targetContentSha256 == target) {
+          return const ResumeDecision(
+            ResumeAction.completed,
+            'transaction-settled',
+          );
         }
         return waitOrTimeout('settled-content-unconfirmed');
       case 'rolled-back':
-        return const ResumeDecision(ResumeAction.rolledBack, 'transaction-rolled-back');
+        return const ResumeDecision(
+          ResumeAction.rolledBack,
+          'transaction-rolled-back',
+        );
       case 'failed':
-        return ResumeDecision(ResumeAction.failed, transaction.reason ?? 'transaction-failed');
+        return ResumeDecision(
+          ResumeAction.failed,
+          transaction.reason ?? 'transaction-failed',
+        );
       case 'restart-pending':
       case 'installing':
       case 'staging':

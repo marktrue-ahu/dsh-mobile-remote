@@ -335,6 +335,9 @@ function main() {
 				name: pluginName,
 				version: appCarrierVersion,
 				description: `DSH Mobile Remote App 载体（与 ${pluginName}@${pluginVersion} 配对）：随插件分发 APK 与发布清单，仅作数据分发，无运行入口。`,
+				// NPM packument exposes these small hints so update checks can show the pair without downloading the carrier.
+				appVersion: manifest.app.version,
+				pluginContentSha256: manifest.plugin.contentSha256,
 				files,
 				dsh: { appCarrier: true },
 				// ── npm 发布元数据（P3-A）──
@@ -369,6 +372,8 @@ function main() {
 				mainPkg: rootPkg,
 				expectedName: pluginName,
 				expectedVersion: appCarrierVersion,
+				expectedAppVersion: manifest.app.version,
+				expectedPluginContentSha256: manifest.plugin.contentSha256,
 				expectedFiles: files,
 			}), check);
 			if (fail > 0) return finish();

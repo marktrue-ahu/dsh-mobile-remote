@@ -6,11 +6,13 @@
 // 宿主投影的固定目标绝对地址；App 只消费该字段（固定目标的 query 由宿主拼好）。
 import 'dart:convert';
 import 'dart:io';
+
 import 'package:convert/convert.dart';
 import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
+
 import 'api.dart';
 import 'logger.dart';
 import 'native_update.dart';
@@ -147,7 +149,8 @@ String hostCheckErrorMessage(ApiException e) {
   }
 }
 
-typedef UpdateInstaller = Future<String?> Function(UpdateCandidate candidate, {
+typedef UpdateInstaller = Future<String?> Function(
+  UpdateCandidate candidate, {
   void Function(int received, int? total)? onProgress,
   void Function(String stage)? onStage,
   UpdateCancelToken? cancel,
@@ -167,28 +170,49 @@ class Updater {
 
   /// 检查更新：只消费宿主给出的固定发布 / 主机清单，不直连 GitHub。
   static Future<UpdateCheckOutcome> check(AppStore store) async {
-    final journal = store.pluginUpdateJournal;
+    var journal = store.pluginUpdateJournal;
+    if (journal != null && journal.release == null) {
+      // 旧 journal 可能只差“接续”：先按宿主当前状态推进一次，再决定是否能检查 App。
+      try {
+        await store.resumePluginUpdate();
+      } catch (_) {}
+      journal = store.pluginUpdateJournal;
+    }
     if (journal != null) {
       if (journal.phase == UpdatePhase.pluginPending) {
-        return const UpdateCheckOutcome(verdict: UpdateVerdict.upToDate, error: '电脑端插件更新尚未健康确认');
+        return const UpdateCheckOutcome(
+          verdict: UpdateVerdict.upToDate,
+          error: '电脑端插件更新尚未健康确认',
+        );
       }
-      return store.checkFixedAppUpdate(journal.release);
+      if (journal.phase == UpdatePhase.pluginRetry &&
+          _hostPluginRecovered(store)) {
+        // 电脑端后来已经完成插件更新（或恢复健康）：旧的“未确认”记录不能继续挡住 App 更新。
+        await store.discardStaleUpdateJournal();
+      } else {
+        return store.checkFixedAppUpdate(journal.release);
+      }
     }
 
-    final preferHostManifest = store.updateSource == 'host';
-    if (preferHostManifest) {
-      final fromManifest = await _checkHostManifest(store);
-      if (fromManifest != null) return fromManifest;
-    }
-    // 新流程权威来源：宿主下发的 currentRelease / updateTarget（GitHub/HTTPS 来源也由宿主投影）。
+    // Only host-provided fixed release snapshots are trusted. There is no source preference
+    // and no direct GitHub lookup; the old host manifest remains a host-owned compatibility path.
     final pointer = store.hostReleasePointer;
     if (pointer != null) return store.checkFixedAppUpdate(pointer.release);
-    if (!preferHostManifest) {
-      // 旧宿主兼容：主机目录里的完整 schema 1 清单（地址同样由宿主投影）。
-      final fromManifest = await _checkHostManifest(store);
-      if (fromManifest != null) return fromManifest;
-    }
-    return UpdateCheckOutcome(verdict: UpdateVerdict.upToDate, error: _noFixedReleaseMessage(store.updateSource));
+    final fromManifest = await _checkHostManifest(store);
+    if (fromManifest != null) return fromManifest;
+    return UpdateCheckOutcome(
+      verdict: UpdateVerdict.upToDate,
+      error: _noFixedReleaseMessage(),
+    );
+  }
+
+  /// 宿主插件已恢复健康且没有新候选：手机端残留的 pluginRetry 记录可以安全退出。
+  static bool _hostPluginRecovered(AppStore store) {
+    final status = store.api.pluginUpdate;
+    if (status.contentUpdateAvailable) return false;
+    final tx = status.transaction;
+    if (tx != null && (tx.rolledBack || tx.phase != 'settled')) return false;
+    return store.hostReleasePointer != null;
   }
 
   /// 主机目录清单（人工区 / 旧宿主兼容）。返回 null = 旧宿主没有可用清单，交给上层兜底。
@@ -209,20 +233,21 @@ class Updater {
           e.code == 'update-manifest-missing') {
         return null;
       }
-      return UpdateCheckOutcome(verdict: UpdateVerdict.upToDate, error: hostCheckErrorMessage(e));
+      return UpdateCheckOutcome(
+        verdict: UpdateVerdict.upToDate,
+        error: hostCheckErrorMessage(e),
+      );
     } catch (e) {
       AppLog.instance.log('Update: 主机清单检查失败 $e');
-      return UpdateCheckOutcome(verdict: UpdateVerdict.upToDate, error: '主机源检查失败：$e');
+      return UpdateCheckOutcome(
+        verdict: UpdateVerdict.upToDate,
+        error: '主机源检查失败：$e',
+      );
     }
   }
 
-  static String _noFixedReleaseMessage(String source) {
-    if (source == 'host') {
-      return '电脑端没有可用的固定发布（updateDir 未配置或清单不完整）；请检查电脑端插件与更新目录，或用连接页二维码重扫一次';
-    }
-    return '新版 App 统一从电脑端固定目标下载（不再直连 GitHub）；电脑端尚未下发可用的固定发布。'
-        '请在电脑上更新插件，或用电脑连接页的二维码重新扫码连接后重试；旧组合仍可继续使用';
-  }
+  static String _noFixedReleaseMessage() =>
+      '电脑端尚未下发可用的固定 App 发布；请检查电脑端插件与更新目录，或用连接页二维码重扫一次';
 
   static Future<UpdateCandidate?> _candidateFromHost(Api client) async {
     final d = await client.updateManifest();
@@ -268,13 +293,45 @@ class Updater {
     Directory? temporaryDirectory,
   }) async {
     final connection = apiClient ?? api;
-    // ── 下载 ──
     final dir = temporaryDirectory ?? await getTemporaryDirectory();
     final updateDir = Directory('${dir.path}/dsh-update');
     await updateDir.create(recursive: true);
-    final target = File('${updateDir.path}/dsh-update-${DateTime.now().millisecondsSinceEpoch}.apk');
+    // 固定缓存名：同一份目标只下载一次。上一次已校验过的 APK 可直接复用，
+    // 避免“安装器被取消/未完成 → 重试又要重新下载 70+MB”。
+    final cacheKey = (candidate.sha256?.trim().isNotEmpty ?? false)
+        ? candidate.sha256!.trim().toLowerCase()
+        : candidate.version.replaceAll(RegExp(r'[^0-9A-Za-z._-]'), '_');
+    final target = File('${updateDir.path}/dsh-update-$cacheKey.apk');
 
-    // 取消即清理：删除半成品并收敛为 'cancelled'（UI 已自行展示取消态）
+    Future<String> fileSha256(File file) async {
+      final acc = AccumulatorSink<Digest>();
+      await sha256.bind(file.openRead()).fold<AccumulatorSink<Digest>>(acc, (
+        a,
+        d,
+      ) {
+        a.add(d);
+        return a;
+      });
+      return acc.events.single.toString();
+    }
+
+    Future<bool> cachedUsable() async {
+      try {
+        if (!await target.exists() || await target.length() == 0) return false;
+        if (candidate.sizeBytes != null &&
+            candidate.sizeBytes! > 0 &&
+            await target.length() != candidate.sizeBytes) {
+          return false;
+        }
+        if (candidate.sha256 != null && candidate.sha256!.isNotEmpty) {
+          return await fileSha256(target) == candidate.sha256!.toLowerCase();
+        }
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+
     Future<String> abortCancelled() async {
       try {
         if (await target.exists()) await target.delete();
@@ -285,64 +342,63 @@ class Updater {
     http.Client? client;
     IOSink? sink;
     try {
-      onStage?.call('download');
-      final req = http.Request('GET', Uri.parse(candidate.downloadUrl));
-      req.headers.addAll(connection.artifactHeaders(req.url));
-      client = downloadClient ?? http.Client();
-      if (cancel != null) cancel._client = client;
-      final resp = await client.send(req).timeout(const Duration(seconds: 30));
-      if (resp.statusCode != 200) {
-        // 固定目标的稳定错误码（410/404/400/503/401）：分类收敛，供接续出口使用。
-        final failure = await _artifactFailureFromResponse(resp);
-        onFailure?.call(failure);
-        return failure.message;
-      }
-      final total = resp.contentLength ?? candidate.sizeBytes;
-      sink = target.openWrite();
-      var received = 0;
-      await for (final chunk in resp.stream) {
-        if (cancel?.cancelled == true) break;
-        sink.add(chunk);
-        received += chunk.length;
-        onProgress?.call(received, total);
-      }
-      await sink.flush();
-      await sink.close();
-      sink = null;
-      if (cancel?.cancelled == true) return await abortCancelled();
-      if (!await target.exists() || await target.length() == 0) {
-        return '下载失败：文件为空';
-      }
       bool wasCancelled() => cancel?.cancelled == true;
-
-      // ── 字节数校验：以**发布清单声明的 size** 为准，不看响应的 Content-Length ──
-      // （同 URL 被替换成另一份产物时，Content-Length 会跟着变，只信它就等于没校验。）
-      if (candidate.sizeBytes != null && candidate.sizeBytes! > 0) {
-        final actual = await target.length();
-        if (actual != candidate.sizeBytes) {
-          await target.delete();
-          return '校验失败：文件大小与发布清单不一致（$actual ≠ ${candidate.sizeBytes}），已取消';
-        }
-      }
-
-      // ── sha256 校验（主机源 manifest 提供；GitHub 无 -> 跳过） ──
-      if (candidate.sha256 != null && candidate.sha256!.isNotEmpty) {
+      var reused = await cachedUsable();
+      if (reused) {
         onStage?.call('checksum');
+        final size = await target.length();
+        onProgress?.call(size, candidate.sizeBytes ?? size);
+      } else {
+        onStage?.call('download');
+        final req = http.Request('GET', Uri.parse(candidate.downloadUrl));
+        req.headers.addAll(connection.artifactHeaders(req.url));
+        client = downloadClient ?? http.Client();
+        if (cancel != null) cancel._client = client;
+        final resp = await client
+            .send(req)
+            .timeout(const Duration(seconds: 30));
+        if (resp.statusCode != 200) {
+          final failure = await _artifactFailureFromResponse(resp);
+          onFailure?.call(failure);
+          return failure.message;
+        }
+        final total = resp.contentLength ?? candidate.sizeBytes;
+        sink = target.openWrite();
+        var received = 0;
+        await for (final chunk in resp.stream) {
+          if (wasCancelled()) break;
+          sink.add(chunk);
+          received += chunk.length;
+          onProgress?.call(received, total);
+        }
+        await sink.flush();
+        await sink.close();
+        sink = null;
         if (wasCancelled()) return await abortCancelled();
-        final acc = AccumulatorSink<Digest>();
-        await sha256.bind(target.openRead()).fold<AccumulatorSink<Digest>>(acc, (a, d) {
-          a.add(d);
-          return a;
-        });
-        final digest = acc.events.single.toString();
-        if (digest != candidate.sha256!.toLowerCase()) {
-          await target.delete();
-          return '校验失败：文件与发布清单不一致，已取消';
+        if (!await target.exists() || await target.length() == 0) {
+          return '下载失败：文件为空';
+        }
+        // 字节数校验：以发布清单声明的 size 为准，不看 Content-Length。
+        if (candidate.sizeBytes != null && candidate.sizeBytes! > 0) {
+          final actual = await target.length();
+          if (actual != candidate.sizeBytes) {
+            await target.delete();
+            return '校验失败：文件大小与发布清单不一致（$actual ≠ ${candidate.sizeBytes}），已取消';
+          }
+        }
+        if (candidate.sha256 != null && candidate.sha256!.isNotEmpty) {
+          onStage?.call('checksum');
+          if (wasCancelled()) return await abortCancelled();
+          final digest = await fileSha256(target);
+          if (digest != candidate.sha256!.toLowerCase()) {
+            await target.delete();
+            return '校验失败：文件与发布清单不一致，已取消';
+          }
         }
       }
       if (wasCancelled()) return await abortCancelled();
 
-      // ── 签名预检（自身 vs 下载 APK；任一读取失败 → 保守取消） ──
+      // 签名预检（自身 vs 下载 APK；任一读取失败 → 保守取消）。
       onStage?.call('signature');
       final own = await NativeUpdate.ownSignatureSha256();
       final apk = await NativeUpdate.apkSignatureSha256(target.path);
@@ -356,25 +412,20 @@ class Updater {
         return '签名不一致，已取消更新（请先卸载旧版，或使用同签名版本）';
       }
 
-      // ── 拉起安装器前复核（§5.9）：无法复核时不用旧缓存证明启动安装 ──
+      // 拉起安装器前复核（§5.9）：无法复核时不用旧缓存证明启动安装。
+      // 已校验的 APK 保留，重试时可直接复用，不再重新下载。
       if (beforeInstall != null) {
         final blocked = await beforeInstall();
-        if (blocked != null && blocked.isNotEmpty) {
-          await target.delete();
-          return blocked;
-        }
+        if (blocked != null && blocked.isNotEmpty) return blocked;
       }
       if (wasCancelled()) return await abortCancelled();
 
-      // ── 安装（拉起系统安装器；最终核对交给系统 + 下次启动的真实版本） ──
       onStage?.call('install');
       await NativeUpdate.installApk(target.path);
       return null;
     } catch (e) {
       AppLog.instance.log('Update: 下载/安装失败 $e');
-      // 用户取消触发的中断（close 流）不算失败——收敛为 cancelled
       if (cancel?.cancelled == true) return await abortCancelled();
-      final err = '$e';
       try {
         if (sink != null) {
           await sink.close();
@@ -384,7 +435,7 @@ class Updater {
       try {
         if (await target.exists()) await target.delete();
       } catch (_) {}
-      return '更新失败：$err';
+      return '更新失败：$e';
     } finally {
       try {
         client?.close();
@@ -393,7 +444,9 @@ class Updater {
   }
 
   /// 读取固定目标下载的错误响应体（`{error, detail}`）并分类。
-  static Future<UpdateFailure> _artifactFailureFromResponse(http.StreamedResponse resp) async {
+  static Future<UpdateFailure> _artifactFailureFromResponse(
+    http.StreamedResponse resp,
+  ) async {
     String? code;
     var detail = '';
     try {

@@ -34,7 +34,11 @@
 
 - 桌面 DSH 插件的“连接移动端”设置页在进入时做一次只读检查，并保留手动重查按钮。检查由宿主侧只读 API 执行，与会安装的 `POST /plugin-update` 分开；返回候选状态、插件版本和配对 App build，不暴露 registry 凭据、token 或可携带认证信息的 URL。没有更新时显示当前/最新状态；registry、认证或配对校验失败时显示不可用，不生成更新按钮。
 - 只有发现完整且高于当前版本的插件/carrier 配对时，桌面页才显示“更新插件”按钮。点击先确认目标版本及宿主重启；确认后调用现有插件更新事务，由外部监督器完成安装、重启、健康核验与回滚。检查页面本身绝不安装或重启。
+- 新 carrier 的 `package.json` 明确写入 `appVersion` 与 `pluginContentSha256`；release preflight 必须将二者与 carrier 内嵌 `manifest.json` 一致性校验。检查页据此同时展示插件版本与 App build。
+- 旧 carrier 缺少上述元数据时，不猜 App build，也不直接安装：用户点击“准备更新”后，宿主按精确 NPM 候选下载并校验 carrier/清单/APK，profile 保持不变；界面展示实际 App build，用户再次确认后才进入 profile 更新事务。准备结果按服务器生成的 prepare ID 短暂缓存并过期清理。
 - 手机 App 的“更新电脑端插件”入口保留，并与桌面按钮共用同一个 opId/事务锁；两端同时触发时不得创建并发安装。App 更新仍必须等插件健康确认后才开放，且 App 只通过 DSH 获取已由 npm 选定并验证的 APK。
+- NPM 事务不必携带可下载的 release 快照；插件健康确认后，手机只可从宿主 `updateTarget`/`currentRelease` 恢复 App 目标，并要求 opId、插件版本、插件内容标识、运行内容及 App build 与该事务/本地确认记录完全一致。缺失或不匹配时拒绝续接，不查 latest、不拼接其他发布。
+- 插件更新事务把 pnpm stdout/stderr 并行排空、脱敏后写入按 generation 隔离的持久日志；每次最多 400 行/128 KiB，全局最多保留最近 20 次更新日志，并通过认证的 opId/序号游标接口读取。监督器也记录 restart/health/rollback 阶段；桌面与手机都以默认折叠面板查看，宿主重启后可接续读取。
 - 移除手机 App 设置页的更新来源选择菜单；旧的 App 侧来源偏好不得继续把更新导向 GitHub 或人工区。当前“检查更新”行只检查 App，文案改为“检查 App 更新”。
 
 ## 后果

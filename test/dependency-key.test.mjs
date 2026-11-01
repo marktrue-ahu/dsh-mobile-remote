@@ -2,7 +2,7 @@
 // 若仍硬编码旧包名，从 npm 安装的插件会找不到 profile → 自更新直接不可用。
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readlink, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -13,6 +13,7 @@ import {
 	dependencyKeysFor,
 	findProfileDir,
 	profileSpecifierOf,
+	publishOwnedSnapshotLink,
 	restoreOwnedProfile,
 	switchOwnedDependency,
 	updateLockPath,
@@ -112,7 +113,58 @@ test("受代际保护的 switch/restore 也按传入的键工作（scope 渠道�
 		});
 		assert.equal(restored.ok, true, restored.error);
 		doc = JSON.parse(await readFile(join(profileDir, "package.json"), "utf8"));
-		assert.equal(doc.dependencies[SCOPED], `file:${join(base, "snap")}`, "恢复也必须写回同一个键");
+		assert.equal(doc.dependencies[SCOPED], `file:${join(base, "snap")}`, "legacy restore writes the snapshot path into the same key");
+	} finally {
+		await rm(base, { recursive: true, force: true });
+	}
+});
+
+test("NPM rollback restores the prior exact package spec instead of leaving a file dependency", async () => {
+	const base = await mkdtemp(join(tmpdir(), "depkey-npm-restore-"));
+	try {
+		const profileDir = join(base, "profile");
+		await mkdir(profileDir, { recursive: true });
+		const oldSpec = "3.2.1-alpha.3";
+		const packageJson = { name: "web", dependencies: { [SCOPED]: oldSpec, qrcode: "^1.5.4" } };
+		await writeFile(join(profileDir, "package.json"), JSON.stringify({ ...packageJson, dependencies: { ...packageJson.dependencies, [SCOPED]: "3.2.2-alpha.1" } }));
+		await writeFile(join(profileDir, "pnpm-lock.yaml"), "candidate-lock\n");
+		const lockPath = updateLockPath(base);
+		const grant = acquireLock(lockPath, { opId: "restore-npm-spec" });
+		assert.equal(grant.ok, true, grant.error);
+		const restored = restoreOwnedProfile({
+			profileDir,
+			snapshotDir: join(base, "snapshot"),
+			key: SCOPED,
+			preserveSpecifier: true,
+			lockPath,
+			lease: grant.lease,
+			snapshot: { packageJson: JSON.stringify(packageJson), pnpmLock: "original-lock\n" },
+		});
+		assert.equal(restored.ok, true, restored.error);
+		const doc = JSON.parse(await readFile(join(profileDir, "package.json"), "utf8"));
+		assert.equal(doc.dependencies[SCOPED], oldSpec);
+		assert.equal(doc.dependencies.qrcode, "^1.5.4");
+		assert.equal(await readFile(join(profileDir, "pnpm-lock.yaml"), "utf8"), "original-lock\n");
+	} finally {
+		await rm(base, { recursive: true, force: true });
+	}
+});
+
+test("scoped rollback snapshot link is published under the real package key", async () => {
+	const base = await mkdtemp(join(tmpdir(), "depkey-scoped-link-"));
+	try {
+		const profileDir = join(base, "profile");
+		const snapshotDir = join(base, "snapshot");
+		await mkdir(join(profileDir, "node_modules"), { recursive: true });
+		await mkdir(join(snapshotDir, "lib"), { recursive: true });
+		await writeFile(join(snapshotDir, "package.json"), JSON.stringify({ name: SCOPED, version: "3.2.1-alpha.3" }));
+		const lockPath = updateLockPath(base);
+		const grant = acquireLock(lockPath, { opId: "restore-scoped-link" });
+		assert.equal(grant.ok, true, grant.error);
+		const published = publishOwnedSnapshotLink({ profileDir, snapshotDir, key: SCOPED, lockPath, lease: grant.lease });
+		assert.equal(published.ok, true, published.error);
+		assert.equal(await realpath(join(profileDir, "node_modules", SCOPED)), await realpath(snapshotDir));
+		assert.equal(await readlink(join(profileDir, "node_modules", SCOPED)), await realpath(snapshotDir));
 	} finally {
 		await rm(base, { recursive: true, force: true });
 	}

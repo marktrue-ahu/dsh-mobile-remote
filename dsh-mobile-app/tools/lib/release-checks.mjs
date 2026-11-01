@@ -426,12 +426,14 @@ function repositoryUrl(pkg) {
 /**
  * 载体 package.json 的 npm 发布元数据断言（stable reason code 供发布预检输出）。
  * @param {object} pkg 载体 package.json
- * @param {{mainPkg?: object|null, expectedName?: string, expectedVersion?: string, expectedFiles?: string[]}} [options]
+ * @param {{mainPkg?: object|null, expectedName?: string, expectedVersion?: string, expectedAppVersion?: string, expectedPluginContentSha256?: string, expectedFiles?: string[]}} [options]
  */
 export function carrierPublishMetadataChecks(pkg, {
 	mainPkg = null,
 	expectedName = "",
 	expectedVersion = "",
+	expectedAppVersion = "",
+	expectedPluginContentSha256 = "",
 	expectedFiles = [],
 } = {}) {
 	const checks = [];
@@ -461,6 +463,18 @@ export function carrierPublishMetadataChecks(pkg, {
 		name: "发布版本与主插件版本严格配对（主插件 X.Y.Z ↔ 载体 X.Y.Z-app）",
 		pass: expectedVersion !== "" && version === expectedVersion,
 		detail: `carrier=${version || "<缺失>"} 期望=${expectedVersion || "<未知>"}`,
+	});
+	checks.push({
+		code: "carrier-publish-app-version-mismatch",
+		name: "NPM metadata 中的 App version/build 与载体清单一致",
+		pass: expectedAppVersion !== "" && pkg?.appVersion === expectedAppVersion,
+		detail: `carrier.appVersion=${pkg?.appVersion ?? "<缺失>"} 期望=${expectedAppVersion || "<未知>"}`,
+	});
+	checks.push({
+		code: "carrier-publish-plugin-content-sha256-mismatch",
+		name: "NPM metadata 中的插件 contentSha256 与载体清单一致",
+		pass: expectedPluginContentSha256 !== "" && pkg?.pluginContentSha256 === expectedPluginContentSha256,
+		detail: `carrier.pluginContentSha256=${pkg?.pluginContentSha256 ?? "<缺失>"} 期望=${expectedPluginContentSha256 || "<未知>"}`,
 	});
 	checks.push({
 		code: "carrier-publish-private-not-false",

@@ -349,3 +349,132 @@ test("W3-a：下载 tab ready→unavailable 刷新迁移清空旧下载二维码
 	assert.equal(downloadOnly.download.ready, true, "控制连接不可用不得误伤下载码");
 	assert.ok(!downloadOnly.download.qrSrc.includes("auth-token-unavailable"));
 });
+
+test("plugin update UI model exposes confirmed App build or explicit legacy preparation", () => {
+	const modern = client.buildPluginUpdateModel({
+		state: "update-available",
+		canSelfUpdate: true,
+		candidate: {
+			plugin: { version: "3.2.2-alpha.1" },
+			carrier: { appVersion: "3.2.2+26", legacyMetadataMissing: false },
+		},
+	});
+	assert.equal(modern.hasUpdate, true);
+	assert.equal(modern.pluginVersion, "3.2.2-alpha.1");
+	assert.equal(modern.appVersion, "3.2.2+26");
+	assert.equal(modern.needsPreparation, false);
+
+	// 检查详情：桌面与手机读同一份宿主 checkLog，按行投影、限长 40 行。
+	const withCheckLog = client.buildPluginUpdateModel({
+		state: "unavailable",
+		reason: "npm-plugin-metadata-unavailable",
+		checkLog: [
+			"# 本机版本 3.2.2-alpha.4 · NPM 通道 alpha",
+			"$ npm view @marktrue/dsh-mobile-remote dist-tags --json",
+			"→ alpha=3.2.2-alpha.4",
+			"$ npm view @marktrue/dsh-mobile-remote@3.2.2-alpha.4 --json",
+			"→ 失败：npm-registry-unavailable",
+			"   ",
+		],
+	});
+	assert.equal(withCheckLog.checkLog.length, 5);
+	assert.ok(withCheckLog.checkLog[1].startsWith("$ npm view"), "命令行走同一行投影");
+	assert.equal(withCheckLog.checkLog.includes(""), false);
+	assert.equal(client.pluginUpdateCheckLogLines({ checkLog: Array.from({ length: 50 }, (_, index) => "line-" + index) }).length, 40);
+	assert.match(client.updateCheckReasonText("npm-plugin-metadata-unavailable"), /检查日志/);
+
+	const legacy = client.buildPluginUpdateModel({
+		state: "update-available",
+		canSelfUpdate: true,
+		candidate: {
+			plugin: { version: "3.2.2-alpha.1" },
+			carrier: { appVersion: null, legacyMetadataMissing: true },
+		},
+	});
+	assert.equal(legacy.hasUpdate, true);
+	assert.equal(legacy.appVersion, "");
+	assert.equal(legacy.needsPreparation, true);
+
+	const resumed = client.buildPluginUpdateModel({
+		state: "update-available",
+		candidate: legacy.candidate,
+		transaction: { targetAppVersion: "3.2.2+26" },
+	});
+	assert.equal(resumed.appVersion, "3.2.2+26");
+	assert.equal(resumed.needsPreparation, false, "a prepared active transaction already has an authoritative App build");
+});
+
+test("update check reasons distinguish a missing npm client from registry failures", () => {
+	assert.match(client.updateCheckReasonText("npm-client-unavailable"), /npm/);
+	assert.match(client.updateCheckReasonText("npm-registry-unavailable"), /registry/);
+	assert.equal(client.updateCheckReasonText("candidate-changed"), "candidate-changed");
+	assert.equal(client.updateCheckReasonText(""), "registry-unavailable");
+});
+
+test("plugin update details merge check diagnostics, install output, and the failure reason", () => {
+	const model = client.buildPluginUpdateModel({
+		state: "unavailable",
+		reason: "update-failed",
+		checkLog: ["# 本机版本 3.2.1-alpha.3 · NPM 通道 alpha", "$ npm view @marktrue/dsh-mobile-remote dist-tags --json", "→ alpha=3.2.2-alpha.6"],
+		transaction: { phase: "failed", result: { ok: false, reason: "npm-carrier-plugin-identity-mismatch" } },
+	});
+	const lines = client.pluginUpdateDetailLines(model, [
+		{ stage: "staging", stream: "status", text: "NPM plugin update accepted" },
+		{ stage: "failed", stream: "status", text: "Plugin update failed: npm-carrier-plugin-identity-mismatch" },
+	]);
+	// 检查详情在前，安装详情在中，失败原因在最后且带可读文案。
+	assert.ok(lines[0].startsWith("# 本机版本"));
+	const installIndex = lines.indexOf("# 安装详情（宿主 pnpm 输出，已脱敏）");
+	const resultIndex = lines.findIndex((line) => line.startsWith("# 安装结果："));
+	assert.ok(installIndex > 0);
+	assert.ok(resultIndex > installIndex);
+	assert.match(lines[resultIndex], /载体清单与 NPM 包身份不一致/);
+	assert.match(lines[resultIndex], /npm-carrier-plugin-identity-mismatch/);
+	assert.ok(lines.some((line) => line.includes("[failed] Plugin update failed: npm-carrier-plugin-identity-mismatch")));
+	assert.match(client.updateFailureReasonText("install-failed"), /pnpm 安装失败/);
+	assert.equal(client.updateFailureReasonText("unknown-code"), "unknown-code");
+});
+
+test("plugin update progress maps transaction phase and latest log stage to the shared six steps", () => {
+	assert.equal(JSON.stringify(client.pluginUpdateProgressSteps), JSON.stringify(["检查候选", "下载校验", "安装依赖", "重启宿主", "健康确认", "完成"]));
+
+	const installing = client.buildPluginUpdateModel({
+		state: "restarting",
+		transaction: { opId: "op-1", phase: "installing" },
+	});
+	const installingProgress = client.pluginUpdateProgress(installing, { stage: "install", text: "pnpm install" });
+	assert.equal(installingProgress.step, 2);
+	assert.match(installingProgress.text, /安装依赖/);
+	assert.equal(installingProgress.terminal, false);
+
+	const downloading = client.pluginUpdateProgress(
+		client.buildPluginUpdateModel({ state: "restarting", transaction: { opId: "op-1", phase: "staging" } }),
+		{ stage: "download", text: "download" },
+	);
+	assert.equal(downloading.step, 1);
+	assert.match(downloading.text, /下载/);
+
+	const restarting = client.pluginUpdateProgress(
+		client.buildPluginUpdateModel({ state: "restarting", transaction: { opId: "op-1", phase: "restart-pending" } }),
+		{ stage: "supervisor", text: "waiting" },
+	);
+	assert.equal(restarting.step, 4);
+	assert.match(restarting.text, /健康/);
+
+	const done = client.pluginUpdateProgress(
+		client.buildPluginUpdateModel({ state: "up-to-date", transaction: { opId: "op-1", phase: "settled", result: { ok: true } } }),
+		null,
+	);
+	assert.equal(done.step, 5);
+	assert.equal(done.terminal, true);
+	assert.equal(done.failed, false);
+
+	const failed = client.pluginUpdateProgress(
+		client.buildPluginUpdateModel({ state: "update-failed", transaction: { opId: "op-1", phase: "failed", result: { ok: false, reason: "install-failed" } } }),
+		null,
+	);
+	assert.equal(failed.step, 4);
+	assert.equal(failed.terminal, true);
+	assert.equal(failed.failed, true);
+	assert.match(client.pluginUpdateStageText("restart-pending"), /重启/);
+});

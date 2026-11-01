@@ -1,7 +1,14 @@
+import 'dart:convert';
+
+import 'package:dsh_mobile_app/api.dart';
+import 'package:dsh_mobile_app/plugin_update_status.dart';
 import 'package:dsh_mobile_app/screens/settings_screen.dart';
 import 'package:dsh_mobile_app/store.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
@@ -127,4 +134,375 @@ void main() {
     ]);
     expect(rows.last.value, isFalse);
   });
+
+  testWidgets(
+    'always exposes a desktop plugin update entry that checks the host',
+    (tester) async {
+      final requestedPaths = <String>[];
+      String? copied;
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(SystemChannels.platform, (call) async {
+        if (call.method == 'Clipboard.setData') {
+          copied = (call.arguments as Map)['text'] as String?;
+        }
+        return null;
+      });
+      addTearDown(
+        () => messenger.setMockMethodCallHandler(SystemChannels.platform, null),
+      );
+      final api = Api(
+        client: MockClient((request) async {
+          requestedPaths.add(request.url.path);
+          if (request.url.path.endsWith('/api/plugin-update/check')) {
+            return http.Response.bytes(
+              utf8.encode(
+                jsonEncode({
+                  'ok': true,
+                  'pluginUpdate': {
+                    'state': 'up-to-date',
+                    'reason': 'same-version-same-content',
+                    'canSelfUpdate': true,
+                    'installShape': 'npm',
+                    'restartForm': 'systemd',
+                    'transaction': null,
+                    'remote': {'version': '3.2.2-alpha.4'},
+                    'checkLog': [
+                      '# 本机版本 3.2.2-alpha.4 · NPM 通道 alpha',
+                      r'$ npm view @marktrue/dsh-mobile-remote dist-tags --json',
+                      '→ alpha=3.2.2-alpha.4',
+                    ],
+                  },
+                }),
+              ),
+              200,
+            );
+          }
+          return http.Response('{}', 200);
+        }),
+      )..baseUrl = 'https://desktop.example';
+      final store = AppStore(apiClient: api);
+      addTearDown(store.dispose);
+      await store.loadPrefs();
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SettingsScreen(store: store, onReconfigure: () async {}),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final title = find.text('更新电脑端插件');
+      await tester.scrollUntilVisible(
+        title,
+        240,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.pumpAndSettle();
+      expect(title, findsOneWidget, reason: '未知是否有新版时也必须能触发检查');
+      final row = find
+          .ancestor(of: title, matching: find.byType(InkWell))
+          .first;
+      expect(
+        find.descendant(of: row, matching: find.text('检查 ▸')),
+        findsOneWidget,
+      );
+      await tester.tap(row);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+
+      expect(
+        requestedPaths.where((p) => p.endsWith('/api/plugin-update/check')),
+        isNotEmpty,
+      );
+      expect(find.text('电脑端插件已是最新'), findsOneWidget);
+      // 更新详情：与桌面端一致，展示宿主的脱敏 npm 查询/结果，并可复制。
+      final detailsTitle = find.text('最近一次插件更新检查：已是最新');
+      expect(detailsTitle, findsOneWidget);
+      await tester.scrollUntilVisible(
+        detailsTitle,
+        240,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('详情 ▸'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(find.textContaining(r'$ npm view'), findsOneWidget);
+      await tester.tap(
+        find.descendant(
+          of: find.byType(BottomSheet),
+          matching: find.text('复制'),
+        ),
+      );
+      await tester.pump();
+      expect(copied, contains(r'$ npm view @marktrue/dsh-mobile-remote'));
+    },
+  );
+
+  testWidgets('merged update details show install log and failure reason', (
+    tester,
+  ) async {
+    String? copied;
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(SystemChannels.platform, (call) async {
+      if (call.method == 'Clipboard.setData') {
+        copied = (call.arguments as Map)['text'] as String?;
+      }
+      return null;
+    });
+    addTearDown(
+      () => messenger.setMockMethodCallHandler(SystemChannels.platform, null),
+    );
+    final api = Api(
+      client: MockClient((request) async {
+        if (request.url.path.endsWith('/api/plugin-update/log')) {
+          return http.Response.bytes(
+            utf8.encode(
+              jsonEncode({
+                'ok': true,
+                'opId': 'op-fail',
+                'phase': 'failed',
+                'events': [
+                  {
+                    'seq': 1,
+                    'stage': 'staging',
+                    'stream': 'status',
+                    'text': 'NPM plugin update accepted',
+                  },
+                  {
+                    'seq': 2,
+                    'stage': 'failed',
+                    'stream': 'status',
+                    'text': 'Plugin update failed: npm-carrier-plugin-identity-mismatch',
+                  },
+                ],
+              }),
+            ),
+            200,
+          );
+        }
+        return http.Response('{}', 200);
+      }),
+    )..baseUrl = 'https://desktop.example';
+    api.pluginUpdate = PluginUpdateStatus.fromJson({
+      'state': 'unavailable',
+      'reason': 'update-failed',
+      'canSelfUpdate': true,
+      'checkLog': [
+        '# 本机版本 3.2.1-alpha.3 · NPM 通道 alpha',
+        r'$ npm view @marktrue/dsh-mobile-remote dist-tags --json',
+        '→ alpha=3.2.2-alpha.6',
+      ],
+      'transaction': {
+        'opId': 'op-fail',
+        'phase': 'failed',
+        'targetVersion': '3.2.2-alpha.6',
+        'targetContentSha256': List.filled(64, 'b').join(),
+        'result': {
+          'ok': false,
+          'reason': 'npm-carrier-plugin-identity-mismatch',
+        },
+      },
+    });
+    final store = AppStore(apiClient: api);
+    addTearDown(store.dispose);
+    await store.loadPrefs();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SettingsScreen(store: store, onReconfigure: () async {}),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final title = find.text('最近一次插件更新：失败');
+    await tester.scrollUntilVisible(
+      title,
+      240,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('详情 ▸'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pump(const Duration(milliseconds: 50));
+
+    expect(find.byType(BottomSheet), findsOneWidget);
+    // 检查详情、安装详情、失败原因三部分都在同一个详情里。
+    expect(find.textContaining(r'$ npm view'), findsOneWidget);
+    expect(find.textContaining('安装详情'), findsOneWidget);
+    expect(
+      find.textContaining(
+        'Plugin update failed: npm-carrier-plugin-identity-mismatch',
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: find.byType(BottomSheet),
+        matching: find.textContaining('载体清单与 NPM 包身份不一致'),
+      ),
+      findsOneWidget,
+    );
+    final copyButton = find.descendant(
+      of: find.byType(BottomSheet),
+      matching: find.text('复制'),
+    );
+    await tester.tap(copyButton);
+    await tester.pump();
+    expect(copied, contains('npm-carrier-plugin-identity-mismatch'));
+    expect(copied, contains(r'$ npm view'));
+  });
+
+  testWidgets('update progress card shows live stage, timeline and target', (
+    tester,
+  ) async {
+    final startedAt = DateTime.now().toUtc().toIso8601String();
+    final statusJson = {
+      'state': 'restarting',
+      'reason': 'update-staged',
+      'canSelfUpdate': true,
+      'transaction': {
+        'opId': 'op-live',
+        'phase': 'installing',
+        'targetVersion': '3.2.2-alpha.11',
+        'targetContentSha256': List.filled(64, 'b').join(),
+        'targetAppVersion': '3.2.2+35',
+        'startedAt': startedAt,
+      },
+    };
+    final api = Api(
+      client: MockClient((request) async {
+        final path = request.url.path;
+        if (path.endsWith('/api/bootstrap')) {
+          return http.Response(
+            jsonEncode({'pluginUpdate': statusJson, 'currentRelease': null}),
+            200,
+          );
+        }
+        if (path.endsWith('/api/plugin-update/log')) {
+          return http.Response(
+            jsonEncode({
+              'ok': true,
+              'opId': 'op-live',
+              'phase': 'installing',
+              'lastSeq': 1,
+              'events': [
+                {
+                  'seq': 1,
+                  'stage': 'install',
+                  'stream': 'status',
+                  'text': 'pnpm install',
+                },
+              ],
+            }),
+            200,
+          );
+        }
+        return http.Response('{}', 200);
+      }),
+    )..baseUrl = 'https://desktop.example';
+    api.pluginUpdate = PluginUpdateStatus.fromJson(statusJson);
+    final store = AppStore(apiClient: api);
+    addTearDown(store.dispose);
+    await store.loadPrefs();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SettingsScreen(store: store, onReconfigure: () async {}),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+    await tester.scrollUntilVisible(
+      find.text('更新电脑端插件'),
+      240,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.pump();
+
+    final cardTitle = find.textContaining('安装依赖');
+    expect(cardTitle, findsWidgets, reason: '进度卡片应显示当前安装阶段');
+    expect(find.textContaining('重启宿主'), findsOneWidget, reason: '时间线包含后续阶段');
+    expect(find.textContaining('目标：插件 v3.2.2-alpha.11'), findsOneWidget);
+    expect(find.textContaining('详情 ▸'), findsOneWidget);
+
+    // 结束轮询计时器。
+    await tester.pumpWidget(const SizedBox());
+    await tester.pump();
+  });
+
+  testWidgets(
+    'settled update waits for host fixed release before showing completion',
+    (tester) async {
+      final startedAt = DateTime.now().toUtc().toIso8601String();
+      final statusJson = {
+        'state': 'up-to-date',
+        'reason': 'content-identical',
+        'canSelfUpdate': true,
+        'transaction': {
+          'opId': 'op-settled',
+          'phase': 'settled',
+          'targetVersion': '3.2.2-alpha.15',
+          'targetContentSha256': List.filled(64, 'b').join(),
+          'targetAppVersion': '3.2.2+39',
+          'startedAt': startedAt,
+          'result': {'ok': true},
+        },
+      };
+      final api = Api(
+        client: MockClient((request) async {
+          if (request.url.path.endsWith('/api/bootstrap')) {
+            // 宿主已 settled，但载体导入尚未完成：没有 currentRelease / appArtifact。
+            return http.Response(
+              jsonEncode({
+                'plugin': {
+                  'version': '3.2.2-alpha.15',
+                  'contentSha256': List.filled(64, 'b').join(),
+                },
+                'pluginUpdate': statusJson,
+                'currentRelease': null,
+                'appArtifact': null,
+              }),
+              200,
+            );
+          }
+          return http.Response('{}', 200);
+        }),
+      )..baseUrl = 'https://desktop.example';
+      api.pluginUpdate = PluginUpdateStatus.fromJson(statusJson);
+      api.pluginContentSha256 = List.filled(64, 'b').join();
+      final store = AppStore(apiClient: api);
+      addTearDown(store.dispose);
+      await store.loadPrefs();
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SettingsScreen(store: store, onReconfigure: () async {}),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 1));
+      await tester.scrollUntilVisible(
+        find.text('更新电脑端插件'),
+        240,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.pump();
+
+      expect(find.textContaining('等待电脑端发布就绪'), findsOneWidget);
+      expect(find.textContaining('正在导入/校验 App 载体'), findsOneWidget);
+
+      await tester.pumpWidget(const SizedBox());
+      await tester.pump();
+    },
+  );
 }

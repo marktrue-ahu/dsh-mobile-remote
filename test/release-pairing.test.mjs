@@ -296,6 +296,8 @@ test("正常顺序：先插件 tgz 后载体；清单/载体/APK/tgz 四者一�
 		assert.equal(carrierPkg.name, PLUGIN_NAME);
 		assert.equal(carrierPkg.version, CARRIER_VERSION);
 		assert.equal(carrierPkg.dsh.appCarrier, true);
+		assert.equal(carrierPkg.appVersion, manifest.app.version, "carrier NPM metadata must expose the paired App version/build");
+		assert.equal(carrierPkg.pluginContentSha256, manifest.plugin.contentSha256, "carrier NPM metadata must expose the paired plugin content identity");
 		assert.deepEqual(
 			[...carrierPkg.files].sort(),
 			[APK_FILE, "LICENSE", "README.md", "manifest.json"].sort(),
@@ -658,6 +660,8 @@ test("publish-carrier-check FAIL：非法发布元数据（tag/private/access/�
 			{ label: "private-true", reason: "carrier-publish-private-not-false", mutate: (pkg) => { pkg.private = true; } },
 			{ label: "access-restricted", reason: "carrier-publish-access-not-public", mutate: (pkg) => { pkg.publishConfig.access = "restricted"; } },
 			{ label: "version-skew", reason: "carrier-version-pairing-mismatch", mutate: (pkg) => { pkg.version = "3.2.1-app"; } },
+			{ label: "app-version-mismatch", reason: "carrier-publish-app-version-mismatch", mutate: (pkg) => { pkg.appVersion = "3.2.1+1"; } },
+			{ label: "plugin-content-hash-mismatch", reason: "carrier-publish-plugin-content-sha256-mismatch", mutate: (pkg) => { pkg.pluginContentSha256 = "f".repeat(64); } },
 		];
 		for (const variant of variants) {
 			const extracted = await extractCarrier(f, `publish-${variant.label}`);
