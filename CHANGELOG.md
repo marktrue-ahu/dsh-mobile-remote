@@ -1,8 +1,35 @@
 # Changelog
 
-## v3.2.2-alpha.1（build 26，issue #39）— NPM-only 自动更新（桌面 + 手机）
+## v3.2.2-alpha.1（build 26，issue #39 + upstream v3.2.2）— NPM-only 自动更新 + 上游 v3.2.2 并入
 
 > 插件 `3.2.2-alpha.1` / App `3.2.2+26` / 载体 `3.2.2-alpha.1-app`。本 fork 的独立预发布线；仅发布到本地 registry 做本机验收，不触发公共 npm 发布或 tag。
+
+### 随上游并入的改动（main v3.2.2 基线，`09dd2934`）
+
+本分支基于 upstream/main 的 v3.2.2 发布提交，以下上游已交付内容一并保留：
+
+#### 审批兜底（真机验收修复）
+
+- 下游返回 `unavailable` 不再抢先应答：仅在桌面给出**真实答复**时才收手机卡；下游 unavailable 时保留手机条目，等 `/respond` 或手机侧 fail-close 超时给出最终结果。
+- 回归覆盖：下游立即 unavailable 时手机仍可作答，且结果以手机为准。
+
+#### 对话轮次导航（PR #42）
+
+- 一期：对话页右侧刻度轨按轮次跳转；长会话定位修复（尺寸缓存、有符号估算、尝试次数上界、尾部安全网）。
+- 二期：接入宿主 `turnOutline` 投影，未加载轮次以短淡刻度显示，点它按 200 条/页有界跨页加载后定位；用户主动滚动即取消，四种终止结果均有明确说明。
+- 新增只读端点 `GET /m/api/turn-outline?sessionId=`：四态（`available` / `empty` / `capability-missing` / `read-failed`）+ 稳定错误码、5 秒有界等待、冷折叠串行（并发 1）+ 有界队列（8）、按体积 256 KB 截断并显式标 `truncated`。
+- 能力位 `capabilities.turnOutline` 按宿主是否真的挂载投影判定；旧插件/旧 App 双方都能降级到既有行为；长会话跨页跳转的限制如实标注。
+
+#### App 在线本地通知（#46）
+
+- SSE 在线且 App **不在前台**时，`approval/requested` 与 `question/requested` 直接弹系统本地通知（Android 13+ 首次启动请求通知权限）；点通知直达该会话的待办卡。
+- 同一 `rpcId` 5 分钟内只提醒一次（SSE 重连/回放会重放未结算帧）；回到前台自动清掉系统通知；`pushUrls` 退为「App 被杀/离线」时的兜底。
+- Android 构建开启 core library desugaring（`desugar_jdk_libs 2.1.5`），满足通知库要求。
+
+#### 二维码地址优选（#49）
+
+- 新增纯函数 `orderQrAddresses`：默认仍是「局域网私有地址优先」；**仅当机器上没有任何 `10./192.168.x/172.16-31` 地址时**，才把 Tailscale CGNAT（`100.64/10`）提到最前。
+- 7 项回归覆盖排序与端到端载荷选择；`docs/03-api.md` 同步。
 
 ### 更新源与安全
 
@@ -20,6 +47,10 @@
 - 完成后等待宿主固定 App 发布就绪再显示完成；「检查 App 更新」自动接续，无需回首页刷新。
 - 历史失败/未确认事务不再阻塞 App 更新；APK 按 sha 复用，安装未完成给出可执行指引。
 - 桌面「连接移动端」同步显示阶段文本与最新输出。
+
+### 其他随分支并入
+
+- Git 标签页设置顺序与 SSE 取消回归覆盖补齐。
 
 ### 平台
 
