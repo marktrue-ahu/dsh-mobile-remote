@@ -293,15 +293,45 @@ class Updater {
     Directory? temporaryDirectory,
   }) async {
     final connection = apiClient ?? api;
-    // ── 下载 ──
     final dir = temporaryDirectory ?? await getTemporaryDirectory();
     final updateDir = Directory('${dir.path}/dsh-update');
     await updateDir.create(recursive: true);
-    final target = File(
-      '${updateDir.path}/dsh-update-${DateTime.now().millisecondsSinceEpoch}.apk',
-    );
+    // 固定缓存名：同一份目标只下载一次。上一次已校验过的 APK 可直接复用，
+    // 避免“安装器被取消/未完成 → 重试又要重新下载 70+MB”。
+    final cacheKey = (candidate.sha256?.trim().isNotEmpty ?? false)
+        ? candidate.sha256!.trim().toLowerCase()
+        : candidate.version.replaceAll(RegExp(r'[^0-9A-Za-z._-]'), '_');
+    final target = File('${updateDir.path}/dsh-update-$cacheKey.apk');
 
-    // 取消即清理：删除半成品并收敛为 'cancelled'（UI 已自行展示取消态）
+    Future<String> fileSha256(File file) async {
+      final acc = AccumulatorSink<Digest>();
+      await sha256.bind(file.openRead()).fold<AccumulatorSink<Digest>>(acc, (
+        a,
+        d,
+      ) {
+        a.add(d);
+        return a;
+      });
+      return acc.events.single.toString();
+    }
+
+    Future<bool> cachedUsable() async {
+      try {
+        if (!await target.exists() || await target.length() == 0) return false;
+        if (candidate.sizeBytes != null &&
+            candidate.sizeBytes! > 0 &&
+            await target.length() != candidate.sizeBytes) {
+          return false;
+        }
+        if (candidate.sha256 != null && candidate.sha256!.isNotEmpty) {
+          return await fileSha256(target) == candidate.sha256!.toLowerCase();
+        }
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+
     Future<String> abortCancelled() async {
       try {
         if (await target.exists()) await target.delete();
@@ -312,67 +342,63 @@ class Updater {
     http.Client? client;
     IOSink? sink;
     try {
-      onStage?.call('download');
-      final req = http.Request('GET', Uri.parse(candidate.downloadUrl));
-      req.headers.addAll(connection.artifactHeaders(req.url));
-      client = downloadClient ?? http.Client();
-      if (cancel != null) cancel._client = client;
-      final resp = await client.send(req).timeout(const Duration(seconds: 30));
-      if (resp.statusCode != 200) {
-        // 固定目标的稳定错误码（410/404/400/503/401）：分类收敛，供接续出口使用。
-        final failure = await _artifactFailureFromResponse(resp);
-        onFailure?.call(failure);
-        return failure.message;
-      }
-      final total = resp.contentLength ?? candidate.sizeBytes;
-      sink = target.openWrite();
-      var received = 0;
-      await for (final chunk in resp.stream) {
-        if (cancel?.cancelled == true) break;
-        sink.add(chunk);
-        received += chunk.length;
-        onProgress?.call(received, total);
-      }
-      await sink.flush();
-      await sink.close();
-      sink = null;
-      if (cancel?.cancelled == true) return await abortCancelled();
-      if (!await target.exists() || await target.length() == 0) {
-        return '下载失败：文件为空';
-      }
       bool wasCancelled() => cancel?.cancelled == true;
-
-      // ── 字节数校验：以**发布清单声明的 size** 为准，不看响应的 Content-Length ──
-      // （同 URL 被替换成另一份产物时，Content-Length 会跟着变，只信它就等于没校验。）
-      if (candidate.sizeBytes != null && candidate.sizeBytes! > 0) {
-        final actual = await target.length();
-        if (actual != candidate.sizeBytes) {
-          await target.delete();
-          return '校验失败：文件大小与发布清单不一致（$actual ≠ ${candidate.sizeBytes}），已取消';
-        }
-      }
-
-      // ── sha256 校验（主机源 manifest 提供；GitHub 无 -> 跳过） ──
-      if (candidate.sha256 != null && candidate.sha256!.isNotEmpty) {
+      var reused = await cachedUsable();
+      if (reused) {
         onStage?.call('checksum');
+        final size = await target.length();
+        onProgress?.call(size, candidate.sizeBytes ?? size);
+      } else {
+        onStage?.call('download');
+        final req = http.Request('GET', Uri.parse(candidate.downloadUrl));
+        req.headers.addAll(connection.artifactHeaders(req.url));
+        client = downloadClient ?? http.Client();
+        if (cancel != null) cancel._client = client;
+        final resp = await client
+            .send(req)
+            .timeout(const Duration(seconds: 30));
+        if (resp.statusCode != 200) {
+          final failure = await _artifactFailureFromResponse(resp);
+          onFailure?.call(failure);
+          return failure.message;
+        }
+        final total = resp.contentLength ?? candidate.sizeBytes;
+        sink = target.openWrite();
+        var received = 0;
+        await for (final chunk in resp.stream) {
+          if (wasCancelled()) break;
+          sink.add(chunk);
+          received += chunk.length;
+          onProgress?.call(received, total);
+        }
+        await sink.flush();
+        await sink.close();
+        sink = null;
         if (wasCancelled()) return await abortCancelled();
-        final acc = AccumulatorSink<Digest>();
-        await sha256.bind(target.openRead()).fold<AccumulatorSink<Digest>>(
-          acc,
-          (a, d) {
-            a.add(d);
-            return a;
-          },
-        );
-        final digest = acc.events.single.toString();
-        if (digest != candidate.sha256!.toLowerCase()) {
-          await target.delete();
-          return '校验失败：文件与发布清单不一致，已取消';
+        if (!await target.exists() || await target.length() == 0) {
+          return '下载失败：文件为空';
+        }
+        // 字节数校验：以发布清单声明的 size 为准，不看 Content-Length。
+        if (candidate.sizeBytes != null && candidate.sizeBytes! > 0) {
+          final actual = await target.length();
+          if (actual != candidate.sizeBytes) {
+            await target.delete();
+            return '校验失败：文件大小与发布清单不一致（$actual ≠ ${candidate.sizeBytes}），已取消';
+          }
+        }
+        if (candidate.sha256 != null && candidate.sha256!.isNotEmpty) {
+          onStage?.call('checksum');
+          if (wasCancelled()) return await abortCancelled();
+          final digest = await fileSha256(target);
+          if (digest != candidate.sha256!.toLowerCase()) {
+            await target.delete();
+            return '校验失败：文件与发布清单不一致，已取消';
+          }
         }
       }
       if (wasCancelled()) return await abortCancelled();
 
-      // ── 签名预检（自身 vs 下载 APK；任一读取失败 → 保守取消） ──
+      // 签名预检（自身 vs 下载 APK；任一读取失败 → 保守取消）。
       onStage?.call('signature');
       final own = await NativeUpdate.ownSignatureSha256();
       final apk = await NativeUpdate.apkSignatureSha256(target.path);
@@ -386,25 +412,20 @@ class Updater {
         return '签名不一致，已取消更新（请先卸载旧版，或使用同签名版本）';
       }
 
-      // ── 拉起安装器前复核（§5.9）：无法复核时不用旧缓存证明启动安装 ──
+      // 拉起安装器前复核（§5.9）：无法复核时不用旧缓存证明启动安装。
+      // 已校验的 APK 保留，重试时可直接复用，不再重新下载。
       if (beforeInstall != null) {
         final blocked = await beforeInstall();
-        if (blocked != null && blocked.isNotEmpty) {
-          await target.delete();
-          return blocked;
-        }
+        if (blocked != null && blocked.isNotEmpty) return blocked;
       }
       if (wasCancelled()) return await abortCancelled();
 
-      // ── 安装（拉起系统安装器；最终核对交给系统 + 下次启动的真实版本） ──
       onStage?.call('install');
       await NativeUpdate.installApk(target.path);
       return null;
     } catch (e) {
       AppLog.instance.log('Update: 下载/安装失败 $e');
-      // 用户取消触发的中断（close 流）不算失败——收敛为 cancelled
       if (cancel?.cancelled == true) return await abortCancelled();
-      final err = '$e';
       try {
         if (sink != null) {
           await sink.close();
@@ -414,7 +435,7 @@ class Updater {
       try {
         if (await target.exists()) await target.delete();
       } catch (_) {}
-      return '更新失败：$err';
+      return '更新失败：$e';
     } finally {
       try {
         client?.close();
