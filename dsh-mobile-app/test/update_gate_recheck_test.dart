@@ -22,6 +22,17 @@ const oldHash =
 const hostBase = 'http://192.168.1.5:3080';
 const mount = '/m';
 const journalKey = 'dsh_mr_plugin_update_journal';
+String nullReleaseJournal() => jsonEncode({
+  'opId': 'op-1',
+  'targetVersion': '3.3.0',
+  'targetContentSha256': pluginHash,
+  'startedAt': DateTime.now().toUtc().toIso8601String(),
+  'attempts': 0,
+  'phase': UpdatePhase.pluginConfirmed,
+  'manifestUrl': '',
+  'appVersion': '',
+});
+
 String staleRetryJournal() => jsonEncode({
   'opId': 'op-stale-retry',
   'targetVersion': '3.2.2-alpha.6',
@@ -447,5 +458,47 @@ void main() {
     expect(outcome.candidate, isNull);
     expect(outcome.error, isNotNull);
     expect(store.pluginUpdateJournal, isNotNull, reason: '插件仍有候选时不得丢弃待处理记录');
+  });
+
+  test('手机 journal 缺快照但宿主事务已 settled：检查前自动接续并放出 App 候选', () async {
+    SharedPreferences.setMockInitialValues({journalKey: nullReleaseJournal()});
+    final client = Api(
+      client: MockClient(
+        (_) async => http.Response(
+          jsonEncode(
+            bootstrapJson(
+              state: 'up-to-date',
+              transaction: {
+                'opId': 'op-1',
+                'phase': 'settled',
+                'targetVersion': '3.3.0',
+                'targetContentSha256': pluginHash,
+                'targetAppVersion': '3.3.0+55',
+                'rolledBack': false,
+                'result': {'ok': true},
+              },
+            ),
+          ),
+          200,
+        ),
+      ),
+    )..baseUrl = hostBase;
+    final store = storeFor(client);
+    addTearDown(store.dispose);
+    await store.loadPrefs();
+    // 模拟“只把状态字段刷新了、还没触发接续回调”的中间态。
+    client.absorbUpdateState(await client.getJson('/api/bootstrap'));
+    expect(
+      store.pluginUpdateJournal?.release,
+      isNull,
+      reason: '初始 journal 只有目标版本，没有快照',
+    );
+
+    final outcome = await Updater.check(store);
+    expect(outcome.error, isNull);
+    expect(outcome.candidate, isNotNull, reason: '接续完成后应能拿到 App 候选');
+    final journal = store.pluginUpdateJournal;
+    expect(journal?.release, isNotNull, reason: '应从宿主 currentRelease 恢复固定快照');
+    expect(journal?.phase, UpdatePhase.appPending);
   });
 }
