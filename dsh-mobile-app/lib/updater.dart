@@ -6,11 +6,13 @@
 // 宿主投影的固定目标绝对地址；App 只消费该字段（固定目标的 query 由宿主拼好）。
 import 'dart:convert';
 import 'dart:io';
+
 import 'package:convert/convert.dart';
 import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
+
 import 'api.dart';
 import 'logger.dart';
 import 'native_update.dart';
@@ -147,7 +149,8 @@ String hostCheckErrorMessage(ApiException e) {
   }
 }
 
-typedef UpdateInstaller = Future<String?> Function(UpdateCandidate candidate, {
+typedef UpdateInstaller = Future<String?> Function(
+  UpdateCandidate candidate, {
   void Function(int received, int? total)? onProgress,
   void Function(String stage)? onStage,
   UpdateCancelToken? cancel,
@@ -170,9 +173,18 @@ class Updater {
     final journal = store.pluginUpdateJournal;
     if (journal != null) {
       if (journal.phase == UpdatePhase.pluginPending) {
-        return const UpdateCheckOutcome(verdict: UpdateVerdict.upToDate, error: '电脑端插件更新尚未健康确认');
+        return const UpdateCheckOutcome(
+          verdict: UpdateVerdict.upToDate,
+          error: '电脑端插件更新尚未健康确认',
+        );
       }
-      return store.checkFixedAppUpdate(journal.release);
+      if (journal.phase == UpdatePhase.pluginRetry &&
+          _hostPluginRecovered(store)) {
+        // 电脑端后来已经完成插件更新（或恢复健康）：旧的“未确认”记录不能继续挡住 App 更新。
+        await store.discardStaleUpdateJournal();
+      } else {
+        return store.checkFixedAppUpdate(journal.release);
+      }
     }
 
     // Only host-provided fixed release snapshots are trusted. There is no source preference
@@ -181,7 +193,19 @@ class Updater {
     if (pointer != null) return store.checkFixedAppUpdate(pointer.release);
     final fromManifest = await _checkHostManifest(store);
     if (fromManifest != null) return fromManifest;
-    return UpdateCheckOutcome(verdict: UpdateVerdict.upToDate, error: _noFixedReleaseMessage());
+    return UpdateCheckOutcome(
+      verdict: UpdateVerdict.upToDate,
+      error: _noFixedReleaseMessage(),
+    );
+  }
+
+  /// 宿主插件已恢复健康且没有新候选：手机端残留的 pluginRetry 记录可以安全退出。
+  static bool _hostPluginRecovered(AppStore store) {
+    final status = store.api.pluginUpdate;
+    if (status.contentUpdateAvailable) return false;
+    final tx = status.transaction;
+    if (tx != null && (tx.rolledBack || tx.phase != 'settled')) return false;
+    return store.hostReleasePointer != null;
   }
 
   /// 主机目录清单（人工区 / 旧宿主兼容）。返回 null = 旧宿主没有可用清单，交给上层兜底。
@@ -202,10 +226,16 @@ class Updater {
           e.code == 'update-manifest-missing') {
         return null;
       }
-      return UpdateCheckOutcome(verdict: UpdateVerdict.upToDate, error: hostCheckErrorMessage(e));
+      return UpdateCheckOutcome(
+        verdict: UpdateVerdict.upToDate,
+        error: hostCheckErrorMessage(e),
+      );
     } catch (e) {
       AppLog.instance.log('Update: 主机清单检查失败 $e');
-      return UpdateCheckOutcome(verdict: UpdateVerdict.upToDate, error: '主机源检查失败：$e');
+      return UpdateCheckOutcome(
+        verdict: UpdateVerdict.upToDate,
+        error: '主机源检查失败：$e',
+      );
     }
   }
 
@@ -260,7 +290,9 @@ class Updater {
     final dir = temporaryDirectory ?? await getTemporaryDirectory();
     final updateDir = Directory('${dir.path}/dsh-update');
     await updateDir.create(recursive: true);
-    final target = File('${updateDir.path}/dsh-update-${DateTime.now().millisecondsSinceEpoch}.apk');
+    final target = File(
+      '${updateDir.path}/dsh-update-${DateTime.now().millisecondsSinceEpoch}.apk',
+    );
 
     // 取消即清理：删除半成品并收敛为 'cancelled'（UI 已自行展示取消态）
     Future<String> abortCancelled() async {
@@ -318,10 +350,13 @@ class Updater {
         onStage?.call('checksum');
         if (wasCancelled()) return await abortCancelled();
         final acc = AccumulatorSink<Digest>();
-        await sha256.bind(target.openRead()).fold<AccumulatorSink<Digest>>(acc, (a, d) {
-          a.add(d);
-          return a;
-        });
+        await sha256.bind(target.openRead()).fold<AccumulatorSink<Digest>>(
+          acc,
+          (a, d) {
+            a.add(d);
+            return a;
+          },
+        );
         final digest = acc.events.single.toString();
         if (digest != candidate.sha256!.toLowerCase()) {
           await target.delete();
@@ -381,7 +416,9 @@ class Updater {
   }
 
   /// 读取固定目标下载的错误响应体（`{error, detail}`）并分类。
-  static Future<UpdateFailure> _artifactFailureFromResponse(http.StreamedResponse resp) async {
+  static Future<UpdateFailure> _artifactFailureFromResponse(
+    http.StreamedResponse resp,
+  ) async {
     String? code;
     var detail = '';
     try {
