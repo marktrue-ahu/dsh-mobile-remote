@@ -1,6 +1,6 @@
 # Git 浏览增强：全量标签、结构化 refs、统一文件查看器与文件提交历史
 
-> 状态：设计定稿，待实现（上游 PR：`feature/git-browser-upgrade` → `github/main`）。
+> 状态：设计定稿，待实现（上游 PR：`upstream/git-browser-upgrade` → `201222-L/dsh-mobile-remote:main`，从已同步的 `main` 开）。
 > 相关：[`mobile-git.md`](mobile-git.md)、[`../03-api.md`](../03-api.md)。
 
 ## Problem Statement
@@ -44,10 +44,13 @@
 
 ### 上游与交付
 
-- 基于 `github/main` 新建 `feature/git-browser-upgrade`，PR 到 `main`；单 PR 同时包含 host 插件与 Android App；桌面端不改。
+- 这是**上游贡献**，不是 fork 内部功能：要求本地 `main == github/main == origin/main`，用 `tools/worktree.sh create <issue> git-browser-upgrade --target upstream-main` 建树，分支为 `upstream/git-browser-upgrade`。
+- PR 从 GitHub fork `marktrue-ahu/dsh-mobile-remote` 提到上游 `201222-L/dsh-mobile-remote:main`；单 PR 同时包含 host 插件与 Android App；桌面端不改。
+- PR 只包含相对 `main` 的自包含补丁，不携带 develop 未上游化的功能，不 bump/release app 或 npm 版本。
+- **PR diff 不得新增/修改** `AGENTS.md`、`AGENT-RULES.md`、`CONTEXT.md`、`docs/adr/`、`docs/agents/`、`docs/design/`；本设计稿只作为 develop 决策记录，不进入上游 PR。`docs/03-api.md` 的增量补充可以进 PR。
 - PR 内 3 个提交：host API/契约 → App 统一查看器与结构化 refs 展示 → file-history tab/独立页/深链。
-- 必带 Node + Flutter 测试、设计/API 文档增量更新、CHANGELOG `Unreleased`。
-- 上游合并后回填 fork 的 develop/release 线另开任务，不在本 PR 内。
+- 必带 Node + Flutter 测试、API 文档增量更新、CHANGELOG `Unreleased`。
+- 上游合并后：先在 GitHub Sync fork，再 `tools/worktree.sh integrate` 只快进 main 镜像；回填 fork 的 develop/release 线另开任务，不在本 PR 内。
 
 ### Host 契约（`contractVersion 1.1.0`）
 
