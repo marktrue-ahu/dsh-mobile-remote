@@ -821,23 +821,20 @@ test("预发布核心版本不配对被拒：App core 必须等于插件 core（
 	}
 });
 
-test("npm publish workflow routes prereleases to their channel without moving latest", async () => {
+test("npm publish workflow routes prereleases to their channel and auto-advances latest monotonically", async () => {
 	const workflow = await readFile(join(ROOT, ".github", "workflows", "publish-npm.yml"), "utf8");
 	assert.match(workflow, /npm publish "\$plugin_file"[\s\S]*?--tag "\$PLUGIN_TAG"/,
 		"plugin publish must use the tag derived by pluginPublishTag");
 	assert.match(workflow, /npm dist-tag add "\$PACKAGE_NAME@\$\{?PLUGIN_VERSION\}?" "\$PLUGIN_TAG"/,
 		"dist-tag update must use the same dynamic channel");
-	const latestSnapshot = workflow.indexOf('echo "LATEST_BEFORE=$latest_version"');
-	const pluginStepStart = workflow.indexOf("- name: Publish plugin (computed release channel)");
-	const channelStepStart = workflow.indexOf("- name: Set and verify plugin channel and app tags");
-	assert.ok(latestSnapshot >= 0 && latestSnapshot < pluginStepStart, "snapshot latest before publishing the carrier or plugin");
-	assert.ok(pluginStepStart >= 0 && channelStepStart > pluginStepStart, "plugin publish steps must be ordered");
-	const pluginStep = workflow.slice(pluginStepStart, channelStepStart);
-	assert.match(pluginStep, /latest_now="\$\(npm view "\$PACKAGE_NAME" dist-tags\.latest/,
-		"re-read latest immediately before plugin publication");
-	assert.match(pluginStep, /if \[\[ "\$latest_now" != "\$LATEST_BEFORE" \]\]/,
-		"stop if the carrier publish moved latest");
+	// latest 自动前进：先比较当前 latest 与本次版本，只允许向前移动。
+	assert.match(workflow, /latest_decision="\$\(node --input-type=module -e '[\s\S]*?' "\$PLUGIN_VERSION" "\$current_latest"\)"/,
+		"workflow must compute a monotonic latest decision");
+	assert.match(workflow, /if \[\[ "\$latest_decision" == "move" \]\]; then[\s\S]*?npm dist-tag add "\$PACKAGE_NAME@\$PLUGIN_VERSION" latest/,
+		"workflow must move latest only when the release is newer");
+	assert.match(workflow, /latest dist-tag stays at newer\/equal version/,
+		"workflow must keep a newer latest instead of rolling it back");
+	assert.match(workflow, /latest is older than this release/,
+		"verification must reject a latest older than the released version");
 	assert.doesNotMatch(workflow, /--tag latest/, "publish must not hardcode latest");
-	assert.doesNotMatch(workflow, /npm dist-tag add "\$PACKAGE_NAME@\$\{?PLUGIN_VERSION\}?" latest/,
-		"latest must not be moved unconditionally");
 });
