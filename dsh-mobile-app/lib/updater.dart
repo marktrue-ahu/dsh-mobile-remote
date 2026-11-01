@@ -170,7 +170,14 @@ class Updater {
 
   /// 检查更新：只消费宿主给出的固定发布 / 主机清单，不直连 GitHub。
   static Future<UpdateCheckOutcome> check(AppStore store) async {
-    final journal = store.pluginUpdateJournal;
+    var journal = store.pluginUpdateJournal;
+    if (journal != null && journal.release == null) {
+      // 旧 journal 可能只差“接续”：先按宿主当前状态推进一次，再决定是否能检查 App。
+      try {
+        await store.resumePluginUpdate();
+      } catch (_) {}
+      journal = store.pluginUpdateJournal;
+    }
     if (journal != null) {
       if (journal.phase == UpdatePhase.pluginPending) {
         return const UpdateCheckOutcome(
