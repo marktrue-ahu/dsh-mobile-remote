@@ -163,10 +163,14 @@ jobs:
               }
               return 0;
             };
-            if (compare(parse(candidateText), parse(currentText)) <= 0) {
+            // 相等表示同一版本已在通道上（上次部分发布后重跑）：允许续跑，由发布步骤跳过
+            // 已存在版本、最终由身份/完整性校验兜底；只有真正回退才拒绝。
+            const order = compare(parse(candidateText), parse(currentText));
+            if (order < 0) {
               console.error(`Refusing ${candidateText}: ${currentText} is already on this dist-tag.`);
               process.exit(1);
             }
+            if (order === 0) console.log(`${candidateText} is already on channel; resuming verification.`);
             ' "$plugin_version" "$channel_version"
           else
             if ! grep -q 'E404' "$channel_log"; then
