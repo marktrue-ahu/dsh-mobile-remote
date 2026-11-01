@@ -1,5 +1,30 @@
 # Changelog
 
+## v3.2.1-rc.1（build 26，issue #39）— NPM-only 自动更新（v3.2.1 线）
+
+> 插件 `3.2.1-rc.1` / App `3.2.1+26` / 载体 `3.2.1-rc.1-app`。本 fork 的 v3.2.1 预发布候选；仅发布到本地 registry 做本机验收，不触发公共 npm 发布或 tag。
+
+### 更新源与安全
+
+- 插件更新唯一来源为宿主有效 npm 配置（`@marktrue:registry` 优先，未设置时用默认 `registry`），手机不直连 npm，registry 凭据不下发。
+- 稳定版跟随 `latest`；预发布跟随自身通道（`alpha` / `rc`）；carrier 使用精确 `<插件完整版本>-app` 并由 `app` tag 约束。
+- 校验 npm `dist.integrity`、插件内容哈希、载体清单、APK 身份与签名；缺 carrier、元数据不一致、降级一律 fail-closed，不改 profile、不触发重启。
+- profile 依赖保持精确 npm 版本，不保留长期 `file:` tarball；回滚恢复更新前精确 spec。
+- 旧 carrier 缺轻量元数据时：仅用户显式操作后准备并校验 carrier，先展示真实 App build，再要求最终确认；最终 POST 前不改 profile。
+
+### 手机 / 桌面
+
+- 移除 App 更新源菜单；App-only 入口改名「检查 App 更新」。
+- 插件更新详情与安装日志合并为可折叠、可复制的脱敏面板，按 opId + 序号回放，重启后仍可查看。
+- 新增「更新进度」卡片：六步时间线、当前阶段、已用时、目标版本、最近一行 pnpm 输出；失败直接显示可读原因与稳定码。
+- 完成后等待宿主固定 App 发布就绪再显示完成；「检查 App 更新」自动接续，无需回首页刷新。
+- 历史失败/未确认事务不再阻塞 App 更新；APK 按 sha 复用，安装未完成给出可执行指引。
+- 桌面「连接移动端」同步显示阶段文本与最新输出。
+
+### 平台
+
+- Windows：npm/pnpm 经 shell 调用，缺失客户端给出稳定原因；桌面原生自更新仍受 `restart-unsupported` 限制（Linux/WSL 宿主可完成自更新）。
+
 ## v3.2.1-alpha.3（2026-10-26）— Android release 签名密钥迁移
 
 > 插件 `3.2.1-alpha.3` / App `3.2.1+25` / 载体 `3.2.1-alpha.3-app`。插件更新 `alpha` dist-tag；`latest` 保持在 alpha1。
