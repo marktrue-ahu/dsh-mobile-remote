@@ -437,4 +437,72 @@ void main() {
     await tester.pumpWidget(const SizedBox());
     await tester.pump();
   });
+
+  testWidgets(
+    'settled update waits for host fixed release before showing completion',
+    (tester) async {
+      final startedAt = DateTime.now().toUtc().toIso8601String();
+      final statusJson = {
+        'state': 'up-to-date',
+        'reason': 'content-identical',
+        'canSelfUpdate': true,
+        'transaction': {
+          'opId': 'op-settled',
+          'phase': 'settled',
+          'targetVersion': '3.2.2-alpha.15',
+          'targetContentSha256': List.filled(64, 'b').join(),
+          'targetAppVersion': '3.2.2+39',
+          'startedAt': startedAt,
+          'result': {'ok': true},
+        },
+      };
+      final api = Api(
+        client: MockClient((request) async {
+          if (request.url.path.endsWith('/api/bootstrap')) {
+            // 宿主已 settled，但载体导入尚未完成：没有 currentRelease / appArtifact。
+            return http.Response(
+              jsonEncode({
+                'plugin': {
+                  'version': '3.2.2-alpha.15',
+                  'contentSha256': List.filled(64, 'b').join(),
+                },
+                'pluginUpdate': statusJson,
+                'currentRelease': null,
+                'appArtifact': null,
+              }),
+              200,
+            );
+          }
+          return http.Response('{}', 200);
+        }),
+      )..baseUrl = 'https://desktop.example';
+      api.pluginUpdate = PluginUpdateStatus.fromJson(statusJson);
+      api.pluginContentSha256 = List.filled(64, 'b').join();
+      final store = AppStore(apiClient: api);
+      addTearDown(store.dispose);
+      await store.loadPrefs();
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SettingsScreen(store: store, onReconfigure: () async {}),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 1));
+      await tester.scrollUntilVisible(
+        find.text('更新电脑端插件'),
+        240,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.pump();
+
+      expect(find.textContaining('等待电脑端发布就绪'), findsOneWidget);
+      expect(find.textContaining('正在导入/校验 App 载体'), findsOneWidget);
+
+      await tester.pumpWidget(const SizedBox());
+      await tester.pump();
+    },
+  );
 }
