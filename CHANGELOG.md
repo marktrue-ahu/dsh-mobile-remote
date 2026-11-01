@@ -1,8 +1,8 @@
 # Changelog
 
-## v3.2.2-alpha.1（build 26，issue #39 + upstream v3.2.2）— NPM-only 自动更新 + 上游 v3.2.2 并入
+## v3.2.2-rc.1（build 27，issue #39 + upstream v3.2.2）— NPM-only 自动更新 + 上游 v3.2.2 并入
 
-> 插件 `3.2.2-alpha.1` / App `3.2.2+26` / 载体 `3.2.2-alpha.1-app`。本 fork 的独立预发布线；仅发布到本地 registry 做本机验收，不触发公共 npm 发布或 tag。
+> 插件 `3.2.2-rc.1` / App `3.2.2+27` / 载体 `3.2.2-rc.1-app`。本 fork 的预发布候选线；经 GitHub Actions 发布到 npm（`rc` dist-tag）。
 
 ### 随上游并入的改动（main v3.2.2 基线，`09dd2934`）
 
