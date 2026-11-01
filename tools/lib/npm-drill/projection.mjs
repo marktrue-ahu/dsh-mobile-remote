@@ -278,7 +278,6 @@ export async function projectCarrier({ sourceTgz, workDir, version, manifest, pl
 	}
 	pkg.version = version;
 	const sanitizedPublishConfig = sanitizePublishConfig(pkg);
-	writePackageJson(root, pkg);
 	// 清单投影：运行时载体发现要求「插件版本是纯 X.Y.Z，且清单 app 版本语义部分 == 插件版本」。
 	// 因此把 app.version 的语义部分投影成演练插件版本、保留原构建号 +N；APK 的 file/size/sha256
 	// 不变（字节还是真实 APK），顶层兼容镜像同步成投影后的 app 段。
@@ -286,6 +285,14 @@ export async function projectCarrier({ sourceTgz, workDir, version, manifest, pl
 	const buildMatch = /^\d+\.\d+\.\d+\+(\d+)$/.exec(sourceAppVersion);
 	if (!buildMatch) return { ok: false, error: `source-app-version-unparsable: ${sourceAppVersion}` };
 	const projectedAppVersion = `${pluginProject.pluginVersion}+${buildMatch[1]}`;
+	// 载体包内的轻量元数据（appVersion / pluginContentSha256）也是载体发现读的字段；
+	// 投影清单却改写这两个值时，包内元数据必须同步改写，否则会误报
+	// carrier-app-version-metadata-mismatch / carrier-plugin-content-sha256-metadata-mismatch。
+	if (typeof pkg.appVersion === "string" && pkg.appVersion !== "") pkg.appVersion = projectedAppVersion;
+	if (typeof pkg.pluginContentSha256 === "string" && pkg.pluginContentSha256 !== "") {
+		pkg.pluginContentSha256 = pluginProject.contentSha256;
+	}
+	writePackageJson(root, pkg);
 	const nextManifest = structuredClone(manifest);
 	nextManifest.app = { ...manifest.app, version: projectedAppVersion };
 	nextManifest.plugin = {
