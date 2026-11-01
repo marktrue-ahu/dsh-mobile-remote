@@ -21,6 +21,17 @@ const oldHash =
     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const hostBase = 'http://192.168.1.5:3080';
 const mount = '/m';
+const journalKey = 'dsh_mr_plugin_update_journal';
+String staleRetryJournal() => jsonEncode({
+  'opId': 'op-stale-retry',
+  'targetVersion': '3.2.2-alpha.6',
+  'targetContentSha256': '',
+  'startedAt': DateTime.now().toUtc().toIso8601String(),
+  'attempts': 0,
+  'phase': UpdatePhase.pluginRetry,
+  'manifestUrl': '',
+  'appVersion': '',
+});
 
 Map<String, dynamic> releaseJson({String version = '3.3.0+55'}) => {
   'schema': 1,
@@ -382,5 +393,59 @@ void main() {
     final pendingGate = pendingStore.appUpdateGate(candidate);
     expect(pendingGate.allowed, isFalse);
     expect(pendingGate.reason, 'plugin-transaction-pending');
+  });
+
+  test('历史 pluginRetry 记录在宿主恢复后自动退出，App 检查继续', () async {
+    SharedPreferences.setMockInitialValues({journalKey: staleRetryJournal()});
+    final client = Api(
+      client: MockClient(
+        (_) async => http.Response(
+          jsonEncode(
+            bootstrapJson(
+              state: 'up-to-date',
+              transaction: {
+                'opId': 'op-settled',
+                'phase': 'settled',
+                'rolledBack': false,
+              },
+            ),
+          ),
+          200,
+        ),
+      ),
+    )..baseUrl = hostBase;
+    final store = storeFor(client);
+    addTearDown(store.dispose);
+    await store.loadPrefs();
+    await absorb(client);
+    expect(store.pluginUpdateJournal, isNotNull, reason: '恢复前确实有历史记录');
+
+    final outcome = await Updater.check(store);
+    expect(outcome.error, isNull, reason: '宿主恢复后不能继续报“缺少固定发布快照”');
+    expect(outcome.candidate, isNotNull);
+    expect(store.pluginUpdateJournal, isNull, reason: '历史 pluginRetry 记录应自动退出');
+  });
+
+  test('宿主插件仍有新候选时，pluginRetry 记录保留并继续要求先处理插件', () async {
+    SharedPreferences.setMockInitialValues({journalKey: staleRetryJournal()});
+    final client = Api(
+      client: MockClient(
+        (_) async => http.Response(
+          jsonEncode(
+            bootstrapJson(state: 'update-available', transaction: null),
+          ),
+          200,
+        ),
+      ),
+    )..baseUrl = hostBase;
+    final store = storeFor(client);
+    addTearDown(store.dispose);
+    await store.loadPrefs();
+    await absorb(client);
+
+    final outcome = await Updater.check(store);
+    expect(outcome.candidate, isNull);
+    expect(outcome.error, isNotNull);
+    expect(store.pluginUpdateJournal, isNotNull, reason: '插件仍有候选时不得丢弃待处理记录');
   });
 }

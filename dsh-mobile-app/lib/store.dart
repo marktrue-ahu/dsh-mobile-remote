@@ -1194,6 +1194,14 @@ class AppStore extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 宿主已恢复健康（PC 端完成更新）后，自动退出手机端残留的未确认记录。
+  Future<void> discardStaleUpdateJournal() async {
+    updateCandidate = null;
+    pluginUpdateNotice = null;
+    await _clearPluginUpdateJournal();
+    notifyListeners();
+  }
+
   /// 用户可见出口（F13）：取消当前两端更新记录，并按当前电脑端状态**重新检查**。
   /// 目标改变、过期（410）、失败、另一事务回滚导致卡住时都走这里。
   Future<void> cancelUpdateAndRecheck() async {
