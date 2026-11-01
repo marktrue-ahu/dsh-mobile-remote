@@ -65,7 +65,7 @@ test("compareVersion 按 SemVer 处理 prerelease（alpha < stable、alpha.2 > a
 	assert.equal(compareVersion("3.2.1-alpha.1", "3.2.1-alpha.1+44"), 0); // build 只在一侧时不参与
 	assert.equal(compareVersion("3.2.1-alpha.1+45", "3.2.1-alpha.1+44"), 1); // 同 prerelease 时 build 参与
 	assert.equal(compareVersion("3.2.1-alpha.1+99", "3.2.1+1"), -1); // prerelease 优先于 build
-	assert.equal(compareVersion("3.2.1-alpha.1", "3.2.2-alpha.1"), -1); // core 优先于 prerelease
+	assert.equal(compareVersion("3.2.1-alpha.1", "3.2.2-alpha.2"), -1); // core 优先于 prerelease
 	// 既有契约不回退
 	assert.equal(compareVersion("3.2.0", "3.2.0"), 0);
 	assert.equal(compareVersion("3.2.0+44", "3.2.0+23"), 1);

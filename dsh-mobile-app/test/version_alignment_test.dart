@@ -99,13 +99,13 @@ void main() {
     test('compareSemanticVersion 只比 core：alpha 不参与两端配对', () {
       expect(compareSemanticVersion('3.2.1-alpha.1', '3.2.1+24'), 0);
       expect(compareSemanticVersion('3.2.1-alpha.2', '3.2.1-alpha.1'), 0);
-      expect(compareSemanticVersion('3.2.2-alpha.1', '3.2.1+24'), 1);
+      expect(compareSemanticVersion('3.2.2-alpha.2', '3.2.1+24'), 1);
       expect(compareSemanticVersion('3.2.0-alpha.1', '3.2.1+24'), -1);
     });
 
     test('core 不同仍能判出该动哪一端（不回退成 unknown）', () {
       expect(
-        computeAlignment(pluginVersion: '3.2.2-alpha.1', appVersion: '3.2.1+24').state,
+        computeAlignment(pluginVersion: '3.2.2-alpha.2', appVersion: '3.2.1+24').state,
         AlignmentState.appOutdated,
       );
       expect(
