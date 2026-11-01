@@ -1176,7 +1176,8 @@ class AppStore extends ChangeNotifier {
       // 安装器已返回但系统尚未完成安装：保留固定目标让它可重试/可取消（F13）。
       updateCandidate = release.candidate;
       pluginUpdateNotice =
-          '尚未确认安装：本机仍是 v$local，目标 v${release.app.version}；记录保留以便重试';
+          '安装尚未完成：请完成系统安装提示（本机仍是 v$local，目标 v${release.app.version}）；'
+          '若未出现安装界面，请允许本应用「安装未知应用」。安装包已保留，可直接重试';
       notifyListeners();
       return;
     }
