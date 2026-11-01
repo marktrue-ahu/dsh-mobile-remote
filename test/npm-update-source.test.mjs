@@ -236,3 +236,44 @@ test("records a sanitized, bounded check log without registry URLs", async () =>
 	assert.ok(successLog.some((line) => line.includes("→ 插件 v" + PLUGIN_VERSION)));
 	assert.ok(successLog.some((line) => line.includes(`→ 载体 v${CARRIER_VERSION} · App build 3.2.2+26`)), JSON.stringify(successLog));
 });
+
+test("rc 预发布跟随 rc 通道，并能解析对应的精确 carrier", async () => {
+	const packageDocs = new Map([
+		[PACKAGE_NAME, { latest: "3.2.1-alpha.3", alpha: "3.2.2-alpha.15", rc: "3.2.2-rc.1" }],
+		[`${PACKAGE_NAME}@3.2.2-rc.1`, {
+			version: "3.2.2-rc.1",
+			dist: { integrity: PLUGIN_INTEGRITY },
+			optionalDependencies: {
+				"@marktrue/dsh-mobile-remote-app": `npm:${PACKAGE_NAME}@3.2.2-rc.1-app`,
+			},
+		}],
+		[`${PACKAGE_NAME}@3.2.2-rc.1-app`, {
+			version: "3.2.2-rc.1-app",
+			appVersion: "3.2.2+40",
+			pluginContentSha256: "d".repeat(64),
+			dist: { integrity: CARRIER_INTEGRITY },
+		}],
+	]);
+	const result = await resolveNpmUpdateCandidate({
+		packageName: PACKAGE_NAME,
+		localVersion: "3.2.2-rc.1",
+		packageView: async (spec) => packageDocs.get(spec) ?? null,
+	});
+	assert.equal(result.ok, true, JSON.stringify(result));
+	assert.equal(result.channel, "rc");
+	assert.equal(result.plugin.version, "3.2.2-rc.1");
+	assert.equal(result.carrier.version, "3.2.2-rc.1-app");
+	assert.equal(result.carrier.appVersion, "3.2.2+40");
+});
+
+test("未知预发布通道仍明确拒绝，不会退回 latest", async () => {
+	const result = await resolveNpmUpdateCandidate({
+		packageName: PACKAGE_NAME,
+		localVersion: "3.2.2-beta.1",
+		packageView: async () => {
+			throw new Error("should-not-be-called");
+		},
+	});
+	assert.equal(result.ok, false);
+	assert.equal(result.reason, "npm-prerelease-channel-unsupported");
+});
