@@ -218,7 +218,7 @@ void main() {
       );
       expect(find.text('电脑端插件已是最新'), findsOneWidget);
       // 更新详情：与桌面端一致，展示宿主的脱敏 npm 查询/结果，并可复制。
-      final detailsTitle = find.text('插件更新详情');
+      final detailsTitle = find.text('最近一次插件更新检查：已是最新');
       expect(detailsTitle, findsOneWidget);
       await tester.scrollUntilVisible(
         detailsTitle,
@@ -226,12 +226,7 @@ void main() {
         scrollable: find.byType(Scrollable).first,
       );
       await tester.pumpAndSettle();
-      final detailsRow = find
-          .ancestor(of: detailsTitle, matching: find.byType(InkWell))
-          .first;
-      await tester.tap(
-        find.descendant(of: detailsRow, matching: find.text('查看 ▸')),
-      );
+      await tester.tap(find.text('详情 ▸'));
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 300));
       expect(find.textContaining(r'$ npm view'), findsOneWidget);
@@ -324,15 +319,14 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
-    final title = find.text('插件更新详情');
+    final title = find.text('最近一次插件更新：失败');
     await tester.scrollUntilVisible(
       title,
       240,
       scrollable: find.byType(Scrollable).first,
     );
     await tester.pumpAndSettle();
-    final row = find.ancestor(of: title, matching: find.byType(InkWell)).first;
-    await tester.tap(find.descendant(of: row, matching: find.text('查看 ▸')));
+    await tester.tap(find.text('详情 ▸'));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
     await tester.pump(const Duration(milliseconds: 50));
