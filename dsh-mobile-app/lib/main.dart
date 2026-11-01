@@ -4,13 +4,18 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'l10n.dart';
 import 'api.dart';
+import 'app_icon_switcher.dart';
 import 'store.dart';
+import 'attention.dart';
 import 'floating.dart';
+import 'keep_alive.dart';
 import 'local_notifications.dart';
+import 'notify_diag.dart';
 import 'theme.dart';
 import 'logger.dart';
 import 'scan_screen.dart';
@@ -67,13 +72,16 @@ void main() async {
     // 版本取不到时对齐提示显示为"无法判定"，不是错误
   }
   await store.loadPrefs();
+  // 桌面图标：把上次选择同步给系统（原生侧已是目标 alias 时不会重复切换）
+  unawaited(AppIconSwitcher.sync(store.appIcon));
   // v2.7.1：启动即把余额预警配置同步给宠物面板（可能已在后台运行，判定以 App 端设置为准）
   unawaited(Floating.setBalanceAlert(store.balanceAlert, store.balanceThreshold));
-  // 桌面宠物配置（大小/减少动态/贴边躲藏）同步给原生服务
+  // 桌面宠物配置（大小/减少动效/贴边躲藏/前台收起）同步给原生服务
   unawaited(Floating.setPetConfig(
     height: store.petHeight,
     reducedMotion: store.petReducedMotion,
     edgeHide: store.petEdgeHide,
+    hideInApp: store.petHideInApp,
   ));
   // v2.7.2：上次开过宠物 → 自动恢复服务（清理后台/重启 App 后无需手动重开）
   unawaited(store.restoreFloating());
@@ -94,6 +102,20 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
   Timer? _bannerTimer;
   DateTime _lastBannerAt = DateTime.fromMillisecondsSinceEpoch(0);
 
+  /// 后台心跳（仅诊断用）：Dart 每 30 秒 +1。
+  /// 与原生服务心跳对照，可判断后台是"整个进程被冻结"还是"只有 Dart 停转"。
+  Timer? _bgBeatTimer;
+
+  /// S2：横幅对应的会话（按会话合并；点击直达该会话）。
+  String? _bannerSessionId;
+  String? _bannerSessionTitle;
+
+  /// M1a：通知去重/撤销的唯一写者。
+  final AttentionLedger _ledger = AttentionLedger();
+
+  /// 当前是否在前台（判据输入之一）。
+  bool _resumed = true;
+
   @override
   void initState() {
     super.initState();
@@ -104,8 +126,18 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
     // 只在 App 不在前台时真正弹出；点击通知走统一 openChat 入口。
     WidgetsBinding.instance.addObserver(this);
     unawaited(LocalNotifier.instance.init());
+    // M2：后台保活（默认关；开启后 onResume 会拉起前台服务）。
+    unawaited(_initKeepAlive());
     LocalNotifier.instance.onOpenSession = (id) =>
         _handleFloatingAction('session:$id');
+    // 冷启动是被通知点开的：回调挂好后再补派发一次（init 早于这里完成）。
+    final pendingOpen = LocalNotifier.instance.consumePendingOpenSession();
+    if (pendingOpen != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        AppLog.instance.log('通知：冷启动补打开 session=$pendingOpen');
+        _handleFloatingAction('session:$pendingOpen');
+      });
+    }
     store.onAttention = (kind, sessionId, rpcId, toolName, reason, prompt) {
       String? title;
       for (final s in store.sessions) {
@@ -125,6 +157,29 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
           sessionTitle: title,
         ),
       );
+    };
+    // M1a：结构化事件 → 判据 → ledger → 展示（取代上面那条旧路径，旧路径保留兜底）。
+    store.onAttentionEvent = (event) {
+      unawaited(_handleAttention(event));
+    };
+    store.onAttentionResolved = (identity) {
+      final id = _ledger.resolveByIdentity(identity);
+      if (id != null) {
+        unawaited(LocalNotifier.instance.cancel(id));
+        AppLog.instance.log('通知：结算撤销 identity=$identity id=$id');
+      }
+    };
+    // S1：进入会话 → 收掉横幅（未读标已读由 store 负责）。
+    store.onChatOpened = (sessionId) {
+      if (!mounted) return;
+      _bannerTimer?.cancel();
+      _bannerTimer = null;
+      setState(() {
+        _bannerCount = null;
+        _bannerSessionId = null;
+        _bannerSessionTitle = null;
+      });
+      AppLog.instance.log('通知：进入会话 $sessionId → 收起横幅');
     };
     // 悬浮球迷你面板动作（原生 → Flutter）：打开会话 / 去充值
     const MethodChannel('dsh/floating').setMethodCallHandler((call) async {
@@ -194,17 +249,47 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     final resumed = state == AppLifecycleState.resumed;
+    _resumed = resumed;
     LocalNotifier.instance.foreground = resumed;
-    // 回到前台：App 内已有卡片/横幅，清掉可能过时的系统通知
-    if (resumed) unawaited(LocalNotifier.instance.clearAll());
+    // v3.3.1（可观测性）：前台/后台切换是"通知该不该弹"的关键输入，记一行便于对时间线。
+    AppLog.instance.log('通知：App 生命周期 → ${state.name}（foreground=$resumed）');
+    // M1a（评审指出）：这里**不再** clearAll()。
+    // 回前台全清会连带清掉**其它会话**未处理的审批提醒，甚至可能清掉保活常驻通知；
+    // 撤销只交给 resolved 帧按 identity 精确 cancel(id)。
+    if (resumed) {
+      // 回前台：停掉后台心跳，并记一行"后台期间有多少次心跳"作为冻结证据。
+      if (_bgBeatTimer != null) {
+        _bgBeatTimer!.cancel();
+        _bgBeatTimer = null;
+        AppLog.instance.log(
+          '通知：后台期间 Dart 心跳共 ${NotifyDiag.dartBeats} 次'
+          '（原生服务 ${NotifyDiag.serviceBeats} 次）→ ${NotifyDiag.freezeVerdict()}',
+        );
+      }
+      AppLog.instance.log('通知：回前台，不清理未结算提醒（保留 ${_ledger.activeEntries.length} 条待处理）');
+      // M2：后台保活开启时，回到前台补一次启动（被杀过也能恢复）。
+      unawaited(BackgroundKeepAlive.instance.ensureStarted());
+      unawaited(BackgroundKeepAlive.instance.refreshStatus());
+    } else if (state == AppLifecycleState.paused || state == AppLifecycleState.hidden) {
+      // 进后台：启动 Dart 心跳。若这里一次都不跳，说明 isolate 已被冻住。
+      _bgBeatTimer ??= Timer.periodic(const Duration(seconds: 30), (_) {
+        NotifyDiag.onDartBeat();
+        AppLog.instance.log('通知：后台 Dart 心跳 #${NotifyDiag.dartBeats}');
+      });
+    }
   }
 
   @override
   void dispose() {
     _bannerTimer?.cancel();
     _bannerTimer = null;
+    _bgBeatTimer?.cancel();
+    _bgBeatTimer = null;
     WidgetsBinding.instance.removeObserver(this);
     store.onAttention = null;
+    store.onAttentionEvent = null;
+    store.onAttentionResolved = null;
+    store.onChatOpened = null;
     store.removeListener(_onStore);
     super.dispose();
   }
@@ -231,7 +316,83 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
     store.clearPluginUpdateNotice();
   }
 
-  /// 新增未读通知横幅：顶部滑入，6 秒自动消失（可左右滑动手动关闭），点击跳通知页；10 秒内不重复。
+  /// M2：读取保活开关（默认关），开启中则补一次启动。
+  Future<void> _initKeepAlive() async {
+    final prefs = await SharedPreferences.getInstance();
+    await BackgroundKeepAlive.instance.load(
+      () => prefs.getBool(BackgroundKeepAlive.prefKey) ?? false,
+      (v) => prefs.setBool(BackgroundKeepAlive.prefKey, v),
+    );
+    await BackgroundKeepAlive.instance.ensureStarted();
+    NotifyDiag.keepAliveRunning = BackgroundKeepAlive.instance.running;
+    NotifyDiag.logSummary(keepAliveEnabled: BackgroundKeepAlive.instance.enabled);
+    // 冷启动时 Activity 可能还没进入 resumed：下一帧再补一次（失败会记录原因，不静默）。
+    if (BackgroundKeepAlive.instance.enabled &&
+        !BackgroundKeepAlive.instance.running) {
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        await Future<void>.delayed(const Duration(seconds: 2));
+        await BackgroundKeepAlive.instance.ensureStarted();
+        NotifyDiag.keepAliveRunning = BackgroundKeepAlive.instance.running;
+        AppLog.instance.log(
+          '保活：冷启动重试 → running=${BackgroundKeepAlive.instance.running} '
+          'err=${BackgroundKeepAlive.instance.lastError ?? "无"}',
+        );
+      });
+    }
+  }
+
+  /// M1a：一条审批/问询事件的完整处理链路（判据 → 去重 → 展示 → 回写 ledger）。
+  Future<void> _handleAttention(AttentionEvent event) async {
+    final snapshot = AttentionSnapshot(
+      phase: _resumed ? AppPhase.foreground : AppPhase.background,
+      permissionGranted: LocalNotifier.instance.ready,
+      // TODO(M4)：用 getNotificationChannels 读渠道 importance，目前假定未静音。
+      channelEnabled: true,
+      visibleSession: LocalNotifier.instance.visibleSession,
+    );
+    final now = DateTime.now();
+    final seen = _ledger.seenRecently(event.key, now: now);
+    final decision = decideAttention(event, snapshot, seenRecently: seen);
+    final reserved = _ledger.reserve(event);
+    NotifyDiag.onFrame(event.kind.wire, inForeground: _resumed);
+    NotifyDiag.onDecision(
+      '${_resumed ? "foreground" : "background"} system=${decision.system} '
+      'banner=${decision.banner} ${decision.reason}',
+    );
+    AppLog.instance.log(
+      '通知：判据 key=${event.key} reason=${decision.reason} '
+      'system=${decision.system} banner=${decision.banner} reserve=$reserved',
+    );
+    if (!decision.system) return;
+    if (!reserved && !event.isReplay) return;
+    String? title;
+    for (final s in store.sessions) {
+      if (s.id == event.sessionId) {
+        title = s.title;
+        break;
+      }
+    }
+    final result = await LocalNotifier.instance.showAttentionEvent(
+      id: event.notificationId,
+      key: event.key,
+      kind: event.kind.wire,
+      sessionId: event.sessionId,
+      toolName: event.toolName,
+      reason: event.kind == AttentionKind.approval ? event.summary : null,
+      prompt: event.kind == AttentionKind.question ? event.summary : null,
+      sessionTitle: title,
+    );
+    final status = switch (result) {
+      AttentionShowResult.shown => AttentionStatus.active,
+      AttentionShowResult.blocked => AttentionStatus.blocked,
+      AttentionShowResult.failed => AttentionStatus.blocked,
+    };
+    _ledger.mark(event.key, status);
+    NotifyDiag.onShow(status.name);
+    AppLog.instance.log('通知：展示结果 key=${event.key} → ${status.name}');
+  }
+
+  /// 新增未读通知横幅：顶部滑入，4 秒自动消失（可左右滑动手动关闭），点击直达会话；10 秒内不重复。
   /// force=true（悬浮球跳转/回前台）时绕过防抖——"错过的也提醒"。
   void _onNewNotifications(int count, {bool force = false}) {
     final now = DateTime.now();
@@ -243,10 +404,18 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
     _bannerTimer?.cancel();
     _bannerTimer = null;
     if (!mounted) return;
+    // S2：横幅按会话合并——记下"最新一条未读属于哪个会话"，文案与点击都用它。
+    final latest = store.latestUnreadNotif;
+    _bannerSessionId = latest?.sessionId;
+    _bannerSessionTitle = (latest != null && latest.title.isNotEmpty)
+        ? latest.title
+        : null;
     setState(() => _bannerCount = count);
-    AppLog.instance.log('Banner: 出现 count=$count');
-    // v2.8.0：滞留 6 秒自动消失（可左右滑动手动关闭，所以敢放长）；同时更新未读基线防反复弹。
-    _bannerTimer = Timer(const Duration(milliseconds: 6000), () {
+    AppLog.instance.log(
+      'Banner: 出现 count=$count session=${_bannerSessionId ?? "未知"}',
+    );
+    // S2：横幅缩短到 4 秒（可左右滑动关闭）；到期只更新未读基线，不代替"已读"。
+    _bannerTimer = Timer(const Duration(milliseconds: 4000), () {
       _bannerTimer = null;
       AppLog.instance.log('Banner: 到期 timer 触发');
       if (!mounted) return;
@@ -267,8 +436,8 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
       title: 'DSH Remote',
       debugShowCheckedModeBanner: false,
       navigatorKey: rootNavigatorKey,
-      theme: DshTheme.light(),
-      darkTheme: DshTheme.dark(),
+      theme: DshTheme.forSkin(store.skin, Brightness.light),
+      darkTheme: DshTheme.forSkin(store.skin, Brightness.dark),
       themeMode: mode,
       home: const RootScreen(),
       // 全局横幅：渲染在 Navigator（所有 route）之上
@@ -297,27 +466,42 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
                       _bannerTimer?.cancel();
                       _bannerTimer = null;
                       if (!mounted) return;
-                      setState(() => _bannerCount = null);
+                      setState(() {
+                        _bannerCount = null;
+                        _bannerSessionId = null;
+                        _bannerSessionTitle = null;
+                      });
                       store.markNotifsSeen();
                     },
                     child: Material(
                       color: Colors.transparent,
                       child: GestureDetector(
                         onTap: () {
-                          AppLog.instance.log('Banner: 点击关闭');
+                          AppLog.instance.log(
+                            'Banner: 点击打开 session=${_bannerSessionId ?? "通知页"}',
+                          );
                           _bannerTimer?.cancel();
                           _bannerTimer = null;
+                          final sid = _bannerSessionId;
                           if (!mounted) return;
-                          setState(() => _bannerCount = null);
+                          setState(() {
+                            _bannerCount = null;
+                            _bannerSessionId = null;
+                            _bannerSessionTitle = null;
+                          });
                           store.markNotifsSeen();
-                          // Phase 2(A8)：与抽屉/悬浮球入口共用通知页打开逻辑
-                          openNotificationsScreen();
+                          if (sid != null && sid.isNotEmpty) {
+                            // S2：直接进该会话（以前只跳通知页，还要再点一次）
+                            _handleFloatingAction('session:$sid');
+                          } else {
+                            openNotificationsScreen();
+                          }
                         },
                         child: Container(
                           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
                           decoration: BoxDecoration(
                             // 跟随主题：浅色=白底深字，深色=深底浅字
-                            color: Theme.of(context).brightness == Brightness.dark ? DshTheme.surfaceDark : Colors.white,
+                            color: DshColors.surface(context),
                             borderRadius: BorderRadius.circular(DshTheme.radiusMd),
                             boxShadow: const [
                               BoxShadow(color: Color(0x33000000), blurRadius: 12, offset: Offset(0, 4)),
@@ -332,7 +516,17 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
                               const SizedBox(width: 8),
                               Expanded(
                                 child: Text(
-                                  L10n.t('有 $bannerCount 条新通知', '$bannerCount new notification${bannerCount > 1 ? 's' : ''}'),
+                                  _bannerSessionTitle != null
+                                      ? L10n.t(
+                                          '「$_bannerSessionTitle」新增 $bannerCount 条提醒',
+                                          '$bannerCount new in "$_bannerSessionTitle"',
+                                        )
+                                      : L10n.t(
+                                          '有 $bannerCount 条新通知',
+                                          '$bannerCount new notification${bannerCount > 1 ? 's' : ''}',
+                                        ),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
                                   style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: DshColors.ink(context)),
                                 ),
                               ),
@@ -377,6 +571,44 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
     if (_configured) {
       _boot();
     }
+    // v3.2.2 build 27：升级后一次性说明「图标入口已换成 alias」——
+    // 老桌面快捷方式指向的是旧组件名，会点不开一次，提前说比让用户自己猜好。
+    WidgetsBinding.instance.addPostFrameCallback((_) => _maybeShowIconMigrationTip());
+  }
+
+  /// 首次启动弹一次图标入口迁移说明；已提示过则直接返回。
+  Future<void> _maybeShowIconMigrationTip() async {
+    if (store.iconMigrationTipShown) return;
+    // 只在支持切换图标的平台提示（Android）；其它平台不涉及 alias 迁移
+    if (!AppIconSwitcher.supported) {
+      await store.markIconMigrationTipShown();
+      return;
+    }
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(L10n.t('桌面图标入口已更新', 'Launcher entry updated')),
+        content: Text(
+          L10n.t(
+            '这一版把启动图标换成了可切换的入口。抽屉里的 App 图标正常；'
+            '但如果桌面上的旧快捷方式点开提示「应用未安装」，'
+            '把它删掉、从抽屉里重新拖一个出来即可，之后切换图标不会再出现。',
+            'This build moved the launcher entry so icons can be switched. '
+            'The app in your drawer still works; if an old home-screen shortcut '
+            'says "App isn\'t installed", remove it and drag a fresh one from the '
+            'drawer. It will not happen again after that.',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: Text(L10n.t('知道了', 'Got it')),
+          ),
+        ],
+      ),
+    );
+    await store.markIconMigrationTipShown();
   }
 
   void _onStore() {
@@ -509,6 +741,9 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
                 fontSize: _index == 0 ? 20 : 17,
                 fontWeight: FontWeight.w700,
                 fontFamily: _index == 0 ? 'Georgia' : null,
+                color: _index == 0 && DshColors.skin(context).isBigFish
+                    ? DshColors.accent(context)
+                    : null,
               ),
             ),
           ],
