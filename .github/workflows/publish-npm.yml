@@ -438,52 +438,58 @@ jobs:
             echo "app dist-tag stays at newer/equal carrier: ${current_app:-<unset>}"
           fi
 
-          npm view "$PACKAGE_NAME" dist-tags --json --prefer-online \
-            --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" > "$RUNNER_TEMP/dist-tags.json"
-          node -e '
-            const tags = require(process.argv[1]);
-            const channel = process.env.PLUGIN_TAG;
-            const latestBefore = process.env.LATEST_BEFORE ?? "";
-            const latestNow = tags.latest ?? "";
-            const strip = (value) => String(value ?? "").endsWith("-app") ? String(value).slice(0, -4) : String(value ?? "");
-            const parse = (value) => {
-              const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.exec(strip(value));
-              if (!match) return null;
-              return { core: match.slice(1, 4).map(BigInt), pre: match[4] ? match[4].split(".") : [] };
-            };
-            const compare = (a, b) => {
-              for (let i = 0; i < 3; i++) if (a.core[i] !== b.core[i]) return a.core[i] < b.core[i] ? -1 : 1;
-              if (!a.pre.length || !b.pre.length) return a.pre.length === b.pre.length ? 0 : (a.pre.length ? -1 : 1);
-              for (let i = 0; i < Math.max(a.pre.length, b.pre.length); i++) {
-                if (a.pre[i] === undefined || b.pre[i] === undefined) return a.pre[i] === b.pre[i] ? 0 : (a.pre[i] === undefined ? -1 : 1);
-                if (a.pre[i] === b.pre[i]) continue;
-                const an = /^\d+$/.test(a.pre[i]), bn = /^\d+$/.test(b.pre[i]);
-                if (an && bn) return BigInt(a.pre[i]) < BigInt(b.pre[i]) ? -1 : 1;
-                if (an !== bn) return an ? -1 : 1;
-                return a.pre[i] < b.pre[i] ? -1 : 1;
+          verified=0
+          for attempt in $(seq 1 24); do
+            npm view "$PACKAGE_NAME" dist-tags --json --prefer-online \
+              --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" > "$RUNNER_TEMP/dist-tags.json"
+            if node -e '
+              const tags = require(process.argv[1]);
+              const channel = process.env.PLUGIN_TAG;
+              const latestBefore = process.env.LATEST_BEFORE ?? "";
+              const latestNow = tags.latest ?? "";
+              const strip = (value) => String(value ?? "").endsWith("-app") ? String(value).slice(0, -4) : String(value ?? "");
+              const parse = (value) => {
+                const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.exec(strip(value));
+                if (!match) return null;
+                return { core: match.slice(1, 4).map(BigInt), pre: match[4] ? match[4].split(".") : [] };
+              };
+              const compare = (a, b) => {
+                for (let i = 0; i < 3; i++) if (a.core[i] !== b.core[i]) return a.core[i] < b.core[i] ? -1 : 1;
+                if (!a.pre.length || !b.pre.length) return a.pre.length === b.pre.length ? 0 : (a.pre.length ? -1 : 1);
+                for (let i = 0; i < Math.max(a.pre.length, b.pre.length); i++) {
+                  if (a.pre[i] === undefined || b.pre[i] === undefined) return a.pre[i] === b.pre[i] ? 0 : (a.pre[i] === undefined ? -1 : 1);
+                  if (a.pre[i] === b.pre[i]) continue;
+                  const an = /^\d+$/.test(a.pre[i]), bn = /^\d+$/.test(b.pre[i]);
+                  if (an && bn) return BigInt(a.pre[i]) < BigInt(b.pre[i]) ? -1 : 1;
+                  if (an !== bn) return an ? -1 : 1;
+                  return a.pre[i] < b.pre[i] ? -1 : 1;
+                }
+                return 0;
+              };
+              if (tags[channel] !== process.env.PLUGIN_VERSION) process.exit(1);
+              const appNow = tags.app ?? "";
+              if (appNow !== process.env.CARRIER_VERSION) {
+                const now = parse(appNow), candidate = parse(process.env.CARRIER_VERSION);
+                if (!now || !candidate || compare(now, candidate) <= 0) process.exit(1);
               }
-              return 0;
-            };
-            if (tags[channel] !== process.env.PLUGIN_VERSION) {
-              console.error(JSON.stringify(tags)); process.exit(1);
-            }
-            const appNow = tags.app ?? "";
-            if (appNow !== process.env.CARRIER_VERSION) {
-              const now = parse(appNow), candidate = parse(process.env.CARRIER_VERSION);
-              if (!now || !candidate || compare(now, candidate) <= 0) {
-                console.error(`app tag is not at/after this carrier: ${JSON.stringify(tags)}`); process.exit(1);
+              if (channel === "latest") {
+                if (latestNow !== process.env.PLUGIN_VERSION) process.exit(1);
+              } else if (latestNow !== latestBefore) {
+                process.exit(1);
               }
-            }
-            if (channel === "latest") {
-              if (latestNow !== process.env.PLUGIN_VERSION) {
-                console.error(`stable release did not move latest: ${JSON.stringify(tags)}`); process.exit(1);
-              }
-            } else if (latestNow !== latestBefore) {
-              console.error(`prerelease moved latest (${latestBefore || "<unset>"} -> ${latestNow || "<unset>"})`);
-              process.exit(1);
-            }
-            console.log(JSON.stringify(tags));
-          ' "$RUNNER_TEMP/dist-tags.json"
+              console.log(JSON.stringify(tags));
+            ' "$RUNNER_TEMP/dist-tags.json"; then
+              verified=1
+              break
+            fi
+            echo "dist-tags not converged yet (attempt $attempt); retrying in 5s..."
+            sleep 5
+          done
+          if [[ "$verified" != "1" ]]; then
+            echo '::error::dist-tags did not converge to the expected values.'
+            cat "$RUNNER_TEMP/dist-tags.json" || true
+            exit 1
+          fi
 
       - name: Verify published tarball integrity
         shell: bash
@@ -514,23 +520,17 @@ jobs:
 
           # 对已发布版本核对轻量身份元数据（与本地 dist 清单一致）：
           # carrier 的 appVersion / pluginContentSha256 是运行时候选发现读取的字段。
-          npm view "$PACKAGE_NAME" --json --prefer-online \
-            --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" > "$RUNNER_TEMP/npm-packument.json"
+          npm view "$PACKAGE_NAME@$CARRIER_VERSION" appVersion pluginContentSha256 --json --prefer-online \
+            --registry "$REGISTRY" --@marktrue:registry="$REGISTRY" > "$RUNNER_TEMP/carrier-meta.json"
           node -e '
             const fs = require("fs");
-            const packument = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            const carrier = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
             const manifest = JSON.parse(fs.readFileSync("dsh-mobile-app/dist/manifest.json", "utf8"));
-            const carrierVersion = process.env.CARRIER_VERSION;
-            const pluginVersion = process.env.PLUGIN_VERSION;
-            const carrier = packument.versions?.[carrierVersion];
-            const plugin = packument.versions?.[pluginVersion];
-            if (!plugin) { console.error(`published plugin metadata missing: ${pluginVersion}`); process.exit(1); }
-            if (!carrier) { console.error(`published carrier metadata missing: ${carrierVersion}`); process.exit(1); }
             if (carrier.appVersion !== manifest.app.version) {
               console.error(`carrier appVersion mismatch: ${carrier.appVersion} != ${manifest.app.version}`); process.exit(1);
             }
             if (carrier.pluginContentSha256 !== manifest.plugin.contentSha256) {
               console.error(`carrier pluginContentSha256 mismatch: ${carrier.pluginContentSha256} != ${manifest.plugin.contentSha256}`); process.exit(1);
             }
-            console.log("Published package identity metadata matches local dist manifest.");
-          ' "$RUNNER_TEMP/npm-packument.json"
+            console.log("Published carrier identity metadata matches local dist manifest.");
+          ' "$RUNNER_TEMP/carrier-meta.json"
