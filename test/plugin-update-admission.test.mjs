@@ -103,7 +103,7 @@ test('C1: actual NPM update-available handler freezes candidate before accepted;
 
 test('NPM read-only check returns a sanitized candidate without scheduling installation', async () => {
   const packageName = '@marktrue/dsh-mobile-remote';
-  const pluginVersion = '3.2.2-alpha.2';
+  const pluginVersion = '3.2.3-alpha.1';
   const carrierVersion = `${pluginVersion}-app`;
   const docs = new Map([
     [packageName, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, rc: pluginVersion, app: carrierVersion } }],
@@ -113,7 +113,7 @@ test('NPM read-only check returns a sanitized candidate without scheduling insta
       optionalDependencies: { '@marktrue/dsh-mobile-remote-app': `npm:${packageName}@${carrierVersion}` },
     }],
     [`${packageName}@${carrierVersion}`, {
-      version: carrierVersion, appVersion: '3.2.2+26',
+      version: carrierVersion, appVersion: '3.2.3+26',
       dist: { integrity: `sha512-${Buffer.from('carrier').toString('base64')}` },
     }],
   ]);
@@ -128,7 +128,7 @@ test('NPM read-only check returns a sanitized candidate without scheduling insta
     assert.equal(r.body.pluginUpdate.source, 'npm');
     assert.equal(r.body.pluginUpdate.state, 'update-available');
     assert.equal(r.body.pluginUpdate.candidate.plugin.version, pluginVersion);
-    assert.equal(r.body.pluginUpdate.candidate.carrier.appVersion, '3.2.2+26');
+    assert.equal(r.body.pluginUpdate.candidate.carrier.appVersion, '3.2.3+26');
     assert.equal(JSON.stringify(r.body).includes('dist.tarball'), false);
     assert.equal(JSON.stringify(r.body).includes(AUTH_TOKEN), false);
     assert.equal(readFileSync(join(h.profile, 'package.json'), 'utf8'), pkgBefore);
@@ -143,7 +143,7 @@ test('NPM read-only check returns a sanitized candidate without scheduling insta
 
 test('NPM check log explains a failed metadata query without leaking registry details', async () => {
   const packageName = '@marktrue/dsh-mobile-remote';
-  const pluginVersion = '3.2.2-alpha.1';
+  const pluginVersion = '3.2.3-alpha.1';
   const npmPackageView = async (spec) => {
     if (spec === packageName) return { 'dist-tags': { alpha: pluginVersion, rc: pluginVersion } };
     throw new Error('npm-view-failed');
@@ -181,7 +181,7 @@ test('NPM POST freezes the exact candidate and gives it to the async worker', as
   const oldHome = process.env.HOME;
   const testHome = mkdtempSync(join(tmpdir(), 'update-npm-submit-'));
   const packageName = '@marktrue/dsh-mobile-remote';
-  const pluginVersion = '3.2.2-alpha.2';
+  const pluginVersion = '3.2.3-alpha.1';
   const carrierVersion = `${pluginVersion}-app`;
   const docs = new Map([
     [packageName, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, rc: pluginVersion, app: carrierVersion } }],
@@ -191,7 +191,7 @@ test('NPM POST freezes the exact candidate and gives it to the async worker', as
       optionalDependencies: { '@marktrue/dsh-mobile-remote-app': `npm:${packageName}@${carrierVersion}` },
     }],
     [`${packageName}@${carrierVersion}`, {
-      version: carrierVersion, appVersion: '3.2.2+26', pluginContentSha256: 'b'.repeat(64),
+      version: carrierVersion, appVersion: '3.2.3+26', pluginContentSha256: 'b'.repeat(64),
       dist: { integrity: `sha512-${Buffer.from('carrier').toString('base64')}` },
     }],
   ]);
@@ -209,7 +209,7 @@ test('NPM POST freezes the exact candidate and gives it to the async worker', as
     const r = await request(h.route, { opId: 'npm-candidate-accepted' });
     assert.equal(r.status, 200, JSON.stringify({ body: r.body, logs: h.logs }));
     assert.equal(r.body.action, 'accepted');
-    assert.equal(r.body.transaction.targetAppVersion, '3.2.2+26');
+    assert.equal(r.body.transaction.targetAppVersion, '3.2.3+26');
     const tx = readTransaction(transactionFile(testHome));
     assert.equal(tx.targetVersion, pluginVersion);
     assert.equal(tx.npmCandidate.plugin.version, pluginVersion);
@@ -236,7 +236,7 @@ test('NPM POST freezes the exact candidate and gives it to the async worker', as
 
 test('legacy carrier metadata triggers preparation before any profile mutation', async () => {
   const testHome = mkdtempSync(join(tmpdir(), 'update-legacy-prepare-'));
-  const pluginVersion = '3.2.2-alpha.2';
+  const pluginVersion = '3.2.3-alpha.1';
   const carrierVersion = `${pluginVersion}-app`;
   const docs = new Map([
     [NPM_PACKAGE_NAME, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, rc: pluginVersion, app: carrierVersion } }],
@@ -267,7 +267,7 @@ test('legacy carrier metadata triggers preparation before any profile mutation',
 test('legacy NPM prepare reveals the carrier build before the final update confirmation', async () => {
   const oldHome = process.env.HOME;
   const testHome = mkdtempSync(join(tmpdir(), 'update-legacy-confirm-'));
-  const pluginVersion = '3.2.2-alpha.2';
+  const pluginVersion = '3.2.3-alpha.1';
   const carrierVersion = `${pluginVersion}-app`;
   const docs = new Map([
     [NPM_PACKAGE_NAME, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, rc: pluginVersion, app: carrierVersion } }],
@@ -296,8 +296,8 @@ test('legacy NPM prepare reveals the carrier build before the final update confi
         pluginTgzPath: join(workDir, 'plugin.tgz'),
         carrierTgzPath: join(workDir, 'carrier.tgz'),
         pluginContentSha256: preparedDigest,
-        carrierAppVersion: '3.2.2+26',
-        manifest: { schema: 1, app: { version: '3.2.2+26' }, plugin: { version: pluginVersion, contentSha256: preparedDigest } },
+        carrierAppVersion: '3.2.3+26',
+        manifest: { schema: 1, app: { version: '3.2.3+26' }, plugin: { version: pluginVersion, contentSha256: preparedDigest } },
       }),
       runSelfUpdate: async args => { workerArgs = args; return { ok: true }; },
     },
@@ -307,7 +307,7 @@ test('legacy NPM prepare reveals the carrier build before the final update confi
     const prepared = await request(h.route, { opId: 'legacy-final-confirm' }, '/m/api/plugin-update/prepare');
     assert.equal(prepared.status, 200, JSON.stringify(prepared.body));
     assert.equal(prepared.body.action, 'prepared');
-    assert.equal(prepared.body.candidate.carrier.appVersion, '3.2.2+26');
+    assert.equal(prepared.body.candidate.carrier.appVersion, '3.2.3+26');
     assert.equal(prepared.body.candidate.carrier.legacyMetadataMissing, false);
     assert.equal(readTransaction(transactionFile(testHome)), null);
     assert.equal(readFileSync(join(h.profile, 'package.json'), 'utf8'), profileBefore);
@@ -317,7 +317,7 @@ test('legacy NPM prepare reveals the carrier build before the final update confi
     assert.equal(accepted.status, 200, JSON.stringify(accepted.body));
     assert.equal(accepted.body.action, 'accepted');
     const tx = readTransaction(transactionFile(testHome));
-    assert.equal(tx.npmCandidate.carrier.appVersion, '3.2.2+26');
+    assert.equal(tx.npmCandidate.carrier.appVersion, '3.2.3+26');
     assert.equal(tx.npmCandidate.plugin.contentSha256, preparedDigest);
     assert.equal(readFileSync(join(h.profile, 'package.json'), 'utf8'), profileBefore, 'profile is unchanged until the async confirmed worker runs');
     const scheduled = jobs.splice(jobsBefore);
