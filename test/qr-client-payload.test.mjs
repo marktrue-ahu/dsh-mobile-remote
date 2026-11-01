@@ -434,3 +434,47 @@ test("plugin update details merge check diagnostics, install output, and the fai
 	assert.match(client.updateFailureReasonText("install-failed"), /pnpm 安装失败/);
 	assert.equal(client.updateFailureReasonText("unknown-code"), "unknown-code");
 });
+
+test("plugin update progress maps transaction phase and latest log stage to the shared six steps", () => {
+	assert.equal(JSON.stringify(client.pluginUpdateProgressSteps), JSON.stringify(["检查候选", "下载校验", "安装依赖", "重启宿主", "健康确认", "完成"]));
+
+	const installing = client.buildPluginUpdateModel({
+		state: "restarting",
+		transaction: { opId: "op-1", phase: "installing" },
+	});
+	const installingProgress = client.pluginUpdateProgress(installing, { stage: "install", text: "pnpm install" });
+	assert.equal(installingProgress.step, 2);
+	assert.match(installingProgress.text, /安装依赖/);
+	assert.equal(installingProgress.terminal, false);
+
+	const downloading = client.pluginUpdateProgress(
+		client.buildPluginUpdateModel({ state: "restarting", transaction: { opId: "op-1", phase: "staging" } }),
+		{ stage: "download", text: "download" },
+	);
+	assert.equal(downloading.step, 1);
+	assert.match(downloading.text, /下载/);
+
+	const restarting = client.pluginUpdateProgress(
+		client.buildPluginUpdateModel({ state: "restarting", transaction: { opId: "op-1", phase: "restart-pending" } }),
+		{ stage: "supervisor", text: "waiting" },
+	);
+	assert.equal(restarting.step, 4);
+	assert.match(restarting.text, /健康/);
+
+	const done = client.pluginUpdateProgress(
+		client.buildPluginUpdateModel({ state: "up-to-date", transaction: { opId: "op-1", phase: "settled", result: { ok: true } } }),
+		null,
+	);
+	assert.equal(done.step, 5);
+	assert.equal(done.terminal, true);
+	assert.equal(done.failed, false);
+
+	const failed = client.pluginUpdateProgress(
+		client.buildPluginUpdateModel({ state: "update-failed", transaction: { opId: "op-1", phase: "failed", result: { ok: false, reason: "install-failed" } } }),
+		null,
+	);
+	assert.equal(failed.step, 4);
+	assert.equal(failed.terminal, true);
+	assert.equal(failed.failed, true);
+	assert.match(client.pluginUpdateStageText("restart-pending"), /重启/);
+});
