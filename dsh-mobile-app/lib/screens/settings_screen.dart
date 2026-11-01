@@ -13,6 +13,7 @@ import '../logger.dart';
 import '../models.dart';
 import '../plugin_update_resume.dart';
 import '../plugin_update_log.dart';
+import '../plugin_update_progress.dart';
 import '../plugin_update_status.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -205,6 +206,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _bubbleOn = false; // 悬浮球开关状态（与服务实际运行状态同步）
   bool _updateFlowBusy = false;
 
+  // 插件更新进度：只在更新进行中轮询，终态后保留结果卡片。
+  Timer? _progressTimer;
+  String _progressOpId = '';
+  String _progressStage = '';
+  String _progressLine = '';
+  int _progressCursor = 0;
+  String _lastProgressPhase = '';
+
   @override
   void initState() {
     super.initState();
@@ -213,6 +222,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _initBubbleState();
     // 连接状态等 store 变化实时刷新（修复：旧版离开页面重进才能看到状态更新）
     widget.store.addListener(_onStoreChanged);
+    _syncUpdateProgressWatcher();
   }
 
   Future<void> _initBubbleState() async {
@@ -289,12 +299,308 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   @override
   void dispose() {
+    _progressTimer?.cancel();
     widget.store.removeListener(_onStoreChanged);
     super.dispose();
   }
 
   void _onStoreChanged() {
+    _syncUpdateProgressWatcher();
     if (mounted) setState(() {});
+  }
+
+  /// 宿主事务或本地接续记录仍在进行时，每 2 秒刷新一次状态与最新日志。
+  bool _updateInFlight() {
+    final store = widget.store;
+    final tx = store.api.pluginUpdate.transaction;
+    if (tx != null &&
+        !tx.rolledBack &&
+        !const {'settled', 'failed', 'rolled-back'}.contains(tx.phase)) {
+      return true;
+    }
+    final journal = store.pluginUpdateJournal;
+    if (journal != null &&
+        !journal.isPreparationPhase &&
+        const {
+          UpdatePhase.pluginPending,
+          UpdatePhase.pluginConfirmed,
+          UpdatePhase.appPending,
+        }.contains(journal.phase)) {
+      return true;
+    }
+    return false;
+  }
+
+  void _syncUpdateProgressWatcher() {
+    final active = _updateInFlight();
+    if (active && _progressTimer == null) {
+      _progressTimer = Timer.periodic(
+        const Duration(seconds: 2),
+        (_) => unawaited(_pollUpdateProgress()),
+      );
+      unawaited(_pollUpdateProgress());
+    } else if (!active && _progressTimer != null) {
+      _progressTimer?.cancel();
+      _progressTimer = null;
+    }
+  }
+
+  Future<void> _pollUpdateProgress() async {
+    if (!mounted) return;
+    final store = widget.store;
+    try {
+      // 宿主重启期间会短暂失败：保留旧状态，等下一次轮询。
+      await store.api.refreshUpdateState();
+    } catch (_) {}
+    final tx = store.api.pluginUpdate.transaction;
+    final journal = store.pluginUpdateJournal;
+    final opId = tx?.opId ?? journal?.opId ?? '';
+    if (opId.isNotEmpty && opId != _progressOpId) {
+      _progressOpId = opId;
+      _progressCursor = 0;
+      _progressStage = '';
+      _progressLine = '';
+      _lastProgressPhase = '';
+    }
+    if (opId.isNotEmpty) {
+      try {
+        final page = await store.api.pluginUpdateLog(
+          opId: opId,
+          afterSeq: _progressCursor,
+        );
+        if (PluginUpdateLog.matchesOperation(page, opId)) {
+          final log = PluginUpdateLog.fromJson(page);
+          if (log.cursor > _progressCursor) _progressCursor = log.cursor;
+          if (log.lines.isNotEmpty) {
+            final last = log.lines.last;
+            if (last.stage.isNotEmpty) _progressStage = last.stage;
+            if (last.text.isNotEmpty) _progressLine = last.text;
+          }
+        }
+      } catch (_) {}
+    }
+    if (!mounted) return;
+    _syncUpdateProgressWatcher();
+    setState(() {});
+    _announceProgressTransition(tx);
+  }
+
+  void _announceProgressTransition(PluginTransaction? tx) {
+    if (tx == null) return;
+    final previous = _lastProgressPhase;
+    _lastProgressPhase = tx.phase;
+    if (previous.isEmpty || previous == tx.phase) return;
+    final progress = PluginUpdateProgressView.describe(
+      phase: tx.phase,
+      rolledBack: tx.rolledBack,
+      resultOk: tx.resultOk,
+    );
+    if (!progress.terminal) return;
+    if (progress.failed) {
+      showToast(
+        context,
+        '${L10n.t('插件更新失败：', 'Plugin update failed: ')}${_pluginUpdateFailureReasonText(tx.reason ?? 'unknown')}',
+      );
+    } else {
+      showToast(
+        context,
+        L10n.t(
+          '插件更新完成（v${tx.targetVersion}）',
+          'Plugin update completed (v${tx.targetVersion})',
+        ),
+      );
+    }
+  }
+
+  static String _formatElapsed(Duration duration) {
+    final seconds = duration.inSeconds.clamp(0, 86400);
+    if (seconds < 60) return '${seconds}s';
+    return '${seconds ~/ 60}m${seconds % 60}s';
+  }
+
+  /// 更新进度卡片：阶段时间线 + 当前阶段/用时 + 最新一行输出 + 失败原因。
+  Widget _updateProgressCard(AppStore store) {
+    final tx = store.api.pluginUpdate.transaction;
+    final journal = store.pluginUpdateJournal;
+    if (tx == null && journal == null) return const SizedBox.shrink();
+    final brand = DshColors.brand(context);
+    final ink3 = DshColors.ink3(context);
+    final danger = DshColors.danger(context);
+    final lineColor = DshColors.line(context);
+
+    PluginUpdateProgressView progress;
+    String title;
+    String? failureReason;
+    DateTime? startedAt;
+    String targetVersion = '';
+    String appBuild = '';
+    if (tx != null) {
+      progress = PluginUpdateProgressView.describe(
+        phase: tx.phase,
+        rolledBack: tx.rolledBack,
+        resultOk: tx.resultOk,
+        logStage: _progressStage.isEmpty ? null : _progressStage,
+      );
+      startedAt = tx.startedAt;
+      targetVersion = tx.targetVersion;
+      appBuild = tx.targetAppVersion;
+      if (progress.failed) {
+        failureReason = _pluginUpdateFailureReasonText(tx.reason ?? 'unknown');
+      }
+      title = progress.terminal
+          ? (progress.failed ? '最近一次插件更新：失败' : '最近一次插件更新：完成')
+          : progress.stageText;
+    } else {
+      final phase = journal!.phase;
+      if (phase == UpdatePhase.pluginPending) {
+        progress = const PluginUpdateProgressView(
+          step: 2,
+          stageText: '等待电脑端确认并安装',
+          terminal: false,
+          failed: false,
+        );
+        title = '等待电脑端确认并安装';
+      } else if (phase == UpdatePhase.pluginConfirmed) {
+        progress = const PluginUpdateProgressView(
+          step: 4,
+          stageText: '插件已更新，正在确定 App 目标',
+          terminal: false,
+          failed: false,
+        );
+        title = '插件已更新，正在确定 App 目标';
+      } else if (phase == UpdatePhase.appPending) {
+        progress = const PluginUpdateProgressView(
+          step: 5,
+          stageText: '等待安装/核验 App',
+          terminal: false,
+          failed: false,
+        );
+        title = '等待安装/核验 App';
+      } else if (phase == UpdatePhase.pluginRetry) {
+        progress = const PluginUpdateProgressView(
+          step: 4,
+          stageText: '上次更新未确认',
+          terminal: true,
+          failed: true,
+        );
+        title = '上次更新未确认';
+        failureReason = '可重试，或取消并重新检查';
+      } else {
+        progress = const PluginUpdateProgressView(
+          step: 0,
+          stageText: '准备中',
+          terminal: false,
+          failed: false,
+        );
+        title = '准备中';
+      }
+      startedAt = journal.startedAt;
+      targetVersion = journal.targetVersion;
+      appBuild = journal.appVersion;
+    }
+    final elapsed = startedAt == null
+        ? ''
+        : _formatElapsed(DateTime.now().toUtc().difference(startedAt));
+    final detailLine = _progressLine.isNotEmpty
+        ? _progressLine
+        : (failureReason ?? progress.stageText);
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: progress.failed ? danger : lineColor,
+          width: 1,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              if (progress.failed)
+                Icon(Icons.error_outline, size: 16, color: danger)
+              else if (progress.terminal)
+                Icon(Icons.check_circle_outline, size: 16, color: brand)
+              else
+                SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  title,
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: progress.failed ? danger : null,
+                  ),
+                ),
+              ),
+              if (elapsed.isNotEmpty)
+                Text(elapsed, style: TextStyle(fontSize: 11, color: ink3)),
+              TextButton(
+                onPressed: _openPluginUpdateDetails,
+                child: Text(
+                  L10n.t('详情 ▸', 'Details ▸'),
+                  style: const TextStyle(fontSize: 12),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          LinearProgressIndicator(
+            value: progress.terminal ? 1 : (progress.step + 1) / 6,
+            minHeight: 3,
+            backgroundColor: lineColor,
+            color: progress.failed ? danger : brand,
+          ),
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 8,
+            runSpacing: 2,
+            children: [
+              for (var i = 0; i < PluginUpdateProgressView.steps.length; i++)
+                Text(
+                  '${i <= progress.step ? '●' : '○'} ${PluginUpdateProgressView.steps[i]}',
+                  style: TextStyle(
+                    fontSize: 10.5,
+                    color: i <= progress.step
+                        ? (progress.failed ? danger : brand)
+                        : ink3,
+                    fontWeight: i == progress.step
+                        ? FontWeight.w700
+                        : FontWeight.w400,
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            detailLine,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: 11,
+              fontFamily: 'monospace',
+              color: progress.failed ? danger : ink3,
+            ),
+          ),
+          if (targetVersion.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                '目标：插件 v$targetVersion${appBuild.isEmpty ? '' : ' · App build $appBuild'}',
+                style: TextStyle(fontSize: 11, color: ink3),
+              ),
+            ),
+        ],
+      ),
+    );
   }
 
   Future<void> _loadAppVersion() async {
@@ -1336,6 +1642,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     style: TextStyle(fontSize: 12, color: brand),
                   ),
           ),
+          if (store.api.pluginUpdate.transaction != null ||
+              store.pluginUpdateJournal != null)
+            _updateProgressCard(store),
           if (store.api.pluginUpdate.checkLog.isNotEmpty ||
               store.pluginUpdateLogOpId.isNotEmpty)
             _row(

@@ -44,6 +44,8 @@ class PluginTransaction {
     required this.reason,
     this.targetAppVersion = '',
     this.release,
+    this.startedAt,
+    this.resultOk,
   });
 
   final String opId;
@@ -54,6 +56,12 @@ class PluginTransaction {
   final bool rolledBack;
   final String? reason;
   final ReleaseSnapshot? release;
+
+  /// 事务开始时间（用于进度卡片展示已用时）。
+  final DateTime? startedAt;
+
+  /// 事务结果是否成功（result.ok）；未知为 null。
+  final bool? resultOk;
 
   static PluginTransaction? fromJson(Map<String, dynamic>? json) {
     if (json == null) return null;
@@ -70,6 +78,12 @@ class PluginTransaction {
       rolledBack: json['rolledBack'] == true,
       reason: result is Map ? (result['reason'] as String?) : null,
       release: ReleaseSnapshot.fromJson(json['release']),
+      startedAt: json['startedAt'] is String
+          ? DateTime.tryParse(json['startedAt'] as String)?.toUtc()
+          : null,
+      resultOk: result is Map && result['ok'] is bool
+          ? result['ok'] as bool
+          : null,
     );
   }
 }

@@ -1,8 +1,19 @@
 /// Safe display projection for the host-sanitized plugin update log.
 class PluginUpdateLogLine {
-  const PluginUpdateLogLine({required this.seq, required this.text});
+  const PluginUpdateLogLine({
+    required this.seq,
+    required this.text,
+    this.stage = '',
+    this.stream = '',
+  });
   final int seq;
   final String text;
+
+  /// 宿主记录的事件阶段（download/install/restart/supervisor…），用于进度展示。
+  final String stage;
+
+  /// stdout / stderr / status。
+  final String stream;
 
   static PluginUpdateLogLine? fromJson(Object? value) {
     if (value is! Map || value['seq'] is! int || value['text'] is! String) {
@@ -11,7 +22,14 @@ class PluginUpdateLogLine {
     final seq = value['seq'] as int;
     final text = (value['text'] as String).trimRight();
     if (seq < 1 || text.isEmpty) return null;
-    return PluginUpdateLogLine(seq: seq, text: text);
+    final stage = value['stage'];
+    final stream = value['stream'];
+    return PluginUpdateLogLine(
+      seq: seq,
+      text: text,
+      stage: stage is String ? stage : '',
+      stream: stream is String ? stream : '',
+    );
   }
 }
 
