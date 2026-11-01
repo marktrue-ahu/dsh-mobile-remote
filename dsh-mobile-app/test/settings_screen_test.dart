@@ -347,7 +347,13 @@ void main() {
       ),
       findsOneWidget,
     );
-    expect(find.textContaining('载体清单与 NPM 包身份不一致'), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byType(BottomSheet),
+        matching: find.textContaining('载体清单与 NPM 包身份不一致'),
+      ),
+      findsOneWidget,
+    );
     final copyButton = find.descendant(
       of: find.byType(BottomSheet),
       matching: find.text('复制'),
@@ -356,5 +362,85 @@ void main() {
     await tester.pump();
     expect(copied, contains('npm-carrier-plugin-identity-mismatch'));
     expect(copied, contains(r'$ npm view'));
+  });
+
+  testWidgets('update progress card shows live stage, timeline and target', (
+    tester,
+  ) async {
+    final startedAt = DateTime.now().toUtc().toIso8601String();
+    final statusJson = {
+      'state': 'restarting',
+      'reason': 'update-staged',
+      'canSelfUpdate': true,
+      'transaction': {
+        'opId': 'op-live',
+        'phase': 'installing',
+        'targetVersion': '3.2.2-alpha.11',
+        'targetContentSha256': List.filled(64, 'b').join(),
+        'targetAppVersion': '3.2.2+35',
+        'startedAt': startedAt,
+      },
+    };
+    final api = Api(
+      client: MockClient((request) async {
+        final path = request.url.path;
+        if (path.endsWith('/api/bootstrap')) {
+          return http.Response(
+            jsonEncode({'pluginUpdate': statusJson, 'currentRelease': null}),
+            200,
+          );
+        }
+        if (path.endsWith('/api/plugin-update/log')) {
+          return http.Response(
+            jsonEncode({
+              'ok': true,
+              'opId': 'op-live',
+              'phase': 'installing',
+              'lastSeq': 1,
+              'events': [
+                {
+                  'seq': 1,
+                  'stage': 'install',
+                  'stream': 'status',
+                  'text': 'pnpm install',
+                },
+              ],
+            }),
+            200,
+          );
+        }
+        return http.Response('{}', 200);
+      }),
+    )..baseUrl = 'https://desktop.example';
+    api.pluginUpdate = PluginUpdateStatus.fromJson(statusJson);
+    final store = AppStore(apiClient: api);
+    addTearDown(store.dispose);
+    await store.loadPrefs();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SettingsScreen(store: store, onReconfigure: () async {}),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+    await tester.scrollUntilVisible(
+      find.text('更新电脑端插件'),
+      240,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.pump();
+
+    final cardTitle = find.textContaining('安装依赖');
+    expect(cardTitle, findsWidgets, reason: '进度卡片应显示当前安装阶段');
+    expect(find.textContaining('重启宿主'), findsOneWidget, reason: '时间线包含后续阶段');
+    expect(find.textContaining('目标：插件 v3.2.2-alpha.11'), findsOneWidget);
+    expect(find.textContaining('详情 ▸'), findsOneWidget);
+
+    // 结束轮询计时器。
+    await tester.pumpWidget(const SizedBox());
+    await tester.pump();
   });
 }
