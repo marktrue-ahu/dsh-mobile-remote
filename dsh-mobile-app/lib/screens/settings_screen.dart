@@ -422,7 +422,77 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Widget _updateProgressCard(AppStore store) {
     final tx = store.api.pluginUpdate.transaction;
     final journal = store.pluginUpdateJournal;
-    if (tx == null && journal == null) return const SizedBox.shrink();
+    if (tx == null && journal == null) {
+      // 只有检查结果（没有更新事务）：仍给一个可打开详情的紧凑卡片。
+      final status = store.api.pluginUpdate;
+      final brand = DshColors.brand(context);
+      final ink3 = DshColors.ink3(context);
+      final danger = DshColors.danger(context);
+      final lineColor = DshColors.line(context);
+      final upToDate = status.upToDate;
+      final failureReason = upToDate
+          ? ''
+          : (status.reason.isEmpty
+                ? '检查暂不可用'
+                : _pluginUpdateFailureReasonText(status.reason));
+      final detail = status.checkLog.isNotEmpty
+          ? status.checkLog.last
+          : failureReason;
+      return Container(
+        margin: const EdgeInsets.only(bottom: 8),
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: upToDate ? lineColor : danger, width: 1),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              upToDate ? Icons.check_circle_outline : Icons.error_outline,
+              size: 16,
+              color: upToDate ? brand : danger,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    upToDate ? '最近一次插件更新检查：已是最新' : '最近一次插件更新检查：不可用',
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w600,
+                      color: upToDate ? null : danger,
+                    ),
+                  ),
+                  if (detail.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: Text(
+                        detail,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 10.5,
+                          fontFamily: 'monospace',
+                          color: upToDate ? ink3 : danger,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            TextButton(
+              onPressed: _openPluginUpdateDetails,
+              child: Text(
+                L10n.t('详情 ▸', 'Details ▸'),
+                style: const TextStyle(fontSize: 12),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
     final brand = DshColors.brand(context);
     final ink3 = DshColors.ink3(context);
     final danger = DshColors.danger(context);
@@ -1643,25 +1713,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
           ),
           if (store.api.pluginUpdate.transaction != null ||
-              store.pluginUpdateJournal != null)
+              store.pluginUpdateJournal != null ||
+              store.api.pluginUpdate.checkLog.isNotEmpty)
             _updateProgressCard(store),
-          if (store.api.pluginUpdate.checkLog.isNotEmpty ||
-              store.pluginUpdateLogOpId.isNotEmpty)
-            _row(
-              leading: const Icon(Icons.receipt_long_outlined),
-              title: L10n.t('插件更新详情', 'Plugin update details'),
-              sub: L10n.t(
-                '检查结果与安装进度（脱敏）',
-                'Check results and install progress (sanitized)',
-              ),
-              trailing: TextButton(
-                onPressed: _openPluginUpdateDetails,
-                child: Text(
-                  L10n.t('查看 ▸', 'View ▸'),
-                  style: TextStyle(fontSize: 12, color: brand),
-                ),
-              ),
-            ),
           _row(
             leading: const Icon(Icons.sync_outlined),
             title: L10n.t('检查 App 更新', 'Check App updates'),
