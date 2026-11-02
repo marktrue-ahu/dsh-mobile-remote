@@ -1,5 +1,22 @@
 # Changelog
 
+## v3.2.4-alpha.2（build 34，issue #42 / #43）— 文件历史选择文件闭环 + 发布链修复
+
+> 插件 `3.2.4-alpha.2` / App `3.2.4+34` / 载体 `3.2.4-alpha.2-app`。在 alpha.1（build 33）基础上的开发快照。
+
+### App：文件历史选择文件闭环（issue #42）
+
+- 文件历史主「选择文件/更换文件」入口改为打开会话文件浏览页：在文件浏览里点文件进入预览，预览页的「选择此文件」按钮返回原历史视图并加载该文件历史，不再叠加第二个 Git 浏览器。
+- 原有 inline 搜索 + 最近文件保留为次要「搜索文件」入口；空态/错误态「重新选择文件」优先进入文件浏览。
+- 自动打开仍只针对 inline 搜索选择器，不会自动全屏进入文件浏览。
+- 浏览根仍为会话 cwd；仓库外/目录路径沿用既有 `path-invalid` / `not-tracked` 空态，不新增宿主字段。
+
+### 发布链（issue #43）
+
+- 修复 release-meta helper 对 linked worktree `.git` 文件的判断（`-d` → `-e`），避免发布成功后 `Mark release intent published` 以 git exit 128 失败。
+- 发布 intent 恢复为 `published`；release-meta 权威记录继续作为全局单调 build 的发布前沿。
+
+
 ## v3.2.4-alpha.1（build 33，issue #42）— Git 浏览增强：全量标签 / 结构化 refs / 统一文件查看器 / 文件提交历史
 
 > 插件 `3.2.4-alpha.1` / App `3.2.4+33` / 载体 `3.2.4-alpha.1-app`。develop 快照：合并 issue #42 上游贡献分支（`upstream/git-browser-upgrade`，已 rebase 到 `github/main`），并带入 main 最新内容（宠物资源瘦身、审批默认 1 小时等）。
