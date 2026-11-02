@@ -23,10 +23,11 @@ const NPM_PACKAGE_NAME = '@marktrue/dsh-mobile-remote';
 // 夹具候选版本必须始终高于「仓库/本机版本」：这里用与发布版本解耦的常量，
 // 否则版本快照（如 3.2.3-alpha.1）后候选不再更新，会触发同版本内容不可变检查（fail-closed），
 // 使 POST/check 用例得到 action=none 而非 accepted。
+// 候选同时由 alpha/rc dist-tag 投影，供两种预发布线共用。
 const NPM_PLUGIN_VERSION = '3.3.0-alpha.1';
 const NPM_CARRIER_VERSION = `${NPM_PLUGIN_VERSION}-app`;
 const NPM_DOCS = new Map([
-  [NPM_PACKAGE_NAME, { 'dist-tags': { latest: '3.2.1-alpha.1', alpha: NPM_PLUGIN_VERSION, app: NPM_CARRIER_VERSION } }],
+  [NPM_PACKAGE_NAME, { 'dist-tags': { latest: '3.2.1-alpha.1', alpha: NPM_PLUGIN_VERSION, rc: NPM_PLUGIN_VERSION, app: NPM_CARRIER_VERSION } }],
   [`${NPM_PACKAGE_NAME}@${NPM_PLUGIN_VERSION}`, {
     version: NPM_PLUGIN_VERSION,
     dist: { integrity: `sha512-${Buffer.from('plugin').toString('base64')}` },
@@ -109,7 +110,7 @@ test('NPM read-only check returns a sanitized candidate without scheduling insta
   const pluginVersion = NPM_PLUGIN_VERSION;
   const carrierVersion = `${pluginVersion}-app`;
   const docs = new Map([
-    [packageName, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, app: carrierVersion } }],
+    [packageName, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, rc: pluginVersion, app: carrierVersion } }],
     [`${packageName}@${pluginVersion}`, {
       version: pluginVersion,
       dist: { integrity: `sha512-${Buffer.from('plugin').toString('base64')}` },
@@ -148,7 +149,7 @@ test('NPM check log explains a failed metadata query without leaking registry de
   const packageName = '@marktrue/dsh-mobile-remote';
   const pluginVersion = NPM_PLUGIN_VERSION;
   const npmPackageView = async (spec) => {
-    if (spec === packageName) return { 'dist-tags': { alpha: pluginVersion } };
+    if (spec === packageName) return { 'dist-tags': { alpha: pluginVersion, rc: pluginVersion } };
     throw new Error('npm-view-failed');
   };
   const h = harness({ config: { pluginUpdateManifest: 'npm' }, pluginUpdates: { npmPackageView } });
@@ -187,7 +188,7 @@ test('NPM POST freezes the exact candidate and gives it to the async worker', as
   const pluginVersion = NPM_PLUGIN_VERSION;
   const carrierVersion = `${pluginVersion}-app`;
   const docs = new Map([
-    [packageName, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, app: carrierVersion } }],
+    [packageName, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, rc: pluginVersion, app: carrierVersion } }],
     [`${packageName}@${pluginVersion}`, {
       version: pluginVersion,
       dist: { integrity: `sha512-${Buffer.from('plugin').toString('base64')}` },
@@ -242,7 +243,7 @@ test('legacy carrier metadata triggers preparation before any profile mutation',
   const pluginVersion = NPM_PLUGIN_VERSION;
   const carrierVersion = `${pluginVersion}-app`;
   const docs = new Map([
-    [NPM_PACKAGE_NAME, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, app: carrierVersion } }],
+    [NPM_PACKAGE_NAME, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, rc: pluginVersion, app: carrierVersion } }],
     [`${NPM_PACKAGE_NAME}@${pluginVersion}`, {
       version: pluginVersion,
       dist: { integrity: `sha512-${Buffer.from('plugin').toString('base64')}` },
@@ -273,7 +274,7 @@ test('legacy NPM prepare reveals the carrier build before the final update confi
   const pluginVersion = NPM_PLUGIN_VERSION;
   const carrierVersion = `${pluginVersion}-app`;
   const docs = new Map([
-    [NPM_PACKAGE_NAME, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, app: carrierVersion } }],
+    [NPM_PACKAGE_NAME, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, rc: pluginVersion, app: carrierVersion } }],
     [`${NPM_PACKAGE_NAME}@${pluginVersion}`, {
       version: pluginVersion,
       dist: { integrity: `sha512-${Buffer.from('plugin').toString('base64')}` },
@@ -556,7 +557,7 @@ test('F1: NPM candidate projection never leaks packument tarball URLs or registr
   const f1Home = mkdtempSync(join(tmpdir(), 'f1-home-'));
   const secretUrl = 'http://private-registry.example/package.tgz?token=should-not-leak';
   const packageView = async (spec) => {
-    if (spec === NPM_PACKAGE_NAME) return { 'dist-tags': { latest: NPM_PLUGIN_VERSION, alpha: NPM_PLUGIN_VERSION, app: NPM_CARRIER_VERSION } };
+    if (spec === NPM_PACKAGE_NAME) return { 'dist-tags': { latest: NPM_PLUGIN_VERSION, alpha: NPM_PLUGIN_VERSION, rc: NPM_PLUGIN_VERSION, app: NPM_CARRIER_VERSION } };
     if (spec === `${NPM_PACKAGE_NAME}@${NPM_PLUGIN_VERSION}`) return {
       version: NPM_PLUGIN_VERSION,
       dist: { integrity: `sha512-${Buffer.from('plugin').toString('base64')}`, tarball: secretUrl },
@@ -638,7 +639,7 @@ test('failed NPM update records the sanitized failure reason in the operation lo
   const pluginVersion = '3.3.0-alpha.1';
   const carrierVersion = `${pluginVersion}-app`;
   const docs = new Map([
-    [packageName, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, app: carrierVersion } }],
+    [packageName, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, rc: pluginVersion, app: carrierVersion } }],
     [`${packageName}@${pluginVersion}`, {
       version: pluginVersion,
       dist: { integrity: `sha512-${Buffer.from('plugin').toString('base64')}` },
