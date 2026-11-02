@@ -65,6 +65,15 @@
       "createdAt": "2026-11-02T16:30:08.354Z",
       "note": "manual recovery: workflow helper linked-worktree exit 128 after successful publish",
       "updatedAt": "2026-11-02T16:48:13.842Z"
+    },
+    {
+      "tag": "v3.2.4-alpha.2",
+      "pluginVersion": "3.2.4-alpha.2",
+      "carrierVersion": "3.2.4-alpha.2-app",
+      "build": 34,
+      "integrity": "sha512-XCHtByVvf5nL2sbCkT6F3jNb33Qji2pd9ilIC+JFcMtJWRdjJfw2+3mbrq/+TJOnndZetoIoDhV24GF9o2BQmg==",
+      "status": "submitted",
+      "createdAt": "2026-11-02T17:50:25.750Z"
     }
   ]
 }
