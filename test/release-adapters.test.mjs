@@ -103,3 +103,55 @@ test("default git adapter: createBranchWithFile uses bounded git plumbing (no wo
 	// 不切换工作树：当前分支仍是初始分支（master/main），工作区无 build-policy.json。
 	assert.equal(fs.existsSync(path.join(repo, "build-policy.json")), false);
 });
+
+
+test("task-19: default npm adapter builds correct `npm view` argv (fake npm on PATH, no network)", (t) => {
+	const bin = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-adapters-npm-argv-"));
+	t.after(() => fs.rmSync(bin, { recursive: true, force: true }));
+	const log = path.join(bin, "calls.log");
+	const script = [
+		"#!/bin/sh",
+		`{ for a in "$@"; do printf '%s\\t' "$a"; done; printf '\\n'; } >> "${log}"`,
+		'case " $* " in',
+		`  *" missing-pkg"*) printf 'npm error code E404\\n' >&2; exit 1 ;;`,
+		`  *" versions "*) printf '["3.2.4-alpha.1"]' ;;`,
+		`  *" dist-tags "*) printf '{"latest":"3.2.4-alpha.1","alpha":"3.2.4-alpha.1"}' ;;`,
+		`  *"@9.9.9 "*) printf 'npm error code E404\\n' >&2; exit 1 ;;`,
+		`  *) printf '{"version":"3.2.4-alpha.1"}' ;;`,
+		"esac",
+		"",
+	].join("\n");
+	const npmFile = path.join(bin, "npm");
+	fs.writeFileSync(npmFile, script, "utf8");
+	fs.chmodSync(npmFile, 0o755);
+
+	const env = envWithBin(bin, { DSH_RELEASE_NPM_VIEW_TIMEOUT_MS: "5000" });
+	const packageName = "@marktrue/dsh-mobile-remote";
+	const adapter = createDefaultNpmAdapter({ packageName, env });
+
+	assert.deepEqual(adapter.listVersions(), ["3.2.4-alpha.1"]);
+	assert.deepEqual(adapter.viewVersion(packageName, "3.2.4-alpha.1"), { version: "3.2.4-alpha.1" });
+	assert.equal(adapter.viewVersion(packageName, "9.9.9"), null);
+	assert.deepEqual(adapter.distTags(), { latest: "3.2.4-alpha.1", alpha: "3.2.4-alpha.1" });
+
+	const calls = fs.readFileSync(log, "utf8").trim().split("\n").map((line) => line.split("\t").filter(Boolean));
+	assert.deepEqual(calls[0], ["view", packageName, "versions", "--json", "--prefer-online"]);
+	assert.deepEqual(calls[1], ["view", `${packageName}@3.2.4-alpha.1`, "--json", "--prefer-online"]);
+	assert.deepEqual(calls[2], ["view", `${packageName}@9.9.9`, "--json", "--prefer-online"]);
+	assert.deepEqual(calls[3], ["view", packageName, "dist-tags", "--json", "--prefer-online"]);
+
+	// registry 参数按包名（不是带 @version 的 spec）推导 scoped registry。
+	const registry = "https://registry.example/";
+	const registryAdapter = createDefaultNpmAdapter({ packageName, registry, env });
+	assert.deepEqual(registryAdapter.listVersions(), ["3.2.4-alpha.1"]);
+	const registryCall = fs.readFileSync(log, "utf8").trim().split("\n").at(-1).split("\t").filter(Boolean);
+	assert.deepEqual(registryCall, [
+		"view", packageName, "versions", "--json", "--prefer-online",
+		"--registry", registry, `--@marktrue:registry=${registry}`,
+	]);
+
+	// E404 仍映射为 missing（不抛错）。
+	const missingAdapter = createDefaultNpmAdapter({ packageName: "missing-pkg", env });
+	assert.deepEqual(missingAdapter.listVersions(), []);
+	assert.equal(missingAdapter.viewVersion("missing-pkg", "1.0.0"), null);
+});

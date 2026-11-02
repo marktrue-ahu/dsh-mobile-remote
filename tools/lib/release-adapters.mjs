@@ -71,19 +71,25 @@ function registryArgs(packageName, registry) {
 	return args;
 }
 
-function npmView(packageName, spec, { registry = null, env = process.env } = {}) {
-	const args = ["view", spec, "--json", "--prefer-online", ...registryArgs(packageName, registry)];
+/**
+ * 只读 `npm view`。**必须把包目标与字段分开拼 argv**（task-19 blocker）：
+ *   `npm view <pkg> versions`、`npm view <pkg>@<ver>`、`npm view <pkg> dist-tags`。
+ * registry 参数按 **packageName** 推导 scope（packageSpec 可能带 `@version`）。
+ * @param {{packageName:string, packageSpec?:string, fields?:string[]}} target
+ */
+function npmView({ packageName, packageSpec = packageName, fields = [] }, { registry = null, env = process.env } = {}) {
+	const args = ["view", packageSpec, ...fields, "--json", "--prefer-online", ...registryArgs(packageName, registry)];
 	const result = runBounded("npm", args, {
 		env,
 		timeout: releaseTimeouts(env).npmView,
 		releaseReason: "npm-metadata-unavailable",
 	});
-	if (result.error) throw new Error(`npm view failed: ${result.error.message}`);
+	if (result.error) throw new Error(`npm view ${packageSpec} failed: ${result.error.message}`);
 	if (result.status !== 0) {
 		const output = `${result.stderr ?? ""}${result.stdout ?? ""}`;
 		if (/\bE404\b/.test(output) || /is not in this registry/.test(output)) return { ok: true, missing: true, value: null };
 		const code = /npm error code (\S+)/.exec(output)?.[1] ?? "unknown";
-		throw new Error(`npm view ${spec} failed (code=${code}): ${output.trim().split("\n").slice(-3).join(" ")}`);
+		throw new Error(`npm view ${packageSpec} failed (code=${code}): ${output.trim().split("\n").slice(-3).join(" ")}`);
 	}
 	const text = String(result.stdout ?? "").trim();
 	if (text === "") return { ok: true, missing: true, value: null };
@@ -190,7 +196,7 @@ export function createDefaultGitAdapter({ repoRoot, env = process.env }) {
 export function createDefaultNpmAdapter({ packageName, registry = null, env = process.env }) {
 	return {
 		listVersions(pkg = packageName) {
-			const result = npmView(pkg, "versions", { registry, env });
+			const result = npmView({ packageName: pkg, fields: ["versions"] }, { registry, env });
 			if (result.missing) return [];
 			const value = result.value;
 			if (Array.isArray(value)) return value.map(String);
@@ -198,12 +204,12 @@ export function createDefaultNpmAdapter({ packageName, registry = null, env = pr
 			throw new Error(`npm view ${pkg} versions 返回非法 JSON: ${JSON.stringify(value)?.slice(0, 200)}`);
 		},
 		viewVersion(pkg = packageName, version) {
-			const result = npmView(pkg, `${version}`, { registry, env });
+			const result = npmView({ packageName: pkg, packageSpec: `${pkg}@${version}` }, { registry, env });
 			if (result.missing) return null;
 			return result.value;
 		},
 		distTags(pkg = packageName) {
-			const result = npmView(pkg, "dist-tags", { registry, env });
+			const result = npmView({ packageName: pkg, fields: ["dist-tags"] }, { registry, env });
 			if (result.missing) return {};
 			return result.value && typeof result.value === "object" ? result.value : {};
 		},
