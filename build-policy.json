@@ -54,5 +54,15 @@
     }
   ],
   "updatedAt": "2026-11-02",
-  "intents": []
+  "intents": [
+    {
+      "tag": "v3.2.4-alpha.1",
+      "pluginVersion": "3.2.4-alpha.1",
+      "carrierVersion": "3.2.4-alpha.1-app",
+      "build": 33,
+      "integrity": "sha512-XNQx8HDkHZIYOu4kXh+hJPGUNBcyZXtmVvSalE4h5iDIrdHJmLBdU4fZPy1V4b7rp/cRFn7/Cfb3Fr5NWjb5zw==",
+      "status": "submitted",
+      "createdAt": "2026-11-02T16:30:08.354Z"
+    }
+  ]
 }
