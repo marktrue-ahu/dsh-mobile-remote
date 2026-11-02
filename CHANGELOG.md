@@ -1,8 +1,8 @@
 # Changelog
 
-## v3.2.3-alpha.1（build 27，issue #39）— NPM-only 自动更新（develop 收口）
+## v3.2.3-rc.1（build 28，issue #39 + 上游 v3.2.3）— NPM-only 自动更新 + 上游 v3.2.3 并入
 
-> 插件 `3.2.3-alpha.1` / App `3.2.3+27` / 载体 `3.2.3-alpha.1-app`。develop 已合并 issue #39 实现；本条目为收口后的开发快照。
+> 插件 `3.2.3-rc.1` / App `3.2.3+28` / 载体 `3.2.3-rc.1-app`。本 fork 的 RC 发布候选；插件发布到 npm `rc` dist-tag，App build 从 +27 提升到 +28。
 
 ### 更新源与安全
 
