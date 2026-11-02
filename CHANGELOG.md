@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### 插件：Git 只读浏览契约 1.1.0（issue #42）— 结构化 refs/tags + 文件列表与文件历史
+
+- `GET /m/api/git/capabilities`：`contractVersion` 升至 `1.1.0`；`features` 新增 `refsDetail` 与 `fileHistory`（两项独立降级，旧 `1.0.0` 外部 provider 继续兼容）。`fileHistory` 仅在**当前生效的** provider 实现 `files()` / `fileHistory()` 时为 `true`，不会用包内 bundled 数据补齐外部 provider 的视图。
+- `GET /m/api/git/graph`、`GET /m/api/git/commit`：保留旧 `refs: string[]`，新增 `refsDetail` / `tagsDetail`（HEAD → 本地分支 → 远程分支 → tag 排序，排除 `refs/stash`，commit 详情返回 annotated tag 的 tagger/date/subject，subject ≤ 200 字）；旧 provider 的原始 refs 字符串由宿主解析兜底，`for-each-ref` 读取改为 NUL/US 分隔（tagger/tag subject 中的 tab 不再破坏解析）。
+- 新增 `GET /m/api/git/files`（HEAD 已跟踪文件，大小写不敏感 `q` 子串过滤，`limit` ≤ 200）与 `GET /m/api/git/file-history`（单文件提交历史，默认 20 / 最多 100，不透明游标，5000 条 / 20 秒上限；空/异常结果以 200 + `reason` 返回），路径由宿主归一化并拒绝越界。
+- 文档：`docs/03-api.md` 新增自包含的 Git 只读浏览接口章节（§6.19）。
+
 ## v3.2.3-alpha.1（build 27，issue #39）— NPM-only 自动更新（develop 收口）
 
 > 插件 `3.2.3-alpha.1` / App `3.2.3+27` / 载体 `3.2.3-alpha.1-app`。develop 已合并 issue #39 实现；本条目为收口后的开发快照。
@@ -25,29 +34,28 @@
 
 - Windows：npm/pnpm 经 shell 调用，缺失客户端给出稳定原因；桌面原生自更新仍受 `restart-unsupported` 限制（Linux/WSL 宿主可完成自更新）。
 
+## v3.2.3（2026-11-01，build 31 重发，issue #55 / PR #56）— 后台提醒保活 + 通知判据与精确撤销
 
-### 上游原文（main v3.2.2 / v3.2.3，截至 `a4fb7a3`）
+> 版本：插件 `3.2.3` / App `3.2.3+31`。对 v3.2.3（build 30）的**同版本号重发**，Release 资产替换；构建号 30 → 31。
+> 验收：`flutter analyze` 0 issue、`flutter test` 593、`node --test test/*.mjs`（审批相关单跑 13/13）、真机见下。
 
-以下为上游 main 已发布条目的原文（标题层级已下移以适配本节），按 main 顺序保留：
+### 真机验收（Xiaomi 17 Pro Max / Android 16，2026-11-01）
 
-#### v3.2.3（2026-10-31，build 30 重发，issue #55 / PR #56）— 后台提醒保活 + 通知判据与精确撤销
-
-> 版本：插件 `3.2.3` / App `3.2.3+30`。对 v3.2.3（build 29）的**同版本号重发**，Release 资产替换；构建号 29 → 30。
-> 验收：`flutter analyze` 0 issue、`flutter test` 593、`node --test test/*.mjs`（审批相关单跑 13/13）、真机 9 项（见下）。
-
-##### 真机验收（build 29 的实现，Xiaomi 17 Pro Max / Android 16，2026-10-31）
-
-- 常驻通知模式启动：`KeepAliveService` 前台运行、通道 `dsh_keep_alive`、通知 ID 1041，`ONGOING|ONLY_ALERT_ONCE|NO_CLEAR`。
-- 与桌面宠物互斥：切常驻通知 → 宠物服务停止；切回桌面宠物 → 常驻服务停止。
-- 选「关闭」→ 两个服务都停。
-- `force-stop` 后重开 App → 按持久化模式自动恢复常驻服务。
-- 按 HOME 退到后台 190 秒：进程 PID 与 ServiceRecord 不变，服务存活。
+- 常驻通知启动：`KeepAliveService` 前台运行、通道 `dsh_keepalive_v2`、通知 ID 3515、`types=0x40000000`（specialUse），`ONGOING|ONLY_ALERT_ONCE|NO_CLEAR`。
+- 状态行「保活运行 · 心跳 服务7/Dart5」：原生与 Dart 心跳都在走。
+- 与桌面宠物双向互斥：切保活 → 宠物停；切宠物 → 保活停。
+- 按 HOME 退后台 150 秒：PID 与 ServiceRecord 不变，服务存活。
+- 开启保活后设置页出现「系统省电设置」入口。
 - 通知权限被拒时选「常驻通知」→ 弹「需要通知权限」且不启动服务。
 - 端到端：后台收到真实审批帧 → 系统通知出现（`dsh_attention`）；`/respond` 结算后通知自动撤销。
 
-> build 30 并入 PR #56 后，原生保活服务与通知判据换成了其实现（通道 `dsh_keepalive_v2`、ID 3515、启动前 `resolveService` 校验），PR 作者在 MIUI / Android 14 上验过；本机 build 30 的复测待设备重新连上后补。
+### build 31 修复
 
-##### 通知判据与身份（PR #56，合并后以此实现为准）
+- 切到常驻通知时同步持久化宠物开关（`floatingEnabled=false`），App 启动时的恢复守卫也检查保活偏好。
+- 真正漏点：主框架用 `IndexedStack`，设置页随 App 启动就 `initState`，其 `_initBubbleState()` 按残留的旧偏好无条件拉起宠物——与保活开关无关。现在该处也做互斥判断，并把冲突的旧偏好纠正为 `false`。
+- 现象（build 30 实测）：先开宠物再切到保活，`force-stop` 重启后 `KeepAliveService` 正常恢复，但 `FloatingBubbleService` 也被拉起，两条常驻通知（同一通知 ID 3515）互相覆盖。
+
+### 通知判据与身份（PR #56，合并后以此实现为准）
 
 - 新增 `lib/attention.dart`：把「要不要弹、弹哪条、怎么撤」抽成纯逻辑层（`AttentionEvent` / `decideAttention` / `AttentionLedger`），key = `kind|sessionId|approvalId 或 rpcId`，通知 id 用稳定哈希，跨重连与重启都不重复、不撤错。
 - 进会话即已读：打开会话时该会话未读自动标已读并撤掉对应横幅；横幅按会话合并，全局一条，点击直达。
@@ -56,7 +64,7 @@
 - 原生启动前用 `resolveService` 校验组件可解析——此前 manifest 漏声明时 `startForegroundService` 不抛异常，UI 会假成功。
 - 单测新增 `attention_test.dart`（38 条）与通知测试补充，总数 593。
 
-##### 后台提醒：三选一模式（#55 步骤 4）
+### 后台提醒：三选一模式（#55 步骤 4）
 
 - 设置 → 后台提醒：`关闭 / 常驻通知 / 桌面宠物` 三选一，互斥（切换时先停另一个服务，不会出现两条常驻通知）。
 - 新增 `KeepAliveService`（`specialUse` 前台服务）：一条低干扰常驻通知把进程钉住，让 Dart 侧 SSE 在后台不被冻结；不自己连 SSE，也不碰宠物渲染。
@@ -64,28 +72,42 @@
 - `onTaskRemoved → stopSelf()`：划掉最近任务时诚实退出，避免"通知还在、进程已死"的假在线。
 - 切到「桌面宠物」沿用原悬浮窗权限引导与失败提示。
 
-##### 通知身份与撤销（#55 步骤 1）
+### 通知身份与撤销（#55 步骤 1）
 
 - 审批通知的 id 与去重键改用 `approvalId`（问题帧退回 `rpcId`）：SSE 重连重放同一审批帧不再堆叠多条通知。
 - `approval/resolved` / `question/resolved` 到达时按 id 精确撤销对应系统通知。
 - 回到前台不再 `cancelAll()`——旧行为会把仍未处理的审批提醒一起抹掉。
 - 插件：`approval/resolved` 帧补 `sessionId` 与 `outcome`，`question/resolved` 补 `sessionId`。
 
-##### 插件（#55 步骤 3）
+### 插件（#55 步骤 3）
 
-- `pendingTimeoutMs` 改为可配置（默认仍 120s），`offlineHoldMs` 保持原默认 300s。
+- `pendingTimeoutMs` 改为可配置，`offlineHoldMs` 保持原默认 300s。
 - `hello` 与 `/api/bootstrap` 的 `capabilities` 增加 `hold: { onlineMs, offlineMs }`，手机端只用它展示剩余时间，结算仍以服务端为准。
 
-##### 未包含（按 issue 约定后置）
+### 插件：审批默认保持 1 小时（PR #59，@qudongzhen）
 
-- 首次连接后的保活引导弹窗、进会话即已读与横幅合并（issue 步骤 2），下一版做。
+- 默认在线保持从 120 秒放宽到 1 小时（`DEFAULT_PENDING_TIMEOUT_MS`），仍可用 `pendingTimeoutMs` 覆盖。手机上看代码再答，2 分钟经常不够。
+- 超时结算从 `unavailable` 改为 `rejected`（手机超时、双端超时两处）——App 与桌面都显示「超时自动拒绝」，而不是「没有答复」。
+- 离线回放 TTL 30 → 70 分钟，必须大于在线保持时长，否则回放帧会先于结算被清掉。
 
-#### v3.2.3（2026-10-30，issue #50 / #52，PR #51 / #53 / #54）— 工作区归属修复 + 大文件流式下载 + Markdown 预览
+### 宠物资源瘦身（issue #58）
+
+- 两套动画重新编码，只改素材不动加载代码：总 23.7 MB → 8.3 MB。
+- 原生侧 16 个 webp：288×229 / 121 帧 → 200×172 / 81 帧（12fps → 8fps），q63，单个 90–482 KB。
+- App 内 4 个 webp：412×327 → 264×210，`idle` 81 帧 q58，点击类三个 61 帧 q60，单个 447–594 KB。
+- 4 张静态 png 同步缩到 190 高（100 KB → 40 KB）。
+- 未做（留待下一版）：两套资源合并成一份、悬浮球通知链路职责收口（两者都要改加载/服务代码）。
+
+### 未包含（按 issue 约定后置）
+
+- 首次连接后的保活引导弹窗（issue 步骤 2 的引导部分），下一版做。
+
+## v3.2.3（2026-10-30，issue #50 / #52，PR #51 / #53 / #54）— 工作区归属修复 + 大文件流式下载 + Markdown 预览
 
 > 版本：插件 `3.2.3` / App `3.2.3+28`。
 > 验收门禁：`node --test test/*.mjs`（208 通过 + 1 平台跳过，`interaction-settlement` 单跑 13/13）、`flutter analyze`（0 issue）、`flutter test`（555）、`flutter build apk --debug` 通过。
 
-##### 建会话前确保 cwd 有归属工作区（#50）
+### 建会话前确保 cwd 有归属工作区（#50）
 
 - **问题**：App 目录选择器可选到任意目录（含新建文件夹），若该目录不在 `workspaceRegistry` 里，会话会带着「无归属工作区」的 `cwd` 落盘。内核 `WorkspaceEntity.attachSession()` 要求 `header.cwd` 与工作区根**完全相等**，于是：
   - 本次 attach 走「向上找祖先工作区」分支必然抛错，且原实现 `workspace?.attachSession(...)` **未 await**，异常逃过 `try/catch`；
@@ -95,7 +117,7 @@
 - **顺带**：attach 改为 `await` + `catch` 记 warn，避免未处理的 Promise rejection。
 - **新增回归**：`test/issue50-cwd-workspace.test.mjs`（未注册→注册并 attach；已注册→复用；目录不可用→400 且不建会话；旧宿主→回落且不改写 cwd）。
 
-##### 插件：`/files` 支持 Range / HEAD / ETag（#52 / PR #53）
+### 插件：`/files` 支持 Range / HEAD / ETag（#52 / PR #53）
 
 - 单区间 `Range: bytes=...` → `206` + `Content-Range`；越界或格式错 → `416` + `bytes */size`（多区间仍不支持，避免响应放大）。
 - `ETag`（size + mtime）与 `Last-Modified`，`If-None-Match` 命中回 `304`。
@@ -103,14 +125,14 @@
 - `/directories` 增加 `fileEntries: [{name,size,mtimeMs,mime}]`，`files` 仍保持纯字符串数组，旧 App 不受影响。
 - `hello` 与 `/api/bootstrap` 的 `capabilities` 增加 `fileRange`；旧插件不声明时 App 自动退回整文件下载。
 
-##### App：流式下载（#52 / PR #54）
+### App：流式下载（#52 / PR #54）
 
 - 下载改为 `StreamedResponse` → 临时文件：进度回调、可取消、`Range` 续传（旧插件返回 200 时自动从头写）；取消/失败清理半成品。
 - 完成后由原生按路径保存到 `Download/DSH-Remote`（MediaStore `IS_PENDING`，I/O 不在主线程），完成弹窗给「查看 / 关闭」两个出口。
 - 失败文案人话化（401/403、404、5xx、断网、超时、中断、证书、保存失败各有表述），原始异常折叠进可复制的技术详情。
 - `MainActivity` 新增 `saveFileFromPath` / `openFile` / `shareFile` / `decodeText`；旧保存路径不再写死包名，改用 `packageName`。
 
-##### App：预览编码识别 + Markdown 渲染（#52 / PR #54）
+### App：预览编码识别 + Markdown 渲染（#52 / PR #54）
 
 - 预览只取前 256 KiB：`fileRange` 可用时发 `Range`，否则读满主动断开。
 - 编码判定改为「BOM → 无 BOM UTF-16 双向试解打分 → 严格 UTF-8（容忍采样末尾被截断的多字节字符）→ GB18030」，GB18030 走原生 `Charset` 解码；修掉真 UTF-8 中文被误判成 GB18030 的整篇乱码。
@@ -118,63 +140,80 @@
 - 修 `isWithinRoot` 的分隔符判断（Windows 下 `root\sub` 曾被判成越界）。
 - 测试：`flutter test` 555（基线 509 + 新增 46：download_stream、download_error、session_files_logic、session_files_widget）。
 
-#### v3.2.2（2026-10-29，build 27 重发）— 外观：三套皮肤 + 8 款图标 + 宠物联动
+## v3.2.2（2026-10-29，build 27 重发）— 外观：三套皮肤 + 8 款图标 + 宠物联动
 
 > 版本：插件 `3.2.2` / App `3.2.2+27`。对已发布 v3.2.2（build 25）的**同版本号重发**，Release 资产替换；构建号 25 → 27（26 为本地产物，从未发布）。
 > 插件 `lib/` 无逻辑改动；重新打包只为修掉 `package.json` 的 UTF-8 BOM（带 BOM 的 tgz 安装会被 npm 拒绝）。
 > 验收：`flutter analyze` 0 issue、`flutter test` 515、`node --test test/*.mjs` 200 通过 + 1 平台跳过、`gradlew :app:compileDebugKotlin` 通过。
 
-##### 外观：三套皮肤（默认仍是原 DSH）
+### 外观：三套皮肤（默认仍是原 DSH）
 
 - `设置 → 外观` 新增皮肤选择：**深潜夜航**（墨绿黑底 / 声呐环 / 冷光气泡 / 潮汐波浪 / 薄荷绿主色 + 深色字）、**海盐汽水**（奶油底 / 可乐蓝按钮 / 光束与气泡）、**鲸落星海**（靛蓝底 / 星尘星座 / 月盘 / 金色主色 + 深色字）。
 - 每套皮肤 × 明暗 = 8 组完整令牌，挂在 `ThemeExtension`（`DshPalette`）上；页面统一走 `DshColors.xxx(context)`，不再逐层传 skin。默认皮肤令牌与旧版逐值一致，老用户视觉不变。
 - 首页在这三套皮肤下换成大肥鱼 Hero：左侧一句问候（按皮肤切换文案），右侧固定 132dp 角色，下方动态背景（30fps 上限、不可见即停、减少动效时只留静态渐变）。
 
-##### 外观：8 款 App 图标
+### 外观：8 款 App 图标
 
 - 新增 `深海头像 / 贝壳徽章 / 月夜潮线 / 奶油贴纸 / 鲸邮票 / 霓虹灯牌 / 鲸尾剪影`，加原图标共 8 款，`设置 → 外观 → App 图标` 四列网格选择。
 - 实现用 8 个 `activity-alias`（`PackageManager` 一次只启用一个），`MainActivity` 不再直接持有 `LAUNCHER`；默认 `IconDefault` 的图标与原 `ic_launcher` 逐像素一致（仅重编码差异），**默认外观不变**。
 - 选择持久化在 `dsh_mr_app_icon`，启动时 `syncIcon` 对账；原生侧已是目标 alias 时不重复切换，避免每次启动触发桌面刷新。
 - 已知限制：Android 13 主题图标（monochrome 层）与 `roundIcon` 未提供，下个版本补。
 
-##### 首页角色互动
+### 首页角色互动
 
 - 点头部摸头、点身体戳一下、点尾部甩尾，各有对应动作与台词气泡（1.8 秒回落）；长按打开迷你面板（运行中会话 / 最近通知 / 桌面宠物状态 / 用量入口）。
 - 角色区域外滑动不被拦截（`GestureDetector` 只吃自己那块）；`减少动效` 或系统「移除动画」时退回静态帧。
 
-##### 桌面宠物与 App 联动（行为变化）
+### 桌面宠物与 App 联动（行为变化）
 
 - **App 在前台时收起桌面宠物**（默认开，可关）：`MainActivity.onStart/onStop` 把前后台状态告诉服务，宠物根视图置 `GONE`，同时收掉状态气泡与迷你面板。解决两件事——悬浮宠物与首页角色同屏重复；移动窗口盖住「＋ 新建会话」等按钮时**吞掉触摸**。
 - 用 `onStart/onStop` 而非 `onResume/onPause`（权限弹窗不算离开）；`onStop` 而非 `onDestroy`（进程被杀时后者不保证回调）。服务与 Activity 同进程，用静态标记而非 `startService` 广播，规避 Android 12+ 后台启动前台服务的限制。
 - 恢复时回到「贴边完全露出」再走 5 秒自动缩进，不改用户拖过的纵向位置。
 
-##### 「减少动态」改为「减少动效」并挪位
+### 「减少动态」改为「减少动效」并挪位
 
 - 该开关实际同时管桌面宠物、首页角色与首页背景三处，原来只写在桌面宠物卡里、文案也只提宠物。现改名 **减少动效**，移入 `设置 → 外观`，副标题写明覆盖范围与「系统级移除动画始终优先」。
 - 行为不变：`MediaQuery.disableAnimations`（系统无障碍）优先级最高且不可被 App 覆盖，App 开关只能在此基础上再关。
 
-##### 图标入口迁移提示
+### 图标入口迁移提示
 
 - 升级后首次启动弹一次说明：启动入口从 `com.dsh.remote.MainActivity` 换成 `com.dsh.remote.IconDefault`，**桌面上的旧快捷方式可能点不开一次**，删掉后从抽屉重新拖一个即可；此后切换图标不再出现。
 - 只在 Android 提示（其它平台不涉及 alias 迁移），结果记在 `dsh_mr_icon_migration_tip`，不会重复打扰。
 
-##### 其它
+### 其它
 
 - 对话页发送按钮的硬编码白色改为 `DshColors.onBrand(context)`，薄荷/金色底上会变深色图标，符合对比度要求。
 - APK 体积：宠物动画（原生 14.1 MB）+ 首页动画（9.6 MB）。实测 release 包约 99 MB（上一版 71.8 MB），如需瘦身可把首页那 4 组 webp 降采样或改静态帧。
 
-#### v3.2.2（2026-10-27，issue #46 / #49，PR #42）— 在线本地通知 + 轮次导航 + 二维码组网地址优选 + 审批兜底修复
+## v3.2.2（2026-10-27，build 26）— 桌面宠物：可互动大肥鱼
+
+> 版本：插件 `3.2.2` / App `3.2.2+26`。该构建**当时未单独发布**，随 build 27 一并对外（见上一条）。
+> 素材：`QCYTSN/dsh-dafeiyu` 当前 16 组动画（MIT；上游 `PC2005-cloud/dsh-pet`），0.7x / 12fps 转码，共 14.1 MB。
+> 验收：`flutter analyze` 0 issue、`flutter test` 509、`node --test test/*.mjs` 200 通过 + 1 平台跳过、Kotlin `PetAnimationModelTest` / `PetStateReducerTest` / `UsagePanelModelTest` 全绿；真机确认动画播放、状态切换、贴边缩进与面板。
+
+### 桌面宠物
+
+- 移除圆形鲸鱼悬浮球，改为原生悬浮宠物（Android 8+；API 28+ 播 animated WebP，更低版本退化为静态首帧）。
+- 沿用大肥鱼的动画状态机：IDLE / THINKING / WORKING（搜索、命令变体）/ WAITING / SUCCESS / ERROR / DISCONNECTED；完成/失败为短促 pulse，工具失败只短暂提示，不把任务判死。
+- 可互动性：点头部摸头、点身体戳一下、点右侧尾巴、双击专属摸头；拖动播放悬空姿势，松手落地并吸附最近边缘；1.2 秒互动冷却。
+- 贴边躲藏：5 秒无操作后只露 45% 画布，透明度 0.45 + 去饱和 + 轻度模糊；点露出部分滑出；完成/等待/出错自动探头，普通工作状态不打扰。
+- 状态气泡：标题 + 当前任务/进度（会话标题、已完成步数），点气泡打开面板；未读通知角标沿用旧逻辑，贴边时角标跟随到可见侧。
+- 旧迷你面板完整保留（运行中会话 / 最近通知 / 用量与额度 / 余额 / 打开 App / 去充值），新增当前状态行与「关闭宠物」入口。
+- 设置页新增宠物大小（76 / 96 / 116dp，默认 96）、减少动效（build 27 起移入「外观」卡）、贴边自动躲藏；沿用旧悬浮球开关的持久化 key。
+- 原生 WebP 不压缩打包。
+
+## v3.2.2（2026-10-27，issue #46 / #49，PR #42）— 在线本地通知 + 轮次导航 + 二维码组网地址优选 + 审批兜底修复
 
 > 版本：插件 `3.2.2` / App `3.2.2+25`。
 > 验收门禁：`node --test test/*.mjs`（200 通过 + 1 平台跳过）、`timeline-contract`（125）、`account-usage`（15）、`account-usage-adversarial`（19）、`flutter analyze`（0 issue）、`flutter test`（509）。
 
-##### 审批兜底：下游 unavailable 不再抢答（真机验收发现）
+### 审批兜底：下游 unavailable 不再抢答（真机验收发现）
 
 - `dualRoute` 原来把「下游返回 `unavailable`」也当成先答：没有任何桌面 `$events` 客户端时，内核转发立刻给 `unavailable`，插件会同时收掉手机侧卡片——手机根本来不及作答。
 - 现在只在桌面给出**真实答复**时才收手机卡；下游是 `unavailable` 时保留手机条目，等 `/respond` 或手机侧 fail-close 超时给出最终结果。
 - 新增回归：下游立即 `unavailable`，手机仍可作答且结果以手机为准；把修复回退该用例即变红。
 
-##### 对话轮次导航（PR #42）
+### 对话轮次导航（PR #42）
 
 - **一期**：对话页右侧刻度轨按轮次跳转；长会话里的定位修复（尺寸缓存、有符号估算、尝试次数上界、尾部安全网）。
 - **二期**：接入宿主 `turnOutline` 投影，已加载轮次正常显示、未加载轮次以短淡刻度显示，点它按 **200 条/页**有界跨页加载后定位；用户主动滚动即取消，四种终止结果（覆盖成功 / 到顶不可达 / 页数上限 / 用户取消）都有明确说明。
@@ -182,18 +221,17 @@
 - **能力位** `capabilities.turnOutline`：按宿主是否真的挂载投影判定，不按版本号推断；旧插件/旧 App 双方都能降级到既有行为。
 - 已知限制（如实标注）：轮次特别多的长会话，跨页跳转可能失败或流畅度一般。
 
-##### App 在线本地通知（#46）
+### App 在线本地通知（#46）
 
 - SSE 在线且 App **不在前台**时，`approval/requested` 与 `question/requested` 直接弹系统本地通知（Android 13+ 首次启动请求通知权限）；点通知直达该会话的待办卡。
 - 文案：`需要授权：<工具名>` + 理由；`需要你回答` + 首个问题；同一 `rpcId` 5 分钟内只提醒一次（SSE 重连/回放会重放未结算帧）。
 - 回到前台自动清掉系统通知（App 内已有卡片与横幅，避免重复打扰）；`pushUrls` 退为「App 被杀/离线」时的兜底。
 - Android 构建开启 core library desugaring（`desugar_jdk_libs 2.1.5`），这是该通知库的硬性要求。
 
-##### 二维码地址优选（#49）
+### 二维码地址优选（#49）
 
 - 新增纯函数 `orderQrAddresses`：默认仍是「局域网私有地址优先」；**仅当机器上没有任何 `10./192.168.x/172.16-31` 地址时**，才把 Tailscale CGNAT（`100.64/10`）提到最前，避免校园网/热点等场景首选到不可达地址。
 - 7 项回归覆盖排序与端到端载荷选择；`docs/03-api.md` 同步。
-
 
 ## v3.2.1-alpha.1（2026-10-24）— Desktop 连接、版本偏斜与 npm 载体预发布
 
@@ -1359,4 +1397,3 @@ lanBridge:
 - `/m` 移动页：登录、发消息、SSE 流式、会话历史
 - 访问口令认证（cookie/header）、Host 校验、二维码
 - 推送桥：Server酱 / ntfy / Bark / generic
-

@@ -238,7 +238,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _initBubbleState() async {
     final on = await Floating.isRunning();
-    final want = widget.store.floatingEnabled;
+    // 互斥兜底（build 31）：设置页在 IndexedStack 里随 App 启动就 initState，
+    // 保活开着时不能按残留的旧偏好把宠物拉回来。
+    final prefs = await SharedPreferences.getInstance();
+    final keepAliveOn = prefs.getBool(BackgroundKeepAlive.prefKey) ?? false;
+    if (keepAliveOn && widget.store.floatingEnabled) {
+      await widget.store.setFloatingEnabled(false); // 纠正偏好，下次启动不再冲突
+    }
+    final want = keepAliveOn ? false : widget.store.floatingEnabled;
     final canOverlay = await Floating.canDrawOverlay();
     // v2.7.2：偏好是开但服务没跑（清理后台/重启后）→ 自动拉起，开关保持开
     if (want && !on && canOverlay) {
@@ -311,6 +318,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (_bubbleOn) {
         // 互斥：先停掉宠物服务（它会自己管理前台服务与 SSE）。
         await Floating.stop();
+        // 持久化也要一起改，否则重启后 restoreFloating() 会按旧偏好把宠物拉回来。
+        await widget.store.setFloatingEnabled(false);
         if (!mounted) return;
         setState(() => _bubbleOn = false);
         showToast(
@@ -956,6 +965,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     'branches' => L10n.t('分支', 'Branches'),
     'graph' => L10n.t('图谱', 'Graph'),
     'worktree' => L10n.t('工作区', 'Worktree'),
+    'fileHistory' => L10n.t('文件历史', 'History'),
     _ => id,
   };
 
@@ -977,6 +987,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   '选择 1–3 项并调整顺序；第一项为默认页。',
                   'Choose 1–3 tabs and reorder them; the first is the default.',
                 ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                L10n.t(
+                  '“文件历史”需要宿主支持；旧版宿主上该 tab 会降级为不可用提示。',
+                  'File history requires host support; on older hosts the tab degrades to an unavailable notice.',
+                ),
+                key: const Key('git-tabs-file-history-note'),
+                style: Theme.of(context).textTheme.bodySmall,
               ),
               const SizedBox(height: 8),
               for (final id in [
