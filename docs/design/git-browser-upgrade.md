@@ -18,6 +18,7 @@
 - 宿主 git 契约（`contractVersion 1.1.0`）加法扩展：graph/commit 返回结构化 `refsDetail` / `tagsDetail`；新增文件列表与文件历史端点；新增 `fileHistory` / `refsDetail` capability。
 - App 统一展示层为 `GitFileViewer(mode: content|diff)`，两个入口只做数据适配；文件查看器顶部增加“提交历史”按钮。
 - Git 管理新增 `fileHistory` tab（候选 4 个，仍可选 1–3 个），顶部选择文件、下方分页提交历史；从查看器深链时，若该 tab 未启用则打开独立历史页（无 TabBar）。
+- 文件历史的“选择文件”主入口复用会话文件浏览页：点文件进入预览，预览页的“提交历史”返回原历史视图并选中该文件；原 inline 搜索/最近文件保留为“搜索文件”快捷入口。
 
 ## User Stories
 
@@ -33,12 +34,13 @@
 10. 作为手机用户，我希望仍然只显示我选择的 1–3 个 git tab，并能调整顺序；新的 history tab 作为可选项。
 11. 作为手机用户，如果 history tab 没被我选进 1–3 个，从文件按钮进入时应看到完整历史页（而不是被隐藏），且返回后回到原文件位置。
 12. 作为手机用户，我希望文件选择器能搜索仓库内的已跟踪文件，并显示最近使用过的文件，以便大仓库里快速定位。
-13. 作为手机用户，我希望历史列表显示短 OID、subject、作者、相对时间和该文件的状态（M/A/D/R），以便扫读。
-14. 作为手机用户，我希望长按历史条目可以复制 OID。
-15. 作为手机用户，我希望未跟踪文件/空仓库/超时等场景有明确空态与错误提示，而不是空白页。
-16. 作为维护者，我希望旧宿主（无新 capability）上的 App 自动降级：不显示历史入口，详情页用字符串兜底解析 refs/tags。
-17. 作为维护者，我希望新 API 是加法扩展，外部 git provider 不实现新方法时仍能工作。
-18. 作为维护者，我希望该功能作为上游 PR 交付，包含双端实现、测试与文档，不混入 fork 专属的更新/发版改动。
+13. 作为手机用户，我希望从文件历史点“选择文件”时进入文件浏览页，点文件看到内容预览后能通过“提交历史”按钮回到原历史视图，这样“历史 → 选择文件 → 预览 → 历史”是一条闭环且不会叠出多个 Git 页面。
+14. 作为手机用户，我希望历史列表显示短 OID、subject、作者、相对时间和该文件的状态（M/A/D/R），以便扫读。
+15. 作为手机用户，我希望长按历史条目可以复制 OID。
+16. 作为手机用户，我希望未跟踪文件/空仓库/超时等场景有明确空态与错误提示，而不是空白页。
+17. 作为维护者，我希望旧宿主（无新 capability）上的 App 自动降级：不显示历史入口，详情页用字符串兜底解析 refs/tags。
+18. 作为维护者，我希望新 API 是加法扩展，外部 git provider 不实现新方法时仍能工作。
+19. 作为维护者，我希望该功能作为上游 PR 交付，包含双端实现、测试与文档，不混入 fork 专属的更新/发版改动。
 
 ## Implementation Decisions
 
@@ -74,8 +76,10 @@
 - 图行：取消 `maxVisible=2` / `+N` / 112px 单标签截断；标签与图共用同一横向滚动轴，单行、行高固定 86；颜色按种类固定（HEAD 高亮、本地分支、远程分支、tag=tertiaryContainer）。
 - 详情页 `Refs`/`Tags` 用 `refsDetail`/`tagsDetail` 渲染；旧 host 走字符串解析兜底（`HEAD ->`、`refs/heads/`、`refs/remotes/`、`tag: refs/tags/`），无法识别保留原文；旧 host 的 Tags 从 refs 字符串派生。
 - `gitTabIds` 增加 `fileHistory`；仍校验 1–3 个、唯一、已知 id；默认仍 `branches/graph/worktree`；设置弹窗候选 4 个、最多勾 3、可排序。
-- history tab/独立页共用同一个 body/controller：顶部文件 chip + 选择器（服务端 `q` 搜索、防抖 250ms、最近文件按仓库持久化最多 5 个）；列表项短 OID + subject + author + 相对时间 + 状态徽标；点提交进现有详情；长按复制 OID；每页 20。
-- 无文件时显示引导空态，并在该 surface 首次显示时自动弹一次选择器；取消后本次不再自动弹；深链始终预填。
+- history tab/独立页共用同一个 body/controller：顶部文件 chip + 主入口“选择文件/更换文件”+ 次入口“搜索文件”；主入口 push `SessionFilesScreen(selectionMode: true)`，在文件浏览里点文件进入预览，预览页的“提交历史”pop 回原历史视图并选中路径，不叠加新的 GitBrowserSheet；搜索入口仍使用服务端 `q`（防抖 250ms、最近文件按仓库持久化最多 5 个）。列表项短 OID + subject + author + 相对时间 + 状态徽标；点提交进现有详情；长按复制 OID；每页 20。
+- 无文件时显示引导空态，并在该 surface 首次显示时自动弹一次 **inline 搜索选择器**（不自动全屏进入文件浏览页）；取消后本次不再自动弹；深链始终预填。
+- 文件浏览选择模式：返回值为会话路径；宿主按既有规则归一化，仓库外/目录路径进入既有 `path-invalid` / `not-tracked` 空态，不新增宿主 repositoryRoot 字段。取消/系统返回返回 null，历史视图保持原选择。
+- 该改动是 App 内导航/交互闭环，不改变宿主契约与领域模型；决策记录在本文档与 issue #42，不新增 ADR。
 - 深链：只看当前文件路径，不传/不定位 OID；范围=当前 HEAD。history tab 已启用→切 tab；未启用→push 独立历史页（无 TabBar）；返回恢复原查看器状态。
 - 入口可见性：文件不在仓库或无 `fileHistory` capability → 按钮隐藏；未跟踪 → 按钮可见，进入空态。
 
@@ -85,7 +89,7 @@
 |---|---|
 | 空仓库/无提交 | 空态“仓库还没有提交” |
 | 未跟踪 | 空态“该文件暂无提交历史（未跟踪）” |
-| 路径非法/目录 | 错误卡片 + 重新选择文件 |
+| 路径非法/目录 | 错误卡片 + 重新选择文件（优先进入文件浏览；搜索入口仍可用） |
 | 超时/超限 | 已取部分 + “仅显示最近 N 条提交” |
 | capability 缺失 | 入口隐藏 |
 | 网络/服务错误 | 错误态 + 重试 |
@@ -95,7 +99,7 @@
 - 好测试只覆盖外部行为：宿主看 HTTP 响应契约与真实 git 仓库行为；App 看用户可见的 widget 行为与 API 适配，不断言内部实现细节。
 - 优先复用现有 seam，新增 seam 控制在两个：
   1. **宿主 HTTP seam**：沿用 `test/git-read-api.test.js` 的 `apply()` + 路由驱动方式，但使用**真实 bundled provider + 临时 git 仓库**（prior art：`test/git-read-bundled-provider.test.js`），覆盖 capabilities、graph/commit 结构化 refs/tags、`/files`、`/file-history`、分页/错误/路径归一化；旧 provider 兜底用注入的 fake provider 补一例。
-  2. **App widget seam**：沿用 `dsh-mobile-app/test/git_browser_widget_test.dart` 的 fake `GitReadApi` 驱动 `GitBrowserSheet` / 历史 body / 独立历史页 / `GitFileViewer`（diff 模式），覆盖全量标签、详情 refs/tags、tab 规则、深链、空态/错误态、分页、最近文件。
+  2. **App widget seam**：沿用 `dsh-mobile-app/test/git_browser_widget_test.dart` 的 fake `GitReadApi` 驱动 `GitBrowserSheet` / 历史 body / 独立历史页 / `GitFileViewer`（diff 模式），覆盖全量标签、详情 refs/tags、tab 规则、深链、空态/错误态、分页、最近文件；新增文件浏览选择模式、返回选中路径、取消/返回不改变选择、搜索次入口、不叠加 GitBrowserSheet 的导航测试。
 - 既有 `git_api_test.dart`、`git_models_test.dart`、`git_graph_*_test.dart`、`git_tabs_preferences_test.dart`、`session_files_*` 测试作为回归，不改断言语义（除被移除的 `+N` 截断用例需按新行为更新）。
 
 ## Out of Scope
