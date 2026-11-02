@@ -383,3 +383,49 @@ _避免_：冒烟、灰度、预发布（与正式预发布版本混淆）
 > 更新候选只由宿主 npm registry 产生；两端配对与 APK 身份仍以 carrier 内的**发布清单**为权威；DSH 负责校验并传输 carrier 中的 APK，不另立版本来源。
 
 > 三条判据各司其职，不得互相代替：**能力能不能用**看能力声明；**要不要下载新版本**看内容标识；**要不要提示用户对齐**看版本号。
+
+## 发布
+
+**alpha 线**：
+develop 上用于实机测试的发布线，版本带 `-alpha.N`；它验证尚未进入冻结版本的 develop 快照。
+_避免_：预发布、测试版、release 线
+
+**release 线**：
+从 develop 切出的短期冻结发布线，承载同一版本 core 的 `-rc.N` 与 stable 发布。
+_避免_：main、上游分支、长期维护分支
+
+**发布 tag**：
+指向一次版本 bump 提交的不可变版本引用；alpha tag 只属于 alpha 线，rc/stable tag 只属于对应 core 的 release 线。
+_避免_：分支名、可变指针、latest
+
+**发布 build 号**：
+`pubspec.yaml` 中 `+N` 的规范名，按全局单调规则分配，供 App 安装包派生 Android versionCode；不是某条分支的本地计数器。
+_避免_：commit 数、构建次数、Android versionCode（它由发布 build 号派生）
+
+**App versionCode**：
+Android 安装包实际用于判断安装/降级的整数版本号，由发布 build 号派生；系统安装只认它。
+_避免_：versionName、发布日期、发布前沿
+
+**发布前沿**：
+npm 上已发布 carrier 的 `appVersion` 所带发布 build 号的最大值；它是判断新发布是否会造成降级的唯一权威。
+_避免_：tag 最大值、工作区 pubspec、latest 指针
+
+**迁移水位**：
+切换到全局单调 build 规则时，用于 grandfather 历史重复 build 的起始发布 build 号；新发布必须高于它。它不是发布前沿。
+_避免_：下一个 build、历史最大 tag、当前 build
+
+**发布通道**：
+npm dist-tag 上的 alpha、rc、latest 三条通道；本机插件版本的预发布段决定使用哪条，预发布只更新自身通道。
+_避免_：App 更新来源、固定快照、下载源
+
+**app 指针**：
+npm `app` dist-tag，指向最近一次允许前进的 carrier；只能按 SemVer 前进，不得回退。
+_避免_：latest 指针、当前发布、发布清单
+
+**latest 指针**：
+npm `latest` dist-tag，稳定版通道；只有 stable 发布可前进它。bootstrap 期可以为 prerelease，但首个 stable 后必须是 stable。
+_避免_：最新构建、发布前沿、当前发布
+
+**冻结**：
+暂停新功能合入与/或暂停发布 tag 的动作。release 线仍冻结功能；本政策取消的是「RC 期间冻结 develop tag」。
+_避免_：代码封版、分支保护、停止开发
