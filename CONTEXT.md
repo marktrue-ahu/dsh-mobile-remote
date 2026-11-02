@@ -410,13 +410,29 @@ _避免_：versionName、发布日期、发布前沿
 npm 上已发布 carrier 的 `appVersion` 所带发布 build 号的最大值；它是判断新发布是否会造成降级的唯一权威。
 _避免_：tag 最大值、工作区 pubspec、latest 指针
 
+**发布政策记录**：
+维护迁移水位、legacy tag 白名单、legacy carrier 核验映射与发布意图的受保护全局记录；分配端与 CI 的唯一水位/白名单来源，不是某条分支的快照。
+_避免_：分支内配置、tag、环境变量
+
 **迁移水位**：
-切换到全局单调 build 规则时，用于 grandfather 历史重复 build 的起始发布 build 号；新发布必须高于它。它不是发布前沿。
+切换到全局单调 build 规则时，用于 grandfather 历史重复 build 的起始发布 build 号；新发布必须高于它。它由发布政策记录维护，不是发布前沿。
 _避免_：下一个 build、历史最大 tag、当前 build
+
+**legacy carrier**：
+迁移前已发布、缺少顶层 `appVersion` 的 carrier；其发布 build 只能通过已核验映射进入发布前沿。
+_避免_：旧版本、损坏 carrier、可忽略历史
 
 **发布通道**：
 npm dist-tag 上的 alpha、rc、latest 三条通道；本机插件版本的预发布段决定使用哪条，预发布只更新自身通道。
 _避免_：App 更新来源、固定快照、下载源
+
+**发布意图**：
+一次发布在提交 registry 前写入发布政策记录的待确认记录；用于区分「从未提交」与「提交后结果未知」。
+_避免_：发布计划、tag、CI 运行记录
+
+**未确认发布**：
+已向 registry 提交但尚未确认最终可见性的发布；未关闭时不得继续分配 build 或推进通道指针。
+_避免_：失败发布、未发布的 tag
 
 **app 指针**：
 npm `app` dist-tag，指向最近一次允许前进的 carrier；只能按 SemVer 前进，不得回退。

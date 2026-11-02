@@ -23,10 +23,13 @@
 ### 2. 发布 build 号全局单调
 
 - 领域规范名：**发布 build 号**指 `dsh-mobile-app/pubspec.yaml` 的 `+N`；Android 安装包实际的 **App versionCode** 由它派生，不再是「各分支自己 +1」。
-- 分配规则：打 tag 前，`next = max(迁移水位, 历史 tag build, 已发布 carrier 的 appVersion build) + 1`。历史 tag 只用于避免复用；**已发布 carrier 才是发布前沿的唯一权威**。
+- 分配规则：打 tag 前，`next = max(迁移水位, 历史 tag build, 已发布新 carrier 的 appVersion build, legacy carrier 的已核验 appBuild) + 1`。历史 tag 只用于避免复用；**发布前沿只由已发布 carrier 事实决定**。
+- 全局权威：迁移水位、legacy tag 白名单、legacy carrier 核验映射与发布意图，统一放在受保护的 **`release-meta`** 发布政策记录中；分配端与 CI 读取同一份最新记录，分支内的副本不是权威。记录缺失、双远端不一致或 schema 非法时 fail-closed。
 - CI 校验规则：对**未发布的新 tag**要求 `build > 发布前沿`；carrier/插件均已发布的重跑幂等跳过；部分发布（例如 carrier 已发、插件未发）恢复时排除自身 carrier 后再校验；**不得用「当前所有 tag 的最大 build」作合法性判据**——tag 集合会在排队发布期间变化，用它会使合法排队或恢复任务被旧 tag 阻断。
 - 历史兼容：迁移前的历史 tag 允许存在重复 build，仅 `legacyTags` 白名单内 grandfathered；新 tag 必须高于迁移水位并从下一个值开始。具体水位值与白名单放设计稿与 issue #43，不写死在 ADR。不得重写、移动或删除历史 tag。
-- 发布前沿只由「已发布 carrier 的 `appVersion` build 最大值」决定；工作区 pubspec、未发布 tag、设备安装记录都不构成发布前沿。缺少可验证 `appVersion` 的旧 carrier 不参与自动前沿推断：迁移时人工核对或显式登记，不得猜测；无法确认时 fail-closed。
+- 发布前沿 = `max(已发布新 carrier 的 appVersion build, legacyCarriers 的已核验 appBuild)`；工作区 pubspec、未发布 tag、设备安装记录都不构成发布前沿。
+- 旧 carrier 缺少顶层 `appVersion` 时，必须经 tarball `dist.integrity` 校验并读取内嵌 manifest/APK 的实际 build，登记在 `legacyCarriers` 后才可进入前沿；新 carrier 缺字段/非法一律 fail-closed；不得修改已发布包、不得静默跳过未知记录。
+- 提交后状态未知：publish 请求可能已提交但可见性无法确认时，不得当作「确定未发布」；必须记录发布意图、进入 `unknown` 并阻断后续发布/通道移动，人工确认后恢复，期间不得删除 tag 重新分配。
 
 ### 3. alpha 与 rc 可以交错，不再冻结 develop tag
 
@@ -36,7 +39,7 @@
 
 ### 4. `app` 与 `latest` 指针
 
-- **`app` 指针不得回退**：carrier 发布前先读取当前 `app`，只有候选 carrier 的 SemVer 大于当前值（或无当前值）才允许移动 `app`；否则用临时 tag 发布 carrier，保持 `app` 原值。禁止「先 `npm publish --tag app` 再比较」的写法。重跑/部分恢复同样先比较后移动；`app` 指向非 carrier 的异常历史转人工处理，不自动修复。
+- **`app` 指针不得回退**：carrier 发布前先读取当前 `app`，只有候选 carrier 的**配对插件版本**（剥离末尾 `-app` 后的 `X.Y.Z[-pre]`）大于当前 `app` 指向 carrier 的配对插件版本（或无当前值）才允许移动 `app`；禁止直接比较裸 carrier 字符串；否则用临时 tag 发布 carrier，保持 `app` 原值。禁止「先 `npm publish --tag app` 再比较」的写法。重跑/部分恢复同样先比较后移动；`app` 指向非 carrier 的异常历史转人工处理，不自动修复。
 - **`latest` 只由稳定版前进**：alpha/rc 只更新自身通道（`alpha`/`rc`），不得移动 `latest`。这与 ADR 0024 的约束一致；当前 workflow 的「所有发布都前进 latest」必须在 issue #43 中修正。
 - **bootstrap 例外**：当前 npm 上 `latest` 为 `3.2.3-rc.1`、尚无稳定版。首个 stable 发布前允许 `latest` 暂为 prerelease；首个 stable 发布后 `latest` 必须指向 stable。不为满足该不变量而自动发布 stable、删除或改名历史版本；发布 stable 仍需正常 release 流程与授权。
 - 通道更新仍由本机插件版本的 prerelease 段决定；候选插件用精确 `${candidate}-app` 配对 carrier，`app`/`latest` 指针不作为 App 与插件的配对依据。
@@ -50,16 +53,16 @@
 ### 6. 生效、实施与授权
 
 - 本 ADR 状态为「已接受」，但**实际发布流程自 issue #43 实现合入起生效**；在实现完成前，既有 release-only 流程仍有效，不能按本 ADR 直接给 develop 打 alpha tag。
-- issue #43 负责：全局 build 分配工具、原子 bump 工具、workflow 的 tag 归属/build/app/latest 校验、发布手册与 AGENT-RULES 同步、迁移水位落地。
+- issue #43 负责：`release-meta` 全局发布政策记录、全局 build 分配工具、原子 bump 工具、workflow 的 tag 归属/build/app/latest/unknown 状态校验、发布手册与 AGENT-RULES 同步、迁移水位与 legacy carrier 核验落地。
 - 发布执行者、推送/tag/发版的逐次授权以 `AGENT-RULES.md` 为准；本 ADR 不复述授权清单，避免两份规则漂移。
 
 ## 后果
 
 - develop 从此可以作为长期实机测试线：alpha tag 直接来自 develop，不需要先切 release 分支；RC 期间不再冻结 develop tag。
 - CI 必须按 §1/§2/§4 修改；在 #43 完成前，当前 workflow 仍会拒绝 develop 上的 alpha tag，并可能让预发布移动 `latest`。这是「已接受但未实现」的已知过渡状态。
-- 历史 8 个 tag 的重复 build 不重写；迁移水位与 legacy 白名单由设计稿给出，新发布从水位之后开始。迁移前必须人工核对已安装设备/未打 tag 构建，必要时抬水位；未打 tag 的更高 build 不能被忽略。
+- 历史 8 个 tag 的重复 build 不重写；迁移水位、legacy tag 与 legacy carrier 核验映射由设计稿给出，新发布从水位之后开始。迁移前必须人工核对已安装设备/未打 tag 构建，必要时抬水位；未打 tag 的更高 build 不能被忽略。3 个缺 `appVersion` 的旧 carrier 必须先核验登记，否则不能作为前沿证据。
 - 当前 npm `latest=3.2.3-rc.1` 的 bootstrap 状态保留到首个 stable 发布；首个 stable 之后 latest 必须为 stable。
-- 发布失败/回滚：未发布 tag 可删除并重新分配；已发布版本不可覆盖、不可回退；部分发布按恢复语义完成或作废，不得借恢复把通道指针回退。
+- 发布失败/回滚：只有确认从未提交 publish 请求时，未发布 tag 才可删除并重新分配；已发布版本不可覆盖、不可回退；部分发布按恢复语义完成或作废，不得借恢复把通道指针回退；提交后可见性未知时必须阻断并人工恢复。
 - 跨 core 更新仍是已知限制：Android versionCode 更大不代表 App 更新器接受；跨 core 需人工安装，这是本期明确不承诺的能力边界。
 
 ## 考虑过的方案
