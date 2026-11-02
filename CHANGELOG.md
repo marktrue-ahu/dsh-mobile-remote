@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## v3.2.4-alpha.1（build 32，issue #42）— Git 浏览增强：全量标签 / 结构化 refs / 统一文件查看器 / 文件提交历史
+
+> 插件 `3.2.4-alpha.1` / App `3.2.4+32` / 载体 `3.2.4-alpha.1-app`。develop 快照：合并 issue #42 上游贡献分支（`upstream/git-browser-upgrade`，已 rebase 到 `github/main`），并带入 main 最新内容（宠物资源瘦身、审批默认 1 小时等）。
 
 ### 插件：Git 只读浏览契约 1.1.0（issue #42）— 结构化 refs/tags + 文件列表与文件历史
 
@@ -8,6 +10,13 @@
 - `GET /m/api/git/graph`、`GET /m/api/git/commit`：保留旧 `refs: string[]`，新增 `refsDetail` / `tagsDetail`（HEAD → 本地分支 → 远程分支 → tag 排序，排除 `refs/stash`，commit 详情返回 annotated tag 的 tagger/date/subject，subject ≤ 200 字）；旧 provider 的原始 refs 字符串由宿主解析兜底，`for-each-ref` 读取改为 NUL/US 分隔（tagger/tag subject 中的 tab 不再破坏解析）。
 - 新增 `GET /m/api/git/files`（HEAD 已跟踪文件，大小写不敏感 `q` 子串过滤，`limit` ≤ 200）与 `GET /m/api/git/file-history`（单文件提交历史，默认 20 / 最多 100，不透明游标，5000 条 / 20 秒上限；空/异常结果以 200 + `reason` 返回），路径由宿主归一化并拒绝越界。
 - 文档：`docs/03-api.md` 新增自包含的 Git 只读浏览接口章节（§6.19）。
+
+### App：统一 Git 文件查看器与文件提交历史
+
+- 新增 `GitFileViewer`：`content` / `diff` 统一渲染（行号、Markdown 预览/源码切换、diff 折叠、横向滚动、复制），会话文件浏览与 git diff 预览复用同一组件。
+- 分支图展示全部 refs/tags：单行共享横向滚动，不再 `+N`/截断；按 HEAD → 本地分支 → 远程分支 → tag 排序，颜色按种类区分；提交详情 Refs/Tags 展示结构化数据与 annotated tag 元数据（旧宿主字符串兜底）。
+- Git 管理新增可选「文件提交历史」tab：候选 4 个仍限选 1–3（默认顺序不变）；顶部文件选择器（仓库内搜索 + 最近文件）、分页历史（20/页）、文件状态徽标、长按复制 OID；查看器新增「提交历史」入口，tab 未启用时打开独立历史页。
+- 旧宿主/旧 provider 全链路降级：`fileHistory` 能力缺失隐藏入口，旧 provider 的原始 refs 字符串由 App 解析兜底。
 
 ## v3.2.3-alpha.1（build 27，issue #39）— NPM-only 自动更新（develop 收口）
 
