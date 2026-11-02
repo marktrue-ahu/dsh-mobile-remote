@@ -821,20 +821,12 @@ test("预发布核心版本不配对被拒：App core 必须等于插件 core（
 	}
 });
 
-test("npm publish workflow routes prereleases to their channel and auto-advances latest monotonically", async () => {
+test("npm publish workflow delegates release policy to release-gate (latest only stable, app pointer pre-compared)", async () => {
 	const workflow = await readFile(join(ROOT, ".github", "workflows", "publish-npm.yml"), "utf8");
-	assert.match(workflow, /npm publish "\$plugin_file"[\s\S]*?--tag "\$PLUGIN_TAG"/,
-		"plugin publish must use the tag derived by pluginPublishTag");
-	assert.match(workflow, /npm dist-tag add "\$PACKAGE_NAME@\$\{?PLUGIN_VERSION\}?" "\$PLUGIN_TAG"/,
-		"dist-tag update must use the same dynamic channel");
-	// latest 自动前进：先比较当前 latest 与本次版本，只允许向前移动。
-	assert.match(workflow, /latest_decision="\$\(node --input-type=module -e '[\s\S]*?' "\$PLUGIN_VERSION" "\$current_latest"\)"/,
-		"workflow must compute a monotonic latest decision");
-	assert.match(workflow, /if \[\[ "\$latest_decision" == "move" \]\]; then[\s\S]*?npm dist-tag add "\$PACKAGE_NAME@\$PLUGIN_VERSION" latest/,
-		"workflow must move latest only when the release is newer");
-	assert.match(workflow, /latest dist-tag stays at newer\/equal version/,
-		"workflow must keep a newer latest instead of rolling it back");
-	assert.match(workflow, /latest is older than this release/,
-		"verification must reject a latest older than the released version");
-	assert.doesNotMatch(workflow, /--tag latest/, "publish must not hardcode latest");
+	assert.match(workflow, /node tools\/release-gate\.mjs prepare[\s\S]*?--github-env "\$GITHUB_ENV"/,
+		"workflow must run the testable release-gate preflight");
+	assert.match(workflow, /PLUGIN_PUBLISH_TAG/, "plugin publish must use the pre-computed channel/staging tag");
+	assert.doesNotMatch(workflow, /latest_decision="\$\$?\(node/, "inline latest auto-advance logic must be removed");
+	assert.doesNotMatch(workflow, /--tag latest[\s\\]/, "publish must not hardcode latest");
+	assert.match(workflow, /node tools\/release-gate\.mjs verify-tags/, "workflow must verify dist-tags via release-gate");
 });
