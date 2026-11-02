@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "watermark": 32,
+  "legacyTags": [
+    "v3.2.1-alpha.1",
+    "v3.2.1-alpha.2",
+    "v3.2.1-alpha.3",
+    "v3.2.1-rc.1",
+    "v3.2.2-alpha.1",
+    "v3.2.2-rc.1",
+    "v3.2.3-alpha.1",
+    "v3.2.3-rc.1"
+  ],
+  "legacyCarriers": [
+    {
+      "version": "3.2.1-alpha.1-app",
+      "integrity": "sha512-+6kBOgE9Ws2j/KfTuVY88TKwrUKiQ9mWmi5IjqoL2AUeKfskRose4z2HKCjvECdFRDawTRJl60HLSDVpBCer3Q==",
+      "appBuild": 24
+    },
+    {
+      "version": "3.2.1-alpha.2-app",
+      "integrity": "sha512-V/r+N/yAJIgQEZkqfHYP7OCPxj5zRtSitcMsEwGOmJupMydwLYU6SBmvq+tSNehhoI24P1tXWbilggGG0ak5kQ==",
+      "appBuild": 24
+    },
+    {
+      "version": "3.2.1-alpha.3-app",
+      "integrity": "sha512-t0Ev0kaNbaZPO+38OWL3Zdr0h8wp0Cy75na1EqwaFDSk7G/Xo6KMPY0XPeAeR8/twBTv09/AE6QQCXwA8SjD8A==",
+      "appBuild": 25
+    },
+    {
+      "version": "3.2.1-rc.1-app",
+      "integrity": "sha512-wNNE1D+yvGRxmFVJhKM36euzjWj5PnrVVS99IRdu+SK2PsAXkjNElYnQN/fmYNNyHlCGgeDkINaEKJ1AAdQ4+Q==",
+      "appBuild": 26
+    },
+    {
+      "version": "3.2.2-alpha.1-app",
+      "integrity": "sha512-L3J4//Dun2D5NtgsopPUs/A0D453JJMSqHY81JtMu2tVujq2zS81gIENddFmb6jhkrim47zKf3uJUR4siMJFcA==",
+      "appBuild": 26
+    },
+    {
+      "version": "3.2.2-rc.1-app",
+      "integrity": "sha512-Ed3sdkKmerdAbUGpiKgUq4NVeK3D0Yc81Jx8jAXnDhMi22u5Hb7tIfC/xnQRJWa7JjGJzkeY5LJCAtu2UNgGmw==",
+      "appBuild": 27
+    },
+    {
+      "version": "3.2.3-alpha.1-app",
+      "integrity": "sha512-gokMxAfN6TCYOqbIQwS5s+9FrMiMdE05m3gEgkHCDvz+ycSRpzdKG4twSs4MXGiy+HICpaBPSyOlCquQFXLB4Q==",
+      "appBuild": 27
+    },
+    {
+      "version": "3.2.3-rc.1-app",
+      "integrity": "sha512-z1fwgTJI9ipG1t8IbAgdBodE0QR/i6J+ssUq8IIV4iEHsZVztBwJ6jv2LlqxztofyRNFrR1Vk316gvKuz4+t8g==",
+      "appBuild": 28
+    }
+  ],
+  "updatedAt": "2026-11-02",
+  "intents": []
+}
