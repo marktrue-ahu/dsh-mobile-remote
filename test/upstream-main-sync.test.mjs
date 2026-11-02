@@ -203,7 +203,7 @@ test("外部错误正文、网络异常文本与非 JSON 响应不进入公开�
 
 test("工作流仅定时/手动触发：default dry-run、固定仓库与 develop、最小权限、无发布或依赖安装", () => {
 	const workflow = readFileSync(new URL("../.github/workflows/sync-upstream-main.yml", import.meta.url), "utf8");
-	assert.match(workflow, /cron: '17 \*\/6 \* \* \*'/);
+	assert.match(workflow, /cron: '43 \*\/6 \* \* \*'/);
 	assert.match(workflow, /type: boolean\s+default: true/);
 	assert.match(workflow, /contents: write/);
 	assert.match(workflow, /github\.repository == 'marktrue-ahu\/dsh-mobile-remote' && github\.ref == 'refs\/heads\/develop'/);
