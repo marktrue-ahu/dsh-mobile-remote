@@ -20,13 +20,22 @@ const manifest = {
   plugin: { version: '3.3.0', file: 'plugin.tgz', size: 3, sha256: 'b'.repeat(64), contentSha256: 'c'.repeat(64), url: 'https://release.test/plugin-70.tgz' },
 };
 const NPM_PACKAGE_NAME = '@marktrue/dsh-mobile-remote';
-// 夹具候选版本必须始终高于「仓库/本机版本」：这里用与发布版本解耦的常量，
-// 否则版本快照（如 3.2.3-alpha.1）后候选不再更新，会触发同版本内容不可变检查（fail-closed），
-// 使 POST/check 用例得到 action=none 而非 accepted。
-const NPM_PLUGIN_VERSION = '3.3.0-alpha.1';
+// NPM 通道由「本机插件版本」的 prerelease 决定（lib/npm-update-source.js）；
+// tag 检出时本机版本就是 tag 版本，CI 的通道会随 tag 在 alpha / rc / latest 之间变化。
+// 因此候选版本和 dist-tag 通道都从仓库 package.json 派生，任何发布线的 tag 都无需再改夹具；
+// 若写死 alpha，rc/stable tag 会查不到候选（npm-channel-version-missing），整组用例失败。
+const REPOSITORY_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+const REPOSITORY_VERSION_PARTS = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.exec(REPOSITORY_VERSION);
+if (!REPOSITORY_VERSION_PARTS) throw new Error(`仓库 package.json 版本无法解析：${REPOSITORY_VERSION}`);
+const REPOSITORY_CHANNEL = REPOSITORY_VERSION_PARTS[4] ? REPOSITORY_VERSION_PARTS[4].split('.')[0] : 'latest';
+const NPM_CANDIDATE_CORE = `${+REPOSITORY_VERSION_PARTS[1]}.${+REPOSITORY_VERSION_PARTS[2]}.${+REPOSITORY_VERSION_PARTS[3] + 1}`;
+// 候选始终比仓库版本高一个 patch，并沿用仓库的 prerelease 通道（stable 则无后缀）。
+const NPM_PLUGIN_VERSION = REPOSITORY_VERSION_PARTS[4] ? `${NPM_CANDIDATE_CORE}-${REPOSITORY_VERSION_PARTS[4]}` : NPM_CANDIDATE_CORE;
 const NPM_CARRIER_VERSION = `${NPM_PLUGIN_VERSION}-app`;
+const NPM_APP_VERSION_70 = `${NPM_CANDIDATE_CORE}+70`;
+const NPM_APP_VERSION_26 = `${NPM_CANDIDATE_CORE}+26`;
 const NPM_DOCS = new Map([
-  [NPM_PACKAGE_NAME, { 'dist-tags': { latest: '3.2.1-alpha.1', alpha: NPM_PLUGIN_VERSION, app: NPM_CARRIER_VERSION } }],
+  [NPM_PACKAGE_NAME, { 'dist-tags': { latest: '3.2.1-alpha.1', alpha: NPM_PLUGIN_VERSION, [REPOSITORY_CHANNEL]: NPM_PLUGIN_VERSION, app: NPM_CARRIER_VERSION } }],
   [`${NPM_PACKAGE_NAME}@${NPM_PLUGIN_VERSION}`, {
     version: NPM_PLUGIN_VERSION,
     dist: { integrity: `sha512-${Buffer.from('plugin').toString('base64')}` },
@@ -34,7 +43,7 @@ const NPM_DOCS = new Map([
     optionalDependencies: { '@marktrue/dsh-mobile-remote-app': `npm:${NPM_PACKAGE_NAME}@${NPM_CARRIER_VERSION}` },
   }],
   [`${NPM_PACKAGE_NAME}@${NPM_CARRIER_VERSION}`, {
-    version: NPM_CARRIER_VERSION, appVersion: '3.3.0+70', pluginContentSha256: 'c'.repeat(64),
+    version: NPM_CARRIER_VERSION, appVersion: NPM_APP_VERSION_70, pluginContentSha256: 'c'.repeat(64),
     dist: { integrity: `sha512-${Buffer.from('carrier').toString('base64')}` },
   }],
 ]);
@@ -92,7 +101,7 @@ test('C1: actual NPM update-available handler freezes candidate before accepted;
     assert.equal(tx.opId, r.body.opId);
     assert.equal(tx.release, null);
     assert.equal(tx.npmCandidate.plugin.version, NPM_PLUGIN_VERSION);
-    assert.equal(tx.npmCandidate.carrier.appVersion, '3.3.0+70');
+    assert.equal(tx.npmCandidate.carrier.appVersion, NPM_APP_VERSION_70);
     assert.equal(jobs.length, jobsBefore + 1); assert.equal(installed, 0);
     const again = await request(h.route, { opId: 'request-accepted' });
     assert.equal(again.body.opId, tx.opId); assert.equal(jobs.length, jobsBefore + 1);
@@ -109,14 +118,14 @@ test('NPM read-only check returns a sanitized candidate without scheduling insta
   const pluginVersion = NPM_PLUGIN_VERSION;
   const carrierVersion = `${pluginVersion}-app`;
   const docs = new Map([
-    [packageName, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, app: carrierVersion } }],
+    [packageName, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, [REPOSITORY_CHANNEL]: pluginVersion, app: carrierVersion } }],
     [`${packageName}@${pluginVersion}`, {
       version: pluginVersion,
       dist: { integrity: `sha512-${Buffer.from('plugin').toString('base64')}` },
       optionalDependencies: { '@marktrue/dsh-mobile-remote-app': `npm:${packageName}@${carrierVersion}` },
     }],
     [`${packageName}@${carrierVersion}`, {
-      version: carrierVersion, appVersion: '3.3.0+26',
+      version: carrierVersion, appVersion: NPM_APP_VERSION_26,
       dist: { integrity: `sha512-${Buffer.from('carrier').toString('base64')}` },
     }],
   ]);
@@ -131,7 +140,7 @@ test('NPM read-only check returns a sanitized candidate without scheduling insta
     assert.equal(r.body.pluginUpdate.source, 'npm');
     assert.equal(r.body.pluginUpdate.state, 'update-available');
     assert.equal(r.body.pluginUpdate.candidate.plugin.version, pluginVersion);
-    assert.equal(r.body.pluginUpdate.candidate.carrier.appVersion, '3.3.0+26');
+    assert.equal(r.body.pluginUpdate.candidate.carrier.appVersion, NPM_APP_VERSION_26);
     assert.equal(JSON.stringify(r.body).includes('dist.tarball'), false);
     assert.equal(JSON.stringify(r.body).includes(AUTH_TOKEN), false);
     assert.equal(readFileSync(join(h.profile, 'package.json'), 'utf8'), pkgBefore);
@@ -148,7 +157,7 @@ test('NPM check log explains a failed metadata query without leaking registry de
   const packageName = '@marktrue/dsh-mobile-remote';
   const pluginVersion = NPM_PLUGIN_VERSION;
   const npmPackageView = async (spec) => {
-    if (spec === packageName) return { 'dist-tags': { alpha: pluginVersion } };
+    if (spec === packageName) return { 'dist-tags': { alpha: pluginVersion, [REPOSITORY_CHANNEL]: pluginVersion } };
     throw new Error('npm-view-failed');
   };
   const h = harness({ config: { pluginUpdateManifest: 'npm' }, pluginUpdates: { npmPackageView } });
@@ -187,14 +196,14 @@ test('NPM POST freezes the exact candidate and gives it to the async worker', as
   const pluginVersion = NPM_PLUGIN_VERSION;
   const carrierVersion = `${pluginVersion}-app`;
   const docs = new Map([
-    [packageName, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, app: carrierVersion } }],
+    [packageName, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, [REPOSITORY_CHANNEL]: pluginVersion, app: carrierVersion } }],
     [`${packageName}@${pluginVersion}`, {
       version: pluginVersion,
       dist: { integrity: `sha512-${Buffer.from('plugin').toString('base64')}` },
       optionalDependencies: { '@marktrue/dsh-mobile-remote-app': `npm:${packageName}@${carrierVersion}` },
     }],
     [`${packageName}@${carrierVersion}`, {
-      version: carrierVersion, appVersion: '3.3.0+26', pluginContentSha256: 'b'.repeat(64),
+      version: carrierVersion, appVersion: NPM_APP_VERSION_26, pluginContentSha256: 'b'.repeat(64),
       dist: { integrity: `sha512-${Buffer.from('carrier').toString('base64')}` },
     }],
   ]);
@@ -212,7 +221,7 @@ test('NPM POST freezes the exact candidate and gives it to the async worker', as
     const r = await request(h.route, { opId: 'npm-candidate-accepted' });
     assert.equal(r.status, 200, JSON.stringify({ body: r.body, logs: h.logs }));
     assert.equal(r.body.action, 'accepted');
-    assert.equal(r.body.transaction.targetAppVersion, '3.3.0+26');
+    assert.equal(r.body.transaction.targetAppVersion, NPM_APP_VERSION_26);
     const tx = readTransaction(transactionFile(testHome));
     assert.equal(tx.targetVersion, pluginVersion);
     assert.equal(tx.npmCandidate.plugin.version, pluginVersion);
@@ -242,7 +251,7 @@ test('legacy carrier metadata triggers preparation before any profile mutation',
   const pluginVersion = NPM_PLUGIN_VERSION;
   const carrierVersion = `${pluginVersion}-app`;
   const docs = new Map([
-    [NPM_PACKAGE_NAME, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, app: carrierVersion } }],
+    [NPM_PACKAGE_NAME, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, [REPOSITORY_CHANNEL]: pluginVersion, app: carrierVersion } }],
     [`${NPM_PACKAGE_NAME}@${pluginVersion}`, {
       version: pluginVersion,
       dist: { integrity: `sha512-${Buffer.from('plugin').toString('base64')}` },
@@ -273,7 +282,7 @@ test('legacy NPM prepare reveals the carrier build before the final update confi
   const pluginVersion = NPM_PLUGIN_VERSION;
   const carrierVersion = `${pluginVersion}-app`;
   const docs = new Map([
-    [NPM_PACKAGE_NAME, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, app: carrierVersion } }],
+    [NPM_PACKAGE_NAME, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, [REPOSITORY_CHANNEL]: pluginVersion, app: carrierVersion } }],
     [`${NPM_PACKAGE_NAME}@${pluginVersion}`, {
       version: pluginVersion,
       dist: { integrity: `sha512-${Buffer.from('plugin').toString('base64')}` },
@@ -299,8 +308,8 @@ test('legacy NPM prepare reveals the carrier build before the final update confi
         pluginTgzPath: join(workDir, 'plugin.tgz'),
         carrierTgzPath: join(workDir, 'carrier.tgz'),
         pluginContentSha256: preparedDigest,
-        carrierAppVersion: '3.3.0+26',
-        manifest: { schema: 1, app: { version: '3.3.0+26' }, plugin: { version: pluginVersion, contentSha256: preparedDigest } },
+        carrierAppVersion: NPM_APP_VERSION_26,
+        manifest: { schema: 1, app: { version: NPM_APP_VERSION_26 }, plugin: { version: pluginVersion, contentSha256: preparedDigest } },
       }),
       runSelfUpdate: async args => { workerArgs = args; return { ok: true }; },
     },
@@ -310,7 +319,7 @@ test('legacy NPM prepare reveals the carrier build before the final update confi
     const prepared = await request(h.route, { opId: 'legacy-final-confirm' }, '/m/api/plugin-update/prepare');
     assert.equal(prepared.status, 200, JSON.stringify(prepared.body));
     assert.equal(prepared.body.action, 'prepared');
-    assert.equal(prepared.body.candidate.carrier.appVersion, '3.3.0+26');
+    assert.equal(prepared.body.candidate.carrier.appVersion, NPM_APP_VERSION_26);
     assert.equal(prepared.body.candidate.carrier.legacyMetadataMissing, false);
     assert.equal(readTransaction(transactionFile(testHome)), null);
     assert.equal(readFileSync(join(h.profile, 'package.json'), 'utf8'), profileBefore);
@@ -320,7 +329,7 @@ test('legacy NPM prepare reveals the carrier build before the final update confi
     assert.equal(accepted.status, 200, JSON.stringify(accepted.body));
     assert.equal(accepted.body.action, 'accepted');
     const tx = readTransaction(transactionFile(testHome));
-    assert.equal(tx.npmCandidate.carrier.appVersion, '3.3.0+26');
+    assert.equal(tx.npmCandidate.carrier.appVersion, NPM_APP_VERSION_26);
     assert.equal(tx.npmCandidate.plugin.contentSha256, preparedDigest);
     assert.equal(readFileSync(join(h.profile, 'package.json'), 'utf8'), profileBefore, 'profile is unchanged until the async confirmed worker runs');
     const scheduled = jobs.splice(jobsBefore);
@@ -508,7 +517,7 @@ test('E2: phone POST accepted returns the NPM candidate without registry or loop
     const candidate = r.body.check.candidate;
     assert.equal(r.body.check.source, 'npm');
     assert.equal(candidate.plugin.version, NPM_PLUGIN_VERSION);
-    assert.equal(candidate.carrier.appVersion, '3.3.0+70');
+    assert.equal(candidate.carrier.appVersion, NPM_APP_VERSION_70);
     assert.equal(JSON.stringify(r.body).includes('127.0.0.1'), false, 'NPM candidate response must not expose local source URLs');
     assert.equal(JSON.stringify(r.body).includes('dist.tarball'), false, 'NPM packument URLs stay host-side');
     // 独立 HOME：无需清理别人的状态，但收敛自己的在飞事务更干净
@@ -556,14 +565,14 @@ test('F1: NPM candidate projection never leaks packument tarball URLs or registr
   const f1Home = mkdtempSync(join(tmpdir(), 'f1-home-'));
   const secretUrl = 'http://private-registry.example/package.tgz?token=should-not-leak';
   const packageView = async (spec) => {
-    if (spec === NPM_PACKAGE_NAME) return { 'dist-tags': { latest: NPM_PLUGIN_VERSION, alpha: NPM_PLUGIN_VERSION, app: NPM_CARRIER_VERSION } };
+    if (spec === NPM_PACKAGE_NAME) return { 'dist-tags': { latest: NPM_PLUGIN_VERSION, alpha: NPM_PLUGIN_VERSION, [REPOSITORY_CHANNEL]: NPM_PLUGIN_VERSION, app: NPM_CARRIER_VERSION } };
     if (spec === `${NPM_PACKAGE_NAME}@${NPM_PLUGIN_VERSION}`) return {
       version: NPM_PLUGIN_VERSION,
       dist: { integrity: `sha512-${Buffer.from('plugin').toString('base64')}`, tarball: secretUrl },
       optionalDependencies: { '@marktrue/dsh-mobile-remote-app': `npm:${NPM_PACKAGE_NAME}@${NPM_CARRIER_VERSION}` },
     };
     if (spec === `${NPM_PACKAGE_NAME}@${NPM_CARRIER_VERSION}`) return {
-      version: NPM_CARRIER_VERSION, appVersion: '3.3.0+70', pluginContentSha256: 'c'.repeat(64),
+      version: NPM_CARRIER_VERSION, appVersion: NPM_APP_VERSION_70, pluginContentSha256: 'c'.repeat(64),
       dist: { integrity: `sha512-${Buffer.from('carrier').toString('base64')}`, tarball: secretUrl },
     };
     return null;
@@ -634,18 +643,18 @@ test('failed NPM update records the sanitized failure reason in the operation lo
   const oldHome = process.env.HOME;
   const testHome = mkdtempSync(join(tmpdir(), 'update-npm-failure-log-'));
   const packageName = '@marktrue/dsh-mobile-remote';
-  // 用与任何发布线无关的“更新版本”，避免测试依赖当前 package.json 的本机版本。
-  const pluginVersion = '3.3.0-alpha.1';
+  // 复用与发布线无关的派生候选版本，避免测试依赖当前 package.json 的本机版本。
+  const pluginVersion = NPM_PLUGIN_VERSION;
   const carrierVersion = `${pluginVersion}-app`;
   const docs = new Map([
-    [packageName, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, app: carrierVersion } }],
+    [packageName, { 'dist-tags': { latest: '3.2.1-alpha.3', alpha: pluginVersion, [REPOSITORY_CHANNEL]: pluginVersion, app: carrierVersion } }],
     [`${packageName}@${pluginVersion}`, {
       version: pluginVersion,
       dist: { integrity: `sha512-${Buffer.from('plugin').toString('base64')}` },
       optionalDependencies: { '@marktrue/dsh-mobile-remote-app': `npm:${packageName}@${carrierVersion}` },
     }],
     [`${packageName}@${carrierVersion}`, {
-      version: carrierVersion, appVersion: '3.3.0+70', pluginContentSha256: 'b'.repeat(64),
+      version: carrierVersion, appVersion: NPM_APP_VERSION_70, pluginContentSha256: 'b'.repeat(64),
       dist: { integrity: `sha512-${Buffer.from('carrier').toString('base64')}` },
     }],
   ]);
