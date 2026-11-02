@@ -282,7 +282,7 @@ jobs:
           }
           release_meta_checkout() {
             release_meta_require_token
-            if [[ ! -d "$RELEASE_META_WT/.git" ]]; then
+            if [[ ! -e "$RELEASE_META_WT/.git" ]]; then
               git worktree add -B release-meta "$RELEASE_META_WT" refs/remotes/origin/release-meta
             fi
           }
