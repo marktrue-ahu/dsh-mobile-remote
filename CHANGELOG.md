@@ -1,8 +1,10 @@
 # Changelog
 
-## v3.2.4-alpha.1（build 32，issue #42）— Git 浏览增强：全量标签 / 结构化 refs / 统一文件查看器 / 文件提交历史
+## v3.2.4-alpha.1（build 33，issue #42）— Git 浏览增强：全量标签 / 结构化 refs / 统一文件查看器 / 文件提交历史
 
-> 插件 `3.2.4-alpha.1` / App `3.2.4+32` / 载体 `3.2.4-alpha.1-app`。develop 快照：合并 issue #42 上游贡献分支（`upstream/git-browser-upgrade`，已 rebase 到 `github/main`），并带入 main 最新内容（宠物资源瘦身、审批默认 1 小时等）。
+> 插件 `3.2.4-alpha.1` / App `3.2.4+33` / 载体 `3.2.4-alpha.1-app`。develop 快照：合并 issue #42 上游贡献分支（`upstream/git-browser-upgrade`，已 rebase 到 `github/main`），并带入 main 最新内容（宠物资源瘦身、审批默认 1 小时等）。
+>
+> 2026-11-03 重新打 tag：build 32 的 `v3.2.4-alpha.1` 未发布即删除，本次使用全局单调 build 33。
 
 ### 插件：Git 只读浏览契约 1.1.0（issue #42）— 结构化 refs/tags + 文件列表与文件历史
 
