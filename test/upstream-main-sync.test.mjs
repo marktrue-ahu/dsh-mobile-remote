@@ -201,9 +201,13 @@ test("外部错误正文、网络异常文本与非 JSON 响应不进入公开�
 	assert.ok(!JSON.stringify(safeFailure(new Error(TOKEN))).includes(TOKEN));
 });
 
-test("工作流仅定时/手动触发：default dry-run、固定仓库与 develop、最小权限、无发布或依赖安装", () => {
+test("工作流已废弃定时触发：保留手动入口、default dry-run、固定仓库与 develop、最小权限", () => {
 	const workflow = readFileSync(new URL("../.github/workflows/sync-upstream-main.yml", import.meta.url), "utf8");
-	assert.match(workflow, /cron: '43 \*\/6 \* \* \*'/);
+	// fork 仓库不支持 scheduled workflow，已移除 schedule 触发器；只保留手动运行。
+	assert.match(workflow, /^# 已废弃（2026-11-02）：本仓库是 fork，GitHub 不支持在 fork 仓库上按计划触发 scheduled workflow。/m);
+	assert.match(workflow, /^on:\n  workflow_dispatch:/m);
+	assert.doesNotMatch(workflow, /^\s{2}schedule:/m, "不应保留实际生效的 schedule 触发器");
+	assert.match(workflow, /^#\s+schedule:$/m, "应保留恢复 schedule 的注释示例");
 	assert.match(workflow, /type: boolean\s+default: true/);
 	assert.match(workflow, /contents: write/);
 	assert.match(workflow, /github\.repository == 'marktrue-ahu\/dsh-mobile-remote' && github\.ref == 'refs\/heads\/develop'/);
