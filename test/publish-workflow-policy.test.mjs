@@ -237,6 +237,14 @@ test("workflow: m8 asserts BUILD vs manifest.app.version/carrier before publish"
 	assert.match(GATE, /plugin-version-mismatch/);
 });
 
+test("workflow: release-meta helper reuses an existing linked worktree", () => {
+	// linked worktree 的 .git 是文件而不是目录；用 -d 会重复 git worktree add，导致第二次
+	// 调用（Mark release intent published）以 git exit 128 失败。必须用 -e。
+	const step = stepByName("Write release-meta helper functions");
+	assert.match(step.run, /\[\[ ! -e "\$RELEASE_META_WT\/\.git" \]\]/);
+	assert.doesNotMatch(step.run, /\[\[ ! -d "\$RELEASE_META_WT\/\.git" \]\]/);
+});
+
 test("workflow: keeps signed APK, drill, carrier pairing, concurrency and idempotent republish skip", () => {
 	assert.match(WORKFLOW_TEXT, /group: npm-publish[\s\S]*?cancel-in-progress: false/);
 	assert.match(blockByName("Build signed Android APK").run, /flutter build apk --release --no-pub/);
