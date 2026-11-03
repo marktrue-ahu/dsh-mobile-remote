@@ -17,6 +17,13 @@
 | 方法 | 路径 | 用途 | 鉴权 |
 |---|---|---|---|
 | GET | `/m/api/bootstrap` | 初始状态：地址、认证要求、agent 摘要、会话列表 | 是 |
+| GET | `/m/api/update/manifest` | App 更新：发布清单（schema 1，含两端身份与下载地址） | 是 |
+| GET | `/m/api/update/apk` | 下发 APK（固定目标或当前发布；唯一匿名例外，见 §2.1） | 部分 |
+| GET | `/m/api/update/plugin` | 下发插件 tgz（固定目标或主机目录中的包） | 是 |
+| GET | `/m/api/plugin-update/check` | 只读检查插件更新（宿主 npm registry；不下载、不改 profile） | 是 |
+| POST | `/m/api/plugin-update/prepare` | 旧载体缺轻量元数据时，预取并校验候选（不改 profile） | 是 |
+| GET | `/m/api/plugin-update/log` | 按 opId/序号读取脱敏后的更新日志 | 是 |
+| POST | `/m/api/plugin-update` | 受理插件更新事务（安装/重启/健康确认/回滚由外部监督器完成） | 是 |
 | POST | `/m/api/send` | 向指定/默认 agent 注入消息（v2.7.2 支持 `mode: "steer"` 插队） | 是 |
 | GET | `/m/api/queue` | 排队消息列表（对齐 PC 端 Queue Dock；`placement: "queued"` 可插话、`"steering"` 不可，v2.7.2） | 是 |
 | POST | `/m/api/messages` | 排队消息操作：`{ sessionId, itemId, action: { kind: "edit"|"remove"|"steer", content? } }`（转发内核 `session.updateQueue`；错误码如 `queue-item-not-found`/`steer-unavailable` 透传，v2.7.2） | 是 |
@@ -57,6 +64,32 @@
 | POST | `/m/api/subagents/interrupt` | 中断子代理（v2.7，`subagent.interrupt`） | 是 |
 | GET/POST | `/m/api/goal` | 当前目标 / 创建·暂停·继续·完成（v2.7，goal RPC 同源） | 是 |
 | GET/POST | `/m/api/commands` | 斜杠命令目录/执行（v2.8.0；v2.8.2 适配内核 0.1.1-rc.2 四参签名，服务缺失优雅降级） | 是 |
+
+### 2.1 更新（插件自更新 + App 更新）
+
+**唯一权威**：两端版本与产物身份的权威是**发布清单（schema 1）**；`updateDir` 里的人工区 `manifest.json` 只是旧宿主兼容路径。
+
+**插件自更新（宿主 npm registry）**：插件检查**只读**——按宿主有效 npm 配置（`<scope>:registry` 优先，未设置时用默认 `registry`）解析候选，不下载完整产物、不改 profile、不重启。安装必须由用户确认，随后由**外部监督器**完成下载/校验/切依赖/重启/健康确认/回滚。
+
+- 稳定版跟随 `latest`，已安装预发布跟随其自身通道（`alpha`/`rc`），不跨通道升级。
+- 插件 `X.Y.Z[-pre]` 精确配对载体 `X.Y.Z[-pre]-app`（同包名、`optionalDependencies` 别名依赖）。载体缺失或不匹配时**拒绝整对更新**（`npm-carrier-alias-mismatch`），不回退到只更新插件。
+- registry 不可达、认证失败、carrier 缺失、`dist.integrity`/清单/内容标识不符、降级候选一律 **fail-closed**，不切换其它来源。
+
+**`GET /m/api/plugin-update/check`**：返回只读检查结果（`state` / `reason` / 候选版本 / App build / 脱敏检查日志）。失败以稳定 `reason` 码返回，不把错误伪装成「已是最新」。
+
+**`POST /m/api/plugin-update`**：受理更新事务，立即返回可查询、幂等的 `opId`；安装与重启在后台推进。`POST /m/api/plugin-update/prepare` 用于旧载体缺少轻量元数据时先预取校验（profile 不变），`GET /m/api/plugin-update/log?opId=&afterSeq=` 按序号读取脱敏日志（重启后可接续）。
+
+**App 更新**：手机只连 DSH，不直接访问包源、不持有 registry 凭据。
+
+- **`GET /m/api/update/manifest`**：返回 `{ ok: true, manifest: {…} }`（schema 1：`plugin` / `app` 两段身份 + 宿主投影后的下载地址）。未配置更新目录且默认目录无清单 → `503 update-not-configured`；目录或清单缺失 → `404 update-dir-missing` / `404 update-manifest-missing`；清单不合法 → `404 update-manifest-invalid`。
+- **`GET /m/api/update/apk`**：下发 APK（`application/vnd.android.package-archive`，含 `content-length`）。
+  - 带 `release=<releaseId>&sha256=<hex>` 时按**固定目标**下发：身份不符 `410 app-artifact-expired` / `app-artifact-unknown`，尚未就绪 `503 app-artifact-not-ready`，永不回落到「最新」。
+  - 不带参数时下发**当前发布**的 APK。
+  - **这是唯一匿名例外**（仅 GET/HEAD，独立并发与速率桶），用于「手机还没装 App」的首装入口；其余端点一律要求口令。
+  - 错误码：`404 update-apk-missing`（含路径越界防御）、`500 update-apk-checksum-mismatch`、`500 update-apk-read-failed`。
+- **`GET /m/api/update/plugin`**：按同一固定目标规则下发插件 tgz（**仍要求鉴权**；不带参数时只服务更新目录里实际存在的包）。
+- 默认更新目录为 `<DSH_HOME>/mobile-remote/update/`（未显式配置 `updateDir` 时自动创建并校验可写）；载体托管区在其下的 `.app-carrier/`，人工区文件永不被覆盖或清理。
+
 
 ## 3. 端点详述（v1 既有端点）
 ### 3.1 GET /m/api/bootstrap

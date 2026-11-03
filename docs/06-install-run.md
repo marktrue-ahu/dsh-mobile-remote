@@ -305,6 +305,36 @@ flutter build apk --release
 - 插件/网页端改动 → 按 §3 同步并重启 DSH。
 - App 改动 → 重新 `flutter build apk --release` 并重装（同签名覆盖安装，保留连接信息）。
 
+### 8.5 自动更新（插件 + App）
+
+两端可各自更新，也可让手机一次走完「插件 → 配对 App」。
+
+**发布侧（把产物放进更新目录）**
+
+```bash
+# 1. 构建 APK（版本号来自 pubspec.yaml 的 version: X.Y.Z+build）
+cd dsh-mobile-app && flutter build apk --release
+
+# 2. 打包：APK + 插件 tgz + manifest.json → dist/，并拷入更新目录
+UPDATE_DIR=~/.dsh/mobile-remote/update bash tools/package-release.sh
+
+# 3. 校验清单与端点
+node tools/verify-update-manifest.mjs ~/.dsh/mobile-remote/update     # 期望 RESULT: PASS
+TOKEN=$(grep -oP 'authToken:\s*\K.*' ~/.dsh/profiles/web/cordis.patch.yml | tr -d '"')
+curl -s -H "X-Mobile-Token: $TOKEN" http://127.0.0.1:3080/m/api/update/manifest
+```
+
+- 更新目录默认 `<DSH_HOME>/mobile-remote/update/`；也可用插件配置 `updateDir` 显式指定。
+- `manifest.json` 是唯一权威：`{ version: "X.Y.Z+build", apk, sha256(小写 hex), size, notes }`，由 `tools/gen-manifest.js` 生成（`notes` 取 CHANGELOG 最新条目）。
+- **测试重复更新**：不改 `pubspec.yaml`，只让清单使用更大的 build 号——`MANIFEST_VERSION=3.1.4+99 UPDATE_DIR=... bash tools/package-release.sh`（部分脚本需 `ALLOW_TEST_MANIFEST_VERSION=1`）。APK 内置 versionCode 未变大时，系统会以「不能降级安装」拒绝，这是预期行为。
+
+**手机侧**
+
+1. 「设置 → 检查 App 更新」：手动检查，明确显示「已是最新 / 有新版 / 失败原因」。
+2. 有新版时弹确认窗（版本 / 说明 / 大小 / 来源）→ 应用内下载（可取消）→ sha256 校验 → **签名预检**（与本机已装版本比对证书）→ 一致才拉起系统安装器；不一致则取消并明确提示。
+3. 首次安装需在系统里允许「安装未知应用」（Android 8+）。
+4. 插件更新在「设置」的更新卡片里进行：只读检查 → 确认 → 宿主安装/重启（**连接会短暂断开，属正常流程**）→ 健康确认后手机重连并接续。
+
 ## 9. 验收清单（已执行 ✅）
 
 - [x] `--dump-config` 含 mobile-remote 行；启动日志含 lanBridge 监听行（桌面版）

@@ -11,6 +11,11 @@ import 'floating.dart';
 import 'l10n.dart';
 import 'logger.dart';
 import 'models.dart';
+import 'update_core.dart';
+import 'updater.dart';
+import 'plugin_update_resume.dart';
+import 'plugin_update_status.dart';
+import 'version_alignment.dart';
 import 'session_list.dart';
 import 'theme.dart';
 
@@ -20,7 +25,167 @@ import 'theme.dart';
 String normalizeAgentStatus(Object? status) =>
     status == 'running' ? 'running' : 'idle';
 
+/// App 自身更新的前置门禁结果（F8：编排只判一次，所有入口共用）。
+class UpdateGate {
+  const UpdateGate(this.allowed, this.reason);
+  final bool allowed;
+  final String reason;
+}
+
+final Api _defaultStoreApi = api;
+
 class AppStore extends ChangeNotifier {
+  AppStore({
+    Api? apiClient,
+    Future<AppVersion?> Function()? localVersion,
+    UpdateInstaller? installer,
+  }) : api = apiClient ?? _defaultStoreApi,
+       _localVersion = localVersion ?? Updater.localVersion,
+       // ignore: prefer_initializing_formals —— 公开参数名 installer 与私有字段 _installer 不能同名
+       _installer = installer;
+
+  final Future<AppVersion?> Function() _localVersion;
+  final UpdateInstaller? _installer;
+
+  bool _installingApp = false;
+  Future<String?> installAppUpdate(
+    UpdateCandidate candidate, {
+    void Function(int received, int? total)? onProgress,
+    void Function(String stage)? onStage,
+    UpdateCancelToken? cancel,
+  }) async {
+    if (_installingApp) return 'App 更新已在进行中';
+    if (!appUpdateGate(candidate).allowed) {
+      return '插件目标尚未健康确认，或候选已变化；不会安装 APK';
+    }
+    // §5.9：下载前重新鉴权读取当前状态；无法复核时不靠旧缓存证明启动安装。
+    final refreshError = await _refreshUpdateStateForInstall();
+    if (refreshError != null) return refreshError;
+    if (!appUpdateGate(candidate).allowed)
+      return _gateBlockedMessage(candidate);
+    final release = pluginUpdateJournal?.release ?? candidate.release;
+    final outcome = await checkFixedAppUpdate(release);
+    if (outcome.error != null) return outcome.error;
+    if (outcome.verdict != UpdateVerdict.updateAvailable || release == null) {
+      return '固定目标不比本机 App 新，不会重装或降级';
+    }
+    // 复核期间可能出现新的在飞/回滚事务：写记录与下载前再确认一次。
+    if (!appUpdateGate(candidate).allowed)
+      return _gateBlockedMessage(candidate);
+    if (pluginUpdateJournal == null) {
+      pluginUpdateJournal = PluginUpdateJournal(
+        opId: api.pluginUpdate.transaction?.opId ?? genRequestId(),
+        targetVersion: release.plugin.version,
+        targetContentSha256: release.plugin.contentSha256,
+        startedAt: DateTime.now().toUtc(),
+        phase: UpdatePhase.appPending,
+        release: release,
+        manifestUrl: release.manifestUrl,
+        appVersion: candidate.version,
+        pluginVerified: _pluginProofFor(release),
+      );
+      await _persistPrefs(
+        _kPluginUpdateJournal,
+        jsonEncode(pluginUpdateJournal!.toJson()),
+      );
+    }
+    _installingApp = true;
+    UpdateFailure? failure;
+    try {
+      final result = _installer != null
+          ? await _installer(
+              candidate,
+              onProgress: onProgress,
+              onStage: onStage,
+              cancel: cancel,
+            )
+          : await Updater.downloadAndInstall(
+              candidate,
+              onProgress: onProgress,
+              onStage: onStage,
+              cancel: cancel,
+              apiClient: api,
+              // §5.9：拉起安装器前再读取一次当前状态并复核"插件先行"；失败则拒绝安装。
+              beforeInstall: () async {
+                final err = await _refreshUpdateStateForInstall();
+                if (err != null) return err;
+                if (!appUpdateGate(candidate).allowed) {
+                  return '插件状态已变化，已取消 App 安装；请重试确认';
+                }
+                return null;
+              },
+              onFailure: (f) => failure = f,
+            );
+      if (_disposed) return result;
+      await reportInstallOutcome(result, failure: failure);
+      return result;
+    } finally {
+      _installingApp = false;
+    }
+  }
+
+  /// 安装/下载结果上报（真实下载路径与契约测试共用）：
+  /// 目标失效（410/404/400）→ 退出旧候选；就绪（503）/认证 → 保留目标可重试。
+  Future<void> reportInstallOutcome(String? result, {UpdateFailure? failure}) =>
+      _applyInstallOutcome(result, failure);
+
+  /// 下载/安装结果 → 接续出口（§5.9 / F13）：
+  /// 目标失效自动退出旧候选，就绪/认证问题保留目标可重试，其余保留记录。
+  Future<void> _applyInstallOutcome(
+    String? result,
+    UpdateFailure? failure,
+  ) async {
+    if (failure?.targetGone == true) {
+      await _abandonUpdate('${failure!.message}；已退出旧目标，请重新检查两端版本');
+      return;
+    }
+    if (failure?.notReady == true) {
+      pluginUpdateNotice = '${failure!.message}；固定目标已保留，可稍后重试';
+    } else if (failure?.authFailure == true) {
+      pluginUpdateNotice = failure!.message; // 重扫二维码后可重试，记录保留
+    } else if (result == null) {
+      pluginUpdateNotice = '已拉起安装器；更新记录保留，重开 App 后核对目标版本/build';
+    } else if (result == 'cancelled') {
+      pluginUpdateNotice = '已取消下载，固定更新仍待安装，可重试';
+    } else {
+      pluginUpdateNotice = 'App 更新失败：$result；固定更新记录已保留，可重试';
+    }
+    notifyListeners();
+  }
+
+  /// 门禁拒绝时给用户/调用方能读的原因（不暴露内部 reason 码）。
+  String _gateBlockedMessage(UpdateCandidate candidate) {
+    final gate = appUpdateGate(candidate);
+    switch (gate.reason) {
+      case 'plugin-update-failed':
+        return '电脑端插件更新未确认（或已回滚），APK 不会先装；请重新检查后在设置页重试';
+      case 'plugin-update-available':
+      case 'plugin-update-guidance':
+        return '电脑端插件需要先更新，APK 不会先装；请先在设置页更新电脑端插件';
+      case 'plugin-check-unavailable':
+        return '无法确认电脑端插件状态，已取消安装；请恢复连接后重试';
+      default:
+        return '插件状态已变化，已取消 App 安装；请重试确认';
+    }
+  }
+
+  /// §5.9：下载前／拉起安装器前重新读取当前状态，失败即拒绝继续（不靠旧缓存证明）。
+  Future<String?> _refreshUpdateStateForInstall() async {
+    try {
+      await api.refreshUpdateState();
+      return null;
+    } catch (e) {
+      return authFixHint(e) ?? '无法复核电脑端当前状态（$e），已取消本次安装；请在连接恢复后重试';
+    }
+  }
+
+  Future<void>? _resumingUpdate;
+  bool _disposed = false;
+  void Function()? _updateBootstrapCallback;
+
+  /// Production and orchestration tests cross the same HTTP seam.
+  final Api api;
+
   // ── 数据 ──
   String? sessionId; // 当前会话
   Catalog? catalog;
@@ -49,6 +214,8 @@ class AppStore extends ChangeNotifier {
   DshSkin skin = DshSkin.dsh; // 主题皮肤（默认 / 深潜夜航 / 海盐汽水 / 鲸落星海）
   String appIcon = 'default'; // 桌面图标样式 id（default/deepsea/shell/moon/sticker/stamp/neon/mono）
   bool showReasoning = false; // 活动条思考面板是否显示内容（默认关：只显示状态，防英文思考刷屏）
+  /// 会话文件浏览是否显示点开头的隐藏条目（默认开；`.git` 始终排除）。
+  bool showHiddenFiles = true;
   bool reasoningDefaultExpanded = false; // 思维链默认展开还是折叠（默认折叠：防英文思考刷屏；单条消息仍可点按切换）
   bool timelineDebug = false; // 普通/调试模式：默认普通，调试显示原始事件详情
   /// 思维链折叠手动状态（会话 -> 消息key -> 手动展开值；滚动/重进/重启持久，null=跟随设置默认）
@@ -58,7 +225,7 @@ class AppStore extends ChangeNotifier {
   double balanceThreshold = 10; // 预警阈值（元）
   /// Git 浏览页显示的 Tab 顺序（最多三个）；配置跨 App 启动持久化。
   List<String> gitTabs = const ['branches', 'graph', 'worktree'];
-  static const gitTabIds = ['branches', 'graph', 'worktree'];
+  static const gitTabIds = ['branches', 'graph', 'worktree', 'fileHistory'];
   static const _defaultGitTabs = ['branches', 'graph', 'worktree'];
 
   /// Chat-page action rail order, shared across conversations on this device.
@@ -72,14 +239,1074 @@ class AppStore extends ChangeNotifier {
     'session_tools',
     'copy',
   ];
-  static const conversationActionIds = ['git', 'files', 'session_tools', 'copy'];
+  static const conversationActionIds = [
+    'git',
+    'files',
+    'session_tools',
+    'copy',
+  ];
   static const _defaultConversationActionOrder = [
     'git',
     'files',
     'session_tools',
     'copy',
   ];
-  bool floatingEnabled = false; // 桌面宠物开关（沿用旧悬浮球 key，v2.7.2 起持久化）
+  bool floatingEnabled = false; // 悬浮球开关（v2.7.2：持久化，清理后台/重启后记住）
+  UpdateCandidate? updateCandidate; // 最近一次检查命中的候选（null = 无）
+  bool updateChecking = false; // 「检查更新」进行中（手动按钮状态）
+
+  /// 两端对齐提示被忽略时的判定身份（见 AppAlignment.signature）。
+  /// **不持久化**：重启后重新提醒一次，避免把真实的版本失配永久藏起来。
+  String? _alignmentDismissedFor;
+
+  /// 是否需要显示两端不对齐的提示（判定变化后会再次出现）。
+  /// `unknown`（未连接 / 版本不可解析）不进首页横幅——那是设置页版本行的信息，
+  /// 拿来弹横幅只会变成噪声。
+  bool get alignmentVisible {
+    final a = api.alignment;
+    if (a.state != AlignmentState.appOutdated &&
+        a.state != AlignmentState.pluginOutdated)
+      return false;
+    return _alignmentDismissedFor != a.signature;
+  }
+
+  /// 本次忽略对齐提示（判定未变化期间不再打扰）。
+  void dismissAlignment() {
+    _alignmentDismissedFor = api.alignment.signature;
+    notifyListeners();
+  }
+
+  /// 当前对齐状态（界面按 state 本地化文案）。
+  AppAlignment get alignment => api.alignment;
+
+  /// App 自身更新的**统一前置门禁**（F8）。
+  ///
+  /// 编排只在这里判一次：插件有内容更新、事务在飞、检查不可用、或本机形态需要人工指引时，
+  /// 都**不允许**先把 App 升上去——否则正是"App 新、插件旧"的坏形态。
+  ///
+  /// §5.9 / §5.3：同时核对固定快照、**正在运行的内容标识**、当前发布健康结果与
+  /// 在飞/回滚矛盾；但远端检查 off／失败不得否定**本地完整验证且健康**的当前配对
+  /// （F14：这只允许继续本地 App 安装，不允许触发外部插件更新）。
+  UpdateGate appUpdateGate([UpdateCandidate? candidate]) {
+    final journal = pluginUpdateJournal;
+    if (journal != null) {
+      if (journal.phase == UpdatePhase.pluginRetry)
+        return const UpdateGate(false, 'plugin-update-failed');
+      if (journal.phase == UpdatePhase.appPending &&
+          journal.release != null &&
+          journal.pluginVerified &&
+          // E1：证明是**下载开始前**记下的；放行前必须重新核对当前事务——
+          // 期间可能出现新的在飞/回滚/矛盾事务，纯哈希比较会漏掉它们。
+          _pluginTargetHealthy(journal.release!) &&
+          (candidate == null ||
+              journal.release!.containsCandidate(candidate))) {
+        return const UpdateGate(true, '');
+      }
+      return const UpdateGate(false, 'plugin-update-in-progress');
+    }
+    final st = api.pluginUpdate;
+    if (st.contentUpdateAvailable) {
+      return UpdateGate(
+        false,
+        st.canSelfUpdate ? 'plugin-update-available' : 'plugin-update-guidance',
+      );
+    }
+    final tx = st.transaction;
+    if (tx != null) {
+      // 终态失败/回滚且未处于回滚中：属于历史记录，由下面的“运行内容=固定发布”证明裁决；
+      // 否则会因一次早已被覆盖的失败永久挡住 App 更新。
+      final terminalHistorical =
+          !tx.rolledBack && const {'failed', 'rolled-back'}.contains(tx.phase);
+      if (!terminalHistorical && (tx.rolledBack || tx.phase != 'settled')) {
+        return UpdateGate(
+          false,
+          st.retryableFailure
+              ? 'plugin-update-failed'
+              : 'plugin-transaction-pending',
+        );
+      }
+    }
+    final selected = candidate ?? updateCandidate;
+    final release =
+        selected?.release ?? st.release ?? hostReleasePointer?.release;
+    if (release == null) {
+      // 没有固定发布就无法确认配对；检查不可用时先把原因说清楚（W3），不退而取 latest。
+      return UpdateGate(
+        false,
+        st.checkUnavailable
+            ? 'plugin-check-unavailable'
+            : 'plugin-release-unconfirmed',
+      );
+    }
+    if (selected != null && !release.containsCandidate(selected)) {
+      return const UpdateGate(false, 'plugin-release-unconfirmed');
+    }
+    if (api.pluginContentSha256 != release.plugin.contentSha256) {
+      return UpdateGate(
+        false,
+        st.canSelfUpdate ? 'plugin-update-available' : 'plugin-update-guidance',
+      );
+    }
+    if (!_pluginTargetHealthy(release)) {
+      // 历史失败事务已被当前运行内容覆盖时，不以它否决固定发布的健康安装。
+      if (_staleFailureProof(release)) return const UpdateGate(true, '');
+      if (st.retryableFailure || api.currentReleaseHealth?.failed == true) {
+        return const UpdateGate(false, 'plugin-update-failed');
+      }
+      return const UpdateGate(false, 'plugin-transaction-pending');
+    }
+    // F14：这里允许本地 App 安装——本地配对已完整验证且健康；不能由此新建插件更新。
+    return const UpdateGate(true, '');
+  }
+
+  /// 宿主下发的固定发布定位（§5.3 三角色）：
+  /// 插件有内容更新时优先"更新目标"，否则优先"当前发布"；旧宿主退回 `pluginUpdate.release`。
+  /// Legacy host manifest is only a compatibility fallback when no fixed release is projected.
+  ReleasePointer? get hostReleasePointer {
+    final st = api.pluginUpdate;
+    final target = api.updateTarget;
+    final current = api.currentRelease;
+    final legacy = st.release;
+    ReleasePointer wrap(ReleaseSnapshot release) =>
+        ReleasePointer(releaseId: '', release: release);
+    if (st.contentUpdateAvailable) {
+      return target ?? (legacy != null ? wrap(legacy) : null) ?? current;
+    }
+    return current ?? (legacy != null ? wrap(legacy) : null) ?? target;
+  }
+
+  /// 进行中的**两端更新**记录（跨断线、跨进程持久化，见 CONTEXT「更新接续」）。
+  PluginUpdateJournal? pluginUpdateJournal;
+
+  /// 一次性提示（更新完成/失败/结果待确认），由界面消费后清空。
+  String? pluginUpdateNotice;
+  String lastPluginUpdateOpId = '';
+
+  /// 供设置页日志面板读取的操作：本地进行中的记录优先，否则读取宿主当前事务，
+  /// 这样电脑端发起的更新也能在手机上查看日志。
+  String get pluginUpdateLogOpId {
+    final journal = pluginUpdateJournal;
+    if (journal != null &&
+        !journal.isPreparationPhase &&
+        journal.opId.trim().isNotEmpty) {
+      return journal.opId.trim();
+    }
+    if (journal?.isPreparationPhase == true) {
+      return lastPluginUpdateOpId.trim();
+    }
+    final hostOpId = api.pluginUpdate.transaction?.opId.trim() ?? '';
+    if (hostOpId.isNotEmpty) return hostOpId;
+    return lastPluginUpdateOpId.trim();
+  }
+
+  /// 接续超时的独立推进定时器（评审 R8）：不依赖任何一次请求成功。
+  Timer? _pluginUpdateTimer;
+
+  /// 提交一次插件自更新。
+  ///
+  /// **先持久化提交意图（带 opId），再发请求**（评审 R6）：下载/安装可能在电脑侧跑很久，
+  /// 响应超时、App 被杀、网络抖动都不该让"已经开始的事"在手机上消失。超时按
+  /// "结果待确认"表达，重连后凭同一个 opId 查询同一事务，而不是另开一次更新。
+  Future<void> _clearLastPluginUpdateLogIfMatches(String opId) async {
+    if (lastPluginUpdateOpId != opId) return;
+    lastPluginUpdateOpId = '';
+    await _persistPrefs(_kLastPluginUpdateOpId, '');
+  }
+
+  Future<void> abandonPluginUpdatePreparation(String opId) async {
+    final journal = pluginUpdateJournal;
+    if (journal?.opId == opId && journal!.isPreparationPhase) {
+      await _clearPluginUpdateJournal();
+      await _clearLastPluginUpdateLogIfMatches(opId);
+    }
+    notifyListeners();
+  }
+
+  Map<String, dynamic>? _pluginUpdateMap(Object? value) {
+    if (value is Map<String, dynamic>) return value;
+    if (value is Map) {
+      return value.map((key, value) => MapEntry(key.toString(), value));
+    }
+    return null;
+  }
+
+  String _pluginUpdateString(Map<String, dynamic>? value, String key) {
+    final raw = value?[key];
+    return raw is String ? raw.trim() : '';
+  }
+
+  Future<Map<String, dynamic>> preparePluginUpdate({
+    required String opId,
+    Map<String, dynamic>? candidate,
+  }) async {
+    final existing = pluginUpdateJournal;
+    final retryingPreparation = existing?.isPreparationPhase == true;
+    if (existing != null && !retryingPreparation) {
+      throw StateError('Plugin update ${existing.opId} is already in progress');
+    }
+    final effectiveOpId = retryingPreparation ? existing!.opId : opId;
+    if (existing?.phase == UpdatePhase.pluginPrepared &&
+        existing?.prepareId != null) {
+      return {
+        'action': 'prepared',
+        'opId': effectiveOpId,
+        'prepareId': existing!.prepareId,
+        'candidate': {
+          'plugin': {
+            'version': existing.targetVersion,
+            'contentSha256': existing.targetContentSha256,
+          },
+          'carrier': {
+            'version': existing.carrierVersion,
+            'appVersion': existing.appVersion,
+          },
+        },
+      };
+    }
+
+    final initialCandidate = retryingPreparation
+        ? null
+        : _pluginUpdateMap(candidate);
+    final initialPlugin = _pluginUpdateMap(initialCandidate?['plugin']);
+    final initialCarrier = _pluginUpdateMap(initialCandidate?['carrier']);
+    final initialVersion = _pluginUpdateString(initialPlugin, 'version');
+    final initialHash = _pluginUpdateString(
+      initialPlugin,
+      'contentSha256',
+    ).toLowerCase();
+    final initialCarrierVersion = _pluginUpdateString(
+      initialCarrier,
+      'version',
+    );
+    final initialAppVersion = _pluginUpdateString(initialCarrier, 'appVersion');
+    var journal = retryingPreparation
+        ? existing!.copyWith(
+            phase: UpdatePhase.pluginPreparePending,
+            targetVersion: initialVersion.isEmpty ? null : initialVersion,
+            targetContentSha256: initialHash.isEmpty ? null : initialHash,
+            carrierVersion: initialCarrierVersion.isEmpty
+                ? null
+                : initialCarrierVersion,
+            appVersion: initialAppVersion.isEmpty ? null : initialAppVersion,
+            release: ReleaseSnapshot.fromJson(initialCandidate?['release']),
+          )
+        : PluginUpdateJournal(
+            opId: effectiveOpId,
+            targetVersion: initialVersion,
+            targetContentSha256: initialHash,
+            startedAt: DateTime.now().toUtc(),
+            phase: UpdatePhase.pluginPreparePending,
+            appVersion: initialAppVersion,
+            carrierVersion: initialCarrierVersion,
+            release: ReleaseSnapshot.fromJson(initialCandidate?['release']),
+          );
+
+    // A lost prepare response is ambiguous: persist the same opId and candidate
+    // before the request so retrying cannot silently switch to a moving tag.
+    pluginUpdateJournal = journal;
+    pluginUpdateNotice = null;
+    await _persistPrefs(_kPluginUpdateJournal, jsonEncode(journal.toJson()));
+    notifyListeners();
+
+    try {
+      final response = await api.preparePluginUpdate(opId: effectiveOpId);
+      final responseOpId = _pluginUpdateString(response, 'opId');
+      if (responseOpId.isNotEmpty && responseOpId != effectiveOpId) {
+        await abandonPluginUpdatePreparation(effectiveOpId);
+        pluginUpdateNotice = '宿主返回的准备操作编号不匹配';
+        notifyListeners();
+        return response;
+      }
+      final action = response['action'];
+      final prepareId = _pluginUpdateString(response, 'prepareId');
+      if ((action != 'prepared' && action != 'confirmation-required') ||
+          prepareId.isEmpty) {
+        await abandonPluginUpdatePreparation(effectiveOpId);
+        pluginUpdateNotice = '无法准备插件更新';
+        notifyListeners();
+        return response;
+      }
+
+      final preparedCandidate = _pluginUpdateMap(response['candidate']);
+      final preparedPlugin = _pluginUpdateMap(preparedCandidate?['plugin']);
+      final preparedCarrier = _pluginUpdateMap(preparedCandidate?['carrier']);
+      final targetVersion =
+          _pluginUpdateString(preparedPlugin, 'version').isNotEmpty
+          ? _pluginUpdateString(preparedPlugin, 'version')
+          : journal.targetVersion;
+      final targetHash =
+          _pluginUpdateString(preparedPlugin, 'contentSha256').isNotEmpty
+          ? _pluginUpdateString(preparedPlugin, 'contentSha256').toLowerCase()
+          : journal.targetContentSha256;
+      final carrierVersion =
+          _pluginUpdateString(preparedCarrier, 'version').isNotEmpty
+          ? _pluginUpdateString(preparedCarrier, 'version')
+          : journal.carrierVersion;
+      final appVersion =
+          _pluginUpdateString(preparedCarrier, 'appVersion').isNotEmpty
+          ? _pluginUpdateString(preparedCarrier, 'appVersion')
+          : journal.appVersion;
+      if (targetVersion.isEmpty || appVersion.isEmpty) {
+        await abandonPluginUpdatePreparation(effectiveOpId);
+        pluginUpdateNotice = '准备结果缺少插件版本或 App build';
+        notifyListeners();
+        return response;
+      }
+
+      final release =
+          ReleaseSnapshot.fromJson(response['release']) ??
+          ReleaseSnapshot.fromJson(preparedCandidate?['release']) ??
+          journal.release;
+      journal = journal.copyWith(
+        phase: UpdatePhase.pluginPrepared,
+        prepareId: prepareId,
+        targetVersion: targetVersion,
+        targetContentSha256: targetHash,
+        carrierVersion: carrierVersion,
+        appVersion: appVersion,
+        release: release,
+        manifestUrl: release?.manifestUrl,
+      );
+      pluginUpdateJournal = journal;
+      await _persistPrefs(_kPluginUpdateJournal, jsonEncode(journal.toJson()));
+      notifyListeners();
+      return response;
+    } on ApiException catch (error) {
+      if (error.status != null &&
+          error.status! >= 400 &&
+          error.status! < 500 &&
+          error.status != 408) {
+        await abandonPluginUpdatePreparation(effectiveOpId);
+        pluginUpdateNotice =
+            authFixHint(error) ??
+            '更新准备被拒绝（${error.code ?? error.status}）；可重新检查，尚未开始安装';
+      } else {
+        journal = pluginUpdateJournal ?? journal;
+        if (journal.opId == effectiveOpId && journal.isPreparationPhase) {
+          pluginUpdateJournal = journal.copyWith(
+            phase: UpdatePhase.pluginPrepareRetry,
+          );
+          await _persistPrefs(
+            _kPluginUpdateJournal,
+            jsonEncode(pluginUpdateJournal!.toJson()),
+          );
+        }
+        pluginUpdateNotice = '更新准备结果待确认；重试会使用同一操作编号';
+      }
+      notifyListeners();
+      rethrow;
+    } catch (error) {
+      journal = pluginUpdateJournal ?? journal;
+      if (journal.opId == effectiveOpId && journal.isPreparationPhase) {
+        pluginUpdateJournal = journal.copyWith(
+          phase: UpdatePhase.pluginPrepareRetry,
+        );
+        await _persistPrefs(
+          _kPluginUpdateJournal,
+          jsonEncode(pluginUpdateJournal!.toJson()),
+        );
+      }
+      pluginUpdateNotice = '更新准备结果待确认；重试会使用同一操作编号';
+      notifyListeners();
+      rethrow;
+    }
+  }
+
+  Future<void> beginPluginUpdate({
+    String? targetVersion,
+    String? targetContentSha256,
+    String? targetAppVersion,
+    String? prepareId,
+    String? opId,
+  }) async {
+    final existing = pluginUpdateJournal;
+    final requestedContentSha256 =
+        targetContentSha256?.trim().toLowerCase() ?? '';
+    final requestedAppVersion = targetAppVersion?.trim() ?? '';
+    final prepared = existing?.phase == UpdatePhase.pluginPrepared;
+    final retrying = existing?.phase == UpdatePhase.pluginRetry;
+    if (existing?.isPreparationPhase == true && !prepared) return;
+    if (prepared) {
+      if (existing != null && opId != null && opId != existing.opId) return;
+      opId = existing!.opId;
+      targetVersion ??= existing.targetVersion;
+    } else if (retrying) {
+      // A failed/rolled-back admitted transaction is a new attempt. Only an
+      // unadmitted prepare retry reuses its opId; a prepared proof takes the
+      // separate branch above and remains bound to its original opId.
+      if (existing != null && (opId == null || opId == existing.opId)) {
+        opId = genRequestId();
+      }
+      targetVersion ??= existing?.targetVersion;
+    } else if (existing != null) {
+      if (opId == null || existing.opId != opId) return;
+    } else {
+      opId ??= genRequestId();
+    }
+    if (existing?.opId != opId) {
+      pluginUpdateJournal = PluginUpdateJournal(
+        opId: opId!,
+        targetVersion: targetVersion ?? '',
+        targetContentSha256: requestedContentSha256,
+        startedAt: DateTime.now().toUtc(),
+        phase: UpdatePhase.pluginPending,
+        manifestUrl: '',
+        appVersion: requestedAppVersion,
+      );
+    }
+    final journalContentHash =
+        pluginUpdateJournal?.targetContentSha256.trim().toLowerCase() ?? '';
+    if (requestedContentSha256.isNotEmpty &&
+        journalContentHash.isNotEmpty &&
+        journalContentHash != requestedContentSha256) {
+      pluginUpdateNotice = '插件内容标识与已保存的更新目标不匹配';
+      notifyListeners();
+      return;
+    }
+    if (requestedContentSha256.isNotEmpty && journalContentHash.isEmpty) {
+      pluginUpdateJournal = pluginUpdateJournal!.copyWith(
+        targetContentSha256: requestedContentSha256,
+      );
+    }
+    final journalAppVersion = pluginUpdateJournal?.appVersion.trim() ?? '';
+    if (requestedAppVersion.isNotEmpty &&
+        journalAppVersion.isNotEmpty &&
+        journalAppVersion != requestedAppVersion) {
+      pluginUpdateNotice = 'App 目标版本与已保存的插件更新目标不匹配';
+      notifyListeners();
+      return;
+    }
+    if (requestedAppVersion.isNotEmpty && journalAppVersion.isEmpty) {
+      pluginUpdateJournal = pluginUpdateJournal!.copyWith(
+        appVersion: requestedAppVersion,
+      );
+    }
+    prepareId ??= pluginUpdateJournal?.prepareId;
+    if (prepared &&
+        (prepareId == null || targetVersion == null || targetVersion.isEmpty)) {
+      pluginUpdateNotice = '准备好的插件候选信息不完整，请重新检查';
+      notifyListeners();
+      return;
+    }
+    if (targetVersion != null &&
+        pluginUpdateJournal!.targetVersion != targetVersion) {
+      pluginUpdateJournal = pluginUpdateJournal!.copyWith(
+        targetVersion: targetVersion,
+      );
+    }
+    if (pluginUpdateJournal!.phase == UpdatePhase.pluginPrepared ||
+        pluginUpdateJournal!.phase == UpdatePhase.pluginRetry) {
+      pluginUpdateJournal = pluginUpdateJournal!.copyWith(
+        phase: UpdatePhase.pluginPending,
+      );
+    }
+    lastPluginUpdateOpId = opId!;
+    await _persistPrefs(_kLastPluginUpdateOpId, opId);
+    pluginUpdateNotice = null;
+    await _persistPrefs(
+      _kPluginUpdateJournal,
+      jsonEncode(pluginUpdateJournal!.toJson()),
+    );
+    notifyListeners();
+    _armPluginUpdateTimer();
+    try {
+      final resp = await api.triggerPluginUpdate(
+        opId: opId,
+        targetVersion: targetVersion,
+        prepareId: prepareId,
+      );
+      final action = resp['action'];
+      final check = resp['check'];
+      final release =
+          ReleaseSnapshot.fromJson(resp['release']) ??
+          ReleaseSnapshot.fromJson(check is Map ? check['release'] : null);
+      final serverTransaction = PluginTransaction.fromJson(
+        _pluginUpdateMap(resp['transaction']),
+      );
+      final currentJournal = pluginUpdateJournal;
+      if (currentJournal?.opId == opId) {
+        final targetVersion = currentJournal!.targetVersion.isNotEmpty
+            ? currentJournal.targetVersion
+            : serverTransaction?.targetVersion ?? release?.plugin.version ?? '';
+        final targetHash = currentJournal.targetContentSha256.isNotEmpty
+            ? currentJournal.targetContentSha256
+            : serverTransaction?.targetContentSha256 ??
+                  release?.plugin.contentSha256 ??
+                  '';
+        final appVersion = currentJournal.appVersion.isNotEmpty
+            ? currentJournal.appVersion
+            : serverTransaction?.targetAppVersion ?? release?.app.version ?? '';
+        final releaseMatchesTargets =
+            release != null &&
+            (targetVersion.isEmpty ||
+                release.plugin.version == targetVersion) &&
+            (targetHash.isEmpty ||
+                release.plugin.contentSha256.toLowerCase() ==
+                    targetHash.toLowerCase()) &&
+            (appVersion.isEmpty || release.app.version == appVersion);
+        pluginUpdateJournal = currentJournal.copyWith(
+          release: releaseMatchesTargets ? release : null,
+          manifestUrl: releaseMatchesTargets ? release.manifestUrl : null,
+          targetVersion: targetVersion.isEmpty ? null : targetVersion,
+          targetContentSha256: targetHash.isEmpty ? null : targetHash,
+          appVersion: appVersion.isEmpty ? null : appVersion,
+        );
+        await _persistPrefs(
+          _kPluginUpdateJournal,
+          jsonEncode(pluginUpdateJournal!.toJson()),
+        );
+      }
+      if (action == 'accepted') {
+        pluginUpdateNotice = '已提交更新，等待电脑端完成并重启…';
+      } else if (action == 'none') {
+        // 检查没做成时**不能**说成"无需更新"（评审 W3）：只有明确的 up-to-date / local-ahead
+        // 才是"没有新版"，其余（unavailable / disabled / unknown）如实说不可用。
+        final check = resp['check'];
+        final state = check is Map ? ((check['state'] as String?) ?? '') : '';
+        final reason = check is Map ? ((check['reason'] as String?) ?? '') : '';
+        if (state == 'up-to-date' || state == 'local-ahead') {
+          pluginUpdateNotice = '电脑端插件已是最新';
+        } else {
+          pluginUpdateNotice =
+              '无法确认更新（${state.isEmpty ? 'unknown' : state}${reason.isEmpty ? '' : '：$reason'}）';
+        }
+        await _clearPluginUpdateJournal();
+        await _clearLastPluginUpdateLogIfMatches(opId);
+      } else {
+        pluginUpdateNotice = '结果待确认：重连后会自动确认';
+      }
+    } on ApiException catch (e) {
+      final auth = authFixHint(e);
+      if (e.status != null && e.status! >= 400 && e.status! < 500) {
+        await _clearPluginUpdateJournal();
+        await _clearLastPluginUpdateLogIfMatches(opId);
+        if (auth != null) {
+          // F21：口令未配置/错误不是通用网络错误——明确让用户用电脑连接页二维码重扫一次。
+          pluginUpdateNotice = auth;
+        } else if (e.code == 'update-busy') {
+          final body = e.body;
+          if (body?['transaction'] is Map) {
+            api.pluginUpdate = PluginUpdateStatus.fromJson({
+              'state': 'unknown',
+              'transaction': body!['transaction'],
+            });
+          } else {
+            try {
+              api.absorbBootstrap(await api.getJson('/api/bootstrap'));
+            } catch (_) {}
+          }
+          final current = api.pluginUpdate.transaction;
+          pluginUpdateNotice = current == null
+              ? '电脑端已有更新操作，请刷新查看；本次请求未提交'
+              : '电脑端已有操作 ${current.opId}（${current.phase}）；本次请求未提交';
+        } else {
+          pluginUpdateNotice =
+              '更新请求被拒绝（${e.code ?? e.status}），可重试；旧插件仍可继续使用，必要时按设置页指引更新';
+        }
+      } else {
+        // Response loss / timeout / 5xx may hide an accepted operation.
+        pluginUpdateNotice = '结果待确认（${e.code}）：电脑端可能已在更新，重连后会自动确认';
+      }
+    } catch (e) {
+      pluginUpdateNotice = '结果待确认（$e）：重连后会自动确认';
+    }
+    notifyListeners();
+  }
+
+  /// 接续判定：宿主重启造成的断线是**正常环节**（评审 R7/R8）。
+  /// 判定依据是电脑端下发的事务 + **正在运行的内容标识**，不是版本号。
+  Future<void> resumePluginUpdate({bool connected = true}) =>
+      _resumingUpdate ??= _resumePluginUpdate(connected: connected)
+          .whenComplete(() => _resumingUpdate = null);
+
+  Future<void> _resumePluginUpdate({required bool connected}) async {
+    final journal = pluginUpdateJournal;
+    if (journal == null) {
+      _pluginUpdateTimer?.cancel();
+      _pluginUpdateTimer = null;
+      return;
+    }
+    if (journal.isPreparationPhase) {
+      // A prepare is not an admitted update transaction. It waits for an explicit
+      // user retry/confirmation; the normal restart monitor must not time it out.
+      _pluginUpdateTimer?.cancel();
+      _pluginUpdateTimer = null;
+      return;
+    }
+    if (journal.phase == UpdatePhase.appPending ||
+        journal.phase == UpdatePhase.pluginConfirmed) {
+      if (!connected && journal.release == null) {
+        // A host-pointer recovery cannot be proven from stale cached bootstrap data.
+        _armPluginUpdateTimer();
+        return;
+      }
+      await _continueAppUpdateAfterPlugin();
+      return;
+    }
+    // D2：**先恢复固定快照再判定**。POST 已被接受、响应丢失/手机被杀时，本地 journal 是空的，
+    // 而服务端同 opId 的已 settled 事务里带着完整 release；不先回填就永远走不到 completed 分支。
+    var current = journal;
+    final serverTx = connected ? api.pluginUpdate.transaction : null;
+    if (serverTx != null &&
+        serverTx.opId == journal.opId &&
+        (journal.release == null || journal.targetContentSha256.isEmpty)) {
+      final release = serverTx.release;
+      if (release != null) {
+        // 只回填**空**快照，绝不覆盖已经固定的完整快照。
+        current = journal.copyWith(
+          release: release,
+          manifestUrl: release.manifestUrl,
+          targetVersion: release.plugin.version,
+          targetContentSha256: release.plugin.contentSha256,
+          appVersion: journal.appVersion.isEmpty ? release.app.version : null,
+        );
+        pluginUpdateJournal = current;
+        await _persistPrefs(
+          _kPluginUpdateJournal,
+          jsonEncode(current.toJson()),
+        );
+      } else if (serverTx.targetContentSha256.isNotEmpty) {
+        current = journal.copyWith(
+          targetVersion: serverTx.targetVersion.isEmpty
+              ? journal.targetVersion
+              : serverTx.targetVersion,
+          targetContentSha256: serverTx.targetContentSha256,
+          appVersion:
+              journal.appVersion.isEmpty && serverTx.targetAppVersion.isNotEmpty
+              ? serverTx.targetAppVersion
+              : null,
+        );
+        pluginUpdateJournal = current;
+        await _persistPrefs(
+          _kPluginUpdateJournal,
+          jsonEncode(current.toJson()),
+        );
+      }
+    }
+    final decision = decidePluginUpdateResume(
+      journal: current,
+      loadedContentSha256: connected ? api.pluginContentSha256 : '',
+      transaction: serverTx,
+      now: DateTime.now().toUtc(),
+    );
+    switch (decision.action) {
+      case ResumeAction.none:
+      case ResumeAction.wait:
+        _armPluginUpdateTimer(); // 继续等；超时由独立定时器推进
+        return;
+      case ResumeAction.completed:
+        final tx = api.pluginUpdate.transaction;
+        final target = tx?.targetVersion ?? current.targetVersion;
+        pluginUpdateJournal = current.copyWith(
+          phase: UpdatePhase.pluginConfirmed,
+          targetVersion: target,
+          targetContentSha256:
+              tx?.targetContentSha256 ?? journal.targetContentSha256,
+          appVersion:
+              current.appVersion.isEmpty &&
+                  (tx?.targetAppVersion.isNotEmpty ?? false)
+              ? tx!.targetAppVersion
+              : null,
+          release: current.release ?? tx?.release,
+          pluginVerified: true,
+        );
+        await _persistPrefs(
+          _kPluginUpdateJournal,
+          jsonEncode(pluginUpdateJournal!.toJson()),
+        );
+        pluginUpdateNotice = '电脑端插件已更新到 v$target';
+        await _continueAppUpdateAfterPlugin();
+      case ResumeAction.rolledBack:
+      case ResumeAction.failed:
+      case ResumeAction.timedOut:
+        pluginUpdateJournal = journal.copyWith(phase: UpdatePhase.pluginRetry);
+        await _persistPrefs(
+          _kPluginUpdateJournal,
+          jsonEncode(pluginUpdateJournal!.toJson()),
+        );
+        _pluginUpdateTimer?.cancel();
+        pluginUpdateNotice =
+            '插件目标未确认（${decision.reason}），APK 不会先装；可在设置页重新检查并重试，旧组合仍可继续使用';
+    }
+    notifyListeners();
+  }
+
+  /// 消费一次性提示。
+  void clearPluginUpdateNotice() {
+    pluginUpdateNotice = null;
+    notifyListeners();
+  }
+
+  /// 插件目标是否**确实健康**（§5.3 / §5.9）。
+  ///
+  /// 当前运行内容哈希与固定发布目标一致是必要条件；宿主给出 `currentReleaseHealth`
+  /// 时还要求健康已确认、运行内容/服务实例一致；在飞或回滚事务一律拒绝。
+  /// settled 事务可能记录较早的插件目标（例如发布流程手工同步后），不应盖过当前内容证明。
+  bool _pluginTargetHealthy(ReleaseSnapshot release) {
+    final loaded = api.pluginContentSha256;
+    if (loaded.isEmpty || loaded != release.plugin.contentSha256) return false;
+    final health = api.currentReleaseHealth;
+    if (health != null) {
+      if (!health.confirmed) return false;
+      if (health.runningContentSha256.isNotEmpty &&
+          health.runningContentSha256 != loaded)
+        return false;
+      // 换了服务实例的旧健康结论不能冒充新的；宿主未给 instanceId 时不猜。
+      if (health.instanceId.isNotEmpty &&
+          api.pluginInstanceId.isNotEmpty &&
+          health.instanceId != api.pluginInstanceId) {
+        return false;
+      }
+    }
+    final tx = api.pluginUpdate.transaction;
+    if (tx == null) return true; // 预装且已加载目标内容：无历史操作也算健康
+    if (tx.rolledBack) return false;
+    // 内容证明已在上方完成；历史终态失败/回滚记录不否定“运行内容 = 固定发布内容”。
+    if (const {'settled', 'failed', 'rolled-back'}.contains(tx.phase))
+      return true;
+    return false; // 非终态：交给门禁的在飞分支处理
+  }
+
+  /// 终态失败事务是否已被当前运行内容覆盖（内容证明优先于历史失败记录）。
+  bool _staleFailureProof(ReleaseSnapshot release) {
+    final tx = api.pluginUpdate.transaction;
+    if (tx == null || tx.rolledBack) return false;
+    if (!const {'failed', 'rolled-back'}.contains(tx.phase)) return false;
+    final loaded = api.pluginContentSha256;
+    if (loaded.isEmpty || loaded != release.plugin.contentSha256) return false;
+    final health = api.currentReleaseHealth;
+    if (health != null &&
+        health.runningContentSha256.isNotEmpty &&
+        health.runningContentSha256 != loaded) {
+      return false;
+    }
+    return true;
+  }
+
+  /// 配对是否已被**明确打断**（回滚/失败/运行内容与快照不符且无在飞事务）。
+  /// 用于接续时给出"两端不匹配，请重新检查"出口，而不是永久等待。
+  bool _pairingBroken(ReleaseSnapshot release) {
+    final tx = api.pluginUpdate.transaction;
+    if (tx != null &&
+        (tx.rolledBack || tx.phase == 'rolled-back' || tx.phase == 'failed'))
+      return true;
+    final health = api.currentReleaseHealth;
+    if (health != null && health.failed) return true;
+    final loaded = api.pluginContentSha256;
+    if (loaded.isEmpty) return false; // 未拿到运行内容（离线/旧宿主）不据此断言
+    return tx == null && loaded != release.plugin.contentSha256;
+  }
+
+  /// 记录"进入 appPending 时插件目标已被确认健康"的持久证明（D1）。
+  bool _pluginProofFor(ReleaseSnapshot release) =>
+      _pluginTargetHealthy(release);
+
+  /// 插件已健康对齐后，再推进 App 自己那半边的更新（**同一份清单**，F9）。
+  ///
+  /// - `plugin-confirmed`：插件健康后第一次确定 App 目标；
+  /// - `app-pending`：安装器返回后的**首次启动复核**（§5.9）：核对真实安装版本/构建号与配对。
+  Future<void> _continueAppUpdateAfterPlugin() async {
+    var journal = pluginUpdateJournal;
+    if (journal == null) return;
+    var release = journal.release;
+    if (release == null) {
+      final transaction = api.pluginUpdate.transaction;
+      if (transaction != null &&
+          transaction.opId == journal.opId &&
+          !transaction.rolledBack &&
+          transaction.phase != 'settled' &&
+          transaction.phase != 'failed' &&
+          transaction.phase != 'rolled-back') {
+        pluginUpdateNotice =
+            '电脑端插件事务尚未 settled（${transaction.phase}）；不会从其他发布拼接 App 目标';
+        notifyListeners();
+        return;
+      }
+      final recovered = resolveHostReleaseForPluginUpdate(
+        journal: journal,
+        transaction: transaction,
+        loadedContentSha256: api.pluginContentSha256,
+        updateTarget: api.updateTarget,
+        currentRelease: api.currentRelease,
+      );
+      if (recovered == null) {
+        await _abandonUpdate(
+          '电脑端没有与本次插件事务精确匹配的固定 App 发布；已退出本次更新（不会回退到 latest/GitHub）',
+        );
+        return;
+      }
+      journal = journal.copyWith(
+        release: recovered,
+        manifestUrl: recovered.manifestUrl,
+        appVersion: journal.appVersion.isEmpty ? recovered.app.version : null,
+      );
+      pluginUpdateJournal = journal;
+      await _persistPrefs(_kPluginUpdateJournal, jsonEncode(journal.toJson()));
+      release = recovered;
+    }
+    // 来源接线（F19）：旧版本可能存下外部 Release 资产地址，新流程只认宿主固定目标。
+    final urlIssue = fixedArtifactUrlIssue(release);
+    if (urlIssue != null) {
+      await _abandonUpdate('$urlIssue；已退出旧目标，请重新检查两端版本');
+      return;
+    }
+    if (journal.phase == UpdatePhase.appPending) {
+      await _verifyInstalledApp(journal, release);
+      return;
+    }
+    // 插件半边还在等（重启/旧实例仍在服务）：不推进 App，也不误判完成。
+    final tx = api.pluginUpdate.transaction;
+    if (tx != null && tx.phase != 'settled' && !tx.rolledBack) {
+      pluginUpdateNotice = '电脑端插件更新尚未确认（${tx.phase}），APK 不会先装；重连后会自动继续';
+      notifyListeners();
+      return;
+    }
+    if (_pairingBroken(release)) {
+      await _abandonUpdate('电脑端插件更新已回滚或失败，本次两端更新已结束；请重新检查两端版本（旧组合仍可继续使用）');
+      return;
+    }
+    if (!_pluginTargetHealthy(release)) {
+      // 插件健康尚未确认：保留固定快照等它收敛，绝不让 APK 先行。
+      pluginUpdateNotice = '电脑端插件目标尚未确认健康，APK 不会先装；重连后会自动继续，也可在设置页重新检查';
+      notifyListeners();
+      return;
+    }
+    final candidate = release.candidate;
+    final outcome = await checkFixedAppUpdate(release);
+    if (_disposed || pluginUpdateJournal?.opId != journal.opId) return;
+    if (outcome.error != null || outcome.candidate == null) {
+      if (_isTransientCheckError(outcome.error)) {
+        pluginUpdateNotice = '${outcome.error ?? '无法确认 App 目标'}，请重试检查；更新记录已保留';
+        notifyListeners();
+        return;
+      }
+      await _abandonUpdate(
+        '${outcome.error ?? '无法确认 App 目标'}；已退出本次更新，请重新检查两端版本',
+      );
+      return;
+    }
+    if (outcome.verdict == UpdateVerdict.upToDate) {
+      pluginUpdateNotice = '两端已更新到 v${candidate.version}';
+      updateCandidate = null;
+      await _clearPluginUpdateJournal();
+      notifyListeners();
+      return;
+    }
+    if (outcome.verdict == UpdateVerdict.updateAvailable) {
+      pluginUpdateJournal = journal.copyWith(
+        phase: UpdatePhase.appPending,
+        appVersion: candidate.version,
+        manifestUrl: release.manifestUrl,
+        pluginVerified: _pluginProofFor(release),
+      );
+      await _persistPrefs(
+        _kPluginUpdateJournal,
+        jsonEncode(pluginUpdateJournal!.toJson()),
+      );
+      updateCandidate = candidate;
+      notifyListeners();
+      return;
+    }
+    // remoteOlder：本机 App 已更高，不尝试降级。
+    await _abandonUpdate(
+      '本机 App 已高于固定目标 v${release.app.version}；不会降级，请重新检查两端发布',
+    );
+  }
+
+  /// 是否为瞬时的"本机版本读取失败"类错误（保留记录可重试）；否则视为结构性失效。
+  bool _isTransientCheckError(String? error) {
+    if (error == null) return true;
+    return error.contains('无法读取或核对') || error.contains('App 检查失败');
+  }
+
+  /// 安装器返回后的**首次启动复核**（§5.9 / C6 / F13）：
+  /// 读真实安装版本/构建号；若插件已回滚或运行内容与快照不符，明确提示"两端不匹配，
+  /// 请重新检查"，不自动降级、不静默继续。
+  Future<void> _verifyInstalledApp(
+    PluginUpdateJournal journal,
+    ReleaseSnapshot release,
+  ) async {
+    var current = journal;
+    // appPending 的持久证明可能来自旧记录（升级前没有 pluginVerified 字段）：
+    // 只要此刻插件目标健康，就补记这份"下载/安装前已确认"的证明。
+    if (!current.pluginVerified && _pluginTargetHealthy(release)) {
+      current = current.copyWith(pluginVerified: true);
+      pluginUpdateJournal = current;
+      await _persistPrefs(_kPluginUpdateJournal, jsonEncode(current.toJson()));
+    }
+    final target = parseAppVersion(release.app.version);
+    final local = await _localVersion();
+    if (_disposed || pluginUpdateJournal?.opId != current.opId) return;
+    if (target == null) {
+      await _abandonUpdate('固定快照的 App 版本不可解析；已退出本次更新，请重新检查两端版本');
+      return;
+    }
+    if (local == null || !local.buildSet) {
+      pluginUpdateNotice = '无法读取本机 App 版本/build，安装结果待确认；更新记录已保留';
+      notifyListeners();
+      return;
+    }
+    final cmp = compareAppVersion(local, target);
+    if (cmp == 0) {
+      if (_pluginTargetHealthy(release)) {
+        pluginUpdateJournal = current.copyWith(phase: UpdatePhase.done);
+        await _persistPrefs(
+          _kPluginUpdateJournal,
+          jsonEncode(pluginUpdateJournal!.toJson()),
+        );
+        await _clearPluginUpdateJournal();
+        pluginUpdateNotice = '两端已更新到 v${release.app.version}';
+        updateCandidate = null;
+      } else if (_pairingBroken(release)) {
+        // 装完首次启动复核发现配对已断：明确提示，不自动降级、不静默继续。
+        await _abandonUpdate(
+          '两端不匹配：电脑端插件已回滚或运行内容与固定快照不符，请重新检查两端版本（不会自动降级 App）',
+        );
+        return;
+      } else {
+        // 只是健康结论还没确认（重启/监督器确认中）：保留记录等它收敛，不误报完成。
+        pluginUpdateNotice =
+            'App 已安装到 v${release.app.version}；等待电脑端插件健康确认后自动收尾';
+        notifyListeners();
+        return;
+      }
+      notifyListeners();
+      return;
+    }
+    // 配对在安装前就断了（另一事务回滚/失败）：退出旧目标，给出重新检查出口。
+    if (_pairingBroken(release)) {
+      await _abandonUpdate('本次 App 更新目标已失效：电脑端插件已回滚或事务失败；请重新检查两端版本（APK 不会先装）');
+      return;
+    }
+    if (cmp < 0) {
+      // 安装器已返回但系统尚未完成安装：保留固定目标让它可重试/可取消（F13）。
+      updateCandidate = release.candidate;
+      pluginUpdateNotice =
+          '安装尚未完成：请完成系统安装提示（本机仍是 v$local，目标 v${release.app.version}）；'
+          '若未出现安装界面，请允许本应用「安装未知应用」。安装包已保留，可直接重试';
+      notifyListeners();
+      return;
+    }
+    // 本机 App 已更高：不降级，退出并提示重新对齐。
+    await _abandonUpdate(
+      '本机 App v$local 已高于固定目标 v${release.app.version}；不会降级，请重新检查两端发布',
+    );
+  }
+
+  /// 退出旧目标并给出明确提示（不永久停在"更新进行中"）：清记录 + 清候选。
+  Future<void> _abandonUpdate(String notice) async {
+    updateCandidate = null;
+    await _clearPluginUpdateJournal();
+    pluginUpdateNotice = notice;
+    notifyListeners();
+  }
+
+  /// 宿主已恢复健康（PC 端完成更新）后，自动退出手机端残留的未确认记录。
+  Future<void> discardStaleUpdateJournal() async {
+    updateCandidate = null;
+    pluginUpdateNotice = null;
+    await _clearPluginUpdateJournal();
+    notifyListeners();
+  }
+
+  /// 用户可见出口（F13）：取消当前两端更新记录，并按当前电脑端状态**重新检查**。
+  /// 目标改变、过期（410）、失败、另一事务回滚导致卡住时都走这里。
+  Future<void> cancelUpdateAndRecheck() async {
+    if (pluginUpdateJournal == null) {
+      pluginUpdateNotice = '当前没有进行中的两端更新';
+      notifyListeners();
+      return;
+    }
+    await _clearPluginUpdateJournal();
+    updateCandidate = null;
+    pluginUpdateNotice = null;
+    notifyListeners();
+    final outcome = await Updater.check(this);
+    if (outcome.verdict == UpdateVerdict.updateAvailable &&
+        outcome.candidate != null) {
+      updateCandidate = outcome.candidate;
+      pluginUpdateNotice =
+          '已取消旧更新目标；发现固定目标 v${outcome.candidate!.version}，请重新更新';
+    } else if (outcome.error != null) {
+      pluginUpdateNotice = '已取消旧更新目标；重新检查未完成：${outcome.error}';
+    } else {
+      pluginUpdateNotice = '已取消旧更新目标；当前没有可用的固定更新目标';
+    }
+    notifyListeners();
+  }
+
+  /// 安装器返回后的首次启动复核入口（保持既有公开方法名）。
+  Future<void> markAppUpdateConfirmed() async {
+    final journal = pluginUpdateJournal;
+    final release = journal?.release;
+    if (journal == null || release == null) return;
+    await _verifyInstalledApp(journal, release);
+  }
+
+  /// No network/source lookup: only the immutable snapshot and this device's real version/build.
+  Future<UpdateCheckOutcome> checkFixedAppUpdate(
+    ReleaseSnapshot? release,
+  ) async {
+    if (release == null) {
+      return const UpdateCheckOutcome(
+        verdict: UpdateVerdict.upToDate,
+        error: '缺少固定发布快照，请先更新电脑端插件或按设置页指引升级（仍可继续使用旧插件）',
+      );
+    }
+    // 来源接线守卫（F19）：固定快照的下载定位必须是宿主固定目标，外部资产地址不再使用。
+    final urlIssue = fixedArtifactUrlIssue(release);
+    if (urlIssue != null) {
+      return UpdateCheckOutcome(
+        verdict: UpdateVerdict.upToDate,
+        error: urlIssue,
+      );
+    }
+    // F16：宿主报告 APK 身份/哈希不一致时停在校验阶段，不服务错件（也不假装能更新）。
+    final artifact = api.appArtifact;
+    if (artifact != null && artifact.mismatch) {
+      final reason = artifact.reason.isEmpty ? '' : '（${artifact.reason}）';
+      return UpdateCheckOutcome(
+        verdict: UpdateVerdict.upToDate,
+        error: '电脑端 APK 与发布清单不一致$reason，不会下载；请检查电脑端发布来源后重新检查',
+      );
+    }
+    try {
+      final local = await _localVersion();
+      final target = parseAppVersion(release.app.version)!;
+      if (local == null || !local.buildSet || !target.buildSet) {
+        return const UpdateCheckOutcome(
+          verdict: UpdateVerdict.upToDate,
+          error: '无法读取或核对 App 版本/build',
+        );
+      }
+      return UpdateCheckOutcome(
+        verdict: verdictFor(local: local, remote: target),
+        candidate: release.candidate,
+      );
+    } catch (error) {
+      return UpdateCheckOutcome(
+        verdict: UpdateVerdict.upToDate,
+        error: 'App 检查失败：$error',
+      );
+    }
+  }
+
+  /// 独立的超时推进（评审 R8）：只靠请求成功才能推进的话，长期离线会永久停在"等待重启"。
+  void _armPluginUpdateTimer() {
+    _pluginUpdateTimer?.cancel();
+    if (pluginUpdateJournal == null) return;
+    _pluginUpdateTimer = Timer(const Duration(seconds: 30), () {
+      unawaited(resumePluginUpdate(connected: api.pluginVersion.isNotEmpty));
+    });
+  }
+
+  Future<void> _clearPluginUpdateJournal() async {
+    pluginUpdateJournal = null;
+    _pluginUpdateTimer?.cancel();
+    _pluginUpdateTimer = null;
+    await _persistPrefs(_kPluginUpdateJournal, '');
+  }
+
   int petHeight = 96; // 宠物画布高度 dp（56~160）
   bool petReducedMotion = false; // 减少动效：宠物静态姿势 + 首页角色/背景静止
   bool petEdgeHide = true; // 贴边 5 秒后自动躲藏/虚化
@@ -227,7 +1454,8 @@ class AppStore extends ChangeNotifier {
     String? toolName,
     String? reason,
     String? prompt,
-  )? onAttention;
+  )?
+  onAttention;
 
   /// M1a：结构化事件（带 approvalId，身份稳定、可精确撤销）。
   void Function(AttentionEvent event)? onAttentionEvent;
@@ -277,6 +1505,7 @@ class AppStore extends ChangeNotifier {
   static const _kSession = 'dsh_mr_session';
   static const _kDark = 'dsh_mr_darkmode';
   static const _kReasoning = 'dsh_mr_show_reasoning';
+  static const _kShowHiddenFiles = 'dsh_mr_show_hidden_files';
   static const _kReasoningDefaultExpanded = 'dsh_mr_reasoning_default_expanded';
   static const _kTimelineDebug = 'dsh_mr_timeline_debug';
   static const _kReasoningOverrides = 'dsh_mr_reasoning_overrides';
@@ -286,6 +1515,8 @@ class AppStore extends ChangeNotifier {
   static const _kBalanceAlert = 'dsh_mr_balance_alert';
   static const _kBalanceThreshold = 'dsh_mr_balance_threshold';
   static const _kFloating = 'dsh_mr_floating';
+  static const _kPluginUpdateJournal = 'dsh_mr_plugin_update_journal';
+  static const _kLastPluginUpdateOpId = 'dsh_mr_plugin_update_last_op_id';
   static const _kPetHeight = 'dsh_mr_pet_height';
   static const _kPetReducedMotion = 'dsh_mr_pet_reduced_motion';
   static const _kPetEdgeHide = 'dsh_mr_pet_edge_hide';
@@ -303,6 +1534,7 @@ class AppStore extends ChangeNotifier {
     appIcon = prefs.getString(_kAppIcon) ?? 'default';
     iconMigrationTipShown = prefs.getBool(_kIconMigrationTip) ?? false;
     showReasoning = prefs.getBool(_kReasoning) ?? false;
+    showHiddenFiles = prefs.getBool(_kShowHiddenFiles) ?? true;
     reasoningDefaultExpanded =
         prefs.getBool(_kReasoningDefaultExpanded) ?? false;
     timelineDebug = prefs.getBool(_kTimelineDebug) ?? false;
@@ -324,6 +1556,35 @@ class AppStore extends ChangeNotifier {
     balanceAlert = prefs.getBool(_kBalanceAlert) ?? false;
     balanceThreshold = prefs.getDouble(_kBalanceThreshold) ?? 10;
     floatingEnabled = prefs.getBool(_kFloating) ?? false;
+    // 进行中的插件自更新记录（跨断线/跨进程）：宿主重启会断线，重连后据此接续
+    lastPluginUpdateOpId = prefs.getString(_kLastPluginUpdateOpId) ?? '';
+    try {
+      final rawJournal = prefs.getString(_kPluginUpdateJournal);
+      pluginUpdateJournal = (rawJournal == null || rawJournal.isEmpty)
+          ? null
+          : PluginUpdateJournal.fromJson(
+              jsonDecode(rawJournal) as Map<String, dynamic>,
+            );
+    } catch (_) {
+      pluginUpdateJournal = null; // 记录损坏即丢弃，不阻塞启动
+    }
+    if (lastPluginUpdateOpId.isEmpty &&
+        pluginUpdateJournal != null &&
+        !pluginUpdateJournal!.isPreparationPhase) {
+      lastPluginUpdateOpId = pluginUpdateJournal!.opId;
+      unawaited(_persistPrefs(_kLastPluginUpdateOpId, lastPluginUpdateOpId));
+    }
+    // 统一接续入口（评审 R8）：首连、SSE 自动重连、下拉刷新、存活探测都会吸收 bootstrap，
+    // 因此把"接续推进"挂在这里，就不会漏掉"用户什么都没做、只是自动重连"的路径。
+    _updateBootstrapCallback = () {
+      notifyListeners(); // host-started update opId can reveal its log panel without a local journal
+      unawaited(resumePluginUpdate());
+    };
+    api.onBootstrapAbsorbed = _updateBootstrapCallback;
+    if (pluginUpdateJournal != null &&
+        !pluginUpdateJournal!.isPreparationPhase) {
+      _armPluginUpdateTimer();
+    }
     petHeight = (prefs.getInt(_kPetHeight) ?? 96).clamp(56, 160).toInt();
     petReducedMotion = prefs.getBool(_kPetReducedMotion) ?? false;
     petEdgeHide = prefs.getBool(_kPetEdgeHide) ?? true;
@@ -526,6 +1787,19 @@ class AppStore extends ChangeNotifier {
     floatingEnabled = v;
     notifyListeners();
     await _persistPrefs(_kFloating, v);
+  }
+
+  /// 清除「有新版本」候选（横幅关闭 / 更新流程启动后）。
+  void clearUpdateCandidate() {
+    if (updateCandidate == null) return;
+    updateCandidate = null;
+    notifyListeners();
+  }
+
+  /// 自动检查命中后写入候选（由 updater 调用；仅状态推进，不弹窗）。
+  void setUpdateCandidate(UpdateCandidate? c) {
+    updateCandidate = c;
+    notifyListeners();
   }
 
   /// App 启动自动恢复桌面宠物（沿用旧悬浮球恢复逻辑）：上次开启过且服务没在跑 → 自动拉起。
@@ -780,9 +2054,8 @@ class AppStore extends ChangeNotifier {
   );
 
   /// 当前列表里是否存在需要驱动旋转标识的会话（存在运行中会话才启动动画）。
-  bool hasRunningSessions(Iterable<Session> visible) => visible.any(
-    (s) => rowStateOf(s.id) == SessionRowState.running,
-  );
+  bool hasRunningSessions(Iterable<Session> visible) =>
+      visible.any((s) => rowStateOf(s.id) == SessionRowState.running);
 
   /// 当前工作区的显示名（无工作区/全部时为 null）。
   String? get workspaceTitle {
@@ -802,6 +2075,13 @@ class AppStore extends ChangeNotifier {
     showReasoning = v;
     notifyListeners();
     await _persistPrefs(_kReasoning, v);
+  }
+
+  /// 会话文件浏览「显示隐藏文件」开关（默认开；只作用于会话文件浏览）。
+  Future<void> setShowHiddenFiles(bool v) async {
+    showHiddenFiles = v;
+    notifyListeners();
+    await _persistPrefs(_kShowHiddenFiles, v);
   }
 
   Future<void> setReasoningDefaultExpanded(bool v) async {
@@ -886,6 +2166,10 @@ class AppStore extends ChangeNotifier {
       _refreshAllInner(),
       Future<void>.delayed(const Duration(seconds: 8)),
     ]);
+    if (!ok) {
+      // 离线也接续判定一次：宿主重启期间连不上是正常的，但等太久要如实收敛为超时
+      unawaited(resumePluginUpdate(connected: false));
+    }
     return ok;
   }
 
@@ -923,11 +2207,9 @@ class AppStore extends ChangeNotifier {
     // 而不只是"当前打开的会话"变化时。下面逐项比对（含将被裁剪的键）。
     final willPrune =
         snapshotEpoch == null || snapshotEpoch == _agentStatusEpoch;
-    final changed = _statusSetChanged(
-      agentStatusMap,
-      liveAgents,
-      prune: willPrune,
-    ) || _statusSetChanged(sessionAgentStatus, liveSessions, prune: willPrune);
+    final changed =
+        _statusSetChanged(agentStatusMap, liveAgents, prune: willPrune) ||
+        _statusSetChanged(sessionAgentStatus, liveSessions, prune: willPrune);
 
     if (willPrune) {
       // 快照权威：先删不在快照里的陈旧键，再写入快照值
@@ -1043,19 +2325,168 @@ class AppStore extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> refreshSessions({bool notify = true}) async {
+  // ── 会话列表刷新的在途守卫（issue #22）──
+  //
+  // 触发源：`_debounceSessions()` 每 800ms 就可能调一次本方法，而一次 `/sessions`
+  // 在服务端是一次**全语料扫描**（实测 70 秒量级）。没有守卫时同一时刻可以有任意多个
+  // 刷新在飞——实测现场 16–18 个连接全部来自手机、宿主 CPU 171%、主线程 91.6%。
+  // 到达速率长期高于完成速率 → 请求无界堆积 → **谁都完不成**，列表永远刷不出来。
+  //
+  // 策略：在途期间不发新请求，只记一次"待补"；在途结束后补发**一次**。
+  //
+  // 评审指出的三条语义，逐条对应到实现：
+  //  1. **被合并的调用不得提前完成**：合并时返回"待补这一轮"的共享 Future，直到补发
+  //     真正结束才释放等待者。否则 `_refreshAllInner()` 会先发布旧数据，而随后的补发
+  //     （notify 意图可能是 false）更新了 sessions 却不再通知 UI——列表就停在旧数据上。
+  //  2. **不得越过生命周期补发**：dispose / 关闭 bridge 时清除待补并释放等待者；
+  //     finally 里还必须确认当前请求仍属于当前代，才允许补发。
+  //  3. **守卫按连接代归属**：切换到新地址后，旧地址的在途请求既不能阻塞新地址的刷新，
+  //     也不能在迟到时清掉新代的在途标志或启动新代补发。
+  //
+  // 注意第 3 条**不能**用"在 disposeBridge 里直接把布尔复位"糊过去：那样旧代的
+  // 迟到 finally 会把新代的守卫清掉，重新放出同代并发。故一律以 `_refreshGeneration`
+  // 判定归属。
+  // 评审第二轮（WARNING 1）暴露的边界：generation 只在 disposeBridge 里自增，
+  // 而**自动地址轮换**（`connect.onError`、`_scheduleReconnect`、`refreshAll` 的候选
+  // 切换）与手动切换都只改 `api.baseUrl`，没有任何统一回调。于是旧地址的请求仍是
+  // "当代 owner"：新地址的刷新被合并到它后面，旧地址的迟到结果还能通过 generation
+  // 检查被当作当前地址的数据应用。
+  //
+  // 逐入口补失效既容易漏，又可能在新代请求已经开始之后**重复失效新代**（评审第 4 点）。
+  // 故改为**按连接身份归属**：在刷新入口比对身份，所有路径一次覆盖，且天然幂等
+  // ——身份没变就什么都不做。
+  int _refreshGeneration = 0;
+  String? _refreshIdentity; // 上次刷新归属的连接身份；**只用于比较**
+  bool _sessionsInFlight = false;
+  bool _sessionsPending = false;
+  bool _sessionsPendingNotify = true;
+  Completer<void>? _sessionsWaiters; // 「待补这一轮」的等待者（尚未启动）
+  // 评审 WARNING 2：等待者一旦成为「补发中那一轮」就会被摘成局部变量，失效逻辑只看
+  // 字段就释放不到它。故用集合追踪**所有尚未完成的轮次**，直到该轮结束或生命周期失效。
+  final Set<Completer<void>> _roundWaiters = <Completer<void>>{};
+
+  /// 当前连接身份：活动地址 + **挂载路径** + 认证身份。
+  /// **只用于比较**——`api.token` 绝不写入日志、界面或错误信息。
+  ///
+  /// 评审备注：`Api` 把挂载路径单独存在 `path` 里，并不包含在 `baseUrl` 中，
+  /// 所以这里必须一并带上，否则"同地址换挂载路径"会被误判为身份未变。
+  String get _connectionIdentity =>
+      '${api.baseUrl}\u0000${api.path}\u0000${api.token}';
+
+  /// 轮次等待者的**幂等**收尾：生命周期可能已经先释放过它，此时旧回调还会到达，
+  /// 二次 complete 会抛 StateError / 未捕获异步异常。
+  void _finishRound(Completer<void>? waiter) {
+    if (waiter == null) return;
+    _roundWaiters.remove(waiter);
+    if (!waiter.isCompleted) waiter.complete();
+  }
+
+  void _finishAllRounds() {
+    for (final w in _roundWaiters.toList(growable: false)) {
+      _finishRound(w);
+    }
+  }
+
+  /// 连接身份变化 → 旧代的刷新归属全部失效（幂等：身份没变就什么都不做）。
+  void _syncConnectionGeneration() {
+    final id = _connectionIdentity;
+    if (id == _refreshIdentity) return;
+    _refreshIdentity = id;
+    _refreshGeneration++;
+    // 新代从零开始：旧地址的在途不再阻塞新地址的首屏刷新。
+    _sessionsInFlight = false;
+    _sessionsPending = false;
+    _sessionsWaiters = null;
+    // 释放旧代**全部**等待者——包括已经变成「补发中」的那一轮（WARNING 2）。
+    _finishAllRounds();
+  }
+
+  /// 连接代变更（关闭 bridge / 销毁）时使旧代的守卫与待补全部失效。
+  ///
+  /// 与 [_syncConnectionGeneration] 的区别：这里**不比对身份**。关闭 bridge 时地址
+  /// 可能没变，但连接已经没了——等待者必须立刻释放，不能拖到旧响应回来或逻辑超时。
+  void _invalidateSessionRefresh() {
+    _refreshGeneration++;
+    _sessionsInFlight = false;
+    _sessionsPending = false;
+    _sessionsWaiters = null;
+    _finishAllRounds();
+  }
+
+  Future<void> refreshSessions({bool notify = true}) {
+    // 兜底入口：任何方式的连接变更（含自动轮换）都在这里被发现。
+    _syncConnectionGeneration();
+    if (_sessionsInFlight) {
+      // 已有刷新在飞：合并到「待补这一轮」，并返回**该轮**的 Future——
+      // 调用者要的是"刷新完成"，不能在旧请求和补发都没结束时就提前完成。
+      _sessionsPending = true;
+      _sessionsPendingNotify = notify; // 沿用最新一次调用的意图
+      final waiter = _sessionsWaiters ??= Completer<void>();
+      _roundWaiters.add(waiter);
+      return waiter.future;
+    }
+    return _runSessionRefresh(notify);
+  }
+
+  Future<void> _runSessionRefresh(bool notify) async {
+    final generation = _refreshGeneration;
+    final identity = _refreshIdentity;
+    _sessionsInFlight = true;
     try {
-      sessions = await api.sessions();
-      _persistSessions(); // 本地缓存：下次打开 App 秒出列表
-      // 排障日志：打印工作区选择与会话 cwd 样本，便于定位筛选不显示的问题
-      AppLog.instance.log(
-        'Sessions: 拉取 ${sessions.length} 条 · workspacePath=${workspacePath ?? "全部"} · '
-        'workspaces=${workspaces.map((w) => w['path']).join("|")} · '
-        'cwd样例=${sessions.take(3).map((s) => s.cwd ?? "null").join("|")}',
-      );
-      if (notify) notifyListeners();
-    } catch (e) {
-      AppLog.instance.log('Sessions: 拉取失败 $e');
+      try {
+        final fetched = await api.sessions();
+        // 归属判定必须比对**实时**连接身份，而不是 `_refreshIdentity`（它只在刷新入口
+        // 更新）：地址可能在没有任何刷新的情况下被自动轮换掉，那时两者的存储值仍然相等，
+        // 旧地址的数据就会被应用上去。
+        if (generation != _refreshGeneration || identity != _connectionIdentity)
+          return;
+        sessions = fetched;
+        _persistSessions(); // 本地缓存：下次打开 App 秒出列表
+        // 排障日志：打印工作区选择与会话 cwd 样本，便于定位筛选不显示的问题
+        AppLog.instance.log(
+          'Sessions: 拉取 ${sessions.length} 条 · workspacePath=${workspacePath ?? "全部"} · '
+          'workspaces=${workspaces.map((w) => w['path']).join("|")} · '
+          'cwd样例=${sessions.take(3).map((s) => s.cwd ?? "null").join("|")}',
+        );
+        if (notify) notifyListeners();
+      } catch (e) {
+        AppLog.instance.log('Sessions: 拉取失败 $e');
+      }
+    } finally {
+      // 收尾必须区分**三种**情形（第三轮评审核定）：
+      //
+      // ① generation 已过期：说明本代已经被别处取代（disposeBridge，或刷新入口的
+      //    身份同步）。此时**绝不能触碰新代**的守卫与等待者。
+      // ② 仍属当前 owner 代，但**实时连接身份已变**（自动轮换 / 手动切换，且期间
+      //    没有任何刷新或 disposeBridge 来收尾）：既不能走正常收尾——那会把旧代的
+      //    pending **补发到新地址**上；也**不能整个跳过**——那会留下一个永远不会被
+      //    清理的 in-flight 与未释放的等待者，而且若之后又轮换回原地址，刷新入口会
+      //    认为"身份没变"（存储值仍是旧地址），那个遗留守卫就**永久卡住、再也不发
+      //    请求**。正确做法是同步失效本代残留并释放旧轮次等待者，**不补发**。
+      // ③ generation 与实时身份都匹配：走正常复位与补发。
+      if (generation == _refreshGeneration) {
+        if (identity != _connectionIdentity) {
+          _syncConnectionGeneration();
+        } else {
+          // **无论成功、失败还是异常都必须复位**：否则一次失败会把守卫永久卡在
+          // in-flight，列表从此再也不刷新——那比不加守卫更糟。
+          _sessionsInFlight = false;
+          final waiters = _sessionsWaiters;
+          _sessionsWaiters = null;
+          if (_sessionsPending) {
+            _sessionsPending = false;
+            // 补发一次（不 await：不让当前调用方被二次刷新拖住）。
+            // 等待者已登记在 `_roundWaiters` 里，**不在这里摘除**——它要等到补发结束
+            // 或生命周期失效才释放（评审 WARNING 2）。
+            unawaited(
+              _runSessionRefresh(_sessionsPendingNotify)
+                  .whenComplete(() => _finishRound(waiters)),
+            );
+          } else {
+            _finishRound(waiters);
+          }
+        }
+      }
     }
   }
 
@@ -1573,7 +3004,9 @@ class AppStore extends ChangeNotifier {
           (sid != null && sid.isNotEmpty && sessionAgentStatus[sid] != norm);
       if (aid != null && aid.isNotEmpty) agentStatusMap[aid] = norm;
       if (sid != null && sid.isNotEmpty) sessionAgentStatus[sid] = norm;
-      final current = sid != null && sid.isNotEmpty ? sid == sessionId : aid == sessionId;
+      final current = sid != null && sid.isNotEmpty
+          ? sid == sessionId
+          : aid == sessionId;
       // legacy：无 id 的帧只影响当前页显示（保留下方原有语义）
       final legacyUnrouted = sid == null && aid == null;
       if (current || legacyUnrouted) {
@@ -1674,10 +3107,18 @@ class AppStore extends ChangeNotifier {
     api.onSseKeepalive = null;
     _sub = null;
     _connecting = false;
+    // issue #22：连接代变更——旧地址的在途刷新不得再阻塞新地址的首屏，
+    // 也不得在迟到时派生新请求（切换地址 / 重配 / 销毁都会走到这里）。
+    _invalidateSessionRefresh();
   }
 
   @override
   void dispose() {
+    // disposeBridge 会自增连接代，使在途请求的 finally 不再补发（评审 WARNING 2）。
+    _disposed = true;
+    _pluginUpdateTimer?.cancel();
+    if (api.onBootstrapAbsorbed == _updateBootstrapCallback)
+      api.onBootstrapAbsorbed = null;
     disposeBridge();
     super.dispose();
   }

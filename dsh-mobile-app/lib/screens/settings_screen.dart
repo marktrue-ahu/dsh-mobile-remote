@@ -17,13 +17,175 @@ import '../local_notifications.dart';
 import '../logger.dart';
 import '../notify_diag.dart';
 import '../models.dart';
+import '../plugin_update_resume.dart';
+import '../plugin_update_log.dart';
+import '../plugin_update_progress.dart';
+import '../plugin_update_status.dart';
 import '../store.dart';
 import '../theme.dart';
 import '../toast.dart';
 import '../fmt.dart';
+import '../update_core.dart';
+import '../update_flow.dart';
+import '../updater.dart';
+import '../version_alignment.dart';
 import 'sheets.dart';
 import 'providers_screen.dart';
 import 'usage_screen.dart';
+
+/// 失败原因的稳定码 → 可读文案（未知码原样显示，绝不隐藏）。
+String _pluginUpdateFailureReasonText(String reason) {
+  const known = <String, String>{
+    'npm-carrier-plugin-identity-mismatch': '载体清单与 NPM 包身份不一致（版本/大小校验失败）',
+    'npm-carrier-manifest-unreadable': '载体清单不可读',
+    'npm-carrier-extract-failed': '载体解包失败',
+    'npm-plugin-tarball-sha256-mismatch': '插件 tarball 字节哈希与载体清单不一致',
+    'npm-plugin-content-sha256-mismatch': '插件内容标识与载体清单不一致',
+    'npm-packument-content-sha256-mismatch': 'NPM 包内容与载体清单不一致',
+    'npm-packument-app-version-mismatch': 'NPM 包 App build 与载体清单不一致',
+    'npm-pack-failed': '宿主机 npm pack 下载插件/载体失败',
+    'npm-pack-integrity-mismatch': 'npm pack 产物完整性不符（registry 返回异常）',
+    'npm-pack-metadata-mismatch': 'npm pack 返回的包版本/完整性不符',
+    'npm-pack-tarball-missing': 'npm pack 产物缺失',
+    'install-failed': 'pnpm 安装失败',
+    'health-check-failed': '新插件健康检查失败，已回滚',
+    'rollback-failed': '回滚失败，需要人工处理',
+    'restart-unsupported': '宿主形态不支持自动重启',
+  };
+  return known[reason] != null ? '${known[reason]}（$reason）' : reason;
+}
+
+class _PluginUpdateDetailsPanel extends StatefulWidget {
+  const _PluginUpdateDetailsPanel({
+    super.key,
+    required this.checkLines,
+    required this.opId,
+    required this.client,
+    this.transaction,
+  });
+  final List<String> checkLines;
+  final String opId;
+  final Api client;
+  final PluginTransaction? transaction;
+  @override
+  State<_PluginUpdateDetailsPanel> createState() =>
+      _PluginUpdateDetailsPanelState();
+}
+
+class _PluginUpdateDetailsPanelState extends State<_PluginUpdateDetailsPanel> {
+  Timer? _timer;
+  int _cursor = 0;
+  final List<PluginUpdateLogLine> _installLines = [];
+  String _phase = '';
+  bool _loading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.opId.isNotEmpty) {
+      _loading = true;
+      _poll();
+      _timer = Timer.periodic(const Duration(seconds: 3), (_) => _poll());
+    }
+  }
+
+  Future<void> _poll() async {
+    try {
+      final data = await widget.client.pluginUpdateLog(
+        opId: widget.opId,
+        afterSeq: _cursor,
+      );
+      if (!mounted || !PluginUpdateLog.matchesOperation(data, widget.opId)) {
+        return;
+      }
+      final page = PluginUpdateLog.fromJson(data);
+      setState(() {
+        _phase = page.phase;
+        _installLines.addAll(page.lines.where((line) => line.seq > _cursor));
+        if (page.cursor > _cursor) _cursor = page.cursor;
+        if (_installLines.length > 400) {
+          _installLines.removeRange(0, _installLines.length - 400);
+        }
+        _loading = false;
+      });
+      if (const {'settled', 'failed', 'rolled-back'}.contains(page.phase)) {
+        _timer?.cancel();
+        _timer = null;
+      }
+    } catch (_) {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  String get _combinedText {
+    final lines = <String>[...widget.checkLines];
+    if (_installLines.isNotEmpty) {
+      lines.add('# 安装详情（宿主 pnpm 输出，已脱敏）');
+      lines.addAll(_installLines.map((line) => line.text));
+    }
+    final reason = widget.transaction?.reason ?? '';
+    if (reason.isNotEmpty) {
+      final phase = widget.transaction?.phase ?? 'failed';
+      lines.add('# 安装结果：$phase · 原因：${_pluginUpdateFailureReasonText(reason)}');
+    }
+    return lines.join('\n');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = _combinedText;
+    final summary = widget.opId.isEmpty
+        ? L10n.t('最近一次检查', 'Last check')
+        : '${L10n.t('操作', 'Operation')}: ${widget.opId} · ${_phase.isEmpty ? L10n.t('等待日志', 'waiting for logs') : _phase}';
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text(
+          summary,
+          textAlign: TextAlign.center,
+          style: TextStyle(fontSize: 11, color: DshColors.ink3(context)),
+        ),
+        const SizedBox(height: 8),
+        ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 360),
+          child: SingleChildScrollView(
+            child: SelectableText(
+              text.isEmpty
+                  ? (_loading
+                        ? L10n.t('正在读取…', 'Loading…')
+                        : L10n.t('（暂无更新详情）', '(No update details)'))
+                  : text,
+              style: TextStyle(
+                fontSize: 11.5,
+                height: 1.6,
+                color: DshColors.ink(context),
+                fontFamily: 'monospace',
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        FilledButton.icon(
+          onPressed: text.isEmpty ? null : () => _copy(text),
+          icon: const Icon(Icons.copy),
+          label: Text(L10n.t('复制', 'Copy')),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _copy(String text) async {
+    await Clipboard.setData(ClipboardData(text: text));
+    if (mounted) showToast(context, L10n.t('已复制', 'Copied'));
+  }
+}
 
 class SettingsScreen extends StatefulWidget {
   final AppStore store;
@@ -48,8 +210,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String _diagTime = '';
   String _appVersion = ''; // App 自身版本（package_info_plus，构建时打包）
   bool _bubbleOn = false; // 悬浮球开关状态（与服务实际运行状态同步）
+  bool _updateFlowBusy = false;
   bool _keepAliveOn = false; // 后台保活（常驻通知）开关，默认关
   Timer? _diagTimer; // 设置页打开时每 5s 刷新原生轮询状态
+
+  // 插件更新进度：只在更新进行中轮询，终态后保留结果卡片。
+  Timer? _progressTimer;
+  String _progressOpId = '';
+  String _progressStage = '';
+  String _progressLine = '';
+  int _progressCursor = 0;
+  String _lastProgressPhase = '';
+  DateTime? _progressTerminalAt;
+  bool _releaseReadyAnnounced = false;
 
   @override
   void initState() {
@@ -60,6 +233,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _initKeepAliveState();
     // 连接状态等 store 变化实时刷新（修复：旧版离开页面重进才能看到状态更新）
     widget.store.addListener(_onStoreChanged);
+    _syncUpdateProgressWatcher();
   }
 
   Future<void> _initBubbleState() async {
@@ -103,9 +277,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
     // 开关是"开"但服务没跑（冷启动时 Activity 尚未 resumed、或被系统杀过）：
     // 设置页在前台，这里补一次启动，失败把原因显示出来。
     if (on && !BackgroundKeepAlive.instance.running) {
-      final ok = await BackgroundKeepAlive.instance.setEnabled(true, appVisible: true);
+      final ok = await BackgroundKeepAlive.instance.setEnabled(
+        true,
+        appVisible: true,
+      );
       NotifyDiag.keepAliveRunning = ok;
-      AppLog.instance.log('保活：设置页补启动 → $ok（${BackgroundKeepAlive.instance.lastError ?? "无错误"}）');
+      AppLog.instance.log(
+        '保活：设置页补启动 → $ok（${BackgroundKeepAlive.instance.lastError ?? "无错误"}）',
+      );
       if (mounted) setState(() {});
     }
     // 读一次原生状态（服务是否真在跑、跑了多久），并每 5 秒刷新，便于现场观察。
@@ -129,7 +308,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
         setState(() => _keepAliveOn = false);
         showToast(
           context,
-          L10n.t('需要通知权限才能后台提醒，请在系统设置中允许', 'Notification permission is required for background alerts'),
+          L10n.t(
+            '需要通知权限才能后台提醒，请在系统设置中允许',
+            'Notification permission is required for background alerts',
+          ),
         );
         return;
       }
@@ -140,12 +322,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
         await widget.store.setFloatingEnabled(false);
         if (!mounted) return;
         setState(() => _bubbleOn = false);
-        showToast(context, L10n.t('已关闭桌面宠物（两者互斥）', 'Desktop pet turned off (mutually exclusive)'));
+        showToast(
+          context,
+          L10n.t(
+            '已关闭桌面宠物（两者互斥）',
+            'Desktop pet turned off (mutually exclusive)',
+          ),
+        );
       }
     }
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(BackgroundKeepAlive.prefKey, v);
-    final ok = await BackgroundKeepAlive.instance.setEnabled(v, appVisible: true);
+    final ok = await BackgroundKeepAlive.instance.setEnabled(
+      v,
+      appVisible: true,
+    );
     if (!mounted) return;
     setState(() => _keepAliveOn = v);
     if (v && !ok) {
@@ -170,7 +361,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
         await prefs.setBool(BackgroundKeepAlive.prefKey, false);
         if (mounted) {
           setState(() => _keepAliveOn = false);
-          showToast(context, L10n.t('已关闭后台提醒（两者互斥）', 'Background alerts turned off (mutually exclusive)'));
+          showToast(
+            context,
+            L10n.t(
+              '已关闭后台提醒（两者互斥）',
+              'Background alerts turned off (mutually exclusive)',
+            ),
+          );
         }
       }
       final ok = await Floating.canDrawOverlay();
@@ -214,10 +411,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       } catch (e) {
         if (mounted) {
           setState(() => _bubbleOn = false);
-          showToast(
-            context,
-            '${L10n.t('桌面宠物启动失败：', 'Pet start failed: ')}$e',
-          );
+          showToast(context, '${L10n.t('桌面宠物启动失败：', 'Pet start failed: ')}$e');
         }
         return;
       }
@@ -233,12 +427,456 @@ class _SettingsScreenState extends State<SettingsScreen> {
   @override
   void dispose() {
     _diagTimer?.cancel();
+    _progressTimer?.cancel();
     widget.store.removeListener(_onStoreChanged);
     super.dispose();
   }
 
   void _onStoreChanged() {
+    _syncUpdateProgressWatcher();
     if (mounted) setState(() {});
+  }
+
+  /// 宿主事务或本地接续记录仍在进行时，每 2 秒刷新一次状态与最新日志。
+  bool _updateInFlight() {
+    final store = widget.store;
+    final tx = store.api.pluginUpdate.transaction;
+    if (tx != null &&
+        !tx.rolledBack &&
+        !const {'settled', 'failed', 'rolled-back'}.contains(tx.phase)) {
+      return true;
+    }
+    final journal = store.pluginUpdateJournal;
+    if (journal != null &&
+        !journal.isPreparationPhase &&
+        const {
+          UpdatePhase.pluginPending,
+          UpdatePhase.pluginConfirmed,
+          UpdatePhase.appPending,
+        }.contains(journal.phase)) {
+      return true;
+    }
+    // 插件已 settled，但宿主的固定 App 发布（载体导入）还没就绪：继续轮询等它可用。
+    return _awaitingHostRelease(store);
+  }
+
+  /// 宿主的固定 App 发布是否已可用（App 更新门禁真正需要的状态）。
+  bool _hostReleaseReady(AppStore store) {
+    final release =
+        store.hostReleasePointer?.release ?? store.api.currentRelease?.release;
+    if (release == null) return false;
+    if (release.plugin.contentSha256 != store.api.pluginContentSha256) {
+      return false;
+    }
+    final artifact = store.api.appArtifact;
+    return artifact == null || artifact.ok;
+  }
+
+  /// 事务已成功 settled，但载体/发布尚未可读（刚重启后导入需要一点时间）。
+  bool _awaitingHostRelease(AppStore store) {
+    final tx = store.api.pluginUpdate.transaction;
+    if (tx == null ||
+        tx.phase != 'settled' ||
+        tx.rolledBack ||
+        tx.resultOk == false) {
+      return false;
+    }
+    if (_hostReleaseReady(store)) return false;
+    final at = _progressTerminalAt;
+    return at != null &&
+        DateTime.now().toUtc().difference(at) < const Duration(seconds: 30);
+  }
+
+  void _syncUpdateProgressWatcher() {
+    final active = _updateInFlight();
+    if (active && _progressTimer == null) {
+      _progressTimer = Timer.periodic(
+        const Duration(seconds: 2),
+        (_) => unawaited(_pollUpdateProgress()),
+      );
+      unawaited(_pollUpdateProgress());
+    } else if (!active && _progressTimer != null) {
+      _progressTimer?.cancel();
+      _progressTimer = null;
+    }
+  }
+
+  Future<void> _pollUpdateProgress() async {
+    if (!mounted) return;
+    final store = widget.store;
+    try {
+      // 用完整 bootstrap（不是只吸收更新字段）：这样会触发 store 的接续回调，
+      // 手机端由本次更新产生的 journal 能在卡片完成时同步推进，而不是等首页刷新。
+      final data = await store.api.getJson('/api/bootstrap');
+      store.api.absorbBootstrap(data);
+    } catch (_) {
+      // 宿主重启期间会短暂失败：保留旧状态，等下一次轮询。
+    }
+    final tx = store.api.pluginUpdate.transaction;
+    final journal = store.pluginUpdateJournal;
+    final opId = tx?.opId ?? journal?.opId ?? '';
+    if (opId.isNotEmpty && opId != _progressOpId) {
+      _progressOpId = opId;
+      _progressCursor = 0;
+      _progressStage = '';
+      _progressLine = '';
+      _lastProgressPhase = '';
+      _progressTerminalAt = null;
+      _releaseReadyAnnounced = false;
+    }
+    if (opId.isNotEmpty) {
+      try {
+        final page = await store.api.pluginUpdateLog(
+          opId: opId,
+          afterSeq: _progressCursor,
+        );
+        if (PluginUpdateLog.matchesOperation(page, opId)) {
+          final log = PluginUpdateLog.fromJson(page);
+          if (log.cursor > _progressCursor) _progressCursor = log.cursor;
+          if (log.lines.isNotEmpty) {
+            final last = log.lines.last;
+            if (last.stage.isNotEmpty) _progressStage = last.stage;
+            if (last.text.isNotEmpty) _progressLine = last.text;
+          }
+        }
+      } catch (_) {}
+    }
+    if (!mounted) return;
+    if (tx != null &&
+        tx.phase == 'settled' &&
+        !tx.rolledBack &&
+        tx.resultOk != false) {
+      _progressTerminalAt ??= DateTime.now().toUtc();
+    } else if (tx != null && (tx.phase == 'failed' || tx.rolledBack)) {
+      _progressTerminalAt = null;
+    }
+    _syncUpdateProgressWatcher();
+    setState(() {});
+    _announceProgressTransition(tx);
+    if (_progressTerminalAt != null &&
+        !_releaseReadyAnnounced &&
+        _hostReleaseReady(store)) {
+      _releaseReadyAnnounced = true;
+      showToast(
+        context,
+        L10n.t(
+          '电脑端发布已就绪，可直接检查 App 更新',
+          'Host release is ready — you can check app updates now',
+        ),
+      );
+    }
+  }
+
+  void _announceProgressTransition(PluginTransaction? tx) {
+    if (tx == null) return;
+    final previous = _lastProgressPhase;
+    _lastProgressPhase = tx.phase;
+    if (previous.isEmpty || previous == tx.phase) return;
+    final progress = PluginUpdateProgressView.describe(
+      phase: tx.phase,
+      rolledBack: tx.rolledBack,
+      resultOk: tx.resultOk,
+    );
+    if (!progress.terminal) return;
+    if (progress.failed) {
+      showToast(
+        context,
+        '${L10n.t('插件更新失败：', 'Plugin update failed: ')}${_pluginUpdateFailureReasonText(tx.reason ?? 'unknown')}',
+      );
+    } else {
+      showToast(
+        context,
+        L10n.t(
+          '插件更新完成（v${tx.targetVersion}）',
+          'Plugin update completed (v${tx.targetVersion})',
+        ),
+      );
+    }
+  }
+
+  static String _formatElapsed(Duration duration) {
+    final seconds = duration.inSeconds.clamp(0, 86400);
+    if (seconds < 60) return '${seconds}s';
+    return '${seconds ~/ 60}m${seconds % 60}s';
+  }
+
+  /// 更新进度卡片：阶段时间线 + 当前阶段/用时 + 最新一行输出 + 失败原因。
+  Widget _updateProgressCard(AppStore store) {
+    final tx = store.api.pluginUpdate.transaction;
+    final journal = store.pluginUpdateJournal;
+    if (tx == null && journal == null) {
+      // 只有检查结果（没有更新事务）：仍给一个可打开详情的紧凑卡片。
+      final status = store.api.pluginUpdate;
+      final brand = DshColors.brand(context);
+      final ink3 = DshColors.ink3(context);
+      final danger = DshColors.danger(context);
+      final lineColor = DshColors.line(context);
+      final upToDate = status.upToDate;
+      final failureReason = upToDate
+          ? ''
+          : (status.reason.isEmpty
+                ? '检查暂不可用'
+                : _pluginUpdateFailureReasonText(status.reason));
+      final detail = status.checkLog.isNotEmpty
+          ? status.checkLog.last
+          : failureReason;
+      return Container(
+        margin: const EdgeInsets.only(bottom: 8),
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: upToDate ? lineColor : danger, width: 1),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              upToDate ? Icons.check_circle_outline : Icons.error_outline,
+              size: 16,
+              color: upToDate ? brand : danger,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    upToDate ? '最近一次插件更新检查：已是最新' : '最近一次插件更新检查：不可用',
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w600,
+                      color: upToDate ? null : danger,
+                    ),
+                  ),
+                  if (detail.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: Text(
+                        detail,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 10.5,
+                          fontFamily: 'monospace',
+                          color: upToDate ? ink3 : danger,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            TextButton(
+              onPressed: _openPluginUpdateDetails,
+              child: Text(
+                L10n.t('详情 ▸', 'Details ▸'),
+                style: const TextStyle(fontSize: 12),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+    final brand = DshColors.brand(context);
+    final ink3 = DshColors.ink3(context);
+    final danger = DshColors.danger(context);
+    final lineColor = DshColors.line(context);
+
+    PluginUpdateProgressView progress;
+    String title;
+    String? failureReason;
+    DateTime? startedAt;
+    String targetVersion = '';
+    String appBuild = '';
+    if (tx != null) {
+      progress = PluginUpdateProgressView.describe(
+        phase: tx.phase,
+        rolledBack: tx.rolledBack,
+        resultOk: tx.resultOk,
+        logStage: _progressStage.isEmpty ? null : _progressStage,
+      );
+      startedAt = tx.startedAt;
+      targetVersion = tx.targetVersion;
+      appBuild = tx.targetAppVersion;
+      if (progress.failed) {
+        failureReason = _pluginUpdateFailureReasonText(tx.reason ?? 'unknown');
+      }
+      final awaitingRelease =
+          tx.phase == 'settled' &&
+          !tx.rolledBack &&
+          tx.resultOk != false &&
+          !_hostReleaseReady(store);
+      if (awaitingRelease) {
+        progress = const PluginUpdateProgressView(
+          step: 5,
+          stageText: '准备 App 发布',
+          terminal: false,
+          failed: false,
+        );
+        title = '插件更新完成，等待电脑端发布就绪…';
+      } else {
+        title = progress.terminal
+            ? (progress.failed ? '最近一次插件更新：失败' : '最近一次插件更新：完成')
+            : progress.stageText;
+      }
+    } else {
+      final phase = journal!.phase;
+      if (phase == UpdatePhase.pluginPending) {
+        progress = const PluginUpdateProgressView(
+          step: 2,
+          stageText: '等待电脑端确认并安装',
+          terminal: false,
+          failed: false,
+        );
+        title = '等待电脑端确认并安装';
+      } else if (phase == UpdatePhase.pluginConfirmed) {
+        progress = const PluginUpdateProgressView(
+          step: 4,
+          stageText: '插件已更新，正在确定 App 目标',
+          terminal: false,
+          failed: false,
+        );
+        title = '插件已更新，正在确定 App 目标';
+      } else if (phase == UpdatePhase.appPending) {
+        progress = const PluginUpdateProgressView(
+          step: 5,
+          stageText: '等待安装/核验 App',
+          terminal: false,
+          failed: false,
+        );
+        title = '等待安装/核验 App';
+      } else if (phase == UpdatePhase.pluginRetry) {
+        progress = const PluginUpdateProgressView(
+          step: 4,
+          stageText: '上次更新未确认',
+          terminal: true,
+          failed: true,
+        );
+        title = '上次更新未确认';
+        failureReason = '可重试，或取消并重新检查';
+      } else {
+        progress = const PluginUpdateProgressView(
+          step: 0,
+          stageText: '准备中',
+          terminal: false,
+          failed: false,
+        );
+        title = '准备中';
+      }
+      startedAt = journal.startedAt;
+      targetVersion = journal.targetVersion;
+      appBuild = journal.appVersion;
+    }
+    final elapsed = startedAt == null
+        ? ''
+        : _formatElapsed(DateTime.now().toUtc().difference(startedAt));
+    final awaitingDetail =
+        tx != null &&
+        tx.phase == 'settled' &&
+        !tx.rolledBack &&
+        tx.resultOk != false &&
+        !_hostReleaseReady(store) &&
+        title.startsWith('插件更新完成，等待');
+    final detailLine = awaitingDetail
+        ? '正在导入/校验 App 载体，就绪后即可检查 App 更新…'
+        : (_progressLine.isNotEmpty
+              ? _progressLine
+              : (failureReason ?? progress.stageText));
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: progress.failed ? danger : lineColor,
+          width: 1,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              if (progress.failed)
+                Icon(Icons.error_outline, size: 16, color: danger)
+              else if (progress.terminal)
+                Icon(Icons.check_circle_outline, size: 16, color: brand)
+              else
+                SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  title,
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: progress.failed ? danger : null,
+                  ),
+                ),
+              ),
+              if (elapsed.isNotEmpty)
+                Text(elapsed, style: TextStyle(fontSize: 11, color: ink3)),
+              TextButton(
+                onPressed: _openPluginUpdateDetails,
+                child: Text(
+                  L10n.t('详情 ▸', 'Details ▸'),
+                  style: const TextStyle(fontSize: 12),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          LinearProgressIndicator(
+            value: progress.terminal ? 1 : (progress.step + 1) / 6,
+            minHeight: 3,
+            backgroundColor: lineColor,
+            color: progress.failed ? danger : brand,
+          ),
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 8,
+            runSpacing: 2,
+            children: [
+              for (var i = 0; i < PluginUpdateProgressView.steps.length; i++)
+                Text(
+                  '${i <= progress.step ? '●' : '○'} ${PluginUpdateProgressView.steps[i]}',
+                  style: TextStyle(
+                    fontSize: 10.5,
+                    color: i <= progress.step
+                        ? (progress.failed ? danger : brand)
+                        : ink3,
+                    fontWeight: i == progress.step
+                        ? FontWeight.w700
+                        : FontWeight.w400,
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            detailLine,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: 11,
+              fontFamily: 'monospace',
+              color: progress.failed ? danger : ink3,
+            ),
+          ),
+          if (targetVersion.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                '目标：插件 v$targetVersion${appBuild.isEmpty ? '' : ' · App build $appBuild'}',
+                style: TextStyle(fontSize: 11, color: ink3),
+              ),
+            ),
+        ],
+      ),
+    );
   }
 
   Future<void> _loadAppVersion() async {
@@ -327,6 +965,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     'branches' => L10n.t('分支', 'Branches'),
     'graph' => L10n.t('图谱', 'Graph'),
     'worktree' => L10n.t('工作区', 'Worktree'),
+    'fileHistory' => L10n.t('文件历史', 'History'),
     _ => id,
   };
 
@@ -348,6 +987,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   '选择 1–3 项并调整顺序；第一项为默认页。',
                   'Choose 1–3 tabs and reorder them; the first is the default.',
                 ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                L10n.t(
+                  '“文件历史”需要宿主支持；旧版宿主上该 tab 会降级为不可用提示。',
+                  'File history requires host support; on older hosts the tab degrades to an unavailable notice.',
+                ),
+                key: const Key('git-tabs-file-history-note'),
+                style: Theme.of(context).textTheme.bodySmall,
               ),
               const SizedBox(height: 8),
               for (final id in [
@@ -844,7 +1492,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
           children: [
             Row(
               children: [
-                Text(L10n.t('主题皮肤', 'Theme skin'), style: const TextStyle(fontSize: 14)),
+                Text(
+                  L10n.t('主题皮肤', 'Theme skin'),
+                  style: const TextStyle(fontSize: 14),
+                ),
                 const Spacer(),
                 Text(
                   widget.store.skin.labelFor(en),
@@ -877,7 +1528,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
           children: [
             Row(
               children: [
-                Text(L10n.t('App 图标', 'App icon'), style: const TextStyle(fontSize: 14)),
+                Text(
+                  L10n.t('App 图标', 'App icon'),
+                  style: const TextStyle(fontSize: 14),
+                ),
                 const Spacer(),
                 Text(
                   AppIconStyle.byId(widget.store.appIcon).labelFor(en),
@@ -911,7 +1565,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 mainAxisSpacing: 10,
                 crossAxisSpacing: 8,
                 childAspectRatio: 0.82,
-                children: [for (final icon in AppIconStyle.all) _iconTile(icon)],
+                children: [
+                  for (final icon in AppIconStyle.all) _iconTile(icon),
+                ],
               ),
           ],
         ),
@@ -941,18 +1597,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final en = L10n.lang == 'en';
     final selected = widget.store.skin == s;
     // 预览用「签名色」：深潜/星海展示暗色，汽水/默认展示亮色，避免四张卡都发白。
-    final previewBrightness =
-        s == DshSkin.abyss || s == DshSkin.whale ? Brightness.dark : Brightness.light;
+    final previewBrightness = s == DshSkin.abyss || s == DshSkin.whale
+        ? Brightness.dark
+        : Brightness.light;
     final p = DshPalette.of(s, previewBrightness);
     return Expanded(
       child: InkWell(
         onTap: () async {
           await widget.store.setSkin(s);
           if (!mounted) return;
-          showToast(
-            context,
-            L10n.t('已切换皮肤：${s.label}', 'Skin: ${s.labelEn}'),
-          );
+          showToast(context, L10n.t('已切换皮肤：${s.label}', 'Skin: ${s.labelEn}'));
         },
         borderRadius: BorderRadius.circular(12),
         child: AnimatedContainer(
@@ -1059,7 +1713,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
             style: TextStyle(
               fontSize: 8.5,
               fontWeight: selected ? FontWeight.w700 : FontWeight.w400,
-              color: selected ? DshColors.brand(context) : DshColors.ink2(context),
+              color: selected
+                  ? DshColors.brand(context)
+                  : DshColors.ink2(context),
             ),
           ),
         ],
@@ -1456,12 +2112,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
           _row(
             leading: const Icon(Icons.notifications_paused_outlined),
-            title: L10n.t('后台提醒（常驻通知）', 'Background alerts (persistent notice)'),
+            title: L10n.t(
+              '后台提醒（常驻通知）',
+              'Background alerts (persistent notice)',
+            ),
             sub: NotifyDiag.summary(
               keepAliveEnabled: _keepAliveOn,
               keepAliveError: BackgroundKeepAlive.instance.lastError,
             ),
-            trailing: DshSwitch(value: _keepAliveOn, onChanged: _toggleKeepAlive),
+            trailing: DshSwitch(
+              value: _keepAliveOn,
+              onChanged: _toggleKeepAlive,
+            ),
           ),
           if (_keepAliveOn)
             _row(
@@ -1475,10 +2137,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
               trailing: const Icon(Icons.chevron_right),
               onTap: () async {
-                final ok = await BackgroundKeepAlive.instance.openBatterySettings();
+                final ok = await BackgroundKeepAlive.instance
+                    .openBatterySettings();
                 if (!mounted) return;
                 if (!ok) {
-                  showToast(this.context, L10n.t('打不开系统设置，请手动进入「电池 → 应用省电策略」', 'Cannot open settings; go to Battery → App battery usage'));
+                  showToast(
+                    this.context,
+                    L10n.t(
+                      '打不开系统设置，请手动进入「电池 → 应用省电策略」',
+                      'Cannot open settings; go to Battery → App battery usage',
+                    ),
+                  );
                 }
               },
             ),
@@ -1527,13 +2196,118 @@ class _SettingsScreenState extends State<SettingsScreen> {
             onTap: _showBubbleGuide,
           ),
         ]),
+        _card(L10n.t('文件浏览', 'File browsing'), [
+          _row(
+            leading: const Icon(Icons.visibility_outlined),
+            title: L10n.t('显示隐藏文件', 'Show hidden files'),
+            sub: L10n.t(
+              '会话文件浏览中显示点开头的文件与目录（.git 始终隐藏；不影响目录选择器）',
+              'Show dot-prefixed files and folders in session file browsing (.git stays hidden; directory picker unaffected)',
+            ),
+            trailing: DshSwitch(
+              value: widget.store.showHiddenFiles,
+              onChanged: (v) => widget.store.setShowHiddenFiles(v),
+            ),
+          ),
+        ]),
         _card(L10n.t('关于', 'About'), [
           _row(
             leading: const Icon(Icons.info_outline),
             title: L10n.t('版本', 'Version'),
             sub:
                 'App v${_appVersion.isEmpty ? '…' : _appVersion}'
-                ' · ${L10n.t('插件', 'plugin')} v${api.pluginVersion.isEmpty ? '…' : api.pluginVersion}',
+                ' · ${L10n.t('插件', 'plugin')} v${store.api.pluginVersion.isEmpty ? '…' : store.api.pluginVersion}'
+                '${_alignmentNote()}'
+                '${store.updateCandidate != null ? ' · ${L10n.t('有新版本', 'update available')} ${store.updateCandidate!.version}' : ''}',
+            onTap: store.updateCandidate == null
+                ? null
+                : () {
+                    final candidate = store.updateCandidate;
+                    if (candidate != null) {
+                      unawaited(runUpdateFlow(context, store, candidate));
+                    }
+                  },
+            trailing: store.updateCandidate != null
+                ? Icon(
+                    Icons.brightness_1,
+                    size: 9,
+                    color: DshColors.danger(context),
+                  )
+                : (store.alignment.needsAttention
+                      ? Icon(
+                          Icons.brightness_1,
+                          size: 9,
+                          color: DshColors.danger(context),
+                        )
+                      : null),
+          ),
+          // 插件更新入口常驻（与桌面「连接移动端」页一致）：即使还不知道有没有新版，
+          // 手机也必须能主动触发宿主侧只读检查；有进行中的记录时可点开「处理」。
+          // 已知候选时按本机形态给「更新」/「指引」，未检查时给「检查」。
+          // 不能自更新的形态给出**对应那一条**可复制指引（评审 R11）。
+          _row(
+            leading: const Icon(Icons.desktop_windows_outlined),
+            title: L10n.t('更新电脑端插件', 'Update desktop plugin'),
+            sub: store.pluginUpdateJournal != null
+                ? _journalSub(store)
+                : !store.api.pluginUpdate.contentUpdateAvailable
+                ? L10n.t(
+                    '检查电脑端插件是否有可用更新',
+                    'Check the desktop plugin for updates',
+                  )
+                : store.api.pluginUpdate.canSelfUpdate
+                ? L10n.t(
+                    '电脑端插件有新版本：可在这里直接触发更新',
+                    'A newer desktop plugin is available — trigger the update here',
+                  )
+                : L10n.t(
+                    '电脑端插件有新版本：本机形态需按指引更新',
+                    'A newer desktop plugin is available — follow the guide for your install',
+                  ),
+            onTap: store.pluginUpdateJournal != null
+                ? () => unawaited(_updateJournalActions(store))
+                : (!store.api.pluginUpdate.contentUpdateAvailable ||
+                          store.api.pluginUpdate.canSelfUpdate
+                      ? _triggerPluginUpdate
+                      : _showPluginUpdateGuidance),
+            trailing: store.pluginUpdateJournal == null
+                ? Text(
+                    !store.api.pluginUpdate.contentUpdateAvailable
+                        ? L10n.t('检查 ▸', 'Check ▸')
+                        : store.api.pluginUpdate.canSelfUpdate
+                        ? L10n.t('更新 ▸', 'Update ▸')
+                        : L10n.t('指引 ▸', 'Guide ▸'),
+                    style: TextStyle(fontSize: 12, color: brand),
+                  )
+                : Text(
+                    L10n.t('处理 ▸', 'Manage ▸'),
+                    style: TextStyle(fontSize: 12, color: brand),
+                  ),
+          ),
+          if (store.api.pluginUpdate.transaction != null ||
+              store.pluginUpdateJournal != null ||
+              store.api.pluginUpdate.checkLog.isNotEmpty)
+            _updateProgressCard(store),
+          _row(
+            leading: const Icon(Icons.sync_outlined),
+            title: L10n.t('检查 App 更新', 'Check App updates'),
+            sub: store.updateChecking
+                ? L10n.t('检查中…', 'Checking…')
+                : L10n.t(
+                    '检查电脑端提供的固定 App 发布',
+                    'Check host-provided fixed App releases',
+                  ),
+            trailing: TextButton(
+              onPressed: store.updateChecking || _updateFlowBusy
+                  ? null
+                  : _checkUpdate,
+              child: Text(
+                store.updateChecking
+                    ? L10n.t('检查中…', 'Checking…')
+                    : L10n.t('检查 ▸', 'Check ▸'),
+                style: TextStyle(fontSize: 12, color: brand),
+              ),
+            ),
           ),
           _row(
             leading: const Icon(Icons.auto_awesome_outlined),
@@ -1631,6 +2405,417 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  /// 不能自更新时展示**与实际安装方式对应的那一条**指引（可复制），而不是先诱导点"一键更新"。
+  Future<void> _showPluginUpdateGuidance() async {
+    final g = widget.store.api.pluginUpdate.guidance;
+    final shape = widget.store.api.pluginUpdate.installShape;
+    final lines = <String>[
+      if (g != null && g.summary.isNotEmpty) g.summary,
+      if (g != null) ...g.steps.map((s) => '· $s'),
+      if (shape.isNotEmpty) '${L10n.t('安装方式', 'install shape')}: $shape',
+    ];
+    final commands = g?.commands ?? const <String>[];
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(L10n.t('电脑端插件更新指引', 'Desktop plugin update guide')),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (final l in lines)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: Text(l, style: const TextStyle(fontSize: 13)),
+                ),
+              if (commands.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                for (final c in commands)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 4),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: SelectableText(
+                            c,
+                            style: const TextStyle(
+                              fontFamily: 'monospace',
+                              fontSize: 12,
+                            ),
+                          ),
+                        ),
+                        TextButton(
+                          onPressed: () async {
+                            await Clipboard.setData(ClipboardData(text: c));
+                            if (ctx.mounted) {
+                              showToast(ctx, L10n.t('已复制', 'Copied'));
+                            }
+                          },
+                          child: Text(
+                            L10n.t('复制', 'Copy'),
+                            style: const TextStyle(fontSize: 12),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text(L10n.t('关闭', 'Close')),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 在手机上触发电脑端插件更新。
+  ///
+  /// Legacy prepare 可在确认前查询候选，但不启动最终插件更新 POST。prepare 失败后
+  /// 保留同一 opId；prepareId 与目标版本持久化后，重启 App 仍会先显示最终确认。
+  Future<void> _triggerPluginUpdate({
+    String? retryPrepareOpId,
+    PluginUpdateJournal? preparedJournal,
+  }) async {
+    final store = widget.store;
+    var opId = '';
+    var pluginVersion = '';
+    var targetAppVersion = '';
+    var targetContentSha256 = '';
+    String? prepareId;
+    var legacy = false;
+    try {
+      if (preparedJournal != null &&
+          preparedJournal.phase == UpdatePhase.pluginPrepared) {
+        opId = preparedJournal.opId;
+        pluginVersion = preparedJournal.targetVersion;
+        targetAppVersion = preparedJournal.appVersion;
+        targetContentSha256 = preparedJournal.targetContentSha256;
+        prepareId = preparedJournal.prepareId;
+        legacy = true;
+      } else if (retryPrepareOpId != null) {
+        final pending = store.pluginUpdateJournal;
+        if (pending == null ||
+            !pending.isPreparationPhase ||
+            pending.opId != retryPrepareOpId) {
+          return;
+        }
+        opId = pending.opId;
+        legacy = true;
+        final prepared = await store.preparePluginUpdate(opId: opId);
+        final current = store.pluginUpdateJournal;
+        if ((prepared['action'] != 'prepared' &&
+                prepared['action'] != 'confirmation-required') ||
+            current?.prepareId == null) {
+          if (mounted) {
+            showToast(
+              context,
+              store.pluginUpdateNotice ??
+                  L10n.t('无法准备插件更新', 'Could not prepare plugin update'),
+            );
+          }
+          return;
+        }
+        pluginVersion = current!.targetVersion;
+        targetAppVersion = current.appVersion;
+        targetContentSha256 = current.targetContentSha256;
+        prepareId = current.prepareId;
+      } else {
+        final response = await store.api.checkPluginUpdate();
+        if (!mounted) return;
+        final rawStatus = response['pluginUpdate'];
+        if (rawStatus is Map) {
+          // 检查结果也是最新状态：刷新后行文案/是否可自更新都跟着变。
+          store.api.pluginUpdate = PluginUpdateStatus.fromJson(
+            Map<String, dynamic>.from(rawStatus),
+          );
+          setState(() {});
+        }
+        final update = response['pluginUpdate'];
+        final candidate = update is Map ? update['candidate'] : null;
+        final state = update is Map ? update['state'] : null;
+        if (candidate is! Map || state != 'update-available') {
+          final reason = update is Map ? update['reason'] : null;
+          final text = switch (state) {
+            'up-to-date' || 'local-ahead' => L10n.t(
+              '电脑端插件已是最新',
+              'Desktop plugin is up to date',
+            ),
+            'disabled' => L10n.t(
+              '电脑端已停用插件自动更新',
+              'Automatic plugin updates are disabled on the desktop',
+            ),
+            _ =>
+              '${L10n.t('检查暂不可用：', 'Check unavailable: ')}${reason ?? state ?? 'unknown'}',
+          };
+          showToast(context, text);
+          return;
+        }
+        if (!store.api.pluginUpdate.canSelfUpdate) {
+          await _showPluginUpdateGuidance();
+          return;
+        }
+        final carrier = candidate['carrier'] is Map
+            ? candidate['carrier'] as Map
+            : const {};
+        final plugin = candidate['plugin'] is Map
+            ? candidate['plugin'] as Map
+            : const {};
+        pluginVersion = (plugin['version'] ?? carrier['version'] ?? '')
+            .toString();
+        targetContentSha256 = (plugin['contentSha256'] ?? '')
+            .toString()
+            .trim()
+            .toLowerCase();
+        targetAppVersion = (carrier['appVersion'] ?? '').toString();
+        legacy = carrier['legacyMetadataMissing'] == true;
+        opId = genRequestId();
+        if (legacy) {
+          final prepared = await store.preparePluginUpdate(
+            opId: opId,
+            candidate: Map<String, dynamic>.from(candidate),
+          );
+          final current = store.pluginUpdateJournal;
+          if ((prepared['action'] != 'prepared' &&
+                  prepared['action'] != 'confirmation-required') ||
+              current?.prepareId == null) {
+            if (mounted) {
+              showToast(
+                context,
+                store.pluginUpdateNotice ??
+                    L10n.t('无法准备插件更新', 'Could not prepare plugin update'),
+              );
+            }
+            return;
+          }
+          opId = current!.opId;
+          pluginVersion = current.targetVersion;
+          targetAppVersion = current.appVersion;
+          targetContentSha256 = current.targetContentSha256;
+          prepareId = current.prepareId;
+        }
+      }
+      if (pluginVersion.isEmpty ||
+          targetAppVersion.isEmpty ||
+          (legacy && prepareId == null)) {
+        if (legacy && opId.isNotEmpty) {
+          await store.abandonPluginUpdatePreparation(opId);
+        }
+        if (!mounted) return;
+        showToast(
+          context,
+          L10n.t(
+            '更新候选缺少插件或 App 目标版本',
+            'Update candidate is missing a plugin or App target version',
+          ),
+        );
+        return;
+      }
+      if (!mounted) return;
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: Text(L10n.t('更新电脑端插件？', 'Update desktop plugin?')),
+          content: Text(
+            L10n.t(
+              '插件目标版本：$pluginVersion\nApp 目标版本：$targetAppVersion\n电脑端宿主会重启，连接会短暂断开。',
+              'Plugin target: $pluginVersion\nApp target: $targetAppVersion\nThe desktop host restarts and the connection briefly drops.',
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: Text(L10n.t('取消', 'Cancel')),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: Text(L10n.t('开始更新', 'Update')),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !mounted) {
+        if (legacy) await store.abandonPluginUpdatePreparation(opId);
+        return;
+      }
+      await store.beginPluginUpdate(
+        opId: opId,
+        targetVersion: pluginVersion,
+        targetContentSha256: targetContentSha256,
+        targetAppVersion: targetAppVersion,
+        prepareId: prepareId,
+      );
+      if (!mounted) return;
+      final notice = store.pluginUpdateNotice;
+      if (notice != null) showToast(context, notice);
+    } catch (error) {
+      if (mounted) showToast(context, store.pluginUpdateNotice ?? '$error');
+    }
+  }
+
+  /// 进行中记录的状态说明（不同阶段该做什么不同）。
+  String _journalSub(AppStore store) {
+    return switch (store.pluginUpdateJournal?.phase) {
+      UpdatePhase.pluginPreparePending => L10n.t(
+        '正在准备插件候选；尚未提交安装',
+        'Preparing the plugin candidate; installation has not been submitted',
+      ),
+      UpdatePhase.pluginPrepareRetry => L10n.t(
+        '准备结果未确认；可用同一操作编号重试',
+        'Prepare result is unknown; retry reuses the same operation id',
+      ),
+      UpdatePhase.pluginPrepared => L10n.t(
+        '插件与 App 目标已固定；等待最终确认',
+        'Plugin and App targets are fixed; waiting for final confirmation',
+      ),
+      UpdatePhase.appPending => L10n.t(
+        '电脑端插件已确认；App 更新待安装/待核验',
+        'Desktop plugin confirmed; the app update is pending install/verification',
+      ),
+      UpdatePhase.pluginConfirmed => L10n.t(
+        '电脑端插件已更新；正在确定 App 目标…',
+        'Desktop plugin updated; resolving the app target…',
+      ),
+      UpdatePhase.pluginRetry => L10n.t(
+        '上次更新未确认；可重试，或取消并重新检查',
+        'Last update was not confirmed; retry, or cancel and re-check',
+      ),
+      _ => L10n.t(
+        '等待电脑端完成更新并重启…',
+        'Waiting for the desktop plugin to restart…',
+      ),
+    };
+  }
+
+  /// 接续记录的出口：prepare 尚未 admission 时可同 opId 重试或安全取消；
+  /// 已准备候选时回到最终确认，不提前发更新 POST。
+  Future<void> _updateJournalActions(AppStore store) async {
+    final journal = store.pluginUpdateJournal;
+    if (journal == null) return;
+    final prepared =
+        journal.phase == UpdatePhase.pluginPrepared &&
+        journal.prepareId != null &&
+        journal.prepareId!.isNotEmpty;
+    final preparing = journal.isPreparationPhase;
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 14, 20, 6),
+              child: Text(
+                L10n.t('处理进行中的更新', 'Manage pending update'),
+                style: const TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+            if (prepared)
+              ListTile(
+                title: Text(L10n.t('继续确认并更新', 'Review and continue update')),
+                subtitle: Text(
+                  L10n.t(
+                    '沿用已准备的目标与操作编号；确认前不会安装',
+                    'Keeps the prepared target and operation id; nothing installs before confirmation',
+                  ),
+                ),
+                onTap: () => Navigator.of(ctx).pop('confirm-prepared'),
+              )
+            else if (preparing)
+              ListTile(
+                title: Text(L10n.t('重试准备', 'Retry preparation')),
+                subtitle: Text(
+                  L10n.t(
+                    '使用同一操作编号安全重试；不会开始安装',
+                    'Retries with the same operation id; installation does not start',
+                  ),
+                ),
+                onTap: () => Navigator.of(ctx).pop('retry-prepare'),
+              )
+            else
+              ListTile(
+                title: Text(L10n.t('继续等待', 'Keep waiting')),
+                subtitle: Text(
+                  L10n.t(
+                    '重连后会自动确认；不会先装 App',
+                    'It continues automatically after reconnecting and never installs the app first',
+                  ),
+                ),
+                onTap: () => Navigator.of(ctx).pop('wait'),
+              ),
+            ListTile(
+              title: Text(
+                preparing
+                    ? L10n.t('取消准备', 'Cancel preparation')
+                    : L10n.t('取消并重新检查', 'Cancel and re-check'),
+              ),
+              subtitle: Text(
+                preparing
+                    ? L10n.t(
+                        '清除未提交的本地准备记录；不会触发插件更新',
+                        'Clears the unsubmitted local preparation; no plugin update is triggered',
+                      )
+                    : L10n.t(
+                        '清除本地旧目标，按电脑端当前状态重新检查；不会自动降级 App',
+                        'Clears the local old target and re-checks the current desktop state; the app is never downgraded',
+                      ),
+              ),
+              onTap: () =>
+                  Navigator.of(ctx)
+                      .pop(preparing ? 'cancel-prepare' : 'recheck'),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (!mounted) return;
+    if (choice == 'retry-prepare') {
+      await _triggerPluginUpdate(retryPrepareOpId: journal.opId);
+      return;
+    }
+    if (choice == 'confirm-prepared') {
+      await _triggerPluginUpdate(preparedJournal: journal);
+      return;
+    }
+    if (choice == 'cancel-prepare') {
+      await store.abandonPluginUpdatePreparation(journal.opId);
+      if (mounted) {
+        showToast(
+          context,
+          L10n.t('已取消插件更新准备', 'Plugin update preparation cancelled'),
+        );
+      }
+      return;
+    }
+    if (choice != 'recheck') return;
+    await store.cancelUpdateAndRecheck();
+    if (!mounted) return;
+    final notice = store.pluginUpdateNotice;
+    if (notice != null) showToast(context, notice);
+  }
+
+  /// 版本行的对齐尾注：未连接不判定；对齐时不加噪声；失配时说清**该动哪一端**。
+  String _alignmentNote() {
+    if (widget.store.api.pluginVersion.isEmpty) return '';
+    return switch (widget.store.alignment.state) {
+      AlignmentState.ok => '',
+      AlignmentState.appOutdated =>
+        ' · ${L10n.t('App 需更新', 'App needs update')}',
+      AlignmentState.pluginOutdated =>
+        ' · ${L10n.t('插件需更新', 'plugin needs update')}',
+      AlignmentState.unknown => ' · ${L10n.t('对齐无法判定', 'alignment unknown')}',
+    };
+  }
+
   String _petSizeLabel(int height) {
     if (height <= 80) return L10n.t('迷你', 'Mini');
     if (height >= 106) return L10n.t('大', 'Large');
@@ -1681,7 +2866,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 (
                   L10n.t('状态气泡', 'Status bubble'),
-                  L10n.t('显示当前任务与进度，点它打开面板', 'Shows the task and progress; tap for panel'),
+                  L10n.t(
+                    '显示当前任务与进度，点它打开面板',
+                    'Shows the task and progress; tap for panel',
+                  ),
                 ),
               ]),
               const SizedBox(height: 10),
@@ -1707,7 +2895,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 (
                   L10n.t('贴边 5 秒', '5s at the edge'),
-                  L10n.t('缩进边缘并虚化，点一下滑出', 'Tucks in and fades; tap to slide out'),
+                  L10n.t(
+                    '缩进边缘并虚化，点一下滑出',
+                    'Tucks in and fades; tap to slide out',
+                  ),
                 ),
               ]),
               const SizedBox(height: 10),
@@ -1725,7 +2916,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 (
                   L10n.t('关闭宠物', 'Turn off pet'),
-                  L10n.t('面板底部的「关闭宠物」', 'Use "Turn off pet" at the bottom of the panel'),
+                  L10n.t(
+                    '面板底部的「关闭宠物」',
+                    'Use "Turn off pet" at the bottom of the panel',
+                  ),
                 ),
               ]),
             ],
@@ -1822,6 +3016,89 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
     );
     if (choice != null) await store.setLanguage(choice);
+  }
+
+  Future<void> _checkUpdate() async {
+    final store = widget.store;
+    // 先把电脑端最新状态与手机端接续记录对齐：否则刚完成插件更新时，
+    // 本地 journal 仍停在“未确认”，会把 App 更新挡在门禁外。
+    try {
+      final data = await store.api.getJson('/api/bootstrap');
+      store.api.absorbBootstrap(data);
+    } catch (_) {}
+    if (store.pluginUpdateJournal != null) {
+      try {
+        await store.resumePluginUpdate();
+      } catch (_) {}
+    }
+    if (!mounted) return;
+    // 刚完成插件更新时，宿主重启后载体的导入/校验可能还需要几秒：
+    // 先等固定发布就绪，避免用户马上点“检查 App 更新”却拿到“缺少固定发布快照”。
+    var waited = 0;
+    while (mounted &&
+        store.hostReleasePointer == null &&
+        store.api.pluginUpdate.upToDate &&
+        waited < 12) {
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      waited++;
+      try {
+        final data = await store.api.getJson('/api/bootstrap');
+        store.api.absorbBootstrap(data);
+      } catch (_) {}
+    }
+    if (!mounted) return;
+    // 两端编排（F8）：**唯一判据在 store.appUpdateGate()**，这里只是同一个门禁的入口
+    store.updateChecking = true;
+    if (mounted) setState(() {});
+    final outcome = await Updater.check(store);
+    store.updateChecking = false;
+    if (!mounted) return;
+    setState(() {});
+    switch (outcome.verdict) {
+      case UpdateVerdict.updateAvailable:
+        final candidate = outcome.candidate;
+        if (candidate == null) return;
+        store.setUpdateCandidate(candidate);
+        _updateFlowBusy = true;
+        setState(() {});
+        await runUpdateFlow(context, store, candidate);
+        _updateFlowBusy = false;
+        if (mounted) setState(() {});
+        break;
+      case UpdateVerdict.upToDate:
+        showToast(
+          context,
+          outcome.error ?? L10n.t('已是最新版本', 'Already up to date'),
+        );
+        break;
+      case UpdateVerdict.remoteOlder:
+        showToast(
+          context,
+          L10n.t(
+            '电脑端固定发布低于当前版本，已忽略',
+            'Host fixed release is older than current — ignored',
+          ),
+        );
+        break;
+    }
+  }
+
+  /// 最近一次插件更新检查的脱敏诊断：与桌面端「检查详情」显示同一份内容。
+  /// 插件更新详情：检查诊断 + 安装进度合并展示（与桌面端同一份内容）。
+  void _openPluginUpdateDetails() {
+    final store = widget.store;
+    final checkLines = store.api.pluginUpdate.checkLog;
+    final opId = store.pluginUpdateLogOpId;
+    if (checkLines.isEmpty && opId.isEmpty) return;
+    showSheet(context, L10n.t('插件更新详情', 'Plugin update details'), [
+      _PluginUpdateDetailsPanel(
+        key: ValueKey('plugin-update-details-$opId'),
+        checkLines: checkLines,
+        opId: opId,
+        client: store.api,
+        transaction: store.api.pluginUpdate.transaction,
+      ),
+    ]);
   }
 
   /// 应用日志：查看 / 复制 / 清空

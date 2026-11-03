@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'l10n.dart';
 import 'api.dart';
 import 'app_icon_switcher.dart';
@@ -25,6 +26,7 @@ import 'screens/settings_screen.dart';
 import 'screens/notifications_screen.dart';
 import 'screens/sheets.dart';
 import 'screens/usage_screen.dart';
+import 'toast.dart';
 
 final AppStore store = AppStore();
 
@@ -61,6 +63,14 @@ void main() async {
     );
   };
   await api.load();
+  // 自身版本：随每个请求上报给电脑端（两端对齐判定的依据）。取不到就按"无法判定"处理，
+  // 不影响任何功能。
+  try {
+    final info = await PackageInfo.fromPlatform();
+    api.setAppVersion('${info.version}+${info.buildNumber}');
+  } catch (_) {
+    // 版本取不到时对齐提示显示为"无法判定"，不是错误
+  }
   await store.loadPrefs();
   // 桌面图标：把上次选择同步给系统（原生侧已是目标 alias 时不会重复切换）
   unawaited(AppIconSwitcher.sync(store.appIcon));
@@ -289,6 +299,24 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
 
   void _onStore() {
     if (mounted) setState(() {});
+    _flushPluginUpdateNotice();
+  }
+
+  /// 更新接续/失败的一次性提示统一在这里浮出（§5.9：两端不匹配、目标过期、
+  /// 认证未配置等必须让用户看到，而不只是存在 store 里）。
+  String? _lastPluginNotice;
+  void _flushPluginUpdateNotice() {
+    final notice = store.pluginUpdateNotice;
+    if (notice == null || notice.isEmpty) {
+      _lastPluginNotice = null;
+      return;
+    }
+    if (notice == _lastPluginNotice) return;
+    final ctx = rootNavigatorKey.currentContext;
+    if (ctx == null || !ctx.mounted) return;
+    _lastPluginNotice = notice;
+    showToast(ctx, notice);
+    store.clearPluginUpdateNotice();
   }
 
   /// M2：读取保活开关（默认关），开启中则补一次启动。
@@ -961,6 +989,13 @@ class _ConnectionSheetState extends State<ConnectionSheet> {
       widget.onConnected();
     } catch (e) {
       if (!mounted) return;
+      // F21：认证未配置/口令错误要给专门、可执行的文案（重扫一次二维码），
+      // 不能显示成通用网络错误。
+      final authHint = authFixHint(e);
+      if (authHint != null) {
+        setState(() => _status = '${L10n.t('连接失败：', 'Connection failed:')}$authHint');
+        return;
+      }
       // v3.0.0：网络原因引导（MiUI 智能网络/蜂窝把局域网流量分流时会表现为超时或 404）
       final hint = L10n.t(
           '；请确认手机与电脑在同一 Wi-Fi，并关闭手机流量/智能网络后重试',
