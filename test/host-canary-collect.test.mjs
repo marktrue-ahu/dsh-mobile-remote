@@ -113,7 +113,7 @@ test('能力三态采用固定白名单；不输出 artifact 内伪造原因或�
   assert.equal(sandbox.first.stage,'sandbox');
   assert.equal(sandbox.first.errorCode,'runtime-sandbox-unavailable');
   assert.equal(classify(sandbox.data),'health');
-  for (const code of ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive','host-identity-inconclusive','host-bundle-unavailable']) {
+  for (const code of ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-exited-hint-startup-audit','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive','host-identity-inconclusive','host-bundle-unavailable']) {
     write('first', result('infrastructure-failure',{stage:'runtime',errorCode:code}));
     const [row] = buildReports({matrix,root,...ctx});
     assert.equal(row.first.errorCode,code);

@@ -26,7 +26,7 @@ test('proposed container worker generates token only in runtime tmpfs', () => {
   assert.match(script,/prefix\.length < 4096/);
   assert.match(script,/stderrCollector\?\.destroy\(\)/);
   assert.doesNotMatch(script,/JSON\.stringify\([^\n]*prefix/);
-  for (const code of ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive']) assert.ok(script.includes(`'${code}'`));
+  for (const code of ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-exited-hint-startup-audit','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive']) assert.ok(script.includes(`'${code}'`));
 });
 
 test('generated worker emits a sanitized hint using only a fake host', async t => {
@@ -61,7 +61,7 @@ test('generated worker emits a sanitized hint using only a fake host', async t =
   await writeFile(join(plugin,'package.json'),JSON.stringify({name:'@marktrue/dsh-mobile-remote',version:'1.2.3'}),{flag:'wx',mode:0o600});
   // No loop: record identity first. Timeout mode remains alive beyond the
   // worker deadline, then self-exits after 1.8s without relying on a signal.
-  const fakeCode = `import {readFileSync,writeFileSync,writeSync} from 'node:fs'; const text=readFileSync('/proc/self/stat','utf8'); const fields=text.slice(text.lastIndexOf(')')+2).trim().split(/\\s+/); if (!/^\\d+$/.test(fields[19])) process.exit(3); writeFileSync(process.env.FAKE_HOST_IDENTITY,JSON.stringify({pid:process.pid,startTime:fields[19]}),{flag:'wx',mode:0o600}); const finish=()=>{try {writeSync(2,'ERR_MODULE_NOT_FOUND secret-token /private/path');} catch {} process.exit(1);}; const mode=process.env.FAKE_HOST_MODE; if (mode === 'exit-zero') process.exit(0); else if (mode === 'exit-nonzero') process.exit(17); else if (mode === 'exit-signal') process.kill(process.pid,'SIGTERM'); else if (mode === 'worker-timeout') setTimeout(finish,1800); else finish();`;
+  const fakeCode = `import {readFileSync,writeFileSync,writeSync} from 'node:fs'; const text=readFileSync('/proc/self/stat','utf8'); const fields=text.slice(text.lastIndexOf(')')+2).trim().split(/\\s+/); if (!/^\\d+$/.test(fields[19])) process.exit(3); writeFileSync(process.env.FAKE_HOST_IDENTITY,JSON.stringify({pid:process.pid,startTime:fields[19]}),{flag:'wx',mode:0o600}); const finish=()=>{try {writeSync(2,'ERR_MODULE_NOT_FOUND secret-token /private/path');} catch {} process.exit(1);}; const mode=process.env.FAKE_HOST_MODE; if (mode === 'exit-zero') process.exit(0); else if (mode === 'exit-nonzero') process.exit(17); else if (mode === 'exit-signal') process.kill(process.pid,'SIGTERM'); else if (mode === 'startup-audit') { writeSync(2,'dsh: startup failed: 2 required plugins did not activate\\nsecret-token /private/path\\n'); process.exit(1); } else if (mode === 'worker-timeout') setTimeout(finish,1800); else finish();`;
   const fakeBin = join(host,'lib/bin.js');
   await writeFile(fakeBin,fakeCode,{flag:'wx',mode:0o600});
   assert.equal(await readFile(fakeBin,'utf8'),fakeCode);
@@ -105,13 +105,13 @@ test('generated worker emits a sanitized hint using only a fake host', async t =
     }
     throw Error('fake host exit unconfirmed; fixture retained');
   }
-  for (const mode of ['normal','worker-error','worker-timeout','exit-zero','exit-nonzero','exit-signal']) {
+  for (const mode of ['normal','startup-audit','worker-error','worker-timeout','exit-zero','exit-nonzero','exit-signal']) {
     const record = join(root,`identity-${mode}.json`);
     // Every run receives a fresh tmpfs-like runtime directory.
     const runPath = join(root,`runtime-${mode}`);
     const runScript = script.replaceAll(runtime,runPath);
     const waitForRecord = `await (async () => { const {access}=await import('node:fs/promises'); for(let i=0;i<100;i++){ try {await access(${JSON.stringify(record)});return;} catch {} await new Promise(ok=>setTimeout(ok,10)); } throw Error('fake-host-record-missing'); })();`;
-    const mockRequest = ['normal','exit-zero','exit-nonzero','exit-signal'].includes(mode) ? '  const request = async () => ({status:0,body:null});' :
+    const mockRequest = ['normal','startup-audit','exit-zero','exit-nonzero','exit-signal'].includes(mode) ? '  const request = async () => ({status:0,body:null});' :
       mode === 'worker-error' ? `  const request = async () => ({status:0,body:null}); ${waitForRecord} throw Error('synthetic-worker-fault');` :
       `  const request = async () => ({status:0,body:null}); ${waitForRecord} Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10000);`;
     const mocked = replaceOne(runScript,request,mockRequest);
@@ -124,7 +124,7 @@ test('generated worker emits a sanitized hint using only a fake host', async t =
       if (mode === 'worker-timeout') assert.equal(worker.error?.code,'ETIMEDOUT');
       else {
         assert.equal(worker.error,undefined); assert.equal(worker.status,2); assert.equal(worker.stderr,'');
-        const expectedCode = {normal:'host-process-exited-hint-module-not-found','worker-error':'worker-failed','exit-zero':'host-process-exited-zero','exit-nonzero':'host-process-exited-nonzero','exit-signal':'host-process-exited-signal'}[mode];
+        const expectedCode = {normal:'host-process-exited-hint-module-not-found','startup-audit':'host-process-exited-hint-startup-audit','worker-error':'worker-failed','exit-zero':'host-process-exited-zero','exit-nonzero':'host-process-exited-nonzero','exit-signal':'host-process-exited-signal'}[mode];
         assert.deepEqual(JSON.parse(worker.stdout),{ok:false,errorCode:expectedCode,checks:[]});
         assert.doesNotMatch(worker.stdout,/SIGTERM|\b17\b/);
       }
@@ -233,7 +233,7 @@ test('Docker CLI driver validates output and never returns raw logs', async () =
   assert.equal((await parse(2,{ok:false,errorCode:'install-failed'},'install')).errorCode,'install-failed');
   assert.equal((await parse(1,{ok:false,errorCode:'compatibility-check-failed',checks:['auth']},'runtime')).errorCode,'compatibility-check-failed');
   assert.equal((await parse(2,{ok:false,errorCode:'host-capabilities-inconclusive',checks:[...checks.slice(0,-1),'host-capability:gateway.eventsPeer:missing']},'runtime')).errorCode,'host-capabilities-inconclusive');
-  for (const code of ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive']) {
+  for (const code of ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-exited-hint-startup-audit','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive']) {
     assert.equal((await parse(2,{ok:false,errorCode:code,checks:[]},'runtime')).errorCode,code);
   }
   await assert.rejects(parse(2,{ok:false,errorCode:'host-start-inconclusive',checks:[]},'runtime'),e => e.code === 'docker-output-invalid');
@@ -430,7 +430,7 @@ test('source identity requires exact commit and clean tracked content', async t 
   };
   const result = await runCanary({hostVersion:'1.2.3',pluginRoot:root,pluginSha:sha},dockerModelAdapter(dockerCliDriver(dockerExecute),{env:{...env,GITHUB_ACTIONS:'true',RUNNER_ENVIRONMENT:'github-hosted'},uid:process.getuid(),gid:process.getgid()}));
   assert.equal(result.status,'passed'); assert.deepEqual(result.checks,checks); assert.equal(containers.size,0); assert.equal(next,2);
-  for (const code of ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive']) {
+  for (const code of ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-exited-hint-startup-audit','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive']) {
     runtimeFailure = code;
     const failure = await runCanary({hostVersion:'1.2.3',pluginRoot:root,pluginSha:sha},dockerModelAdapter(dockerCliDriver(dockerExecute),{env:{...env,GITHUB_ACTIONS:'true',RUNNER_ENVIRONMENT:'github-hosted'},uid:process.getuid(),gid:process.getgid()}));
     assert.equal(failure.status,'infrastructure-failure'); assert.equal(failure.stage,'runtime'); assert.equal(failure.errorCode,code); assert.deepEqual(failure.checks,[]);
@@ -716,6 +716,35 @@ test('probe rejects exit during diagnostics even with valid responses', async ()
   await assert.rejects(probeMobile({token:'secret',version:'1.0.0',pid:9,delay:async () => {},childState:() => state,request:async () => { const response = responses.shift(); if (response === diagnostics) state='exited'; return response; }}),e => e.code === 'host-process-exited' && e.status === 'infrastructure-failure');
   const pending = [denied,denied,bootstrap,bootstrap,denied,denied,diagnostics,diagnostics]; state = 'running';
   await assert.rejects(probeMobile({token:'secret',version:'1.0.0',pid:9,delay:async () => {},childState:() => state,request:async () => { const response = pending.shift(); if (response === diagnostics) state='starting'; return response; }}),e => e.code === 'host-process-state-inconclusive' && e.status === 'infrastructure-failure');
+});
+
+test('startup audit hint requires a complete authentic-shaped stderr line', async () => {
+  const one = 'dsh: startup failed: 1 required plugin did not activate\n';
+  const many = 'dsh: startup failed: 27 required plugins did not activate\r\n';
+  const code = 'host-process-exited-hint-startup-audit';
+  assert.equal(stderrExitHint(one),code);
+  assert.equal(stderrExitHint(`secret-token /private/path\n${many}secret-token`),code);
+  for (const count of [2,9,10,99,100,1000]) assert.equal(stderrExitHint(`dsh: startup failed: ${count} required plugins did not activate\n`),code);
+  const exactBoundary = `${'x'.repeat(4096-one.length-1)}\n${one}`;
+  assert.equal(exactBoundary.length,4096); assert.equal(stderrExitHint(exactBoundary),code);
+  for (const value of [
+    one.slice(0,-1), many.slice(0,-1), `prefix ${one}`,
+    'dsh: startup failed: 0 required plugins did not activate\n',
+    'dsh: startup failed: 01 required plugins did not activate\n',
+    'dsh: startup failed: 1 required plugins did not activate\n',
+    'dsh: startup failed: 2 required plugin did not activate\n',
+    'dsh: startup failed: 2 required plugins did not activate extra\n',
+    `\u001b[31m${one}`, `${'x'.repeat(4095)}\n${one}`,
+    `${'x'.repeat(4096-one.length)}\n${one}`,
+  ]) assert.equal(stderrExitHint(value),null);
+  for (const [other,expected] of [['uv_os_get_passwd','host-process-exited-hint-user-lookup'],['EACCES','host-process-exited-hint-eacces'],['EROFS','host-process-exited-hint-erofs'],['ENOENT','host-process-exited-hint-enoent'],['ENOSPC','host-process-exited-hint-enospc'],['ERR_MODULE_NOT_FOUND','host-process-exited-hint-module-not-found'],['ERR_DLOPEN_FAILED','host-process-exited-hint-native-load']]) {
+    assert.equal(stderrExitHint(`${one}${other}`),expected);
+    assert.equal(stderrExitHint(`${other}\n${one}`),expected);
+  }
+  const stream = new PassThrough(), collector = createStderrCollector(stream);
+  stream.write(one.slice(0,-1)); assert.equal(collector.hint(),null);
+  stream.write('\n'); assert.equal(collector.hint(),code); collector.destroy();
+  await assert.rejects(probeMobile({token:'secret-token',version:'1.0.0',pid:9,delay:async () => {},childState:() => 'exited',childExitHint:() => stderrExitHint(`secret-token /private/path\n${one}`),request:async () => ({status:0})}),e => e.code === code && e.status === 'infrastructure-failure' && !/secret-token|\/private\/path|\b1\b/.test(e.message));
 });
 
 test('stderr exit hints are fixed, bounded, and never return raw content', async () => {

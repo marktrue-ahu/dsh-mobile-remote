@@ -266,7 +266,7 @@ export async function createDockerExecutor(root, runnerEnv, invoke = command) {
   execute[CLEANUP_AUTH] = id => { if (!/^[a-f0-9]{64}$/.test(id)) fail('docker-identity-invalid'); authorized.add(id); };
   return execute;
 }
-const runtimeWorkerErrors = new Set(['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive','host-identity-inconclusive','response-inconclusive','compatibility-check-failed','host-capabilities-inconclusive','probe-input-invalid','worker-failed']);
+const runtimeWorkerErrors = new Set(['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-exited-hint-startup-audit','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive','host-identity-inconclusive','response-inconclusive','compatibility-check-failed','host-capabilities-inconclusive','probe-input-invalid','worker-failed']);
 function exactKeys(value, keys) {
   return value !== null && typeof value === 'object' && !Array.isArray(value) && isDeepStrictEqual(Object.keys(value).sort(),[...keys].sort());
 }
@@ -477,7 +477,7 @@ export function dockerModelAdapter(client, {env,uid,gid,signal}) {
       result = validateCanonicalWorkerResult('runtime',result);
       const checks = result.checks;
       if (result.errorCode === 'compatibility-check-failed' && result.exitCode === 1) throw new CanaryError('compatibility-check-failed','compatibility-failure',Array.isArray(checks) ? checks : []);
-      if (['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive','host-identity-inconclusive','response-inconclusive','host-capabilities-inconclusive','worker-failed','probe-input-invalid'].includes(result.errorCode)) throw new CanaryError(result.errorCode,'infrastructure-failure',Array.isArray(checks) ? checks : []);
+      if (['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-exited-hint-startup-audit','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive','host-identity-inconclusive','response-inconclusive','host-capabilities-inconclusive','worker-failed','probe-input-invalid'].includes(result.errorCode)) throw new CanaryError(result.errorCode,'infrastructure-failure',Array.isArray(checks) ? checks : []);
       if (result.exitCode !== 0 || result.errorCode) fail('docker-output-invalid');
       return checks;
     },
@@ -695,6 +695,9 @@ export function stderrExitHint(text) {
   const prefix = text.slice(0,4096);
   if (/\b(?:uv_os_get_passwd|getpwuid(?:_r)?)\b/i.test(prefix)) return 'host-process-exited-hint-user-lookup';
   for (const [pattern,code] of [[/\bEACCES\b/,'host-process-exited-hint-eacces'],[/\bEROFS\b/,'host-process-exited-hint-erofs'],[/\bENOENT\b/,'host-process-exited-hint-enoent'],[/\bENOSPC\b/,'host-process-exited-hint-enospc'],[/\b(?:ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND)\b/,'host-process-exited-hint-module-not-found'],[/\bERR_DLOPEN_FAILED\b/,'host-process-exited-hint-native-load']]) if (pattern.test(prefix)) return code;
+  // Require an actual newline inside the retained prefix; EOF or truncation
+  // is not evidence that the observed text was a complete diagnostic line.
+  if (/(?:^|\n)dsh: startup failed: (?:1 required plugin|(?:[2-9]|[1-9]\d+) required plugins) did not activate\r?\n/.test(prefix)) return 'host-process-exited-hint-startup-audit';
   return null;
 }
 // Shared by the generated worker and local tests. No stderr bytes leave this
@@ -738,7 +741,7 @@ async function probeMobileCore({request, token, version, pid, delay, childState 
     if (state === 'proc-unknown') fail('host-process-state-inconclusive');
     if (state === 'exited') {
       let hint; try { hint = childExitHint(); } catch { hint = null; }
-      const allowed = ['host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load'];
+      const allowed = ['host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-exited-hint-startup-audit'];
       fail(allowed.includes(hint) ? hint : 'host-process-exited');
     }
     if (state !== 'running' && state !== 'starting') fail('probe-input-invalid');
@@ -815,7 +818,7 @@ async function probeMobileCore({request, token, version, pid, delay, childState 
 // returns no text; its sole purpose is to let queued stderr events drain.
 // Codes are bounded log clues, not root-cause findings.
 export async function resolveExitedChildHint(initialCode, childStderrDrain, childExitHint, budgetMs = 250, exitObserver = {status:() => null,wait:async () => {}}) {
-  const allowed = ['host-process-exited','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load'];
+  const allowed = ['host-process-exited','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-exited-hint-startup-audit'];
   if (!allowed.includes(initialCode) || typeof childStderrDrain !== 'function' || typeof childExitHint !== 'function' || !Number.isFinite(budgetMs) || budgetMs < 0 || !exitObserver || typeof exitObserver.status !== 'function' || typeof exitObserver.wait !== 'function') fail('probe-input-invalid');
   const limit = Math.min(250,Math.floor(budgetMs));
   if (limit > 0) {
@@ -840,7 +843,7 @@ export async function probeMobile(options) {
   if (typeof clock !== 'function' || typeof childStderrDrain !== 'function' || typeof childExitHint !== 'function' || !childExitObserver || typeof childExitObserver.status !== 'function' || typeof childExitObserver.wait !== 'function' || !Number.isInteger(reserve) || reserve < 0 || reserve > 250 || (overallDeadline !== Infinity && !Number.isFinite(overallDeadline))) fail('probe-input-invalid');
   try { return await probeMobileCore({...options,probeDeadline:overallDeadline === Infinity ? Infinity : overallDeadline - reserve}); }
   catch (error) {
-    const allowed = ['host-process-exited','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load'];
+    const allowed = ['host-process-exited','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-exited-hint-startup-audit'];
     if (!(error instanceof CanaryError) || !allowed.includes(error.code)) throw error;
     const remaining = overallDeadline === Infinity ? reserve : Math.max(0,Math.min(reserve,overallDeadline - clock()));
     const code = await resolveExitedChildHint(error.code,childStderrDrain,childExitHint,remaining,childExitObserver);
@@ -916,7 +919,7 @@ try {
   if (finalState !== 'running') fail('host-process-state-inconclusive');
   process.stdout.write(JSON.stringify({ok:true,checks}) + '\\n');
 } catch (error) {
-  const codes = ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive','host-identity-inconclusive','response-inconclusive','compatibility-check-failed','host-capabilities-inconclusive','probe-input-invalid'];
+  const codes = ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-exited-hint-startup-audit','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive','host-identity-inconclusive','response-inconclusive','compatibility-check-failed','host-capabilities-inconclusive','probe-input-invalid'];
   const code = codes.includes(error?.code) ? error.code : 'worker-failed';
   const checks = Array.isArray(error?.checks) ? error.checks.filter(value => typeof value === 'string' && (/^(auth|bootstrap|diagnostics)$/.test(value) || capabilityNames.some(name => ['ok','missing','drift'].some(state => value === 'host-capability:' + name + ':' + state)))) : [];
   process.stdout.write(JSON.stringify({ok:false,errorCode:code,checks}) + '\\n');
