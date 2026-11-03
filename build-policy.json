@@ -105,8 +105,10 @@
       "carrierVersion": "3.2.4-alpha.5-app",
       "build": 37,
       "integrity": "sha512-Jul9PuYXvJarhSmXMav1o022RIME+J4h4+umpddUq98Exl20BRhVcOtKc4jzKQB3yAN6XdTUH6834zX06G5ekA==",
-      "status": "submitted",
-      "createdAt": "2026-11-03T12:05:51.638Z"
+      "status": "published",
+      "createdAt": "2026-11-03T12:05:51.638Z",
+      "note": "dist-tags verified",
+      "updatedAt": "2026-11-03T12:12:38.604Z"
     }
   ]
 }
