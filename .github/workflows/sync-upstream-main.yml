@@ -1,21 +1,12 @@
-# 已废弃（2026-11-02）：本仓库是 fork，GitHub 不支持在 fork 仓库上按计划触发 scheduled workflow。
-#
-# 现象与结论：
-#   - workflow 位于默认分支 develop、state=active、cron 合法，手动 workflow_dispatch 多次成功；
-#   - 但多个计划时间点（06:17/12:17/12:43 UTC）均未产生任何 schedule 运行记录，全仓库 schedule 计数为 0；
-#   - 已按官方建议改过 cron 试图重新注册，仍不触发；GitHub Copilot 确认根因是 fork 仓库不支持定时任务。
-#
-# 处置：
-#   - 已移除 schedule 触发器，避免留下一个永不生效、又可能误以为仍在同步的定时配置；
-#   - 上流 main 的定时同步改由仓库外的替代方案完成；
-#   - 本文件、tools/sync-upstream-main.mjs 与相关测试保留，仅用于手动触发（workflow_dispatch）与回归验证。
-#   - 若将来本仓库不再是 fork（例如迁移为独立仓库），可恢复下方 schedule 配置：
-#       schedule:
-#         - cron: '43 */6 * * *'   # UTC，对应北京时间 02:43/08:43/14:43/20:43
-
+# issue #44：恢复 fork 自身定时同步并观察24小时。
+# 此前未观察到 schedule 运行，但不能由此断定所有 fork 均不支持定时任务。
+# 定时执行真实快进；手动运行默认只预演。独立仓库也同步，双方不共享并发锁。
+# UTC 第17分钟与独立仓库第43分钟错开，GitHub调度仍可能延迟或丢弃。
 name: Sync upstream main
 
 on:
+  schedule:
+    - cron: '17 */6 * * *'
   workflow_dispatch:
     inputs:
       dry_run:
