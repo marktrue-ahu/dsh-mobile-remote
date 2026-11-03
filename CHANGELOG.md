@@ -1,5 +1,16 @@
 # Changelog
 
+## v3.2.4-alpha.5（build 37，issue #42）— 文件历史路径归一化修复
+
+> 插件 `3.2.4-alpha.5` / App `3.2.4+37` / 载体 `3.2.4-alpha.5-app`。
+
+### App：文件历史
+
+- 从会话文件浏览深链进入文件历史时，采用宿主 `/api/git/file-history` 返回的**仓库相对路径**更新选中文件；修复历史行点击后 diff 预览报 `preview-invalid`（absolute path 被 `/api/git/preview` 的 safeFilePath 拒绝）。
+- `path-invalid` 时不覆盖原路径；分页/刷新继续使用归一化路径。
+- 未放宽宿主 preview 契约；内联搜索/最近文件等原有路径行为不变。
+
+
 ## v3.2.4-alpha.4（build 36，issue #45）— 会话文件浏览显示隐藏条目
 
 > 插件 `3.2.4-alpha.4` / App `3.2.4+36` / 载体 `3.2.4-alpha.4-app`。
