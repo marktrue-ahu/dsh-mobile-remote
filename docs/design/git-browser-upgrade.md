@@ -80,6 +80,14 @@
 - 无文件时显示引导空态，并在该 surface 首次显示时自动弹一次 **inline 搜索选择器**（不自动全屏进入文件浏览页）；取消后本次不再自动弹；深链始终预填。
 - 文件浏览选择模式：返回值为会话路径；宿主按既有规则归一化，仓库外/目录路径进入既有 `path-invalid` / `not-tracked` 空态，不新增宿主 repositoryRoot 字段。取消/系统返回返回 null，历史视图保持原选择。
 - 该改动是 App 内导航/交互闭环，不改变宿主契约与领域模型；决策记录在本文档与 issue #42，不新增 ADR。
+
+### 文件历史导航（2026-11-03 bugfix）
+
+- 历史行点按**直接打开该文件在该提交上的 diff**（`openPreview(kind: commit, path: selectedPath, oid)`），不再先进入通用提交详情。
+- 预览返回目标显式化：history-origin diff → 历史 surface；commit 详情打开文件 → 提交详情；worktree 文件 → 当前 tab。
+- 独立历史视图（fileHistory tab 未启用）按返回**直接退出 Git 浏览器到调用页**，不再恢复进入前的 preview/commit；tab 已启用时在 tab 根退出。由此消除 `历史 → 预览 → 提交详情 → 历史` 的返回环。
+- 深链到独立历史页同样按“返回退出到调用页”处理；历史 body 的提交行 tap 回调改为 `onOpenCommitDiff`。
+
 - 深链：只看当前文件路径，不传/不定位 OID；范围=当前 HEAD。history tab 已启用→切 tab；未启用→push 独立历史页（无 TabBar）；返回恢复原查看器状态。
 - 入口可见性：文件不在仓库或无 `fileHistory` capability → 按钮隐藏；未跟踪 → 按钮可见，进入空态。
 
