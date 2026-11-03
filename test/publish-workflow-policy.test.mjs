@@ -255,3 +255,23 @@ test("workflow: keeps signed APK, drill, carrier pairing, concurrency and idempo
 	assert.match(blockByName("Verify published tarball integrity").run, /dist\.integrity/);
 	assert.match(WORKFLOW_TEXT, /carrier pluginContentSha256 mismatch/);
 });
+
+test("workflow: caches Gradle and runs Node/Flutter tests in parallel", () => {
+	const cache = stepByName("Cache Gradle caches");
+	assert.equal(cache.uses, "actions/cache@v4");
+	assert.match(cache.with.path, /~\/\.gradle\/caches/);
+	assert.match(cache.with.path, /~\/\.gradle\/wrapper/);
+	assert.match(cache.with.key, /hashFiles\(.*dsh-mobile-app\/android\/.*gradle/);
+	assert.match(cache.with["restore-keys"], /gradle-\$\{\{ runner\.os \}\}-v1-/);
+
+	const parallel = stepByName("Run Node and Flutter tests in parallel");
+	assert.match(parallel.run, /run_node_tests >"\$node_log" 2>&1 &/);
+	assert.match(parallel.run, /wait "\$node_pid"/);
+	assert.match(parallel.run, /flutter analyze --no-pub --no-fatal-infos/);
+	assert.match(parallel.run, /flutter test --no-pub/);
+	assert.match(parallel.run, /test failure \(node=\$\{node_rc\} flutter=\$\{flutter_rc\}\)/);
+	assert.doesNotMatch(parallel.run, /GITHUB_ENV/);
+
+	assert.equal(STEPS.some((step) => step.name === "Run Node tests"), false);
+	assert.equal(STEPS.some((step) => step.name === "Run Flutter analysis and tests"), false);
+});
