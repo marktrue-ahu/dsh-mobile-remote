@@ -10,6 +10,9 @@ const API_ROOT = "https://api.github.com";
 const SHA_PATTERN = /^[a-f0-9]{40}$/;
 const READ_ATTEMPTS = 3;
 const REQUEST_TIMEOUT_MS = 15_000;
+// GitHub 对 compare 响应的 files 数组有上限（300）；达到上限时不能断言「没有 workflow 变更」。
+const COMPARE_FILE_LIMIT = 300;
+const WORKFLOW_PREFIX = ".github/workflows/";
 const sleep = (milliseconds) => new Promise((done) => setTimeout(done, milliseconds));
 
 export class SyncError extends Error {
@@ -27,6 +30,35 @@ function apiError(status) {
 	if (status === 404) return new SyncError("ref-or-comparison-unavailable", "仓库、main 引用或跨 fork 提交比较不可用，请检查仓库关系与历史。");
 	if (status === 409 || status === 422) return new SyncError("update-rejected", "GitHub 拒绝更新，可能存在并发修改或非快进历史；未强推，请人工检查。");
 	return new SyncError("github-api-failed", `GitHub API 请求失败（HTTP ${status}），本次不继续同步。`);
+}
+
+// 从 compare 响应提取本次区间内被新增/修改/删除的 workflow 文件。
+// 目的是把「写入被拒」拆成可自解释的原因，而不是让维护者只看到泛化的 permission-denied。
+// files 可能因响应上限被截断，此时只报告已见部分并标注可能不完整，不声称清单是全集。
+export function workflowChanges(comparison) {
+	const files = Array.isArray(comparison?.files) ? comparison.files : [];
+	const paths = files
+		.map((file) => file?.filename)
+		.filter((name) => typeof name === "string" && name.startsWith(WORKFLOW_PREFIX))
+		.sort();
+	// compare 的 files 数组上限是 300；只有真的顶到上限才不能断言「没有 workflow 变更」，
+	// 提交数本身不说明 files 是否被截断，不能据此判定。
+	const truncated = files.length >= COMPARE_FILE_LIMIT;
+	return { paths, truncated };
+}
+
+function workflowPermissionError(paths, truncated, status) {
+	const list = paths.length ? paths.join("、") : "（响应已截断，未能列出具体文件）";
+	return new SyncError(
+		"workflow-permission-required",
+		`上游本次引入了 ${WORKFLOW_PREFIX} 下的变更（${list}${truncated ? "，清单可能不完整" : ""}），`
+		+ `而 GitHub 以 HTTP ${status} 拒绝了这次引用更新。`
+		+ "GitHub 不允许内置 GITHUB_TOKEN 更新 workflow 文件（它拿不到 workflows 权限），"
+		+ "仅有 Contents 写权限的细粒度 token 也不行；这是独立于并发修改/非快进历史/认证失效的权限规则。"
+		+ "处置：在 fork 的 Environment `upstream-sync` 配置 secret `UPSTREAM_SYNC_TOKEN`"
+		+ "（细粒度 PAT，需 Contents:write 与 Workflows:write），或改用具备 workflows 权限的 GitHub App token。"
+		+ "未扩大任何权限，也未重发写请求。",
+	);
 }
 
 export function assertContext({ dryRun, context = {}, token = "" }) {
@@ -112,7 +144,7 @@ function createClient({ token, fetchImpl, sleepImpl }) {
 				await sleepImpl(delay);
 			}
 		},
-		async update(sha) {
+		async update(sha, { hasWorkflowChanges = false, workflowPaths = [], workflowTruncated = false } = {}) {
 			let response;
 			try {
 				response = await request(`/repos/${TARGET_REPOSITORY}/git/refs/heads/main`, {
@@ -124,6 +156,11 @@ function createClient({ token, fetchImpl, sleepImpl }) {
 			if (response.ok) return true;
 			if (await rateLimit(response)) throw new SyncError("rate-limited", "GitHub API 已限流，本次不重发写请求，请等待恢复后重试。");
 			if (response.status >= 500 || response.status === 408) return false;
+			// 已知本次区间改了 workflow 文件，且写入被 403/422 拒绝：这是 workflows 权限规则，
+			// 不是并发修改或非快进历史。给出独立原因与清单，避免与 permission-denied/update-rejected 混淆。
+			if (hasWorkflowChanges && [403, 422].includes(response.status)) {
+				throw workflowPermissionError(workflowPaths, workflowTruncated, response.status);
+			}
 			throw apiError(response.status);
 		},
 	};
@@ -172,8 +209,17 @@ export async function synchronizeMain({
 			throw new SyncError("comparison-unproven", "无法证明 fork main 是本次上游目标的祖先；不更新引用。");
 		}
 		result.commits = comparison.ahead_by;
+		// 先算清 workflow 变更，供写入失败时给出可自解释的原因；预演也照常报告，
+		// 让维护者能在真正写入前就知道这一轮会撞上 workflows 权限规则。
+		const { paths: workflowPaths, truncated: workflowTruncated } = workflowChanges(comparison);
+		result.workflowChanges = workflowPaths;
+		if (workflowTruncated) result.workflowChangesTruncated = true;
 		if (dryRun) return { ...result, status: "would-fast-forward" };
-		const acknowledged = await client.update(upstreamSha);
+		const acknowledged = await client.update(upstreamSha, {
+			hasWorkflowChanges: workflowPaths.length > 0 || workflowTruncated,
+			workflowPaths,
+			workflowTruncated,
+		});
 		let afterSha;
 		try { afterSha = mainSha(await client.read(`/repos/${TARGET_REPOSITORY}/git/ref/heads/main`)); }
 		catch { throw new SyncError("verification-unavailable", "已尝试快进更新，但无法读回确认结果；请先检查远端 main，不盲目重试写入。"); }
@@ -206,6 +252,13 @@ export function formatSummary(result) {
 	if (result.afterSha) lines.push(`- 读回的 main：\`${result.afterSha}\``);
 	if (result.recovered) lines.push("- 写入响应不确定，已通过读回确认生效，未重发写请求。");
 	if (result.commits !== undefined) lines.push(`- 上游新增提交数：${result.commits}`);
+	if (Array.isArray(result.workflowChanges) && result.workflowChanges.length) {
+		lines.push(
+			`- 本次区间涉及 \`${WORKFLOW_PREFIX}\` 的变更（${result.workflowChanges.length} 个）：`,
+			...result.workflowChanges.map((path) => `  - \`${path}\``),
+		);
+		if (result.workflowChangesTruncated) lines.push("  - ⚠ 比较响应已截断，以上清单可能不完整。");
+	}
 	if (result.compareUrl) lines.push(`- [查看本次提交比较](${result.compareUrl})`);
 	if (result.reason) lines.push(`- 原因：\`${result.reason}\``, `- 说明：${result.message}`);
 	lines.push("", "本脚本仅直接操作 GitHub main，不直接合并 develop、更新 release/tag/npm 或同步本地/GitLab；PAT/App 产生的 push 可能触发其他工作流，需另行审查。", "");

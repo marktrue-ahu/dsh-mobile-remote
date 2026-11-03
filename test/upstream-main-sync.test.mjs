@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import {
-	TARGET_REPOSITORY, UPSTREAM_REPOSITORY, synchronizeMain,
+	TARGET_REPOSITORY, UPSTREAM_REPOSITORY, synchronizeMain, workflowChanges,
 	parseMode, safeFailure, formatSummary,
 } from "../tools/sync-upstream-main.mjs";
 
@@ -415,4 +415,70 @@ test("W6: 失败也保留写后观测到的非目标 SHA，不把观测值伪装
 		assert.ok(formatSummary(failure).includes(OTHER));
 		assert.equal(writes(h.calls).length, 1);
 	}
+});
+
+// ── issue #48：workflow 文件写入权限是独立失败原因，不能与并发/快进/认证混淆 ──
+
+const withFiles = (files) => ({ ...comparison, files: files.map((filename) => ({ filename, status: "added" })) });
+
+test("#48 workflowChanges 只取 .github/workflows/ 下的文件，且排序稳定", () => {
+	assert.deepEqual(workflowChanges(withFiles([".github/workflows/b.yml", "lib/index.js", ".github/workflows/a.yml"])).paths,
+		[".github/workflows/a.yml", ".github/workflows/b.yml"]);
+	assert.deepEqual(workflowChanges(comparison).paths, []);
+	assert.deepEqual(workflowChanges({}).paths, []);
+	assert.deepEqual(workflowChanges({ files: "not-an-array" }).paths, []);
+	// 未顶到 300 上限时不能声称截断，提交数多也不等于 files 被截断。
+	assert.equal(workflowChanges(withFiles([".github/workflows/a.yml"])).truncated, false);
+	assert.equal(workflowChanges({ ...comparison, files: new Array(300).fill({ filename: "x" }) }).truncated, true);
+});
+
+test("#48 写入被拒且区间含 workflow 变更 → 专门原因、带文件清单、不重发写请求", async () => {
+	for (const status of [403, 422]) {
+		const h = setup([json(ref(BEFORE)), json(ref(UPSTREAM)), json(withFiles([
+			".github/workflows/release.yml", ".github/workflows/check.yml", "CHANGELOG.md",
+		])), json({}, status)]);
+		let failure;
+		try { await h.run({ dryRun: false }); } catch (error) { failure = safeFailure(error); }
+		assert.equal(failure.reason, "workflow-permission-required");
+		assert.deepEqual(failure.workflowChanges, [".github/workflows/check.yml", ".github/workflows/release.yml"]);
+		assert.match(failure.message, /\.github\/workflows\//);
+		assert.match(failure.message, /UPSTREAM_SYNC_TOKEN/);
+		assert.match(failure.message, /Workflows:write/);
+		// 带上真实 HTTP 状态，便于与日志中的响应码对照。
+		assert.ok(failure.message.includes(`HTTP ${status}`), `message 应包含 HTTP ${status}`);
+		// 失败语义不变：仍然只发了一次写请求，不做回读、不回滚、不强推。
+		assert.equal(writes(h.calls).length, 1);
+		assert.equal(h.calls.length, 4);
+		assert.equal(failure.afterSha, undefined);
+	}
+});
+
+test("#48 无 workflow 变更时，同样的 403/422 仍按原有原因分类（不误判）", async () => {
+	for (const [status, reason] of [[403, "permission-denied"], [422, "update-rejected"]]) {
+		const h = setup([json(ref(BEFORE)), json(ref(UPSTREAM)), json(withFiles(["lib/index.js"])), json({}, status)]);
+		let failure;
+		try { await h.run({ dryRun: false }); } catch (error) { failure = safeFailure(error); }
+		assert.equal(failure.reason, reason);
+	}
+});
+
+test("#48 预演就报告 workflow 变更清单（写入前即可预见），且仍零写入", async () => {
+	const h = setup([json(ref(BEFORE)), json(ref(UPSTREAM)), json(withFiles([".github/workflows/check.yml"]))]);
+	const result = await h.run();
+	assert.equal(result.status, "would-fast-forward");
+	assert.deepEqual(result.workflowChanges, [".github/workflows/check.yml"]);
+	assert.equal(writes(h.calls).length, 0);
+	assert.match(formatSummary(result), /\.github\/workflows\/check\.yml/);
+});
+
+test("#48 摘要含清单与截断提示，且不泄露 token", () => {
+	const summary = formatSummary({
+		status: "failed", repository: TARGET_REPOSITORY, upstream: UPSTREAM_REPOSITORY, branch: "main",
+		beforeSha: BEFORE, upstreamSha: UPSTREAM, reason: "workflow-permission-required",
+		message: "需要 Workflows 写权限", workflowChanges: [".github/workflows/check.yml"],
+		workflowChangesTruncated: true,
+	});
+	assert.match(summary, /check\.yml/);
+	assert.match(summary, /可能不完整/);
+	assert.ok(!summary.includes(TOKEN));
 });
