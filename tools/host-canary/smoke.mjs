@@ -266,7 +266,7 @@ export async function createDockerExecutor(root, runnerEnv, invoke = command) {
   execute[CLEANUP_AUTH] = id => { if (!/^[a-f0-9]{64}$/.test(id)) fail('docker-identity-invalid'); authorized.add(id); };
   return execute;
 }
-const runtimeWorkerErrors = new Set(['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive','host-identity-inconclusive','response-inconclusive','compatibility-check-failed','host-capabilities-inconclusive','probe-input-invalid','worker-failed']);
+const runtimeWorkerErrors = new Set(['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive','host-identity-inconclusive','response-inconclusive','compatibility-check-failed','host-capabilities-inconclusive','probe-input-invalid','worker-failed']);
 function exactKeys(value, keys) {
   return value !== null && typeof value === 'object' && !Array.isArray(value) && isDeepStrictEqual(Object.keys(value).sort(),[...keys].sort());
 }
@@ -288,7 +288,7 @@ export function parseWorkerOutput(phase, exitCode, data) {
   if (exitCode === 0 && exactKeys(data,['ok','checks']) && data.ok === true && validWorkerChecks(data.checks,true) && data.checks.slice(3).every(value => value.endsWith(':ok'))) return {exitCode,ok:true,checks:data.checks,errorCode:null};
   if (!exactKeys(data,['ok','errorCode','checks']) || data.ok !== false || typeof data.errorCode !== 'string' || !runtimeWorkerErrors.has(data.errorCode) || !validWorkerChecks(data.checks)) fail('docker-output-invalid');
   if ((data.errorCode === 'compatibility-check-failed' ? 1 : 2) !== exitCode) fail('docker-output-invalid');
-  if (data.errorCode === 'compatibility-check-failed' && data.checks.length < 1) fail('docker-output-invalid');
+  if (data.errorCode === 'compatibility-check-failed' && (data.checks.length < 1 || data.checks.length >= 3 + capabilityNames.length)) fail('docker-output-invalid');
   if (data.errorCode === 'host-capabilities-inconclusive' && (!validWorkerChecks(data.checks,true) || !data.checks.slice(3).some(value => !value.endsWith(':ok')))) fail('docker-output-invalid');
   return {exitCode,ok:false,checks:data.checks,errorCode:data.errorCode};
 }
@@ -477,7 +477,7 @@ export function dockerModelAdapter(client, {env,uid,gid,signal}) {
       result = validateCanonicalWorkerResult('runtime',result);
       const checks = result.checks;
       if (result.errorCode === 'compatibility-check-failed' && result.exitCode === 1) throw new CanaryError('compatibility-check-failed','compatibility-failure',Array.isArray(checks) ? checks : []);
-      if (['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive','host-identity-inconclusive','response-inconclusive','host-capabilities-inconclusive','worker-failed','probe-input-invalid'].includes(result.errorCode)) throw new CanaryError(result.errorCode,'infrastructure-failure',Array.isArray(checks) ? checks : []);
+      if (['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive','host-identity-inconclusive','response-inconclusive','host-capabilities-inconclusive','worker-failed','probe-input-invalid'].includes(result.errorCode)) throw new CanaryError(result.errorCode,'infrastructure-failure',Array.isArray(checks) ? checks : []);
       if (result.exitCode !== 0 || result.errorCode) fail('docker-output-invalid');
       return checks;
     },
@@ -658,6 +658,36 @@ export function createLinuxChildMonitor(child, readStat = readLinuxProcessStat) 
     return current.state === 'running' ? 'running' : 'proc-unknown';
   };
 }
+// Observe Node's own ChildProcess exit event and require it to agree with both
+// ChildProcess fields. No numeric exit code or signal leaves this closure.
+export function createChildExitObserver(child) {
+  if (!child || typeof child.on !== 'function' || typeof child.off !== 'function') fail('probe-input-invalid');
+  let seen = false, eventCode = null, eventSignal = null, disposed = false;
+  const pending = new Set();
+  const onExit = (code,signal) => { seen = true; eventCode = code; eventSignal = signal; };
+  child.on('exit',onExit);
+  const status = () => {
+    if (!seen || disposed || child.exitCode !== eventCode || child.signalCode !== eventSignal) return null;
+    if (eventSignal === null && Number.isInteger(eventCode) && eventCode >= 0 && eventCode <= 255) return eventCode === 0 ? 'host-process-exited-zero' : 'host-process-exited-nonzero';
+    if (eventCode === null && typeof eventSignal === 'string' && /^SIG[A-Z0-9]+$/.test(eventSignal)) return 'host-process-exited-signal';
+    return null;
+  };
+  const wait = budgetMs => new Promise(resolve => {
+    const limit = Number.isFinite(budgetMs) ? Math.max(0,Math.min(250,Math.floor(budgetMs))) : 0;
+    if (seen || disposed || limit === 0) return resolve();
+    let timer, done = false;
+    const finish = () => {
+      if (done) return; done = true; clearTimeout(timer); pending.delete(finish);
+      child.off('exit',finish); child.off('close',finish); child.off('error',finish); resolve();
+    };
+    pending.add(finish); child.once('exit',finish); child.once('close',finish); child.once('error',finish);
+    timer = setTimeout(finish,limit);
+    if (seen || disposed) finish();
+  });
+  const cancelWaits = () => { for (const finish of pending) finish(); };
+  const destroy = () => { if (disposed) return; disposed = true; cancelWaits(); child.off('exit',onExit); };
+  return {status,wait,cancelWaits,destroy};
+}
 // Error-text categories are clues only, never proof of root cause. Only a
 // bounded prefix is inspected and the original contents are never returned.
 export function stderrExitHint(text) {
@@ -784,32 +814,36 @@ async function probeMobileCore({request, token, version, pid, delay, childState 
 // Only invoke after the monitored child is known to have exited. The callback
 // returns no text; its sole purpose is to let queued stderr events drain.
 // Codes are bounded log clues, not root-cause findings.
-export async function resolveExitedChildHint(initialCode, childStderrDrain, childExitHint, budgetMs = 250) {
+export async function resolveExitedChildHint(initialCode, childStderrDrain, childExitHint, budgetMs = 250, exitObserver = {status:() => null,wait:async () => {}}) {
   const allowed = ['host-process-exited','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load'];
-  if (!allowed.includes(initialCode) || typeof childStderrDrain !== 'function' || typeof childExitHint !== 'function' || !Number.isFinite(budgetMs) || budgetMs < 0) fail('probe-input-invalid');
+  if (!allowed.includes(initialCode) || typeof childStderrDrain !== 'function' || typeof childExitHint !== 'function' || !Number.isFinite(budgetMs) || budgetMs < 0 || !exitObserver || typeof exitObserver.status !== 'function' || typeof exitObserver.wait !== 'function') fail('probe-input-invalid');
   const limit = Math.min(250,Math.floor(budgetMs));
   if (limit > 0) {
     let timer;
-    try { await Promise.race([Promise.resolve().then(() => childStderrDrain(limit)),new Promise(resolve => { timer = setTimeout(resolve,limit); })]); }
-    catch {} finally { clearTimeout(timer); }
+    try { await Promise.race([Promise.allSettled([Promise.resolve().then(() => childStderrDrain(limit)),Promise.resolve().then(() => exitObserver.wait(limit))]),new Promise(resolve => { timer = setTimeout(resolve,limit); })]); }
+    catch {} finally { clearTimeout(timer); try { exitObserver.cancelWaits?.(); } catch {} }
   }
   let hint; try { hint = childExitHint(); } catch { hint = null; }
-  return allowed.includes(hint) ? hint : initialCode;
+  if (allowed.includes(hint) && hint !== 'host-process-exited') return hint;
+  if (initialCode !== 'host-process-exited') return initialCode;
+  let status; try { status = exitObserver.status(); } catch { status = null; }
+  return ['host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal'].includes(status) ? status : initialCode;
 }
 export async function probeMobile(options) {
   if (!options || typeof options !== 'object') fail('probe-input-invalid');
   const clock = options.clock ?? (() => performance.now());
   const childStderrDrain = options.childStderrDrain ?? (async () => {});
   const childExitHint = options.childExitHint ?? (() => null);
+  const childExitObserver = options.childExitObserver ?? {status:() => null,wait:async () => {}};
   const overallDeadline = options.overallDeadline ?? Infinity;
   const reserve = options.stderrDrainBudgetMs ?? 250;
-  if (typeof clock !== 'function' || typeof childStderrDrain !== 'function' || typeof childExitHint !== 'function' || !Number.isInteger(reserve) || reserve < 0 || reserve > 250 || (overallDeadline !== Infinity && !Number.isFinite(overallDeadline))) fail('probe-input-invalid');
+  if (typeof clock !== 'function' || typeof childStderrDrain !== 'function' || typeof childExitHint !== 'function' || !childExitObserver || typeof childExitObserver.status !== 'function' || typeof childExitObserver.wait !== 'function' || !Number.isInteger(reserve) || reserve < 0 || reserve > 250 || (overallDeadline !== Infinity && !Number.isFinite(overallDeadline))) fail('probe-input-invalid');
   try { return await probeMobileCore({...options,probeDeadline:overallDeadline === Infinity ? Infinity : overallDeadline - reserve}); }
   catch (error) {
     const allowed = ['host-process-exited','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load'];
     if (!(error instanceof CanaryError) || !allowed.includes(error.code)) throw error;
     const remaining = overallDeadline === Infinity ? reserve : Math.max(0,Math.min(reserve,overallDeadline - clock()));
-    const code = await resolveExitedChildHint(error.code,childStderrDrain,childExitHint,remaining);
+    const code = await resolveExitedChildHint(error.code,childStderrDrain,childExitHint,remaining,childExitObserver);
     throw new CanaryError(code,'infrastructure-failure',error.checks);
   }
 }
@@ -840,6 +874,7 @@ const fail = ${fail.toString()};
 ${evaluateResponses.toString()}
 ${readLinuxProcessStat.toString()}
 ${createLinuxChildMonitor.toString()}
+${createChildExitObserver.toString()}
 ${stderrExitHint.toString()}
 ${createStderrCollector.toString()}
 ${probeMobileCore.toString()}
@@ -847,7 +882,7 @@ ${resolveExitedChildHint.toString()}
 ${probeMobile.toString()}
 ${profileFiles.toString()}
 const workerDeadline = performance.now() + 75000;
-let child, stderrCollector;
+let child, stderrCollector, childExitObserver;
 try {
   const base = '/tmp/canary', target = base + '/dsh/profiles/canary';
   for (const dir of ['home','dsh/profiles/canary','xdg-config','xdg-cache','xdg-data','xdg-state','xdg-runtime']) await mkdir(base + '/' + dir,{recursive:true,mode:0o700});
@@ -863,6 +898,7 @@ try {
   const port = reservation.address().port;
   await new Promise(ok => reservation.close(ok));
   child = spawn(process.execPath,['/profile/dsh/profiles/canary/node_modules/@deepseek-ai/dsh/lib/bin.js','--profile','canary','--host','127.0.0.1','--port',String(port),'--no-open'],{cwd:'/tmp/canary',stdio:['ignore','ignore','pipe']});
+  childExitObserver = createChildExitObserver(child);
   const childState = createLinuxChildMonitor(child);
   stderrCollector = createStderrCollector(child.stderr);
   const childExitHint = stderrCollector.hint;
@@ -873,19 +909,19 @@ try {
     let body; try { body = await res.json(); } catch { body = null; }
     return {status:res.status,body};
   };
-  const checks = await probeMobile({request,token,version:manifest.version,pid:child.pid,childState,childExitHint,childStderrDrain,overallDeadline:workerDeadline,delay:(ms) => new Promise(ok => setTimeout(ok,ms))});
+  const checks = await probeMobile({request,token,version:manifest.version,pid:child.pid,childState,childExitHint,childStderrDrain,childExitObserver,overallDeadline:workerDeadline,delay:(ms) => new Promise(ok => setTimeout(ok,ms))});
   const finalState = childState();
-  if (finalState === 'exited') fail(await resolveExitedChildHint('host-process-exited',childStderrDrain,childExitHint,Math.max(0,Math.min(250,workerDeadline-performance.now()))));
+  if (finalState === 'exited') fail(await resolveExitedChildHint('host-process-exited',childStderrDrain,childExitHint,Math.max(0,Math.min(250,workerDeadline-performance.now())),childExitObserver));
   if (finalState === 'spawn-error') fail('host-process-spawn-failed');
   if (finalState !== 'running') fail('host-process-state-inconclusive');
   process.stdout.write(JSON.stringify({ok:true,checks}) + '\\n');
 } catch (error) {
-  const codes = ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive','host-identity-inconclusive','response-inconclusive','compatibility-check-failed','host-capabilities-inconclusive','probe-input-invalid'];
+  const codes = ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive','host-identity-inconclusive','response-inconclusive','compatibility-check-failed','host-capabilities-inconclusive','probe-input-invalid'];
   const code = codes.includes(error?.code) ? error.code : 'worker-failed';
   const checks = Array.isArray(error?.checks) ? error.checks.filter(value => typeof value === 'string' && (/^(auth|bootstrap|diagnostics)$/.test(value) || capabilityNames.some(name => ['ok','missing','drift'].some(state => value === 'host-capability:' + name + ':' + state)))) : [];
   process.stdout.write(JSON.stringify({ok:false,errorCode:code,checks}) + '\\n');
   process.exitCode = code === 'compatibility-check-failed' ? 1 : 2;
-} finally { stderrCollector?.destroy(); child?.kill('SIGKILL'); }
+} finally { childExitObserver?.destroy(); stderrCollector?.destroy(); child?.kill('SIGKILL'); }
 `;
 }
 async function main(args) {

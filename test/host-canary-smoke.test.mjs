@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, symlink, lstat, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, isAbsolute, join } from 'node:path';
-import { DOCKER_IMAGE, RUNTIME_LIFECYCLE_MS, checkHostedRunner, createDockerExecutor, createLinuxChildMonitor, createSourceArchive, createStderrCollector, dockerCliDriver, dockerCreatePlan, dockerModelAdapter, evaluateResponses, gitArchiveArgs, hostedDockerAdapter, libSnapshot, makeInstallWorker, makeRuntimeWorker, managedDocker, probeMobile, profileFiles, prepareContainerProfile, removeSourceArchive, readLinuxProcessStat, resolveExitedChildHint, runCanary, stderrExitHint, validateDockerMounts, verifyDockerInspection, verifyInstalled, verifyPluginSource, verifyRequiredBundles } from '../tools/host-canary/smoke.mjs';
+import { DOCKER_IMAGE, RUNTIME_LIFECYCLE_MS, checkHostedRunner, createChildExitObserver, createDockerExecutor, createLinuxChildMonitor, createSourceArchive, createStderrCollector, dockerCliDriver, dockerCreatePlan, dockerModelAdapter, evaluateResponses, gitArchiveArgs, hostedDockerAdapter, libSnapshot, makeInstallWorker, makeRuntimeWorker, managedDocker, probeMobile, profileFiles, prepareContainerProfile, removeSourceArchive, readLinuxProcessStat, resolveExitedChildHint, runCanary, stderrExitHint, validateDockerMounts, verifyDockerInspection, verifyInstalled, verifyPluginSource, verifyRequiredBundles } from '../tools/host-canary/smoke.mjs';
 
 const imageEnv = ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin','NODE_VERSION=24.1.0','YARN_VERSION=1.22.22'];
 const profileEnvFor = phase => { const base = phase === 'install' ? '/profile' : '/tmp/canary'; return [`HOME=${base}/home`,`DSH_HOME=${base}/dsh`,`XDG_CONFIG_HOME=${base}/xdg-config`,`XDG_CACHE_HOME=${base}/xdg-cache`,`XDG_DATA_HOME=${base}/xdg-data`,`XDG_STATE_HOME=${base}/xdg-state`,`XDG_RUNTIME_DIR=${base}/xdg-runtime`,`NPM_CONFIG_USERCONFIG=${base}/npmrc`,`NPM_CONFIG_GLOBALCONFIG=${base}/npm-globalrc`]; };
@@ -26,7 +26,7 @@ test('proposed container worker generates token only in runtime tmpfs', () => {
   assert.match(script,/prefix\.length < 4096/);
   assert.match(script,/stderrCollector\?\.destroy\(\)/);
   assert.doesNotMatch(script,/JSON\.stringify\([^\n]*prefix/);
-  for (const code of ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive']) assert.ok(script.includes(`'${code}'`));
+  for (const code of ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive']) assert.ok(script.includes(`'${code}'`));
 });
 
 test('generated worker emits a sanitized hint using only a fake host', async t => {
@@ -61,7 +61,7 @@ test('generated worker emits a sanitized hint using only a fake host', async t =
   await writeFile(join(plugin,'package.json'),JSON.stringify({name:'@marktrue/dsh-mobile-remote',version:'1.2.3'}),{flag:'wx',mode:0o600});
   // No loop: record identity first. Timeout mode remains alive beyond the
   // worker deadline, then self-exits after 1.8s without relying on a signal.
-  const fakeCode = `import {readFileSync,writeFileSync,writeSync} from 'node:fs'; const text=readFileSync('/proc/self/stat','utf8'); const fields=text.slice(text.lastIndexOf(')')+2).trim().split(/\\s+/); if (!/^\\d+$/.test(fields[19])) process.exit(3); writeFileSync(process.env.FAKE_HOST_IDENTITY,JSON.stringify({pid:process.pid,startTime:fields[19]}),{flag:'wx',mode:0o600}); const finish=()=>{try {writeSync(2,'ERR_MODULE_NOT_FOUND secret-token /private/path');} catch {} process.exit(1);}; if (process.env.FAKE_HOST_MODE === 'worker-timeout') setTimeout(finish,1800); else finish();`;
+  const fakeCode = `import {readFileSync,writeFileSync,writeSync} from 'node:fs'; const text=readFileSync('/proc/self/stat','utf8'); const fields=text.slice(text.lastIndexOf(')')+2).trim().split(/\\s+/); if (!/^\\d+$/.test(fields[19])) process.exit(3); writeFileSync(process.env.FAKE_HOST_IDENTITY,JSON.stringify({pid:process.pid,startTime:fields[19]}),{flag:'wx',mode:0o600}); const finish=()=>{try {writeSync(2,'ERR_MODULE_NOT_FOUND secret-token /private/path');} catch {} process.exit(1);}; const mode=process.env.FAKE_HOST_MODE; if (mode === 'exit-zero') process.exit(0); else if (mode === 'exit-nonzero') process.exit(17); else if (mode === 'exit-signal') process.kill(process.pid,'SIGTERM'); else if (mode === 'worker-timeout') setTimeout(finish,1800); else finish();`;
   const fakeBin = join(host,'lib/bin.js');
   await writeFile(fakeBin,fakeCode,{flag:'wx',mode:0o600});
   assert.equal(await readFile(fakeBin,'utf8'),fakeCode);
@@ -105,13 +105,13 @@ test('generated worker emits a sanitized hint using only a fake host', async t =
     }
     throw Error('fake host exit unconfirmed; fixture retained');
   }
-  for (const mode of ['normal','worker-error','worker-timeout']) {
+  for (const mode of ['normal','worker-error','worker-timeout','exit-zero','exit-nonzero','exit-signal']) {
     const record = join(root,`identity-${mode}.json`);
     // Every run receives a fresh tmpfs-like runtime directory.
     const runPath = join(root,`runtime-${mode}`);
     const runScript = script.replaceAll(runtime,runPath);
     const waitForRecord = `await (async () => { const {access}=await import('node:fs/promises'); for(let i=0;i<100;i++){ try {await access(${JSON.stringify(record)});return;} catch {} await new Promise(ok=>setTimeout(ok,10)); } throw Error('fake-host-record-missing'); })();`;
-    const mockRequest = mode === 'normal' ? '  const request = async () => ({status:0,body:null});' :
+    const mockRequest = ['normal','exit-zero','exit-nonzero','exit-signal'].includes(mode) ? '  const request = async () => ({status:0,body:null});' :
       mode === 'worker-error' ? `  const request = async () => ({status:0,body:null}); ${waitForRecord} throw Error('synthetic-worker-fault');` :
       `  const request = async () => ({status:0,body:null}); ${waitForRecord} Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10000);`;
     const mocked = replaceOne(runScript,request,mockRequest);
@@ -124,7 +124,9 @@ test('generated worker emits a sanitized hint using only a fake host', async t =
       if (mode === 'worker-timeout') assert.equal(worker.error?.code,'ETIMEDOUT');
       else {
         assert.equal(worker.error,undefined); assert.equal(worker.status,2); assert.equal(worker.stderr,'');
-        assert.deepEqual(JSON.parse(worker.stdout),{ok:false,errorCode:mode === 'normal' ? 'host-process-exited-hint-module-not-found' : 'worker-failed',checks:[]});
+        const expectedCode = {normal:'host-process-exited-hint-module-not-found','worker-error':'worker-failed','exit-zero':'host-process-exited-zero','exit-nonzero':'host-process-exited-nonzero','exit-signal':'host-process-exited-signal'}[mode];
+        assert.deepEqual(JSON.parse(worker.stdout),{ok:false,errorCode:expectedCode,checks:[]});
+        assert.doesNotMatch(worker.stdout,/SIGTERM|\b17\b/);
       }
     } finally {
       const disposition = await confirmFakeExited(record,mode === 'worker-timeout');
@@ -218,6 +220,8 @@ test('Docker CLI driver validates output and never returns raw logs', async () =
     [0,{ok:true,checks,errorCode:'worker-failed'},'runtime'], [0,{ok:true,checks,extra:'secret'},'runtime'],
     [0,{ok:true,checks:checks.slice(0,-1)},'runtime'], [1,{ok:false,errorCode:'worker-failed',checks:[]},'runtime'],
     [2,{ok:false,errorCode:'compatibility-check-failed',checks:[]},'runtime'],
+    [1,{ok:false,errorCode:'compatibility-check-failed',checks},'runtime'],
+    [1,{ok:false,errorCode:'compatibility-check-failed',checks:[...checks.slice(0,-1),'host-capability:gateway.eventsPeer:missing']},'runtime'],
     [0,{ok:true,checks:[...checks.slice(0,-1),'host-capability:gateway.eventsPeer:drift']},'runtime'],
     [0,{ok:true,checks:[...checks.slice(0,-1),checks[3]]},'runtime'],
     [2,{ok:false,errorCode:'host-capabilities-inconclusive',checks},'runtime'],
@@ -229,7 +233,7 @@ test('Docker CLI driver validates output and never returns raw logs', async () =
   assert.equal((await parse(2,{ok:false,errorCode:'install-failed'},'install')).errorCode,'install-failed');
   assert.equal((await parse(1,{ok:false,errorCode:'compatibility-check-failed',checks:['auth']},'runtime')).errorCode,'compatibility-check-failed');
   assert.equal((await parse(2,{ok:false,errorCode:'host-capabilities-inconclusive',checks:[...checks.slice(0,-1),'host-capability:gateway.eventsPeer:missing']},'runtime')).errorCode,'host-capabilities-inconclusive');
-  for (const code of ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive']) {
+  for (const code of ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive']) {
     assert.equal((await parse(2,{ok:false,errorCode:code,checks:[]},'runtime')).errorCode,code);
   }
   await assert.rejects(parse(2,{ok:false,errorCode:'host-start-inconclusive',checks:[]},'runtime'),e => e.code === 'docker-output-invalid');
@@ -426,7 +430,7 @@ test('source identity requires exact commit and clean tracked content', async t 
   };
   const result = await runCanary({hostVersion:'1.2.3',pluginRoot:root,pluginSha:sha},dockerModelAdapter(dockerCliDriver(dockerExecute),{env:{...env,GITHUB_ACTIONS:'true',RUNNER_ENVIRONMENT:'github-hosted'},uid:process.getuid(),gid:process.getgid()}));
   assert.equal(result.status,'passed'); assert.deepEqual(result.checks,checks); assert.equal(containers.size,0); assert.equal(next,2);
-  for (const code of ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive']) {
+  for (const code of ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive']) {
     runtimeFailure = code;
     const failure = await runCanary({hostVersion:'1.2.3',pluginRoot:root,pluginSha:sha},dockerModelAdapter(dockerCliDriver(dockerExecute),{env:{...env,GITHUB_ACTIONS:'true',RUNNER_ENVIRONMENT:'github-hosted'},uid:process.getuid(),gid:process.getgid()}));
     assert.equal(failure.status,'infrastructure-failure'); assert.equal(failure.stage,'runtime'); assert.equal(failure.errorCode,code); assert.deepEqual(failure.checks,[]);
@@ -733,6 +737,40 @@ test('stderr exit hints are fixed, bounded, and never return raw content', async
   await assert.rejects(probeMobile({token:'secret-token',version:'1.0.0',pid:9,delay:async () => {},childState:() => 'exited',childExitHint:() => 'secret-token /private/path',request:async () => ({status:0})}),e => e.code === 'host-process-exited' && !e.message.includes('secret-token'));
 });
 
+test('exit observer emits only coarse codes after a consistent exit event', () => {
+  const make = () => { const child = new EventEmitter(); child.exitCode = null; child.signalCode = null; return child; };
+  const child = make(), observer = createChildExitObserver(child);
+  assert.equal(observer.status(),null);
+  child.exitCode = 0; assert.equal(observer.status(),null); // no event yet
+  child.emit('exit',0,null); assert.equal(observer.status(),'host-process-exited-zero');
+  child.signalCode = 'SIGTERM'; assert.equal(observer.status(),null); // contradiction
+  observer.destroy();
+  const other = make(), nonzero = createChildExitObserver(other);
+  other.exitCode = 17; other.emit('exit',17,null); assert.equal(nonzero.status(),'host-process-exited-nonzero'); nonzero.destroy();
+  const signaled = make(), signalObserver = createChildExitObserver(signaled);
+  signaled.signalCode='SIGTERM'; signaled.emit('exit',null,'SIGTERM'); assert.equal(signalObserver.status(),'host-process-exited-signal'); signalObserver.destroy();
+  const malformed = make(), invalid = createChildExitObserver(malformed);
+  malformed.exitCode=999; malformed.emit('exit',999,null); assert.equal(invalid.status(),null); invalid.destroy();
+});
+
+test('stderr drain and exit observation share one wait budget', async () => {
+  const child = new EventEmitter(); child.exitCode=null; child.signalCode=null;
+  const observer = createChildExitObserver(child); let drainStarted=false, waitStarted=false, release;
+  const drain = async () => { drainStarted = true; if (waitStarted) release(); await new Promise(resolve => { release=resolve; if (waitStarted) resolve(); }); };
+  const wait = async () => { waitStarted = true; if (drainStarted && release) release(); child.exitCode=5; child.emit('exit',5,null); };
+  const code = await resolveExitedChildHint('host-process-exited',drain,() => null,100,{status:observer.status,wait});
+  assert.equal(drainStarted,true); assert.equal(waitStarted,true); assert.equal(code,'host-process-exited-nonzero');
+  assert.equal(await resolveExitedChildHint('host-process-exited',async () => {},() => 'host-process-exited-hint-eacces',20,observer),'host-process-exited-hint-eacces');
+  observer.destroy();
+  const pending = new EventEmitter(); pending.exitCode=null; pending.signalCode=null;
+  const late = createChildExitObserver(pending);
+  const beforeEvent = await resolveExitedChildHint('host-process-exited',async () => {},() => null,10,late);
+  assert.equal(beforeEvent,'host-process-exited');
+  assert.equal(pending.listenerCount('close'),0); assert.equal(pending.listenerCount('error'),0);
+  pending.exitCode=7; pending.emit('exit',7,null); assert.equal(late.status(),'host-process-exited-nonzero');
+  assert.equal(beforeEvent,'host-process-exited'); late.destroy();
+});
+
 test('stderr drain is bounded, sanitized, and preserves hint priority', async () => {
   let observed;
   const start = performance.now();
@@ -866,6 +904,25 @@ test('inherited stderr pipe cannot hold exit diagnostics open', async t => {
         if (!ended) await new Promise(resolve => setTimeout(resolve,25));
       }
       assert.equal(ended,true,'self-limited descendant did not exit in time');
+    }
+  }
+});
+
+test('real local child exits map to fixed coarse categories only', async t => {
+  if (process.platform !== 'linux') return t.skip('Linux /proc required');
+  for (const [code,expected] of [['process.exit(0)','host-process-exited-zero'],['process.exit(17)','host-process-exited-nonzero'],["process.kill(process.pid,'SIGTERM')",'host-process-exited-signal']]) {
+    const child = spawn(process.execPath,['-e',code],{stdio:['ignore','ignore','pipe'],timeout:2000});
+    const observer = createChildExitObserver(child), monitor = createLinuxChildMonitor(child), collector = createStderrCollector(child.stderr);
+    const closed = new Promise(resolve => child.once('close',resolve));
+    const lock = new Int32Array(new SharedArrayBuffer(4)), deadline = Date.now()+2000;
+    while (Date.now()<deadline && readLinuxProcessStat(child.pid).state !== 'exited') Atomics.wait(lock,0,0,10);
+    try {
+      assert.equal(readLinuxProcessStat(child.pid).state,'exited');
+      assert.equal(child.exitCode,null);
+      await assert.rejects(probeMobile({token:'synthetic-secret',version:'1.0.0',pid:child.pid,delay:async () => {},childState:monitor,childExitHint:collector.hint,childStderrDrain:collector.drain,childExitObserver:observer,request:async () => ({status:0})}),error => error.code === expected && error.status === 'infrastructure-failure' && !/synthetic-secret|SIGTERM|\b17\b/.test(error.message));
+    } finally {
+      observer.destroy(); collector.destroy();
+      let timer; try { await Promise.race([closed,new Promise((_,reject) => { timer=setTimeout(() => reject(Error('owned child close timeout')),2500); })]); } finally { clearTimeout(timer); }
     }
   }
 });

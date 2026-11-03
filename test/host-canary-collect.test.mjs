@@ -67,6 +67,11 @@ test('artifact 目录自身为符号链接时不读取其目标', () => fixture(
   const [row]=buildReports({matrix:otherMatrix,root,...ctx});
   assert.equal(row.first.status,'infrastructure-failure');
   assert.equal(row.first.errorCode,'missing-or-invalid-result');
+  writeFileSync(join(dir,'first.json'),JSON.stringify(result('passed')));
+  const rootAlias=join(root,'root-alias'); symlinkSync(root,rootAlias);
+  const [aliasRow]=buildReports({matrix,root:rootAlias,...ctx});
+  assert.equal(aliasRow.first.status,'infrastructure-failure');
+  assert.equal(aliasRow.first.errorCode,'missing-or-invalid-result');
 }));
 test('兼容失败必须包含顺序正确的认证起始检查，否则按基础设施不确定处理', () => fixture(({root,write}) => {
   for (const checks of [[],['bootstrap'],['auth','diagnostics'],['auth','bootstrap','diagnostics','host-capability:jobs.eventsApi:ok'],['auth','bootstrap','diagnostics',...capabilities.map(name => `host-capability:${name}:ok`)],['auth','bootstrap','diagnostics',...capabilities.map(name => `host-capability:${name}:missing`)]]) {
@@ -108,7 +113,7 @@ test('能力三态采用固定白名单；不输出 artifact 内伪造原因或�
   assert.equal(sandbox.first.stage,'sandbox');
   assert.equal(sandbox.first.errorCode,'runtime-sandbox-unavailable');
   assert.equal(classify(sandbox.data),'health');
-  for (const code of ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive','host-identity-inconclusive','host-bundle-unavailable']) {
+  for (const code of ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive','host-identity-inconclusive','host-bundle-unavailable']) {
     write('first', result('infrastructure-failure',{stage:'runtime',errorCode:code}));
     const [row] = buildReports({matrix,root,...ctx});
     assert.equal(row.first.errorCode,code);
