@@ -1,0 +1,91 @@
+name: Issue 40 - one-time hosted diagnostic 3
+
+# 仅本临时分支 push；不监听 tag、schedule 或 workflow_dispatch。
+# 再次 push 或 UI rerun 仍会重复执行，必须遵守用户单次授权。
+on:
+  push:
+    branches:
+      - verification/issue-40-hosted-diagnostics-3
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue-40-one-time-hosted-diagnostics-3
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'marktrue-ahu/dsh-mobile-remote' && github.ref == 'refs/heads/verification/issue-40-hosted-diagnostics-3'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact diagnostic commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Verify offline sandbox contract tests
+        shell: bash
+        run: |
+          if node --test test/host-canary-smoke.test.mjs >/dev/null 2>&1; then
+            echo 'Offline sandbox contract tests passed.'
+          else
+            echo '::error::Offline sandbox contract tests failed; raw output withheld.'
+            exit 1
+          fi
+      - name: Run one isolated host diagnostic
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from 'node:fs';
+          import { hostedDockerAdapter, installCanarySignalHandlers, runCanary } from './tools/host-canary/smoke.mjs';
+
+          // 此临时工作流调用隔离测试后端；正式 CLI 仍保持禁用。
+          // 不传 GH_TOKEN、不使用 repository/environment secrets、不创建 issue。
+          const controller = new AbortController();
+          const removeHandlers = installCanarySignalHandlers(controller);
+          let result;
+          try {
+            result = await runCanary({
+              hostVersion: '0.2.1-rc.5',
+              pluginRoot: process.env.GITHUB_WORKSPACE,
+              pluginSha: process.env.RELEASE_SHA,
+            }, hostedDockerAdapter({
+              runnerEnv: process.env,
+              uid: process.getuid(),
+              gid: process.getgid(),
+              signal: controller.signal,
+            }));
+          } finally {
+            removeHandlers();
+          }
+
+          // 仅固定状态/阶段/错误码/能力；退出类别与stderr线索仅为有限枚举。
+          const safe = {
+            schema: result.schema,
+            hostVersion: result.hostVersion,
+            pluginSha: result.pluginSha,
+            status: result.status,
+            stage: result.stage,
+            checks: result.checks,
+            errorCode: result.errorCode,
+          };
+          const encoded = Buffer.from(JSON.stringify(safe), 'utf8').toString('base64');
+          console.log(`::notice title=Issue 40 diagnostic 3 result::${encoded}`);
+          console.log(JSON.stringify(safe));
+          if (process.env.GITHUB_STEP_SUMMARY) {
+            appendFileSync(process.env.GITHUB_STEP_SUMMARY,
+              '## Issue 40 one-time hosted diagnostic 3\n\n```json\n' + JSON.stringify(safe, null, 2) + '\n```\n');
+          }
+          if (safe.status !== 'passed') process.exitCode = 1;
+          NODE
