@@ -373,34 +373,58 @@ jobs:
         working-directory: dsh-mobile-app
         run: flutter pub get --enforce-lockfile
 
-      - name: Run Node tests
+      - name: Cache Gradle caches
+        if: ${{ env.STATE != 'fully-published' }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-v1-${{ hashFiles('dsh-mobile-app/android/**/*.gradle*', 'dsh-mobile-app/android/**/gradle.properties', 'dsh-mobile-app/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-v1-
+
+      - name: Run Node and Flutter tests in parallel
         if: ${{ env.STATE != 'fully-published' }}
         shell: bash
         run: |
-          set -euo pipefail
-          gate_home="$(mktemp -d)"
-          trap 'rm -rf "$gate_home"' EXIT
-          env \
-            -u DSH_PROFILE -u DSH_PROFILE_DIR -u DSH_SESSION_ID \
-            -u DSH_SHELL -u DSH_WEB_URL -u DSH_WEB_FOREGROUND -u INVOCATION_ID \
-            -u ANDROID_HOME -u ANDROID_SDK_ROOT -u ANDROID_SDK_HOME \
-            -u NPM_TOKEN -u NODE_AUTH_TOKEN \
-            -u NPM_CONFIG_USERCONFIG -u npm_config_userconfig \
-            -u NPM_CONFIG_REGISTRY -u npm_config_registry \
-            HOME="$gate_home" \
-            DSH_HOME="$gate_home/.dsh" \
-            XDG_CONFIG_HOME="$gate_home/.config" \
-            XDG_CACHE_HOME="$gate_home/.cache" \
-            XDG_DATA_HOME="$gate_home/.local/share" \
-            npm_config_cache="$gate_home/.npm-cache" \
-            node --test test/*.mjs
-
-      - name: Run Flutter analysis and tests
-        if: ${{ env.STATE != 'fully-published' }}
-        working-directory: dsh-mobile-app
-        run: |
-          flutter analyze --no-pub --no-fatal-infos
-          flutter test --no-pub
+          set -uo pipefail
+          node_log="$RUNNER_TEMP/node-tests.log"
+          flutter_log="$RUNNER_TEMP/flutter-tests.log"
+          run_node_tests() {
+            local gate_home
+            gate_home="$(mktemp -d)"
+            trap 'rm -rf "$gate_home"' EXIT
+            env \
+              -u DSH_PROFILE -u DSH_PROFILE_DIR -u DSH_SESSION_ID \
+              -u DSH_SHELL -u DSH_WEB_URL -u DSH_WEB_FOREGROUND -u INVOCATION_ID \
+              -u ANDROID_HOME -u ANDROID_SDK_ROOT -u ANDROID_SDK_HOME \
+              -u NPM_TOKEN -u NODE_AUTH_TOKEN \
+              -u NPM_CONFIG_USERCONFIG -u npm_config_userconfig \
+              -u NPM_CONFIG_REGISTRY -u npm_config_registry \
+              HOME="$gate_home" \
+              DSH_HOME="$gate_home/.dsh" \
+              XDG_CONFIG_HOME="$gate_home/.config" \
+              XDG_CACHE_HOME="$gate_home/.cache" \
+              XDG_DATA_HOME="$gate_home/.local/share" \
+              npm_config_cache="$gate_home/.npm-cache" \
+              node --test test/*.mjs
+          }
+          run_node_tests >"$node_log" 2>&1 &
+          node_pid=$!
+          flutter_rc=0
+          (cd dsh-mobile-app && flutter analyze --no-pub --no-fatal-infos && flutter test --no-pub) >"$flutter_log" 2>&1 || flutter_rc=$?
+          node_rc=0
+          wait "$node_pid" || node_rc=$?
+          echo '===== Node tests ====='
+          cat "$node_log"
+          echo '===== Flutter analysis/tests ====='
+          cat "$flutter_log"
+          if [[ "$node_rc" -ne 0 || "$flutter_rc" -ne 0 ]]; then
+            echo "::error::test failure (node=${node_rc} flutter=${flutter_rc})"
+            exit 1
+          fi
+          echo 'Node and Flutter tests passed in parallel.'
 
       # key.properties and the keystore are intentionally not committed.
       # 所有 release tag（stable 与 prerelease）都使用正式 release key 现场构建 APK；
