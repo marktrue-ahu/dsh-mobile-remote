@@ -29,6 +29,14 @@ test('proposed container worker generates token only in runtime tmpfs', () => {
   for (const code of ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-exited-hint-startup-audit','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive']) assert.ok(script.includes(`'${code}'`));
 });
 
+// KNOWN-FLAKY #40: this fixture spawns a real fake-host process per mode and
+// confirms its identity through /proc. Under load the fixture's own start can
+// exceed the fixed wait window, so it intermittently reports "fake host identity
+// unavailable" (measured 30-60% on a busy machine, 0% once warmed). That failure
+// is fixture timing, not a product defect: the hint/exit-code behaviour it
+// exercises is also covered by deterministic tests that inject childState and
+// childExitHint directly. Do not treat a flake here as a product regression, and
+// do not weaken the security assertions to make it pass.
 test('generated worker emits a sanitized hint using only a fake host', async t => {
   if (process.platform !== 'linux') return t.skip('generated worker uses Linux /proc');
   const parent = await realpath(tmpdir());
