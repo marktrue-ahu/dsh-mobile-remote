@@ -678,7 +678,14 @@ cmd_init() {
   export ANDROID_HOME="${ANDROID_HOME:-/home/mark/sdk/android}"
   export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
   export GRADLE_USER_HOME="${GRADLE_USER_HOME:-$REAL_HOME/.gradle}"
-  export GRADLE_OPTS="${GRADLE_OPTS:--Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=1080 -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=1080}"
+  # 出网代理：迁移到容器后旧的 127.0.0.1:1080 已不存在，统一走 SOCKS5。
+  # 允许用 DSH_GRADLE_SOCKS_HOST/PORT 覆盖，不把内网地址写死成唯一路径；
+  # 设为空字符串可显式禁用（例如完全离线环境）。
+  if [ -z "${DSH_GRADLE_SOCKS_HOST+x}" ]; then DSH_GRADLE_SOCKS_HOST='192.168.50.33'; fi
+  if [ -z "${DSH_GRADLE_SOCKS_PORT+x}" ]; then DSH_GRADLE_SOCKS_PORT='1088'; fi
+  if [ -n "$DSH_GRADLE_SOCKS_HOST" ] && [ -n "$DSH_GRADLE_SOCKS_PORT" ]; then
+    export GRADLE_OPTS="${GRADLE_OPTS:--DsocksProxyHost=$DSH_GRADLE_SOCKS_HOST -DsocksProxyPort=$DSH_GRADLE_SOCKS_PORT}"
+  fi
   local lock="$wt/dsh-mobile-app/pubspec.lock"
   if [ -f "$lock" ]; then
     if grep -q 'pub\.dev' "$lock"; then
@@ -789,7 +796,14 @@ run_gates() { # run_gates <工作树> <报告临时文件> <required|synthetic>
   export ANDROID_HOME="${ANDROID_HOME:-/home/mark/sdk/android}"
   export ANDROID_SDK_ROOT="$ANDROID_HOME"
   export GRADLE_USER_HOME="$REAL_HOME/.gradle"
-  export GRADLE_OPTS="${GRADLE_OPTS:--Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=1080 -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=1080}"
+  # 出网代理：迁移到容器后旧的 127.0.0.1:1080 已不存在，统一走 SOCKS5。
+  # 允许用 DSH_GRADLE_SOCKS_HOST/PORT 覆盖，不把内网地址写死成唯一路径；
+  # 设为空字符串可显式禁用（例如完全离线环境）。
+  if [ -z "${DSH_GRADLE_SOCKS_HOST+x}" ]; then DSH_GRADLE_SOCKS_HOST='192.168.50.33'; fi
+  if [ -z "${DSH_GRADLE_SOCKS_PORT+x}" ]; then DSH_GRADLE_SOCKS_PORT='1088'; fi
+  if [ -n "$DSH_GRADLE_SOCKS_HOST" ] && [ -n "$DSH_GRADLE_SOCKS_PORT" ]; then
+    export GRADLE_OPTS="${GRADLE_OPTS:--DsocksProxyHost=$DSH_GRADLE_SOCKS_HOST -DsocksProxyPort=$DSH_GRADLE_SOCKS_PORT}"
+  fi
 
   report_printf() { # printf-style report writer; every I/O error is fatal to verification evidence
     local fmt="$1"; shift
