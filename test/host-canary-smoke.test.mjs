@@ -662,6 +662,36 @@ test('install failure remains infrastructure failure and always cleans up', asyn
   assert.equal(cleaned, true);
 });
 
+test('a real 0.2.1-rc.5 payload shape satisfies the probed contract', () => {
+  // Shape captured from a real locally installed @deepseek-ai/dsh@0.2.1-rc.5
+  // serving this plugin, including fields the canary does not read. One verbatim
+  // sample guards against tightening the contract into something no real host
+  // actually emits.
+  const names = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer'];
+  const caps = Object.fromEntries(names.map(name => [name,'ok']));
+  const pid = 24451;
+  const unauth = {status:401,body:{error:'auth-required',detail:'访问口令未通过验证'}};
+  const bootstrap = {status:200,body:{
+    ok:true,
+    auth:{enabled:true,source:'config'},
+    server:{port:38123,urls:[],path:'/m'},
+    connection:{state:'unavailable',source:'none',origins:[],reason:'bridge-disabled'},
+    plugin:{name:'dsh-mobile-remote',version:'3.2.3-alpha.1',contentSha256:'16343c3f',pid,instanceId:'71b49ce3'},
+    capabilities:{eventTimeline:{version:1,live:true,history:true},turnOutline:{version:1,supported:true},fileRange:{version:1,supported:true},hold:{version:1,onlineMs:120000,offlineMs:300000}},
+    alignment:{appVersion:null,pluginVersion:'3.2.3-alpha.1',expectedAppVersion:'3.2.3',state:'unknown'},
+    agents:[],sessions:[],
+  }};
+  const diagnostics = {status:200,body:{
+    ok:true,
+    plugin:{name:'dsh-mobile-remote',version:'3.2.3-alpha.1',contentSha256:'16343c3f',instanceId:'f84dab1b'},
+    runtime:{form:'cli',host:'127.0.0.1',port:38124,authEnabled:true,lanBridge:{enabled:false,listening:false,phase:'disabled'},metrics:{agents:0,sessions:0}},
+    services:{webServer:true,agents:true,sessions:true,llm:true,permissionPresets:true,agentPresets:true,workspaceRegistry:true,approval:true,credentials:true,messageFeedback:true,userQuestions:true},
+    checks:{hostCapabilities:caps},
+  }};
+  assert.deepEqual(evaluateResponses(unauth,bootstrap,diagnostics,'3.2.3-alpha.1',pid),
+    ['auth','bootstrap','diagnostics',...names.map(name => `host-capability:${name}:ok`)]);
+});
+
 test('response contract checks identity, authentication, diagnostics and capability drift', () => {
   const names = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer'];
   const caps = Object.fromEntries(names.map(name => [name,'ok']));
