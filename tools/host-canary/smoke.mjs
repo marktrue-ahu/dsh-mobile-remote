@@ -864,11 +864,21 @@ export async function probeMobile(options) {
 export function makeInstallWorker(version) {
   if (typeof version !== 'string' || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) fail('docker-plan-invalid');
   return `import { execFileSync } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, symlinkSync } from 'node:fs';
 try {
   mkdirSync('/tmp/plugin',{recursive:true,mode:0o700});
   execFileSync('tar',['-xf','/source/source.tar','-C','/tmp/plugin','--no-same-owner','--no-same-permissions'],{stdio:'ignore',timeout:30000});
-  execFileSync('npm',['install','--prefix','/profile/dsh/profiles/canary','--ignore-scripts','--install-links','--no-audit','--no-fund','--save-exact',${JSON.stringify('@deepseek-ai/dsh@' + version)},'/tmp/plugin'],{stdio:'ignore',timeout:300000});
+  // Install the host alone: this resolves its full, self-consistent dependency
+  // closure. Adding the plugin to the same command lets the plugin's wide peer
+  // ranges (">=0.1.0-rc.6 <0.3.0") pull old 0.1.x host packages into the tree,
+  // which disables dozens of host rows and drops @deepseek-ai/dsh-web-app, so the
+  // host dies before any HTTP surface exists.
+  execFileSync('npm',['install','--prefix','/profile/dsh/profiles/canary','--ignore-scripts','--no-audit','--no-fund','--save-exact',${JSON.stringify('@deepseek-ai/dsh@' + version)}],{stdio:'ignore',timeout:300000});
+  // Then install the plugin into its own prefix and link it into the host tree,
+  // so installing the plugin cannot rewrite the host's resolved versions.
+  execFileSync('npm',['install','--prefix','/tmp/plugin-prefix','--ignore-scripts','--install-links','--no-audit','--no-fund','--legacy-peer-deps','/tmp/plugin'],{stdio:'ignore',timeout:300000});
+  mkdirSync('/profile/dsh/profiles/canary/node_modules/@marktrue',{recursive:true});
+  symlinkSync('/tmp/plugin-prefix/node_modules/@marktrue/dsh-mobile-remote','/profile/dsh/profiles/canary/node_modules/@marktrue/dsh-mobile-remote');
   process.stdout.write('{"ok":true}\\n');
 } catch { process.stdout.write('{"ok":false,"errorCode":"install-failed"}\\n'); process.exitCode = 2; }
 `;

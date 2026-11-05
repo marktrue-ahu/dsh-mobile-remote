@@ -626,6 +626,23 @@ test('profile uses shipped bundles and explicitly safe mobile settings', () => {
   assert.deepEqual(patch[0].insert[0], {id:'mobile-remote',name:'@marktrue/dsh-mobile-remote',config:{path:'/m',authToken:'test-token',pluginUpdateManifest:'off',lanBridge:{enabled:false},pushUrls:[]}});
 });
 
+test('install worker keeps the host closure isolated from plugin peer ranges', () => {
+  // Regression: installing the plugin in the same npm command as the host let the
+  // plugin's wide peer ranges (">=0.1.0-rc.6 <0.3.0") pull old 0.1.x host packages
+  // into the tree and drop @deepseek-ai/dsh-web-app. The host then disabled dozens
+  // of rows and exited before serving HTTP. The host must be installed alone, and
+  // the plugin installed separately then linked in.
+  const script = makeInstallWorker('0.2.1-rc.5');
+  const checked = spawnSync(process.execPath,['--check','--input-type=module'],{input:script,encoding:'utf8'});
+  assert.equal(checked.status,0,checked.stderr);
+  assert.match(script,/@deepseek-ai\/dsh@0\.2\.1-rc\.5/);
+  assert.match(script,/\/tmp\/plugin-prefix/);
+  assert.match(script,/--legacy-peer-deps/);
+  assert.match(script,/symlinkSync/);
+  // The plugin path must NOT be an argument of the host install command.
+  assert.doesNotMatch(script,/dsh@\$\{JSON\.stringify\([^)]*\)\}[^\n]*\/tmp\/plugin'/);
+});
+
 test('runtime worker restores the bundle declaration that npm install overwrites', () => {
   // Regression: `npm install --prefix <profile>` rewrites the profile manifest
   // into a dependency list and drops dsh.profile.bundles. The host then loads no
