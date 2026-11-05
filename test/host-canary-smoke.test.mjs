@@ -59,9 +59,11 @@ test('generated worker emits a sanitized hint using only a fake host', async t =
   await writeFile(join(fixtureProfile,'package.json'),JSON.stringify({name:'fixture',private:true}),{flag:'wx',mode:0o600});
   await writeFile(join(host,'package.json'),JSON.stringify({type:'module'}),{flag:'wx',mode:0o600});
   await writeFile(join(plugin,'package.json'),JSON.stringify({name:'@marktrue/dsh-mobile-remote',version:'1.2.3'}),{flag:'wx',mode:0o600});
-  // No loop: record identity first. Timeout mode remains alive beyond the
-  // worker deadline, then self-exits after 1.8s without relying on a signal.
-  const fakeCode = `import {readFileSync,writeFileSync,writeSync} from 'node:fs'; const text=readFileSync('/proc/self/stat','utf8'); const fields=text.slice(text.lastIndexOf(')')+2).trim().split(/\\s+/); if (!/^\\d+$/.test(fields[19])) process.exit(3); writeFileSync(process.env.FAKE_HOST_IDENTITY,JSON.stringify({pid:process.pid,startTime:fields[19]}),{flag:'wx',mode:0o600}); const finish=()=>{try {writeSync(2,'ERR_MODULE_NOT_FOUND secret-token /private/path');} catch {} process.exit(1);}; const mode=process.env.FAKE_HOST_MODE; if (mode === 'exit-zero') process.exit(0); else if (mode === 'exit-nonzero') process.exit(17); else if (mode === 'exit-signal') process.kill(process.pid,'SIGTERM'); else if (mode === 'startup-audit') { writeSync(2,'dsh: startup failed: 2 required plugins did not activate\\nsecret-token /private/path\\n'); process.exit(1); } else if (mode === 'worker-timeout') setTimeout(finish,1800); else finish();`;
+  // No loop: record identity first, then exit after a short lived window so the
+  // worker can read a baseline identity before this process disappears. Timeout
+  // mode stays alive past the worker deadline, then self-exits after 1.8s
+  // without relying on a signal.
+  const fakeCode = `import {readFileSync,writeFileSync,writeSync} from 'node:fs'; const text=readFileSync('/proc/self/stat','utf8'); const fields=text.slice(text.lastIndexOf(')')+2).trim().split(/\\s+/); if (!/^\\d+$/.test(fields[19])) process.exit(3); writeFileSync(process.env.FAKE_HOST_IDENTITY,JSON.stringify({pid:process.pid,startTime:fields[19]}),{flag:'wx',mode:0o600}); const finish=()=>{try {writeSync(2,'ERR_MODULE_NOT_FOUND secret-token /private/path');} catch {} process.exit(1);}; const mode=process.env.FAKE_HOST_MODE; const exitSoon=action=>setTimeout(action,250); if (mode === 'exit-zero') exitSoon(()=>process.exit(0)); else if (mode === 'exit-nonzero') exitSoon(()=>process.exit(17)); else if (mode === 'exit-signal') exitSoon(()=>process.kill(process.pid,'SIGTERM')); else if (mode === 'startup-audit') exitSoon(()=>{ writeSync(2,'dsh: startup failed: 2 required plugins did not activate\\nsecret-token /private/path\\n'); process.exit(1); }); else if (mode === 'worker-timeout') setTimeout(finish,1800); else exitSoon(finish);`;
   const fakeBin = join(host,'lib/bin.js');
   await writeFile(fakeBin,fakeCode,{flag:'wx',mode:0o600});
   assert.equal(await readFile(fakeBin,'utf8'),fakeCode);
@@ -764,6 +766,23 @@ test('stderr exit hints are fixed, bounded, and never return raw content', async
   assert.equal(stderrExitHint({toString:() => { throw Error('secret-token'); }}),null);
   await assert.rejects(probeMobile({token:'secret-token',version:'1.0.0',pid:9,delay:async () => {},childState:() => 'exited',childExitHint:() => stderrExitHint('secret-token /private/path EROFS'),request:async () => ({status:0})}),e => e.code === 'host-process-exited-hint-erofs' && e.status === 'infrastructure-failure' && !e.message.includes('secret-token'));
   await assert.rejects(probeMobile({token:'secret-token',version:'1.0.0',pid:9,delay:async () => {},childState:() => 'exited',childExitHint:() => 'secret-token /private/path',request:async () => ({status:0})}),e => e.code === 'host-process-exited' && !e.message.includes('secret-token'));
+});
+
+test('fast-exit without a readable /proc baseline keeps an already captured stderr hint', async () => {
+  // A host can exit before the monitor's baseline stat; the process identity is
+  // then unprovable, but a bounded stderr hint is still real evidence from this
+  // child and must not be replaced by a state-inconclusive code.
+  const child = new EventEmitter(); child.pid = 424242; child.exitCode = null; child.signalCode = null;
+  const gone = () => { const error = Error('ENOENT'); error.code = 'ENOENT'; throw error; };
+  const monitor = createLinuxChildMonitor(child,() => readLinuxProcessStat(424242,gone,'linux'));
+  assert.equal(monitor(),'exited');
+  const audit = 'dsh: startup failed: 3 required plugins did not activate\n';
+  await assert.rejects(probeMobile({token:'secret-token',version:'1.0.0',pid:424242,delay:async () => {},childState:monitor,childExitHint:() => stderrExitHint(`secret-token /private/path\n${audit}`),request:async () => ({status:0})}),e => e.code === 'host-process-exited-hint-startup-audit' && e.status === 'infrastructure-failure' && !e.message.includes('secret-token'));
+  // A genuinely unreadable /proc entry is unprovable and must still fail closed.
+  const unreadableChild = new EventEmitter(); unreadableChild.pid = 424243; unreadableChild.exitCode = null; unreadableChild.signalCode = null;
+  const unreadable = createLinuxChildMonitor(unreadableChild,() => ({state:'unknown',startTime:null}));
+  assert.equal(unreadable(),'proc-unknown');
+  await assert.rejects(probeMobile({token:'secret-token',version:'1.0.0',pid:424243,delay:async () => {},childState:unreadable,childExitHint:() => stderrExitHint('secret-token /private/path'),request:async () => ({status:0})}),e => e.code === 'host-process-state-inconclusive' && e.status === 'infrastructure-failure');
 });
 
 test('exit observer emits only coarse codes after a consistent exit event', () => {

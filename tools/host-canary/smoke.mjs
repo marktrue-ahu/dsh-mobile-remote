@@ -637,7 +637,12 @@ export function readLinuxProcessStat(pid, reader = readFileSync, platform = proc
     if (fields.length < 20 || !/^[A-Za-z]$/.test(fields[0]) || !/^\d+$/.test(fields[19])) return unknown;
     const state = fields[0] === 'R' || fields[0] === 'S' ? 'running' : ['Z','X','x'].includes(fields[0]) ? 'exited' : 'unknown';
     return {state,startTime:fields[19]};
-  } catch { return unknown; }
+  } catch (error) {
+    // A definitely missing entry means the process is gone; an unreadable or
+    // transient /proc failure is only unknown and must stay inconclusive.
+    if (error?.code === 'ENOENT' || error?.code === 'ESRCH') return {state:'exited',startTime:null,missing:true};
+    return unknown;
+  }
 }
 export function createLinuxChildMonitor(child, readStat = readLinuxProcessStat) {
   let spawnFailed = false, exited = false;
@@ -650,10 +655,16 @@ export function createLinuxChildMonitor(child, readStat = readLinuxProcessStat) 
     if (spawnFailed) return 'spawn-error';
     if (exited || child.exitCode != null || child.signalCode != null) return 'exited';
     if (!Number.isSafeInteger(pid) || pid <= 0) return 'starting';
+    // The process disappeared before a baseline identity could be read. That is
+    // an exit, not an unreadable state: stderr evidence from this child stays
+    // usable while the exact identity remains unproven.
+    if (baseline?.missing) return 'exited';
     if (!baseline || baseline.state === 'unknown' || !/^\d+$/.test(baseline.startTime ?? '')) return 'proc-unknown';
     let current;
     try { current = readStat(pid); } catch { return 'proc-unknown'; }
-    if (!current || current.startTime !== baseline.startTime) return 'proc-unknown';
+    if (!current) return 'proc-unknown';
+    if (current.missing) return 'exited';
+    if (current.startTime !== baseline.startTime) return 'proc-unknown';
     if (current.state === 'exited') return 'exited';
     return current.state === 'running' ? 'running' : 'proc-unknown';
   };
