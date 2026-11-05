@@ -626,6 +626,20 @@ test('profile uses shipped bundles and explicitly safe mobile settings', () => {
   assert.deepEqual(patch[0].insert[0], {id:'mobile-remote',name:'@marktrue/dsh-mobile-remote',config:{path:'/m',authToken:'test-token',pluginUpdateManifest:'off',lanBridge:{enabled:false},pushUrls:[]}});
 });
 
+test('runtime worker restores the bundle declaration that npm install overwrites', () => {
+  // Regression: `npm install --prefix <profile>` rewrites the profile manifest
+  // into a dependency list and drops dsh.profile.bundles. The host then loads no
+  // bundle, webServer never appears, and this plugin stays pending until the
+  // process exits reporting only "1 entry did not activate" -- which the canary
+  // surfaced as a generic host startup failure.
+  const script = makeRuntimeWorker();
+  assert.match(script,/installed\.dsh = desired\.dsh/);
+  assert.match(script,/readFile\('\/profile\/dsh\/profiles\/canary\/package\.json'/);
+  assert.match(script,/profileFiles\(''\)\.manifest/);
+  const checked = spawnSync(process.execPath,['--check','--input-type=module'],{input:script,encoding:'utf8'});
+  assert.equal(checked.status,0,checked.stderr);
+});
+
 test('mocked canary reports a successful isolated run', async () => {
   const calls = [];
   const checks = ['auth','bootstrap','diagnostics',...['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer'].map(name => `host-capability:${name}:ok`)];

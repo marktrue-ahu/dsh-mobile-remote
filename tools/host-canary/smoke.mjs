@@ -900,7 +900,18 @@ let child, stderrCollector, childExitObserver;
 try {
   const base = '/tmp/canary', target = base + '/dsh/profiles/canary';
   for (const dir of ['home','dsh/profiles/canary','xdg-config','xdg-cache','xdg-data','xdg-state','xdg-runtime']) await mkdir(base + '/' + dir,{recursive:true,mode:0o700});
-  await copyFile('/profile/dsh/profiles/canary/package.json',target + '/package.json');
+  // npm install --prefix rewrites this manifest into a plain dependency list and
+  // drops dsh.profile.bundles. Without the bundles the base and web bundles never
+  // load, so webServer never exists and this plugin stays pending forever: the
+  // host then exits with only "1 entry did not activate". Restore the bundle
+  // declaration the canary actually asked for before booting.
+  {
+    const installed = JSON.parse(await readFile('/profile/dsh/profiles/canary/package.json','utf8'));
+    const desired = profileFiles('').manifest;
+    if (!installed || typeof installed !== 'object' || Array.isArray(installed)) fail('probe-input-invalid');
+    installed.dsh = desired.dsh;
+    await writeFile(target + '/package.json',JSON.stringify(installed),{flag:'wx',mode:0o600});
+  }
   await symlink('/profile/dsh/profiles/canary/node_modules',target + '/node_modules');
   const token = randomBytes(32).toString('hex');
   const {patch} = profileFiles(token);
