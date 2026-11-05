@@ -273,7 +273,10 @@ test('mock Docker lifecycle requires verified cleanup before success', async () 
   removed = false;
   let finishStart;
   const lateStart = {...driver,start:async () => new Promise(resolve => { finishStart = resolve; })};
-  await assert.rejects(managedDocker(lateStart,options,5),e => e.code === 'docker-cleanup-unconfirmed');
+  // Budget must cover create/inspect so start() is actually reached, then the
+  // hanging start still exceeds it. 5ms made create/inspect consume the whole
+  // budget under load, so start() never ran and this asserted the wrong path.
+  await assert.rejects(managedDocker(lateStart,options,50),e => e.code === 'docker-cleanup-unconfirmed');
   assert.equal(removed,true); finishStart();
   removed = false;
   await assert.rejects(managedDocker({...driver,remove:async () => { throw Error('denied'); }},options,100), e => e.code === 'docker-cleanup-unconfirmed');

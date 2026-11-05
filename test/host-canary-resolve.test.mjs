@@ -23,6 +23,25 @@ test('每周固定两版本，加本轮 latest；若重合保留两个来源并�
   assert.equal(newer.hosts.length, 3);
   assert.deepEqual(newer.hosts[2], { hostVersion: '0.2.2-alpha.2', sources: ['latest'], isCandidate: true });
 });
+test('真实 registry 快照形状（2026-11-05 观测）解析为预期矩阵', () => {
+  // dist-tags observed from registry.npmjs.org for @deepseek-ai/dsh on
+  // 2026-11-05. They move over time, so this pins the *shape* the resolver must
+  // handle, not the versions themselves.
+  const live = { latest: '0.2.1-rc.5', next: '0.2.2-rc.1', alpha: '0.2.2-alpha.3' };
+  assert.deepEqual(resolveMatrix(live, 'daily'), {
+    schema: 1, mode: 'daily', hosts: [
+      { hostVersion: '0.2.1-rc.5', sources: ['latest'], isCandidate: true },
+      { hostVersion: '0.2.2-rc.1', sources: ['next'], isCandidate: true },
+      { hostVersion: '0.2.2-alpha.3', sources: ['alpha'], isCandidate: true },
+    ],
+  });
+  // Weekly keeps both fixed targets and folds the live latest into them without
+  // producing a duplicate run for the same exact version.
+  assert.deepEqual(resolveMatrix(live, 'weekly').hosts, [
+    { hostVersion: '0.2.0-rc.2', sources: ['fixed'], isCandidate: false },
+    { hostVersion: '0.2.1-rc.5', sources: ['fixed', 'latest'], isCandidate: true },
+  ]);
+});
 test('只接受明确版本，不接受range、tag、命令或前导零', () => {
   for (const value of ['0.2.1-rc.5', '1.0.0', '0.2.2-alpha.12']) assert.equal(isExactVersion(value), true);
   for (const value of ['latest', '^0.2.0', '0.2.0;touch /tmp/a', '0.2.0$(id)', '01.2.3', '0.2.1-rc.01', '../2.0.0', '', null, 'x'.repeat(101)]) assert.equal(isExactVersion(value), false, String(value));

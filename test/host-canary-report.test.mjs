@@ -20,6 +20,25 @@ function mock(pages = [[]], created = { number: 42 }, commentPages = [[]]) {
 const opts = m => ({ token: 'test-token', fetchImpl: m.fetchImpl });
 const marker = '<!-- host-canary:compatibility:0.2.1-rc.1+build.7 -->';
 
+test('repeated identical state performs zero writes; a real regression writes once', async () => {
+  // Guards the two behaviours that matter for not spamming an issue: repeating
+  // the same verdict is read-only, and a genuine new verdict appends exactly one
+  // comment instead of rewriting history.
+  const candidate = `${marker}\n<!-- host-canary-state:candidate -->\n\nThe candidate passed the automated check. Manual confirmation is required; this is not a compatibility guarantee.\n`;
+  const existing = { number: 8, state: 'open', body: candidate };
+  const same = mock([[existing]]);
+  assert.deepEqual(await report(sample(), opts(same)), { status: 'unchanged', issue: 8 });
+  assert.ok(same.calls.every(c => c.method === 'GET'), 'no write for an unchanged verdict');
+
+  const regression = mock([[existing]]);
+  assert.deepEqual(await report(sample(['compatibility-failure', 'compatibility-failure']), opts(regression)),
+    { status: 'updated', issue: 8 });
+  assert.deepEqual(regression.calls.filter(c => c.method !== 'GET').map(c => c.method), ['POST']);
+  const posted = JSON.parse(regression.calls.find(c => c.method === 'POST').body);
+  assert.match(posted.body, /host-canary-state:compatibility/);
+  assert.doesNotMatch(posted.body, /test-token/);
+});
+
 test('rejects a matching issue owned by an untrusted account', async () => {
   const m = mock([[{ number: 8, state: 'open', body: marker, user: { id: 1, login: 'attacker', type: 'User' } }]]);
   await assert.rejects(report(sample(), opts(m)), /issue lookup/);
