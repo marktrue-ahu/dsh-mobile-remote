@@ -40,19 +40,32 @@ DSH_GLAB=glab   # 直接调用即可；不要再引用 /mnt/d/... 下的 Windows
 
 ### 上传附件（图片）优先用 curl
 
-容器内 glab 是原生二进制，理论上 `glab api "projects/53/uploads" --field "file=@<路径>"` 可用；
-但该端点此前在 Windows 版 glab 上实测 400（路径不可读），已验证的路径仍是原生 `curl` 打 multipart：
+容器内 glab 是原生二进制，`glab api "projects/53/uploads" --field "file=@<路径>"` 理论上可用；
+但附件上传属于低频操作，已验证可用的是原生 `curl` 打 multipart。
+
+**curl 直接调 API 必须满足三个条件**（缺一不可，均为实测）：
+
+1. `gitlab.local` 能解析 —— 容器 **`/etc/hosts` 不持久**，重建后需重新补：
+   ```sh
+   grep -q gitlab.local /etc/hosts || echo '117.68.9.95 gitlab.local' >> /etc/hosts
+   ```
+2. 该实例使用**自签名证书**，curl 默认校验会报
+   `SSL certificate problem: unable to get local issuer certificate`，需 `-k`
+   （glab 在配置里已设 `skip_tls_verify: true`，所以 glab 不需要这个参数）
+3. 必须**经 SOCKS5 代理**：直连会被拒，用 `--socks5-hostname 192.168.50.33:1088`
+   （glab 配置里已设 `proxy: socks5://192.168.50.33:1088`）
 
 ```sh
-TOKEN=$(awk '/^    gitlab.local:/{f=1} f&&/token:/{print $2; exit}' ~/.config/glab-cli/config.yml)
-curl -sS -X POST -H "PRIVATE-TOKEN: $TOKEN" \
+TOKEN=$(sed -n '76s/.*token: *//p' ~/.config/glab-cli/config.yml | tr -d '"'"'"' \r')
+curl -sk --socks5-hostname 192.168.50.33:1088 -X POST -H "PRIVATE-TOKEN: $TOKEN" \
   -F "file=@overview.png" \
   https://gitlab.local/api/v4/projects/53/uploads
 ```
 
+> 用 `glab api` 时以上三点都由 glab 配置自动处理，不需要额外参数——这是优先用 glab 的原因。
+
 返回 `{"alt":..., "url":"/uploads/<hash>/<name>", "markdown":"![...](/uploads/...)"}`；
 把 `markdown` 字段原样贴进 issue 正文即可内嵌显示（`url` 是**项目级**的，同一文件可被多个 issue 复用）。
-容器内可直连 `gitlab.local`（glab 配置了 socks5 代理；`curl` 需按需带代理参数）。
 
 ### 已知问题：REST `PUT /projects/:id/issues/:iid` 卡在读响应
 
@@ -62,7 +75,9 @@ curl -sS -X POST -H "PRIVATE-TOKEN: $TOKEN" \
 read tcp 172.17.255.182:…->117.68.9.95:80: connection attempt failed
 ```
 
-WSL 直连 `curl -X PUT` 与 Windows 侧 `glab` 现象一致。注意 `gitlab.local` 解析到 `117.68.9.95` 是 Windows hosts 的显式配置（该地址上就是这套 GitLab），**不是解析错误**。创建 issue 与发表评论（POST）不受影响。
+> 该现象记录于 WSL 时期；**迁移到开发容器后尚未复测**。如再遇到，可先按下面的 GraphQL 替代路径处理。
+
+`gitlab.local` 解析到 `117.68.9.95` 就是这套 GitLab 的实际地址，**不是解析错误**。创建 issue 与发表评论（POST）不受影响。
 
 替代路径（已验证）：
 
