@@ -40,8 +40,8 @@ for c in git python3 flock; do need "$c"; done
 
 gitq() { git --no-optional-locks "$@"; }
 
-# ── 环境特定配置（代理）──
-# 解析与应用代理在 tools/proxy-env.sh（issue #57：唯一实现，便于自测直接断言）。
+# ── 环境特定配置（代理 + 工具链路径）──
+# 解析与应用在 tools/proxy-env.sh（issue #57/#51：唯一实现，便于自测直接断言）。
 # 本脚本用绝对路径 source 它；NO_PROXY 会自动补本机回环（flutter_tester / Gradle / Node
 # 的本机回连不能走代理，否则 verify 门禁会永久卡死）。
 TOOLS_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
@@ -728,14 +728,8 @@ cmd_init() {
   # ⚠ 关键：**必须跟随 develop 的 pubspec.lock 记录的源**，不能无条件强制镜像。
   # 若用与 lock 不同的镜像跑 pub get，pub 会重写 lock 的每个 url（实测 143 行，还夹带包版本升级），
   # 直接污染 develop PR。缓存里两种源都有，跟随即可。
-  export PUB_CACHE="${PUB_CACHE:-$REAL_HOME/.pub-cache}"
-  export PATH="/home/mark/sdk/flutter/bin:/home/mark/sdk/jdk17/bin:$PATH"
-  export JAVA_HOME="${JAVA_HOME:-/home/mark/sdk/jdk17}"
-  export ANDROID_HOME="${ANDROID_HOME:-/home/mark/sdk/android}"
-  export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-  export GRADLE_USER_HOME="${GRADLE_USER_HOME:-$REAL_HOME/.gradle}"
-  # 出网代理来自项目根 .env（环境特定，不进版本库）；缺失或未启用则不设代理。
-  apply_proxy_env "$MAIN_DIR/.env"
+  # 工具链路径来自项目根 .env（环境特定，不进版本库），缺省回退内置约定。
+  apply_toolchain_env "$MAIN_DIR/.env"
   local lock="$wt/dsh-mobile-app/pubspec.lock"
   if [ -f "$lock" ]; then
     if grep -q 'pub\.dev' "$lock"; then
@@ -759,7 +753,7 @@ cmd_init() {
 
   info "3/3 补齐 Gradle wrapper（被 gitignore，新树不会自带）"
   local wrapper_dir="$wt/dsh-mobile-app/android/gradle/wrapper"
-  local sdk_wrapper="/home/mark/sdk/flutter/bin/cache/artifacts/gradle_wrapper"
+  local sdk_wrapper="${DSH_GRADLE_WRAPPER:-$DSH_FLUTTER_BIN/cache/artifacts/gradle_wrapper}"
   local main_wrapper="$MAIN_DIR/dsh-mobile-app/android/gradle/wrapper/gradle-wrapper.jar"
   if [ ! -x "$wt/dsh-mobile-app/android/gradlew" ]; then
     [ -f "$sdk_wrapper/gradlew" ] || die "缺少 gradlew 且 SDK 缓存里没有：$sdk_wrapper"
@@ -840,14 +834,7 @@ run_gates() { # run_gates <工作树> <报告临时文件> <required|synthetic>
   if [ -f "$lock" ] && grep -q 'pub\.dev' "$lock"; then export PUB_HOSTED_URL="https://pub.dev"
   else export PUB_HOSTED_URL="${PUB_HOSTED_URL:-https://pub.flutter-io.cn}"; fi
   export FLUTTER_STORAGE_BASE_URL="${FLUTTER_STORAGE_BASE_URL:-https://storage.flutter-io.cn}"
-  export PUB_CACHE="$REAL_HOME/.pub-cache"
-  export PATH="/home/mark/sdk/flutter/bin:/home/mark/sdk/jdk17/bin:$PATH"
-  export JAVA_HOME="${JAVA_HOME:-/home/mark/sdk/jdk17}"
-  export ANDROID_HOME="${ANDROID_HOME:-/home/mark/sdk/android}"
-  export ANDROID_SDK_ROOT="$ANDROID_HOME"
-  export GRADLE_USER_HOME="$REAL_HOME/.gradle"
-  # 出网代理来自项目根 .env（环境特定，不进版本库）；缺失或未启用则不设代理。
-  apply_proxy_env "$MAIN_DIR/.env"
+  apply_toolchain_env "$MAIN_DIR/.env"
 
   report_printf() { # printf-style report writer; every I/O error is fatal to verification evidence
     local fmt="$1"; shift
@@ -1599,12 +1586,7 @@ cmd_verify_baseline() {
   local rc=0 setup_rc=0 report_tmp final_report gate_out
   report_tmp="$(mktemp "$REPORTS_DIR/.$issue-baseline.XXXXXX.tmp")" || { gitq worktree remove "$base_wt" >/dev/null 2>&1 || true; die "无法创建 baseline 报告临时文件"; }
   if [ "$synthetic" != "1" ]; then
-    export PUB_CACHE="${PUB_CACHE:-$REAL_HOME/.pub-cache}"
-    export PATH="/home/mark/sdk/flutter/bin:/home/mark/sdk/jdk17/bin:$PATH"
-    export JAVA_HOME="${JAVA_HOME:-/home/mark/sdk/jdk17}"
-    export ANDROID_HOME="${ANDROID_HOME:-/home/mark/sdk/android}"
-    export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-    export GRADLE_USER_HOME="${GRADLE_USER_HOME:-$REAL_HOME/.gradle}"
+    apply_toolchain_env "$MAIN_DIR/.env"
     export FLUTTER_STORAGE_BASE_URL="${FLUTTER_STORAGE_BASE_URL:-https://storage.flutter-io.cn}"
     local lock="$base_wt/dsh-mobile-app/pubspec.lock"
     if grep -q 'pub\.dev' "$lock"; then export PUB_HOSTED_URL=https://pub.dev
@@ -1612,7 +1594,7 @@ cmd_verify_baseline() {
     (exec 7>&-; cd "$base_wt" && npm install --no-audit --no-fund --no-package-lock --loglevel=error) || setup_rc=1
     [ "$setup_rc" -ne 0 ] || (exec 7>&-; cd "$base_wt/dsh-mobile-app" && flutter pub get >/dev/null) || setup_rc=1
     local wrapper_dir="$base_wt/dsh-mobile-app/android/gradle/wrapper"
-    local sdk_wrapper="/home/mark/sdk/flutter/bin/cache/artifacts/gradle_wrapper"
+    local sdk_wrapper="${DSH_GRADLE_WRAPPER:-$DSH_FLUTTER_BIN/cache/artifacts/gradle_wrapper}"
     mkdir -p "$wrapper_dir"
     if [ -x "$sdk_wrapper/gradlew" ]; then cp -p "$sdk_wrapper/gradlew" "$base_wt/dsh-mobile-app/android/gradlew" && chmod +x "$base_wt/dsh-mobile-app/android/gradlew" || setup_rc=1; else setup_rc=1; fi
     if [ -f "$sdk_wrapper/gradle/wrapper/gradle-wrapper.jar" ]; then cp -p "$sdk_wrapper/gradle/wrapper/gradle-wrapper.jar" "$wrapper_dir/" || setup_rc=1; else setup_rc=1; fi

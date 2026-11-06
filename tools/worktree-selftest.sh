@@ -122,6 +122,30 @@ run "DSH_PROXY_ENABLED=0 时完全不设代理" 0 \
   '. "$1"; apply_proxy_env "$2"; test -z "${HTTP_PROXY:-}" && test -z "${NO_PROXY:-}" && test -z "${ALL_PROXY:-}"' \
   _ "$PROXY_HELPER" "$TMP/proxy/disabled.env"
 
+section "工具链路径集中到 .env（issue #51）"
+printf 'DSH_FLUTTER_SDK=/opt/flutter\nDSH_JAVA_HOME=/opt/jdk\nDSH_ANDROID_HOME=/opt/android\nDSH_PUB_CACHE=/opt/pub\nDSH_GRADLE_USER_HOME=/opt/gradle\n' > "$TMP/proxy/toolchain.env"
+run "未配置工具链时回退脚本内置约定值" 0 \
+  env -i PATH="$PATH" HOME="$TMP/proxy" bash -c \
+  '. "$1"; apply_toolchain_env "$2"; [ "$FLUTTER_ROOT" = "/home/mark/sdk/flutter" ] && [ "$JAVA_HOME" = "/home/mark/sdk/jdk17" ] && [ "$ANDROID_HOME" = "/home/mark/sdk/android" ] && [ "$ANDROID_SDK_ROOT" = "/home/mark/sdk/android" ] && [ "$PUB_CACHE" = "$HOME/.pub-cache" ] && [ "$GRADLE_USER_HOME" = "$HOME/.gradle" ]' \
+  _ "$PROXY_HELPER" "$TMP/proxy/missing.env"
+run ".env 覆盖 SDK 路径且 ANDROID_SDK_ROOT 跟随" 0 \
+  env -i PATH="$PATH" HOME="$TMP/proxy" bash -c \
+  '. "$1"; apply_toolchain_env "$2"; [ "$FLUTTER_ROOT" = "/opt/flutter" ] && [ "$JAVA_HOME" = "/opt/jdk" ] && [ "$ANDROID_HOME" = "/opt/android" ] && [ "$ANDROID_SDK_ROOT" = "/opt/android" ] && [ "$PUB_CACHE" = "/opt/pub" ] && [ "$GRADLE_USER_HOME" = "/opt/gradle" ] && [ "$DSH_GRADLE_WRAPPER" = "/opt/flutter/bin/cache/artifacts/gradle_wrapper" ]' \
+  _ "$PROXY_HELPER" "$TMP/proxy/toolchain.env"
+run "重复 apply 不累积 PATH 且代理同源自 .env" 0 \
+  env -i PATH="$PATH" HOME="$TMP/proxy" bash -c \
+  '. "$1"; apply_toolchain_env "$2"; apply_toolchain_env "$2"; p="$PATH"; for d in /opt/flutter/bin /opt/jdk/bin /opt/android/platform-tools; do n=$(printf "%s" "$p" | tr ":" "\n" | grep -cxF -- "$d"); [ "$n" = 1 ] || exit 1; done; [ -z "${HTTP_PROXY:-}" ]' \
+  _ "$PROXY_HELPER" "$TMP/proxy/toolchain.env"
+run "worktree.sh 不再内联机器特定 SDK 路径" 0 \
+  bash -c 'test "$(grep -c "/home/mark/sdk/" "$1")" = 0' _ "$WT"
+if [ "$(id -u)" != "0" ]; then
+  : > "$TMP/proxy/unreadable.env"; chmod 000 "$TMP/proxy/unreadable.env"
+  run_fail_with "不可读 .env 时 fail-closed 并提示权限" "不可读" \
+    env -i PATH="$PATH" HOME="$TMP/proxy" bash -c \
+    '. "$1"; apply_toolchain_env "$2"' _ "$PROXY_HELPER" "$TMP/proxy/unreadable.env"
+  chmod 600 "$TMP/proxy/unreadable.env"
+fi
+
 section "create 输入边界与并发登记"
 INJECTION_MARKER="$TMP/python-injection-ran"
 INJECTED_WRITER="\", \"evil\": __import__(\"os\").system(\"touch $INJECTION_MARKER\"), \"z\": \""
