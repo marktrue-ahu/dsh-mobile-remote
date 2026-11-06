@@ -10,6 +10,13 @@ const STATUSES = new Set(['passed', 'compatibility-failure', 'infrastructure-fai
 const SOURCES = new Set(['fixed', 'latest', 'next', 'alpha']);
 const CAPABILITIES = Object.freeze(['jobs.callerShape', 'jobs.eventsApi', 'settings.read', 'gateway.wireStream', 'permissionPresets.apply', 'permissionPresets.catalog', 'workspaceRegistry.stateWrite', 'gateway.eventsPeer']);
 const PASS_CHECKS = Object.freeze(['auth', 'bootstrap', 'diagnostics', ...CAPABILITIES.map(name => `host-capability:${name}:ok`)]);
+// Capabilities that only become 'ok' after a real browser GUI session connects.
+// A passing canary still reports them, and may report them as missing/drift,
+// because it never opens a browser; those paths need human device verification.
+const SESSION_GATED = Object.freeze(['workspaceRegistry.stateWrite', 'gateway.eventsPeer']);
+const isSessionGatedIndex = i => i >= 3 && SESSION_GATED.includes(CAPABILITIES[i - 3]);
+const isPassingChecks = checks => Array.isArray(checks) && checks.length === PASS_CHECKS.length &&
+  checks.every((value, i) => value === PASS_CHECKS[i] || (isSessionGatedIndex(i) && ['missing', 'drift'].some(state => value === `host-capability:${CAPABILITIES[i - 3]}:${state}`)));
 const CHECKS = new Set([...['auth', 'bootstrap', 'diagnostics'], ...CAPABILITIES.flatMap(name => ['ok', 'missing', 'drift'].map(state => `host-capability:${name}:${state}`))]);
 const STAGES = new Set(['validate', 'sandbox', 'prepare', 'install', 'runtime', 'complete', 'cleanup']);
 const ERROR_CODES = new Set(['invalid-input', 'incomplete-checks', 'interrupted', 'process-start-failed', 'plugin-snapshot-invalid', 'source-identity-mismatch', 'installed-identity-mismatch', 'docker-plan-invalid', 'docker-operation-failed', 'docker-identity-invalid', 'docker-image-unverified', 'docker-output-invalid', 'docker-security-mismatch', 'docker-operation-timeout', 'docker-execution-failed', 'docker-cleanup-unconfirmed', 'docker-cleanup-unauthorized', 'runner-identity-mismatch', 'install-failed', 'install-timeout', 'invalid-checks', 'compatibility-check-failed', 'host-start-inconclusive', 'host-process-spawn-inconclusive', 'host-process-spawn-failed', 'host-process-exited', 'host-process-exited-zero', 'host-process-exited-nonzero', 'host-process-exited-signal', 'host-process-exited-hint-eacces', 'host-process-exited-hint-erofs', 'host-process-exited-hint-enoent', 'host-process-exited-hint-enospc', 'host-process-exited-hint-user-lookup', 'host-process-exited-hint-module-not-found', 'host-process-exited-hint-native-load', 'host-process-exited-hint-startup-audit', 'host-process-state-inconclusive', 'host-ready-timeout', 'host-auth-response-inconclusive', 'host-identity-inconclusive', 'host-bundle-unavailable', 'response-inconclusive', 'host-capabilities-inconclusive', 'probe-input-invalid', 'worker-failed', 'source-archive-failed', 'docker-mount-invalid', 'cleanup-failed', 'runner-not-ephemeral', 'runtime-sandbox-unavailable', 'unexpected-error']);
@@ -50,7 +57,7 @@ function parseArtifact(root, hostVersion, name, pluginSha) {
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 16384) return null;
     const data = JSON.parse(readFileSync(file, 'utf8'));
     if (!data || typeof data !== 'object' || Array.isArray(data) || data.schema !== 1 || data.hostVersion !== hostVersion || data.pluginSha !== pluginSha || !STATUSES.has(data.status) || !Array.isArray(data.checks) || data.checks.length > 11 || new Set(data.checks).size !== data.checks.length || data.checks.some(value => !CHECKS.has(value)) || !validCheckPrefix(data.checks)) return null;
-    if (data.status === 'passed' && (data.stage !== 'complete' || data.errorCode !== null || JSON.stringify(data.checks) !== JSON.stringify(PASS_CHECKS))) return null;
+    if (data.status === 'passed' && (data.stage !== 'complete' || data.errorCode !== null || !isPassingChecks(data.checks))) return null;
     if (data.status === 'compatibility-failure' && (data.stage !== 'runtime' || data.errorCode !== 'compatibility-check-failed' || data.checks.length < 1 || data.checks.length >= PASS_CHECKS.length)) return null;
     return { status: data.status, stage: STAGES.has(data.stage) ? data.stage : 'unknown', errorCode: ERROR_CODES.has(data.errorCode) ? data.errorCode : null, checks: data.checks };
   } catch { return null; }

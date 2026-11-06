@@ -29,8 +29,17 @@ export async function runCanary(options, adapter) {
     result.stage = 'prepare'; root = await adapter.prepare(options);
     result.stage = 'install'; await adapter.install(root, options);
     result.stage = 'runtime'; result.checks = await adapter.isolatedRun(root, options);
-    const expected = ['auth','bootstrap','diagnostics',...capabilityNames.map(name => `host-capability:${name}:ok`)];
-    if (JSON.stringify(result.checks) !== JSON.stringify(expected)) fail('incomplete-checks');
+    // Shape must be exactly the 3 core checks plus every capability in fixed
+    // order; session-gated capabilities are allowed to be non-ok (reported, not judged).
+    const checksOk = Array.isArray(result.checks) && result.checks.length === 3 + capabilityNames.length &&
+      ['auth','bootstrap','diagnostics'].every((name,i) => result.checks[i] === name) &&
+      capabilityNames.every((name,i) => {
+        const state = result.checks[3+i];
+        if (!['ok','missing','drift'].some(s => state === `host-capability:${name}:${s}`)) return false;
+        if (state !== `host-capability:${name}:ok` && !sessionGatedCapabilityNames.includes(name)) return false;
+        return true;
+      });
+    if (!checksOk) fail('incomplete-checks');
     result.stage = 'complete'; result.status = 'passed';
   } catch (error) {
     result.status = error instanceof CanaryError ? error.status : 'infrastructure-failure';
@@ -285,7 +294,10 @@ export function parseWorkerOutput(phase, exitCode, data) {
     if (exitCode === 2 && exactKeys(data,['ok','errorCode']) && data.ok === false && data.errorCode === 'install-failed') return {exitCode,ok:false,checks:[],errorCode:'install-failed'};
     fail('docker-output-invalid');
   }
-  if (exitCode === 0 && exactKeys(data,['ok','checks']) && data.ok === true && validWorkerChecks(data.checks,true) && data.checks.slice(3).every(value => value.endsWith(':ok'))) return {exitCode,ok:true,checks:data.checks,errorCode:null};
+  // A successful run may still report a session-gated capability as missing/drift:
+  // the canary never opens a browser, so those stay unavailable by construction.
+  const nonGatedAllOk = data.checks.slice(3).every((value,i) => value.endsWith(':ok') || sessionGatedCapabilityNames.includes(capabilityNames[i]));
+  if (exitCode === 0 && exactKeys(data,['ok','checks']) && data.ok === true && validWorkerChecks(data.checks,true) && nonGatedAllOk) return {exitCode,ok:true,checks:data.checks,errorCode:null};
   if (!exactKeys(data,['ok','errorCode','checks']) || data.ok !== false || typeof data.errorCode !== 'string' || !runtimeWorkerErrors.has(data.errorCode) || !validWorkerChecks(data.checks)) fail('docker-output-invalid');
   if ((data.errorCode === 'compatibility-check-failed' ? 1 : 2) !== exitCode) fail('docker-output-invalid');
   if (data.errorCode === 'compatibility-check-failed' && (data.checks.length < 1 || data.checks.length >= 3 + capabilityNames.length)) fail('docker-output-invalid');
@@ -594,6 +606,14 @@ const adapter = {
   async isolatedRun() { fail('runtime-sandbox-unavailable'); },
   async cleanup() { fail('runtime-sandbox-unavailable'); },
 };
+// These two become 'ok' only after a real browser GUI session has connected: the
+// workspace registry and the in-process owner Peer are created lazily for a user
+// session. This canary deliberately never opens a browser (no model account, no
+// GUI, isolated container), so they stay missing/drift here by construction.
+// They are still reported for diagnosis, but they must not decide the verdict:
+// compatibility of those paths needs a human on a real device, which is exactly
+// the manual confirmation step the canary asks for.
+const sessionGatedCapabilityNames = Object.freeze(['workspaceRegistry.stateWrite','gateway.eventsPeer']);
 const capabilityNames = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer'];
 export function evaluateResponses(unauth, bootstrap, diagnostics, version, pid, repeats = {}) {
   const checks = [];
@@ -619,7 +639,14 @@ export function evaluateResponses(unauth, bootstrap, diagnostics, version, pid, 
   // Missing or drifting services can be caused by an incomplete isolated host.
   // Until service loading is independently proven, this is inconclusive, not
   // evidence of a host/plugin protocol incompatibility.
-  if (checks.some(check => check.endsWith(':missing') || check.endsWith(':drift'))) throw new CanaryError('host-capabilities-inconclusive','infrastructure-failure',checks);
+  // Only capabilities that do not require a browser session may block the verdict.
+  // A session-gated capability is reported (so a human sees the truth) but is not
+  // evidence of incompatibility in an environment that never opens a GUI.
+  const blocking = checks.filter(check => {
+    const name = check.slice('host-capability:'.length).replace(/:(?:ok|missing|drift)$/,'');
+    return !sessionGatedCapabilityNames.includes(name);
+  });
+  if (blocking.some(check => check.endsWith(':missing') || check.endsWith(':drift'))) throw new CanaryError('host-capabilities-inconclusive','infrastructure-failure',checks);
   return checks;
 }
 // /proc is a point-in-time check, not an atomic socket/health guarantee.
@@ -893,6 +920,7 @@ import { randomBytes } from 'node:crypto';
 import { readFile, mkdir, copyFile, symlink, writeFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 const capabilityNames = ${JSON.stringify(capabilityNames)};
+const sessionGatedCapabilityNames = ${JSON.stringify(sessionGatedCapabilityNames)};
 ${CanaryError.toString()}
 const fail = ${fail.toString()};
 ${evaluateResponses.toString()}

@@ -232,7 +232,7 @@ test('Docker CLI driver validates output and never returns raw logs', async () =
     [2,{ok:false,errorCode:'compatibility-check-failed',checks:[]},'runtime'],
     [1,{ok:false,errorCode:'compatibility-check-failed',checks},'runtime'],
     [1,{ok:false,errorCode:'compatibility-check-failed',checks:[...checks.slice(0,-1),'host-capability:gateway.eventsPeer:missing']},'runtime'],
-    [0,{ok:true,checks:[...checks.slice(0,-1),'host-capability:gateway.eventsPeer:drift']},'runtime'],
+    [0,{ok:true,checks:[...checks.slice(0,-1),'host-capability:settings.read:drift']},'runtime'],
     [0,{ok:true,checks:[...checks.slice(0,-1),checks[3]]},'runtime'],
     [2,{ok:false,errorCode:'host-capabilities-inconclusive',checks},'runtime'],
     [2,{ok:false,errorCode:'host-capabilities-inconclusive',checks:checks.slice(0,3)},'runtime'],
@@ -726,6 +726,26 @@ test('a real 0.2.1-rc.5 payload shape satisfies the probed contract', () => {
     ['auth','bootstrap','diagnostics',...names.map(name => `host-capability:${name}:ok`)]);
 });
 
+test('browser-session-gated capabilities are reported but never decide the verdict', () => {
+  // These become 'ok' only after a real browser GUI session connects. The canary
+  // never opens a browser by design, so they stay missing/drift; judging them
+  // would make every run inconclusive regardless of real compatibility. Their
+  // compatibility is the human on-device verification the canary asks for.
+  const names = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer'];
+  const pid = 7;
+  const unauth = {status:401,body:{error:'auth-required'}};
+  const bootstrap = {status:200,body:{ok:true,auth:{enabled:true},plugin:{name:'dsh-mobile-remote',version:'1.0.0',pid},capabilities:{}}};
+  const diagnosticsWith = overrides => ({status:200,body:{ok:true,plugin:{name:'dsh-mobile-remote',version:'1.0.0'},runtime:{authEnabled:true,lanBridge:{listening:false}},services:{webServer:true},checks:{hostCapabilities:Object.fromEntries(names.map(n => [n, overrides[n] ?? 'ok']))}}});
+
+  const sessionOnly = evaluateResponses(unauth,bootstrap,diagnosticsWith({'workspaceRegistry.stateWrite':'missing','gateway.eventsPeer':'drift'}),'1.0.0',pid);
+  assert.equal(sessionOnly.length, 3 + names.length);
+  assert.ok(sessionOnly.includes('host-capability:workspaceRegistry.stateWrite:missing'));
+  assert.ok(sessionOnly.includes('host-capability:gateway.eventsPeer:drift'));
+
+  assert.throws(() => evaluateResponses(unauth,bootstrap,diagnosticsWith({'settings.read':'drift'}),'1.0.0',pid), e => e.code === 'host-capabilities-inconclusive');
+  assert.throws(() => evaluateResponses(unauth,bootstrap,diagnosticsWith({'gateway.wireStream':'missing'}),'1.0.0',pid), e => e.code === 'host-capabilities-inconclusive');
+});
+
 test('response contract checks identity, authentication, diagnostics and capability drift', () => {
   const names = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer'];
   const caps = Object.fromEntries(names.map(name => [name,'ok']));
@@ -756,7 +776,7 @@ test('probe waits through non-ready responses without visiting arbitrary endpoin
   assert.deepEqual(checks.slice(0,3),['auth','bootstrap','diagnostics']);
   assert.ok(seen.every(([path]) => ['/m/api/bootstrap','/m/api/diagnostics'].includes(path)));
   assert.ok(seen.slice(0,3).every(([,token]) => token === null));
-  const missing = structuredClone(diagnostics); missing.body.checks.hostCapabilities['gateway.eventsPeer'] = 'missing';
+  const missing = structuredClone(diagnostics); missing.body.checks.hostCapabilities['settings.read'] = 'missing';
   assert.equal(seen.filter(([,credential]) => credential === 'canary-invalid').length,2);
   assert.deepEqual(seen.filter(([,credential]) => credential === 'canary-invalid').map(([path]) => path),['/m/api/bootstrap','/m/api/diagnostics']);
   assert.deepEqual(seen.slice(3),[['/m/api/bootstrap','canary-invalid'],['/m/api/bootstrap','secret'],['/m/api/bootstrap','secret'],['/m/api/diagnostics',null],['/m/api/diagnostics','canary-invalid'],['/m/api/diagnostics','secret'],['/m/api/diagnostics','secret']]);
@@ -764,7 +784,7 @@ test('probe waits through non-ready responses without visiting arbitrary endpoin
   await assert.rejects(probeMobile({token:'secret',version:'1.0.0',pid:9,maxAttempts:2,delay:async () => {},request:async () => exposed.shift()}),e => e.code === 'host-auth-response-inconclusive' && e.status === 'infrastructure-failure');
   let retryResponses = [boot,boot,bootstrap,bootstrap,boot,boot,missing,missing,diagnostics,diagnostics], delays = 0;
   const recovered = await probeMobile({token:'secret',version:'1.0.0',pid:9,maxAttempts:2,maxDiagnosticAttempts:2,delay:async () => { delays++; },request:async () => retryResponses.shift()});
-  assert.equal(recovered.at(-1),'host-capability:gateway.eventsPeer:ok'); assert.equal(delays,1);
+  assert.ok(recovered.includes('host-capability:settings.read:ok'), 'recovered capability reported ok'); assert.equal(delays,1);
   retryResponses = [boot,boot,bootstrap,bootstrap,boot,boot,missing,missing,missing,missing]; delays = 0;
   await assert.rejects(probeMobile({token:'secret',version:'1.0.0',pid:9,maxAttempts:2,maxDiagnosticAttempts:2,delay:async () => { delays++; },request:async () => retryResponses.shift()}),e => e.code === 'host-capabilities-inconclusive' && e.status === 'infrastructure-failure');
   assert.equal(delays,1);
