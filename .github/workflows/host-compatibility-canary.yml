@@ -117,16 +117,24 @@ jobs:
           HOST_VERSION: ${{ matrix.hostVersion }}
           RELEASE_SHA: ${{ github.sha }}
         run: |
+          # GitHub 对 `shell: bash` 默认加 `-e`，首轮非零会立刻终止脚本，
+          # 导致 `first=$?` 与第二轮都不可达（独立重试失效）。这里显式关闭 errexit，
+          # 由脚本自己捕获每轮退出码并决定是否重试。
+          set +e
           set -u
           mkdir -p "$RUNNER_TEMP/canary-results"
           # 不上传或输出被测宿主的原始日志；smoke 负责超时、脱敏及只清理自己的进程。
           node tools/host-canary/smoke.mjs --host-version "$HOST_VERSION" --plugin-root "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/canary-results/first.json" > /dev/null 2>&1
           first=$?
           if [ "$first" -ne 0 ]; then
-            node tools/host-canary/smoke.mjs --host-version "$HOST_VERSION" --plugin-root "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/canary-results/second.json" > /dev/null 2>&1 || true
+            node tools/host-canary/smoke.mjs --host-version "$HOST_VERSION" --plugin-root "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/canary-results/second.json" > /dev/null 2>&1
+            second=$?
+          else
+            second='not-attempted'
           fi
           # 后续报告 job 校验 JSON 与身份；缺失/畸形结果归类为基础设施故障。
-          printf 'Attempt(s) completed for %s; inspect structured report in Summary.\n' "$HOST_VERSION"
+          # 两个 artifact 的存在性决定"是否完成了两次独立尝试"，故把结论写进日志。
+          printf 'Attempt(s) completed for %s (first=%s second=%s); inspect structured report in Summary.\n' "$HOST_VERSION" "$first" "$second"
       - name: Upload structured results only
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

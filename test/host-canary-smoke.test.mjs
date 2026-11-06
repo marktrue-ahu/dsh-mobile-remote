@@ -71,7 +71,7 @@ test('generated worker emits a sanitized hint using only a fake host', async t =
   // worker can read a baseline identity before this process disappears. Timeout
   // mode stays alive past the worker deadline, then self-exits after 1.8s
   // without relying on a signal.
-  const fakeCode = `import {readFileSync,writeFileSync,writeSync} from 'node:fs'; const text=readFileSync('/proc/self/stat','utf8'); const fields=text.slice(text.lastIndexOf(')')+2).trim().split(/\\s+/); if (!/^\\d+$/.test(fields[19])) process.exit(3); writeFileSync(process.env.FAKE_HOST_IDENTITY,JSON.stringify({pid:process.pid,startTime:fields[19]}),{flag:'wx',mode:0o600}); const finish=()=>{try {writeSync(2,'ERR_MODULE_NOT_FOUND secret-token /private/path');} catch {} process.exit(1);}; const mode=process.env.FAKE_HOST_MODE; const exitSoon=action=>setTimeout(action,250); if (mode === 'exit-zero') exitSoon(()=>process.exit(0)); else if (mode === 'exit-nonzero') exitSoon(()=>process.exit(17)); else if (mode === 'exit-signal') exitSoon(()=>process.kill(process.pid,'SIGTERM')); else if (mode === 'startup-audit') exitSoon(()=>{ writeSync(2,'dsh: startup failed: 2 required plugins did not activate\\nsecret-token /private/path\\n'); process.exit(1); }); else if (mode === 'worker-timeout') setTimeout(finish,1800); else exitSoon(finish);`;
+  const fakeCode = `import {readFileSync,writeFileSync,writeSync} from 'node:fs'; const text=readFileSync('/proc/self/stat','utf8'); const fields=text.slice(text.lastIndexOf(')')+2).trim().split(/\\s+/); if (!/^\\d+$/.test(fields[19])) process.exit(3); writeFileSync(process.env.FAKE_HOST_IDENTITY,JSON.stringify({pid:process.pid,startTime:fields[19]}),{flag:'wx',mode:0o600}); const finish=()=>{try {writeSync(2,'ERR_MODULE_NOT_FOUND secret-token /private/path');} catch {} process.exit(1);}; const mode=process.env.FAKE_HOST_MODE; const exitSoon=action=>setTimeout(action,250); const linger=()=>setTimeout(()=>{},1200); if (mode === 'exit-zero') { exitSoon(()=>process.exit(0)); linger(); } else if (mode === 'exit-nonzero') { exitSoon(()=>process.exit(17)); linger(); } else if (mode === 'exit-signal') { exitSoon(()=>process.kill(process.pid,'SIGTERM')); linger(); } else if (mode === 'startup-audit') { exitSoon(()=>{ writeSync(2,'dsh: startup failed: 2 required plugins did not activate\\nsecret-token /private/path\\n'); process.exit(1); }); linger(); } else if (mode === 'worker-timeout') setTimeout(finish,1800); else { exitSoon(finish); linger(); }`;
   const fakeBin = join(host,'lib/bin.js');
   await writeFile(fakeBin,fakeCode,{flag:'wx',mode:0o600});
   assert.equal(await readFile(fakeBin,'utf8'),fakeCode);
@@ -121,7 +121,10 @@ test('generated worker emits a sanitized hint using only a fake host', async t =
     const runPath = join(root,`runtime-${mode}`);
     const runScript = script.replaceAll(runtime,runPath);
     const waitForRecord = `await (async () => { const {access}=await import('node:fs/promises'); for(let i=0;i<100;i++){ try {await access(${JSON.stringify(record)});return;} catch {} await new Promise(ok=>setTimeout(ok,10)); } throw Error('fake-host-record-missing'); })();`;
-    const mockRequest = ['normal','startup-audit','exit-zero','exit-nonzero','exit-signal'].includes(mode) ? '  const request = async () => ({status:0,body:null});' :
+    // Every mode must wait for the fake host to record its identity before the
+    // worker can finish and kill it. Otherwise the worker's teardown races the
+    // host's identity write and confirmFakeExited fails on scheduler luck alone.
+    const mockRequest = ['normal','startup-audit','exit-zero','exit-nonzero','exit-signal'].includes(mode) ? `  const request = async () => ({status:0,body:null}); ${waitForRecord}` :
       mode === 'worker-error' ? `  const request = async () => ({status:0,body:null}); ${waitForRecord} throw Error('synthetic-worker-fault');` :
       `  const request = async () => ({status:0,body:null}); ${waitForRecord} Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10000);`;
     const mocked = replaceOne(runScript,request,mockRequest);
@@ -626,19 +629,35 @@ test('profile uses shipped bundles and explicitly safe mobile settings', () => {
   assert.deepEqual(patch[0].insert[0], {id:'mobile-remote',name:'@marktrue/dsh-mobile-remote',config:{path:'/m',authToken:'test-token',pluginUpdateManifest:'off',lanBridge:{enabled:false},pushUrls:[]}});
 });
 
+test('install worker materializes the plugin into the persistent profile tree', () => {
+  // Regression: the plugin used to be installed under /tmp (container tmpfs) and
+  // only symlinked into /profile. The installer container is removed before the
+  // runtime container starts, so the symlink dangled -- and verifyInstalled
+  // deliberately rejects plugin symlinks, so the run could never pass.
+  const script = makeInstallWorker('0.2.1-rc.5');
+  const checked = spawnSync(process.execPath,['--check','--input-type=module'],{input:script,encoding:'utf8'});
+  assert.equal(checked.status,0,checked.stderr);
+  // Nothing the runtime needs may live only under /tmp.
+  assert.doesNotMatch(script,/\/tmp\/plugin-prefix/);
+  // The plugin must be copied as a real directory into the mounted profile.
+  assert.match(script,/execFileSync\('cp',\['-a'/);
+  assert.match(script,/\/profile\/dsh\/profiles\/canary\/node_modules\/@marktrue/);
+  // And it must not be linked.
+  assert.doesNotMatch(script,/symlinkSync\([^\n]*dsh-mobile-remote/);
+});
+
 test('install worker keeps the host closure isolated from plugin peer ranges', () => {
   // Regression: installing the plugin in the same npm command as the host let the
   // plugin's wide peer ranges (">=0.1.0-rc.6 <0.3.0") pull old 0.1.x host packages
   // into the tree and drop @deepseek-ai/dsh-web-app. The host then disabled dozens
   // of rows and exited before serving HTTP. The host must be installed alone, and
-  // the plugin installed separately then linked in.
+  // the plugin resolved in a separate prefix (now a persistent one, then copied in).
   const script = makeInstallWorker('0.2.1-rc.5');
   const checked = spawnSync(process.execPath,['--check','--input-type=module'],{input:script,encoding:'utf8'});
   assert.equal(checked.status,0,checked.stderr);
   assert.match(script,/@deepseek-ai\/dsh@0\.2\.1-rc\.5/);
-  assert.match(script,/\/tmp\/plugin-prefix/);
+  assert.match(script,/\/profile\/dsh\/profiles\/plugin/);
   assert.match(script,/--legacy-peer-deps/);
-  assert.match(script,/symlinkSync/);
   // The plugin path must NOT be an argument of the host install command.
   assert.doesNotMatch(script,/dsh@\$\{JSON\.stringify\([^)]*\)\}[^\n]*\/tmp\/plugin'/);
 });
@@ -1099,17 +1118,29 @@ test('unpinned version is rejected before any operation', async () => {
   assert.equal(result.stage, 'validate');
 });
 
-test('CLI describes requirements and rejects direct worker without isolation', async t => {
+test('CLI runs the real backend but stays fail-closed outside a hosted runner', async t => {
   const root = await mkdtemp(join(tmpdir(),'canary-test-'));
   t.after(() => rm(root,{recursive:true,force:true}));
   const file = new URL('../tools/host-canary/smoke.mjs', import.meta.url).pathname;
   const help = execFileSync(process.execPath,[file,'--help'],{encoding:'utf8'});
   assert.match(help,/--host-version VERSION/);
-  assert.match(help,/no fallback/);
+  // The backend is implemented now; help must no longer claim it is not.
+  assert.doesNotMatch(help,/not implemented/);
+
+  // Outside a hosted runner the CLI must refuse before touching Docker.
   const out = join(root,'result.json');
-  const stopped = spawnSync(process.execPath,[file,'--host-version','1.2.3','--plugin-root','/missing','--out',out],{encoding:'utf8',env:{...process.env,GITHUB_ACTIONS:'true',RUNNER_ENVIRONMENT:'github-hosted',RELEASE_SHA:'a'.repeat(40)}});
-  assert.equal(stopped.status,2);
-  assert.equal(JSON.parse(await readFile(out,'utf8')).errorCode,'runtime-sandbox-unavailable');
+  const local = spawnSync(process.execPath,[file,'--host-version','1.2.3','--plugin-root','/missing','--out',out],{encoding:'utf8',env:{...process.env,GITHUB_ACTIONS:'',RUNNER_ENVIRONMENT:'',RELEASE_SHA:'a'.repeat(40)}});
+  assert.equal(local.status,2);
+  assert.equal(JSON.parse(await readFile(out,'utf8')).errorCode,'runner-not-ephemeral');
+
+  // Claiming to be hosted is not enough either unless the runner identity is usable:
+  // here /missing cannot be a valid git plugin root, so it fails closed harmlessly.
+  const claimed = spawnSync(process.execPath,[file,'--host-version','1.2.3','--plugin-root','/missing','--out',join(root,'claimed.json')],{encoding:'utf8',env:{...process.env,GITHUB_ACTIONS:'true',RUNNER_ENVIRONMENT:'github-hosted',RELEASE_SHA:'a'.repeat(40)}});
+  assert.equal(claimed.status,2);
+  const claimedResult = JSON.parse(await readFile(join(root,'claimed.json'),'utf8'));
+  assert.equal(claimedResult.status,'infrastructure-failure');
+  assert.notEqual(claimedResult.status,'passed');
+
   const worker = spawnSync(process.execPath,[file,'--internal-worker','/nonexistent'],{encoding:'utf8'});
   assert.equal(worker.status, 1);
   assert.equal(JSON.parse(worker.stdout).errorCode,'runtime-sandbox-unavailable');

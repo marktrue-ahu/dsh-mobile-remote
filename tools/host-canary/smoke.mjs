@@ -595,17 +595,15 @@ async function cleanupRoot(root) {
 export function checkHostedRunner(env) {
   if (env.GITHUB_ACTIONS !== 'true' || env.RUNNER_ENVIRONMENT !== 'github-hosted') fail('runner-not-ephemeral');
 }
-const adapter = {
-  async preflight() {
-    checkHostedRunner(process.env);
-    // Even a claimed hosted runner cannot run until the Docker backend exists.
-    fail('runtime-sandbox-unavailable');
-  },
-  async prepare() { fail('runtime-sandbox-unavailable'); },
-  async install() { fail('runtime-sandbox-unavailable'); },
-  async isolatedRun() { fail('runtime-sandbox-unavailable'); },
-  async cleanup() { fail('runtime-sandbox-unavailable'); },
-};
+// Production CLI adapter: the real isolated Docker backend, still refusing to run
+// anywhere that is not a hosted, ephemeral runner. Every isolation guarantee is
+// enforced inside hostedDockerAdapter/dockerModelAdapter (network none, non-root,
+// read-only mounts, capability drops, bounded lifecycle, verified cleanup); this
+// wrapper only supplies the runner identity and an abort signal.
+export function createCliAdapter({env = process.env, signal} = {}) {
+  if (typeof process.getuid !== 'function' || typeof process.getgid !== 'function') fail('runner-identity-mismatch');
+  return hostedDockerAdapter({runnerEnv: env, uid: process.getuid(), gid: process.getgid(), signal});
+}
 // These two become 'ok' only after a real browser GUI session has connected: the
 // workspace registry and the in-process owner Peer are created lazily for a user
 // session. This canary deliberately never opens a browser (no model account, no
@@ -901,11 +899,28 @@ try {
   // which disables dozens of host rows and drops @deepseek-ai/dsh-web-app, so the
   // host dies before any HTTP surface exists.
   execFileSync('npm',['install','--prefix','/profile/dsh/profiles/canary','--ignore-scripts','--no-audit','--no-fund','--save-exact',${JSON.stringify('@deepseek-ai/dsh@' + version)}],{stdio:'ignore',timeout:300000});
-  // Then install the plugin into its own prefix and link it into the host tree,
-  // so installing the plugin cannot rewrite the host's resolved versions.
-  execFileSync('npm',['install','--prefix','/tmp/plugin-prefix','--ignore-scripts','--install-links','--no-audit','--no-fund','--legacy-peer-deps','/tmp/plugin'],{stdio:'ignore',timeout:300000});
-  mkdirSync('/profile/dsh/profiles/canary/node_modules/@marktrue',{recursive:true});
-  symlinkSync('/tmp/plugin-prefix/node_modules/@marktrue/dsh-mobile-remote','/profile/dsh/profiles/canary/node_modules/@marktrue/dsh-mobile-remote');
+  // Install the plugin into its own PERSISTENT prefix under /profile, then copy it
+  // into the host tree as a real directory.
+  //
+  // Two constraints force this shape:
+  //  - Installing into the host prefix directly lets the plugin's wide peer ranges
+  //    (">=0.1.0-rc.6 <0.3.0") pull old 0.1.x host packages in and drop
+  //    @deepseek-ai/dsh-web-app, so the host dies before serving HTTP.
+  //  - Anything left in /tmp lives on the container tmpfs and disappears with the
+  //    installer container; a symlink there would dangle for the runtime container
+  //    (and verifyInstalled deliberately rejects plugin symlinks anyway).
+  // So: resolve the plugin's own dependencies in a separate prefix, then
+  // materialize it into the profile tree the runtime container mounts read-only.
+  execFileSync('npm',['install','--prefix','/profile/dsh/profiles/plugin','--ignore-scripts','--install-links','--no-audit','--no-fund','--legacy-peer-deps','/tmp/plugin'],{stdio:'ignore',timeout:300000});
+  const srcPlugin = '/profile/dsh/profiles/plugin/node_modules/@marktrue/dsh-mobile-remote';
+  const dstScope = '/profile/dsh/profiles/canary/node_modules/@marktrue';
+  const dstPlugin = dstScope + '/dsh-mobile-remote';
+  mkdirSync(dstScope,{recursive:true});
+  // cp -a keeps the plugin's own nested node_modules (its real dependencies).
+  execFileSync('cp',['-a',srcPlugin,dstPlugin],{stdio:'ignore',timeout:120000});
+  // The separate prefix is scaffolding only; drop it so it cannot be mistaken for
+  // part of the installed tree.
+  execFileSync('rm',['-rf','/profile/dsh/profiles/plugin'],{stdio:'ignore',timeout:60000});
   process.stdout.write('{"ok":true}\\n');
 } catch { process.stdout.write('{"ok":false,"errorCode":"install-failed"}\\n'); process.exitCode = 2; }
 `;
@@ -991,10 +1006,21 @@ async function main(args) {
   if (args[0] === '--internal-worker') {
     console.log(JSON.stringify({errorCode:'runtime-sandbox-unavailable',checks:[]})); process.exitCode=1; return;
   }
-  if (args.length === 1 && args[0] === '--help') { console.log('Usage: node smoke.mjs --host-version VERSION --plugin-root PATH --out PATH\nRELEASE_SHA must be the full Git commit. The safe sandbox backend is not implemented: installation and runtime currently fail closed; no fallback.'); return; }
+  if (args.length === 1 && args[0] === '--help') { console.log('Usage: node smoke.mjs --host-version VERSION --plugin-root PATH --out PATH\nRELEASE_SHA must be the full Git commit. Runs the real isolated Docker backend on a hosted runner; fails closed anywhere else.'); return; }
   const flags = {}; let valid = args.length === 6;
   for (let i=0; i<args.length; i+=2) { if (!['--host-version','--plugin-root','--out'].includes(args[i]) || !args[i+1] || flags[args[i]]) valid=false; else flags[args[i]]=args[i+1]; }
-  const result = await runCanary({hostVersion:valid ? flags['--host-version'] : '',pluginRoot:flags['--plugin-root'],pluginSha:process.env.RELEASE_SHA},adapter);
+  let result;
+  try {
+    const controller = new AbortController();
+    const removeHandlers = installCanarySignalHandlers(controller);
+    try {
+      result = await runCanary({hostVersion:valid ? flags['--host-version'] : '',pluginRoot:flags['--plugin-root'],pluginSha:process.env.RELEASE_SHA},createCliAdapter({signal:controller.signal}));
+    } finally { removeHandlers(); }
+  } catch {
+    // Any construction/preflight failure is an infrastructure result, never a pass
+    // and never a compatibility claim.
+    result = {schema:1,hostVersion:valid ? flags['--host-version'] : '',pluginSha:/^[a-f0-9]{40}$/.test(process.env.RELEASE_SHA ?? '') ? process.env.RELEASE_SHA : '',status:'infrastructure-failure',stage:'sandbox',checks:[],errorCode:'runtime-sandbox-unavailable'};
+  }
   const json = JSON.stringify(result) + '\n';
   try { if (flags['--out']) await writeFile(flags['--out'],json,{mode:0o600}); else process.stdout.write(json); } catch { process.stderr.write('output-write-failed\n'); process.exitCode=2; return; }
   process.exitCode = result.status === 'passed' ? 0 : result.status === 'compatibility-failure' ? 1 : 2;
