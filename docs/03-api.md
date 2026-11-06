@@ -46,6 +46,9 @@
 | GET | `/m/api/workspaces` | 已注册工作区 | 是 |
 | GET/POST | `/m/api/directories` | 目录浏览/新建文件夹 | 是 |
 | GET | `/m/api/diagnostics` | 环境诊断（插件运行时、services、checks） | 是 |
+| GET | `/m/api/changes/summary` | 本轮改动文件摘要（按轮查询，宿主内存态，v3.3） | 是 |
+| GET | `/m/api/changes/diff` | 本轮单文件对比（最小闭环 diff，v3.3） | 是 |
+| GET | `/m/api/turn-file` | 按轮末记录坐标读取文件（预览/下载，v3.3） | 是 |
 | — | `/m/api/git/*`（规划中） | 设计草案；v3.1.5 未注册这些路由 | 不适用 |
 | GET | `/m/api/balance` | DeepSeek 官方余额 | 是 |
 | GET | `/m/api/account-usage` | 用量与额度（DeepSeek / Codex / OpenCode Go） | 是 |
@@ -122,6 +125,9 @@
 - `urls`：按优先级排列——默认「局域网私有地址优先」（`10./192.168.x` → `172.16-31` → Tailscale CGNAT `100.64/10` → 其他），首个非 internal IPv4 在前，loopback 最后；**仅当机器上没有任何局域网私有地址时**，才把 Tailscale CGNAT 提到最前（issue #49，避免校园网/热点等场景选出不可达地址）；`port` 来自 `ctx.webServer.port`。v3.0.0：`lanBridge` 监听成功时首选地址为桥地址（`http://<IP>:<lanBridge.port>`，端口默认 3080），回环 webserver 地址仅作本机自连兜底。
 - `agents[].status`：`"running" | "idle"`（映射自 agent 状态与最近事件推断）。
 - `capabilities.turnOutline`：轮次大纲能力位（轮次导航）。宿主**真的注册了** `turnOutline` 投影单元、且投影感知观察面（`sessionQuery.observeSession`）可用时，返回 `{ "version": 1, "supported": true, "unloaded": true, "truncated": true }`——`unloaded` 表示未加载轮次也可跳转、`truncated` 表示超过体积上限会显式截断；否则返回 `{ "version": 1, "supported": false }`。**不按宿主版本号推断**：旧宿主/裁剪宿主显式声明不支持，App 据此退回「只用已加载轮次」的降级行为。SSE hello 的同名字段与该处**同判据、同形状**（见 §3.6 与 §6.18）。
+
+- `capabilities.turnTail`：轮末页脚能力位（v3.3，issue #52/#53）：宿主注册了 `workspaceChanges` 服务时返回 `{ "version": 1, "presented": true, "changed": true, "changesDiff": true }`，否则 `presented` 仍可为真而 `changed`/`changesDiff` 为假；旧插件不下发该字段，App 据此不渲染轮末卡片与展示模式设置。判据与字段详见 §6.20，SSE hello 同名字段与之同判据、同形状。
+
 - 未认证：`401`（见通用约定）。
 ### 3.2 POST /m/api/send
 **请求**
@@ -1162,3 +1168,110 @@ graph 的每个提交与 commit 详情都**保留旧的** `refs: string[]`（dep
 `HistoryEntry`（`fileHistory()` 元素）：`{ oid, shortOid, author, timestamp, subject, status }`；`status` 为 Git 单字母（`A`/`M`/`D`/`R`/`C`/`T`，实际出现哪些由 provider 决定）；`author` 只含姓名；`timestamp` 为 Unix 秒。provider 只返回有界结果，不应抛出宿主未知的错误码（未知错误会被映射为 `git-provider-unavailable`）。
 
 约束：provider 不得返回主机绝对路径、remote URL 或邮箱；路径事实必须限定在 `repositoryRoot` 授权仓库内。
+
+### 6.20 轮次页脚能力位与信号（v3.3，issue #52/#53）
+
+手机端要呈现「轮次过程折叠 + 轮末产出物」，需要的信号与能力都按增量字段下发；旧 App 忽略未知字段，旧插件不提供能力位时新 App 静默降级。
+
+**能力位**（`GET /m/api/bootstrap` 与 SSE `hello` 同判据、同形状）：
+
+```json
+"capabilities": {
+  "turnTail": { "version": 1, "presented": true, "changed": true, "changesDiff": true }
+}
+```
+
+- `presented`：事件摘要会下发 `deliverables/presented` 的文件声明（见下）。
+- `changed`：`/m/api/changes/summary` 可用；宿主**真的注册了** `workspaceChanges` 服务时才是 `true`，不按宿主版本推断（ADR 0017）。
+- `changesDiff`：`/m/api/changes/diff` 可用。
+- 三者缺省（旧插件）时 App 不渲染对应卡片，也不显示展示模式设置。
+
+**事件摘要增量 `time`**：所有时间线事件摘要新增顶层 `time`（Unix 毫秒，取自 SessionEvent.time），供轮次/过程组计算用时。旧插件不下发时 App 不显示任何耗时，**不得**用本地接收时间推算。
+
+**交付文件声明**（`deliverables/presented` 摘要 data）：
+
+```json
+{ "turn": 12, "callId": "call_abc", "files": [ { "name": "报告.pdf", "display": "~/Documents/报告.pdf", "description": "最终交付" } ] }
+```
+
+- 只下发文件名、显示名与说明；**不下发主机绝对路径**。预览坐标 = 该事件 `seq` + `files` 下标。
+- 同轮多次 `present` 时由 App 按路径去重，说明取该轮最后一次声明（与桌面一致）。
+
+**`GET /m/api/history` 响应增量 `turnTails`**：
+
+```json
+"turnTails": { "12": { "changes": true, "presented": true } }
+```
+
+- key 为轮次号的字符串形式；只包含有产出物的轮次；服务端单次遍历已加载事件得出（不额外调用宿主服务）。
+- 实时侧：`turn/end` 摘要 data 增量 `tail`，形状相同。App 据此决定是否渲染卡片位置与是否按需拉摘要。
+
+**兼容**：新插件 + 旧 App —— 旧 App 忽略上述字段；`workspace/changes` 事件不再进入移动时间线（见 6.21），旧 App 也不会再渲染裸类型名空卡。旧插件 + 新 App —— 无 `turnTail` 能力位，两卡与展示模式设置不显示；新 App 同时把裸 `workspace/changes` 归入调试可见。
+
+### 6.21 GET /m/api/changes/summary（本轮改动文件摘要，issue #53）
+
+**查询参数**：`sessionId`（必填）、`turn`（必填，非负整数）。
+
+**响应**：
+
+```json
+{
+  "ok": true,
+  "state": "available",
+  "turn": 12,
+  "files": [
+    { "seq": 843, "index": 0, "display": "src/a.ts", "name": "a.ts",
+      "added": 12, "deleted": 3, "binary": false, "oversized": false }
+  ],
+  "total": 5,
+  "added": 42,
+  "deleted": 7,
+  "truncated": false
+}
+```
+
+- `state` 三态：`available`（宿主仍有该轮摘要）、`absent`（该轮没有改动记录）、`unavailable`（宿主没有 `workspaceChanges` 服务、会话休眠、宿主重启后摘要丢失或读取超时）。后两者 `files` 为空，App 不渲染改动卡、不占位。
+- `files[].seq` 是该轮最新 `workspace/changes` 事件的持久序号（供预览与 diff 坐标）；`index` 是该文件在宿主摘要中的下标。
+- `display` 由宿主给出（工作目录内相对路径、仓库上层为 `../`、家目录为 `~`，其余为绝对路径的展示形式）；**不返回用于拼接的绝对路径字段**。
+- `truncated`：受宿主 `maxFiles`（默认 500）与移动端上限（200）截断时为 `true`，`total` 仍是全量计数。
+- 稳定错误：`400 bad-request`（缺参/非法 turn）、`503 sessions-unavailable`。服务不可用**不**返回 5xx，按 `state: "unavailable"` 返回，便于 App 统一降级。
+
+### 6.22 GET /m/api/changes/diff（本轮单文件对比，issue #53）
+
+**查询参数**：`sessionId`、`turn`、`index`（均必填，非负整数）。
+
+**响应（文本）**：
+
+```json
+{
+  "ok": true,
+  "state": "available",
+  "diff": {
+    "kind": "text",
+    "display": "src/a.ts",
+    "before": true,
+    "after": true,
+    "coarse": false,
+    "diff": "--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,3 +1,4 @@\n ...",
+    "truncated": false
+  }
+}
+```
+
+- 宿主返回 `{ kind, display, before, after, hunks, coarse }`；插件把 hunks 渲染成统一 diff 文本（`---`/`+++`/`@@`），供 App 复用 `GitFileViewer` 差异模式，并限制文本体积（512 KiB，超出 `truncated: true`）。
+- `kind` 为 `binary` / `oversized` 时只带 `display` 与原因式 `kind`，App 显示不可比对提示。
+- `coarse: true` 表示宿主逐行对比超时后退化为整文件替换。
+- 稳定错误：`400 bad-request`、`404 diff-not-found`（摘要已失效或下标不存在）、`503 changes-unavailable`。
+
+### 6.23 GET /m/api/turn-file（按轮末记录坐标读取文件，issue #53）
+
+**查询参数**：`sessionId`、`kind`（`presented` | `changed`）、`seq`（记录事件序号）、`index`（文件下标，均必填）。
+
+- `kind=presented`：`seq` 为 `deliverables/presented` 事件序号；`index` 为该事件 `files` 下标。
+- `kind=changed`：`seq` 为 `workspace/changes` 事件序号；`index` 为摘要 `files` 下标。
+
+**响应**：文件字节流；头部与 `/m/api/files` 一致（`content-type`、`content-length`、`content-disposition`、`etag`、`last-modified`、`accept-ranges`、`connection: close`，支持 `Range`/`HEAD`，见 §6.17）。
+
+**与 `/m/api/files` 的边界**：本端点**不接受客户端指定路径**，路径由服务端从会话记录解析；只允许该记录内的文件（GitLab #16 的收紧方向）。读取失败不泄露主机路径。
+
+- 稳定错误：`400 bad-request`、`404 record-not-found`（事件不存在/不属于该会话/下标越界）、`404 file-not-found`（记录内的文件已被删除）、`503 changes-unavailable`（改动摘要已失效）。

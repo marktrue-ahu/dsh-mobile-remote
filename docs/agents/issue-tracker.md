@@ -4,14 +4,14 @@
 
 ## CLI 环境
 
-glab 安装在 Windows 宿主机，从 WSL 直接调用：
+开发容器（2026-11 起）内 `glab` 是 Linux 原生二进制，已在 PATH 中：
 
 ```sh
-DSH_GLAB='/mnt/d/Program Files (x86)/glab/glab.exe'
+DSH_GLAB=glab   # 直接调用即可；不要再引用 /mnt/d/... 下的 Windows 版本
 ```
 
-- 已登录 `gitlab.local`（用户 `luxiao`，token 存在 Windows 凭据管理器），REST 端点为 `http://gitlab.local/api/v4/`。用 `"$DSH_GLAB" auth status` 自检。
-- **不需要 HTTP 代理**；WSL 下中文输出正常，无需 hex 之类的变通。
+- 已登录 `gitlab.local`（用户 `luxiao`），凭据在 `~/.config/glab-cli/config.yml`；REST 端点为 `https://gitlab.local/api/v4/`。用 `glab auth status` 自检。
+- **不需要 HTTP 代理**；中文输出正常，无需 hex 之类的变通（glab 自身配置了 socks5 代理）。
 - 原生子命令可用，但**必须带 `-R`**，否则会按当前目录的 remote 推断目标。
 
 ## 约定
@@ -27,7 +27,7 @@ DSH_GLAB='/mnt/d/Program Files (x86)/glab/glab.exe'
 
 ### 长多行正文走 stdin
 
-`glab issue create` 只提供 `-d/--description` 字符串参数，没有从文件读取正文的选项；而 glab 是 Windows 二进制，**解析不了 WSL 侧传进去的绝对路径**。规格这类长正文一律用 `glab api` 的 `@-` 从 stdin 读：
+`glab issue create` 只提供 `-d/--description` 字符串参数，没有从文件读取正文的选项。规格这类长正文一律用 `glab api` 的 `@-` 从 stdin 读（容器内 glab 是原生二进制，也能读本地路径；但 stdin 方式不受 shell 引号与转义影响）：
 
 ```sh
 "$DSH_GLAB" api "projects/53/issues" --method POST \
@@ -38,22 +38,21 @@ DSH_GLAB='/mnt/d/Program Files (x86)/glab/glab.exe'
 
 `glab api` 的项目引用支持数字 ID（`projects/53`）与 URL 编码 path（`projects/ahedu%2Fdsh-mobile-remote`）两种写法。
 
-### 上传附件（图片）走 curl，不要用 glab
+### 上传附件（图片）优先用 curl
 
-`glab api "projects/53/uploads" --field "file=@<路径>"` **会失败**（HTTP 400）：glab 是 Windows 二进制，
-既读不了 WSL 侧路径，换成 `\\wsl.localhost\...` 的 UNC 路径也报 400。改用 WSL 原生 `curl` 直接打 multipart：
+容器内 glab 是原生二进制，理论上 `glab api "projects/53/uploads" --field "file=@<路径>"` 可用；
+但该端点此前在 Windows 版 glab 上实测 400（路径不可读），已验证的路径仍是原生 `curl` 打 multipart：
 
 ```sh
-TOKEN=$(/mnt/d/Program\ Files\ \(x86\)/glab/glab.exe auth status --show-token 2>/dev/null \
-        | grep -oP 'keyring:\s*\K\S+')
+TOKEN=$(awk '/^    gitlab.local:/{f=1} f&&/token:/{print $2; exit}' ~/.config/glab-cli/config.yml)
 curl -sS -X POST -H "PRIVATE-TOKEN: $TOKEN" \
   -F "file=@overview.png" \
-  http://gitlab.local/api/v4/projects/53/uploads
+  https://gitlab.local/api/v4/projects/53/uploads
 ```
 
 返回 `{"alt":..., "url":"/uploads/<hash>/<name>", "markdown":"![...](/uploads/...)"}`；
 把 `markdown` 字段原样贴进 issue 正文即可内嵌显示（`url` 是**项目级**的，同一文件可被多个 issue 复用）。
-WSL 能直连 `gitlab.local`（解析到 Windows hosts 里配置的地址，不是解析错误）。
+容器内可直连 `gitlab.local`（glab 配置了 socks5 代理；`curl` 需按需带代理参数）。
 
 ### 已知问题：REST `PUT /projects/:id/issues/:iid` 卡在读响应
 
