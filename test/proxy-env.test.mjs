@@ -172,19 +172,22 @@ printf '%s\\n' "$PATH"
 });
 
 test('an unreadable .env fails loudly instead of silently running unconfigured', () => {
+  // Otherwise a permission mistake silently drops the proxy and toolchain paths and
+  // the gates still report green, which is worse than failing.
   const dir = mkdtempSync(join(tmpdir(), 'proxy-unreadable-'));
   try {
     const envPath = join(dir, '.env');
     writeFileSync(envPath, 'DSH_PROXY_ENABLED=1\n', { mode: 0o000 });
     const harness = join(dir, 'harness.sh');
     writeFileSync(harness, `${extractHelpers()}
+die() { printf 'ERR %s\\n' "$*" >&2; exit 7; }
 apply_toolchain_env ${JSON.stringify(envPath)}
 echo OK
 `, { mode: 0o700 });
     const out = spawnSync('bash', [harness], { encoding: 'utf8', env: { PATH: process.env.PATH } });
     // Running as root bypasses permission bits, so only assert when it cannot read.
     if (process.getuid?.() !== 0) {
-      assert.equal(out.status, 1, 'expected a fail-closed exit');
+      assert.equal(out.status, 7, 'expected a fail-closed exit');
       assert.match(out.stderr, /不可读/);
     }
   } finally {
