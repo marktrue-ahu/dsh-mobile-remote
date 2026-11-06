@@ -17,3 +17,7 @@ dsh-mobile-app/dist/
 
 # AGENT 规则（写给 AI 助手的项目约定，仅本机保留，不推送 GitHub）
 AGENT-RULES.md
+
+# 本机/本容器的环境特定配置（代理开关与地址等），不进版本库
+.env
+.env.local
