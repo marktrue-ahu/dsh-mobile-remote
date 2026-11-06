@@ -750,88 +750,58 @@ Remove-Item Env:ALLOW_TEST_MANIFEST_VERSION, Env:MANIFEST_VERSION, Env:UPDATE_DI
 
 验收：检查 `updateDir/manifest.json` 的 `version` 为 `3.1.5+99`，并校验其中的 `sha256`、`size` 与 APK 一致；更新完成后可再次执行同一流程重复测试。只有显式设置 `ALLOW_TEST_MANIFEST_VERSION=1` 才允许覆盖；正式发布不得设置该变量，发布脚本还会要求测试 manifest 与 APK 语义版本一致且 build 更大。测试结束后清理测试 manifest 并恢复正式版本。
 
-### A.4 Google 下载必须走本地代理
+### A.4 首次构建需要出网（代理由 .env 驱动）
 
-首次构建会从 Google Storage 下载 Flutter Android 引擎和其他依赖。当前环境使用 HTTP 代理：
+首次构建会从 Google Storage / pub 下载 Flutter Android 引擎与依赖，因此需要出网。**代理地址属于环境特定信息，不写在文档或脚本里**，改为项目根 `.env`（已被 `.gitignore` 忽略）中声明：
 
-```text
-http://127.0.0.1:1080/
+```sh
+# 项目根 .env
+DSH_PROXY_ENABLED=1
+DSH_PROXY_HTTP=http://<proxy-host>:<port>
+DSH_PROXY_SOCKS=socks5://<proxy-host>:<port>
 ```
 
-#### A.4.1 Linux / WSL
+`tools/worktree.sh init/verify` 会自动读取它并导出：
 
-先设置通用代理环境变量：
+- `HTTP_PROXY` / `HTTPS_PROXY`（来自 `DSH_PROXY_HTTP`）
+- `ALL_PROXY`，以及给 Gradle/JVM 用的 `-DsocksProxyHost/-DsocksProxyPort`（来自 `DSH_PROXY_SOCKS`；JVM **不认** `ALL_PROXY`）
+
+未创建 `.env` 或 `DSH_PROXY_ENABLED` 不为 `1` 时**完全不设代理**——离线/直连环境保持默认即可。模板见仓库根的 `.env.example`。
+
+#### A.4.1 手动构建（不经 worktree.sh）
+
+如果直接调用 Flutter/Gradle 而非 `tools/worktree.sh`，需自己导出等价变量：
 
 ```bash
-export HTTP_PROXY=http://127.0.0.1:1080
-export HTTPS_PROXY=http://127.0.0.1:1080
+# HTTP 代理（Flutter/pub 走这个）
+export HTTP_PROXY=http://<proxy-host>:<port>
+export HTTPS_PROXY="$HTTP_PROXY"
 export http_proxy="$HTTP_PROXY"
 export https_proxy="$HTTPS_PROXY"
 export NO_PROXY=localhost,127.0.0.1
 export no_proxy="$NO_PROXY"
-```
 
-Java/Gradle 不一定只读取 `HTTP_PROXY`，因此构建时同时传入 JVM 代理参数：
-
-```bash
-cd dsh-mobile-app/android
-./gradlew :app:assembleRelease \
-  --no-daemon \
-  --console=plain \
-  --max-workers=2 \
-  -Dhttp.proxyHost=127.0.0.1 \
-  -Dhttp.proxyPort=1080 \
-  -Dhttps.proxyHost=127.0.0.1 \
-  -Dhttps.proxyPort=1080
-```
-
-通过 Flutter CLI 构建时，可将 JVM 参数放入 `GRADLE_OPTS`：
-
-```bash
-export GRADLE_OPTS="-Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=1080 -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=1080"
-cd dsh-mobile-app
-flutter build apk --release
-```
-
-#### A.4.2 Windows PowerShell
-
-```powershell
-$env:HTTP_PROXY = "http://127.0.0.1:1080"
-$env:HTTPS_PROXY = "http://127.0.0.1:1080"
-$env:GRADLE_OPTS = "-Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=1080 -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=1080"
+# Gradle/JVM 不认 ALL_PROXY/HTTP_PROXY，必须显式给 socks 参数
+export GRADLE_OPTS="-DsocksProxyHost=<proxy-host> -DsocksProxyPort=<port>"
 
 cd dsh-mobile-app
 flutter build apk --release
 ```
 
-#### A.4.3 持久化 Gradle 代理（可选）
+> 早期文档曾写死 `127.0.0.1:1080` 的 HTTP 代理；该地址随构建环境迁移已不存在，
+> 填入实际代理地址即可，不要再照抄旧值。
 
-如果该机器始终需要代理，可写入用户级 `~/.gradle/gradle.properties`：
+#### A.4.2 验证出网
 
-```properties
-systemProp.http.proxyHost=127.0.0.1
-systemProp.http.proxyPort=1080
-systemProp.https.proxyHost=127.0.0.1
-systemProp.https.proxyPort=1080
-```
-
-这是机器级配置，不要将个人代理配置写入项目的 `android/gradle.properties` 后提交。
-
-#### A.4.4 验证代理
-
-先确认代理能访问 Flutter Storage：
+先确认代理能访问 Flutter Storage（把地址换成实际代理）：
 
 ```bash
-curl -x http://127.0.0.1:1080 \
+curl -x http://<proxy-host>:<port> \
   -I --max-time 15 \
   https://storage.googleapis.com/download.flutter.io/
 ```
 
-返回 `HTTP/2 200` 或其他有效 HTTP 响应，说明代理链路可用。构建期间可检查 Gradle 是否连接代理：
-
-```bash
-ss -tpn | rg '127\.0\.0\.1:1080'
-```
+返回任意有效 HTTP 响应（如 `HTTP/2 200`）说明链路可用。若 Flutter 已下载过引擎、依赖命中本地缓存，则离线（`--offline`）也能完成构建，此时不设代理是正常的。
 
 ### A.5 干净重建
 
@@ -1051,6 +1021,9 @@ flutter clean
 不要随意删除整个 Android SDK、Flutter SDK 或 Gradle 用户缓存。
 
 ### A.9 本次成功构建记录
+
+> 以下为**历史记录**，如实保留当时的环境细节（含当时使用的代理地址 `127.0.0.1:1080`）。
+> 该代理已随构建环境迁移不再存在，**不要照抄本节的代理值**；当前做法见 A.4。
 
 2026-08-24 在 Linux 环境完成一次 Release 构建：
 
