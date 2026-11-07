@@ -519,10 +519,13 @@ require_clean_tree() { # require_clean_tree <目录> <用途>
 }
 
 # ── 并发限额（flock 多锁）──
-# 轻量检查不限；Flutter 全量 ≤2；Gradle/APK 构建 ≤1，且**与 flutter-test 互斥**。
-# 按内存上限保守互斥：Gradle daemon jvmargs 上限约 12.5G，本机物理内存 15G。
+# 轻量检查不限；Flutter 全量 ≤5；Gradle 构建 ≤2，且**与 flutter-test 不再强制互斥**。
+# 依据（2026-11 实测）：15.5G 内存下 Gradle daemon 实际 RSS 仅约 1.4G，而旧配置按
+# -Xmx8G 的"最坏上界"做保守互斥，导致多会话时 flutter-test 只有 2 槽、kotlin 门禁
+# 还必须等所有 flutter-test 结束，排队可达 30–90 分钟。现改为按实测占用设槽，并把
+# gradle 堆降到 -Xmx4G（仍高于实测峰值），使槽位与真实资源匹配。
 # 曾观察到一次 59.5 分钟 Gradle stall，但同一 verify 内门禁是顺序执行，现有证据不能确认根因。
-# 互斥只保证不同工作树并行运行时不叠加 Flutter 全测与 Gradle；shared/exclusive 表达该约束。
+# 限额只保证不同工作树并行时不把内存打爆；shared/exclusive 表达 flutter-test 与 gradle 的叠加约束。
 #
 # ⚠ 两个坑（自测已抓到）：
 #   1) 必须在**当前 shell** 持有 fd——放进 $(...) 会让锁随 sub shell 释放，限额静默失效；
@@ -898,10 +901,10 @@ run_gates() { # run_gates <工作树> <报告临时文件> <required|synthetic>
     gate "synthetic-pass" - 60 true
     gate "synthetic-plugin-path" - 60 bash -c 'test "$DSH_MOBILE_PLUGIN" = "$1"' _ "$wt/lib/index.js"
     # 此门禁真实走 flutter-test 的 slots:2 + shared 锁；marker/sleep 仅供并发自测观测重叠。
-    gate "synthetic-flutter" "flutter-test:slots:2,gradle-build:shared" "${DSH_WT_SLOT_TIMEOUT:-5}" \
+    gate "synthetic-flutter" "flutter-test:slots:5,gradle-build:shared" "${DSH_WT_SLOT_TIMEOUT:-5}" \
       bash -c 'if [ -n "${DSH_WT_TEST_GATE_MARKER:-}" ]; then : > "$DSH_WT_TEST_GATE_MARKER"; fi; sleep "${DSH_WT_TEST_GATE_SLEEP:-0}"'
-    gate "synthetic-heavy-a" "gradle-build:exclusive" "${DSH_WT_SLOT_TIMEOUT:-5}" true
-    gate "synthetic-heavy-b" "gradle-build:exclusive" "${DSH_WT_SLOT_TIMEOUT:-5}" true
+    gate "synthetic-heavy-a" "gradle-build:slots:2" "${DSH_WT_SLOT_TIMEOUT:-5}" true
+    gate "synthetic-heavy-b" "gradle-build:slots:2" "${DSH_WT_SLOT_TIMEOUT:-5}" true
     if [ -f "$wt/.selftest-fail-gate" ] || { [ "${DSH_WT_ALLOW_SYNTHETIC:-0}" = "1" ] && [ "${DSH_WT_TEST_BASELINE_FAIL_GATE:-}" = "synthetic-fail" ]; }; then
       gate "synthetic-fail" - 60 false
     fi
@@ -912,7 +915,7 @@ run_gates() { # run_gates <工作树> <报告临时文件> <required|synthetic>
     [ "${DSH_WT_TEST_MISSING_TIMELINE:-0}" = "1" ] && report_fail "timeline-contract" "当前树缺少必需脚本" missing || true
   else
     gate "flutter-analyze" - 900 bash -c 'cd "$1/dsh-mobile-app" && flutter analyze --no-pub --no-fatal-infos' _ "$wt"
-    gate "flutter-test" "flutter-test:slots:2,gradle-build:shared" 1800 \
+    gate "flutter-test" "flutter-test:slots:5,gradle-build:shared" 1800 \
       bash -c 'cd "$1/dsh-mobile-app" && flutter test --no-pub' _ "$wt"
     if [ -f "$wt/tools/timeline-contract-check.mjs" ]; then
       gate "timeline-contract" - 600 bash -c 'cd "$1" && DSH_MOBILE_PLUGIN="$1/lib/index.js" node tools/timeline-contract-check.mjs' _ "$wt"
@@ -926,7 +929,7 @@ run_gates() { # run_gates <工作树> <报告临时文件> <required|synthetic>
     elif [ "${DSH_WT_SKIP_GRADLE:-0}" = "1" ]; then
       report_fail "kotlin-usage-panel" "DSH_WT_SKIP_GRADLE=1 跳过了必需门禁" skipped
     else
-      gate "kotlin-usage-panel" "gradle-build:exclusive" 5400 \
+      gate "kotlin-usage-panel" "gradle-build:slots:2" 5400 \
         bash -c 'cd "$1/dsh-mobile-app/android" && ./gradlew :app:testDebugUnitTest --tests "com.dsh.remote.UsagePanelModelTest" --offline' _ "$wt"
     fi
   fi
