@@ -729,6 +729,18 @@ export function createChildExitObserver(child) {
 // Every fixed hint code this canary may report for a host that exited before it
 // became ready. Kept in one place so adding a detection cannot be silently rejected
 // by a downstream allowlist that was not updated.
+// Well-known peer/runtime dependencies this plugin imports. If startup fails with
+// "Cannot find package <x>", the canary reports a SPECIFIC fixed code instead of the
+// generic module-not-found one, so a single hosted run is enough to attribute it.
+// Only these exact specifiers participate; anything else stays generic.
+export const MISSING_DEPENDENCY_SPECIFIERS = Object.freeze([
+  ['@deepseek-ai/schemastery', 'host-process-exited-hint-missing-schemastery'],
+  ['@deepseek-ai/dsh-llm', 'host-process-exited-hint-missing-dsh-llm'],
+  ['@deepseek-ai/dsh-sandbox-policy', 'host-process-exited-hint-missing-dsh-sandbox-policy'],
+  ['@deepseek-ai/dsh-credentials', 'host-process-exited-hint-missing-dsh-credentials'],
+  ['@deepseek-ai/dsh-scope', 'host-process-exited-hint-missing-dsh-scope'],
+  ['qrcode', 'host-process-exited-hint-missing-qrcode'],
+]);
 export const HINT_CODES = Object.freeze([
   'host-process-exited-hint-eacces',
   'host-process-exited-hint-erofs',
@@ -742,6 +754,7 @@ export const HINT_CODES = Object.freeze([
   'host-process-exited-hint-out-of-memory',
   'host-process-exited-hint-engine-mismatch',
   'host-process-exited-hint-bad-invocation',
+  ...MISSING_DEPENDENCY_SPECIFIERS.map(([, code]) => code),
 ]);
 export function stderrExitHint(text) {
   if (typeof text !== 'string') return null;
@@ -756,6 +769,10 @@ export function stderrExitHint(text) {
     [/\bEROFS\b/,'host-process-exited-hint-erofs'],
     [/\bENOENT\b/,'host-process-exited-hint-enoent'],
     [/\bENOSPC\b/,'host-process-exited-hint-enospc'],
+    // Identify WHICH well-known dependency is missing. Only names from a closed
+    // allowlist are ever mapped to a code; the raw module specifier never leaves
+    // this function, so no path or user data can leak through it.
+    ...MISSING_DEPENDENCY_SPECIFIERS.map(([specifier,code]) => [new RegExp(`Cannot find package ['"\"]${specifier.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}['"\"]`), code]),
     [/\b(?:ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND)\b/,'host-process-exited-hint-module-not-found'],
     [/\bERR_DLOPEN_FAILED\b/,'host-process-exited-hint-native-load'],
     // Unsupported runtime: node refuses to start the CLI's declared engine range.
@@ -1000,6 +1017,7 @@ import { readFileSync } from 'node:fs';
 const capabilityNames = ${JSON.stringify(capabilityNames)};
 const sessionGatedCapabilityNames = ${JSON.stringify(sessionGatedCapabilityNames)};
 const HINT_CODES = ${JSON.stringify(HINT_CODES)};
+const MISSING_DEPENDENCY_SPECIFIERS = ${JSON.stringify(MISSING_DEPENDENCY_SPECIFIERS)};
 ${CanaryError.toString()}
 const fail = ${fail.toString()};
 ${evaluateResponses.toString()}

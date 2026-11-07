@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, symlink, lstat, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, isAbsolute, join } from 'node:path';
-import { DOCKER_IMAGE, HINT_CODES, RUNTIME_LIFECYCLE_MS, checkHostedRunner, createChildExitObserver, createDockerExecutor, createLinuxChildMonitor, createSourceArchive, createStderrCollector, dockerCliDriver, dockerCreatePlan, dockerModelAdapter, evaluateResponses, gitArchiveArgs, hostedDockerAdapter, libSnapshot, makeInstallWorker, makeRuntimeWorker, managedDocker, probeMobile, profileFiles, prepareContainerProfile, removeSourceArchive, readLinuxProcessStat, resolveExitedChildHint, runCanary, stderrExitHint, validateDockerMounts, verifyDockerInspection, verifyInstalled, verifyPluginSource, verifyRequiredBundles } from '../tools/host-canary/smoke.mjs';
+import { DOCKER_IMAGE, HINT_CODES, MISSING_DEPENDENCY_SPECIFIERS, RUNTIME_LIFECYCLE_MS, checkHostedRunner, createChildExitObserver, createDockerExecutor, createLinuxChildMonitor, createSourceArchive, createStderrCollector, dockerCliDriver, dockerCreatePlan, dockerModelAdapter, evaluateResponses, gitArchiveArgs, hostedDockerAdapter, libSnapshot, makeInstallWorker, makeRuntimeWorker, managedDocker, probeMobile, profileFiles, prepareContainerProfile, removeSourceArchive, readLinuxProcessStat, resolveExitedChildHint, runCanary, stderrExitHint, validateDockerMounts, verifyDockerInspection, verifyInstalled, verifyPluginSource, verifyRequiredBundles } from '../tools/host-canary/smoke.mjs';
 
 const imageEnv = ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin','NODE_VERSION=24.1.0','YARN_VERSION=1.22.22'];
 const profileEnvFor = phase => { const base = phase === 'install' ? '/profile' : '/tmp/canary'; return [`HOME=${base}/home`,`DSH_HOME=${base}/dsh`,`XDG_CONFIG_HOME=${base}/xdg-config`,`XDG_CACHE_HOME=${base}/xdg-cache`,`XDG_DATA_HOME=${base}/xdg-data`,`XDG_STATE_HOME=${base}/xdg-state`,`XDG_RUNTIME_DIR=${base}/xdg-runtime`,`NPM_CONFIG_USERCONFIG=${base}/npmrc`,`NPM_CONFIG_GLOBALCONFIG=${base}/npm-globalrc`]; };
@@ -884,6 +884,24 @@ test('startup failures on stdout or stderr both yield a fixed hint code', () => 
   noisyOut.emit('data','\nFATAL ERROR: Reached heap limit Allocation failed\n');
   assert.equal(noisy.hint(),'host-process-exited-hint-out-of-memory');
   noisy.destroy();
+});
+
+test('a missing well-known dependency is attributed to a specific fixed code', () => {
+  // Generic "module-not-found" costs a whole hosted round-trip to disambiguate.
+  // For a closed allowlist of packages this plugin actually imports, report which
+  // one is missing. The raw specifier must never appear in the emitted code.
+  const mk = spec => `Error [ERR_MODULE_NOT_FOUND]: Cannot find package '${spec}' imported from /a/b`;
+  assert.equal(stderrExitHint(mk('@deepseek-ai/schemastery')),'host-process-exited-hint-missing-schemastery');
+  assert.equal(stderrExitHint(mk('@deepseek-ai/dsh-llm')),'host-process-exited-hint-missing-dsh-llm');
+  assert.equal(stderrExitHint(mk('@deepseek-ai/dsh-credentials')),'host-process-exited-hint-missing-dsh-credentials');
+  assert.equal(stderrExitHint(mk('qrcode')),'host-process-exited-hint-missing-qrcode');
+  // Unknown packages stay generic: the allowlist must not become an oracle for
+  // arbitrary module names, and nothing derived from them may leak.
+  assert.equal(stderrExitHint(mk('some-other-pkg')),'host-process-exited-hint-module-not-found');
+  for (const [, code] of MISSING_DEPENDENCY_SPECIFIERS) {
+    assert.match(code,/^host-process-exited-hint-missing-[a-z-]+$/);
+    assert.ok(HINT_CODES.includes(code), code);
+  }
 });
 
 test('every emitted hint code is a fixed constant and never carries raw text', () => {
