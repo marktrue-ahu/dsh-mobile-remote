@@ -1,3 +1,4 @@
+import 'l10n.dart';
 import 'models.dart';
 import 'timeline.dart' show timelineIsInjectedNoise;
 
@@ -302,10 +303,15 @@ class ProcessSegment {
   /// 段折叠摘要（整段收起时替代过程块的一行）。
   String get summary {
     final parts = <String>[];
-    if (reasoningChars > 0) parts.add('思考 $reasoningChars 字');
+    if (reasoningChars > 0) {
+      parts.add(L10n.t('思考 $reasoningChars 字', '$reasoningChars chars of thinking'));
+    }
     parts.add(toolCount == 0
-        ? '${groups.length} 个过程组'
-        : '${groups.length} 组 · $toolCount 次工具调用');
+        ? L10n.t('${groups.length} 个过程组', '${groups.length} process groups')
+        : L10n.t(
+            '${groups.length} 组 · $toolCount 次工具调用',
+            '${groups.length} groups · $toolCount tool calls',
+          ));
     return parts.join(' · ');
   }
 }
@@ -400,40 +406,53 @@ String processGroupHeader(
           }
         }
       }
-      if (name != null && name.isNotEmpty) return '正在调用工具…（$name）';
+      if (name != null && name.isNotEmpty) {
+        return L10n.t('正在调用工具…（$name）', 'Calling tool… ($name)');
+      }
     }
-    return '正在调用工具…';
+    return L10n.t('正在调用工具…', 'Calling tool…');
   }
-  return '${group.toolCount} 次工具调用';
+  return L10n.t('${group.toolCount} 次工具调用', '${group.toolCount} tool calls');
 }
 
 /// 轮次页脚文案：已完成（可用时带用时）/ 中止 / 中断 / 出错。
 String turnFooterText(TurnProcess turn) {
   final kind = turn.endReasonKind;
   final label = switch (kind) {
-    'aborted' => '已中止',
-    'interrupted' => '已中断',
-    'error' => '出错',
-    _ => '已完成',
+    'aborted' => L10n.t('已中止', 'Aborted'),
+    'interrupted' => L10n.t('已中断', 'Interrupted'),
+    'error' => L10n.t('出错', 'Error'),
+    _ => L10n.t('已完成', 'Completed'),
   };
   final duration = turn.durationMs;
   if (duration == null) return label;
-  return '$label · 用时 ${formatTurnDuration(duration)}';
+  return L10n.t(
+    '$label · 用时 ${formatTurnDuration(duration)}',
+    '$label · took ${formatTurnDuration(duration)}',
+  );
 }
 
 /// 用时格式：<1s 保留一位小数秒，<60s 保留一位小数秒，<1h 用「分 秒」，否则「小时 分」。
 String formatTurnDuration(int milliseconds) {
   final seconds = milliseconds / 1000;
-  if (seconds < 60) return '${seconds.toStringAsFixed(1)} 秒';
+  if (seconds < 60) {
+    return L10n.t('${seconds.toStringAsFixed(1)} 秒', '${seconds.toStringAsFixed(1)}s');
+  }
   final total = seconds.round();
   if (total < 3600) {
     final minutes = total ~/ 60;
     final rest = total % 60;
-    return '$minutes 分 ${rest.toString().padLeft(2, '0')} 秒';
+    return L10n.t(
+      '$minutes 分 ${rest.toString().padLeft(2, '0')} 秒',
+      '${minutes}m ${rest.toString().padLeft(2, '0')}s',
+    );
   }
   final hours = total ~/ 3600;
   final minutes = (total % 3600) ~/ 60;
-  return '$hours 小时 ${minutes.toString().padLeft(2, '0')} 分';
+  return L10n.t(
+    '$hours 小时 ${minutes.toString().padLeft(2, '0')} 分',
+    '${hours}h ${minutes.toString().padLeft(2, '0')}m',
+  );
 }
 
 /// 从服务端事件折叠出的轮次过程跟踪器。

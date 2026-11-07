@@ -3,6 +3,7 @@
 // 这里锁的是**行为语义**，不是像素：三层折叠、强制展开三条件、两档收起时机、
 // 用时只认服务端 time、单轮 >50 行分批、按 step 派生过程组。
 
+import 'package:dsh_mobile_app/l10n.dart';
 import 'package:dsh_mobile_app/models.dart';
 import 'package:dsh_mobile_app/turn_process.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -557,6 +558,51 @@ void main() {
       expect(turn.toolCount, 6);
       expect(turn.ended, isTrue);
       expect(turnFooterText(turn), '已完成', reason: '缺 time 时按既有规则不显示用时');
+    });
+  });
+
+  group('R19 过程抬头/页脚随语言设置本地化', () {
+    tearDown(() => L10n.lang = 'zh');
+
+    test('英文设置下页脚、用时、过程组抬头与段摘要均为英文', () {
+      L10n.lang = 'en';
+      final tracker = trackerOf(oneTurn(startTime: 1000, endTime: 4500));
+      final turn = tracker.build().single;
+      expect(turnFooterText(turn), 'Completed · took 3.5s');
+      expect(turnFooterText(turn), isNot(contains('已完成')));
+      expect(formatTurnDuration(3500), '3.5s');
+      expect(formatTurnDuration(65000), '1m 05s');
+      expect(formatTurnDuration(3660000), '1h 01m');
+
+      final group = ProcessGroup(step: 1, rows: [
+        ProcessRow.tool(seq: 1, callId: 'c1', toolName: 'bash', status: 'success'),
+      ]);
+      expect(processGroupHeader(group, running: false), '1 tool calls');
+      expect(processGroupHeader(group, running: true), 'Calling tool…');
+      final segment = ProcessSegment(rows: [
+        ProcessRow.reasoning(seq: 1, reasoning: 'think', reasoningChars: 5),
+        ProcessRow.tool(seq: 2, callId: 'c1', toolName: 'bash', status: 'success'),
+      ]);
+      expect(segment.summary, contains('tool calls'));
+      expect(segment.summary, contains('thinking'));
+
+      // 含用时的页脚：英文标签 + 英文用时。
+      final withDuration = TurnProcess(
+        turn: 1,
+        startSeq: 1,
+        endSeq: 9,
+        ended: true,
+        startedAtMs: 1000,
+        endedAtMs: 4500,
+        groups: const [],
+      );
+      expect(turnFooterText(withDuration), 'Completed · took 3.5s');
+    });
+
+    test('中文（默认）仍输出既有中文文案', () {
+      final tracker = trackerOf(oneTurn());
+      expect(turnFooterText(tracker.build().single), '已完成 · 用时 3.5 秒');
+      expect(formatTurnDuration(3500), '3.5 秒');
     });
   });
 }
