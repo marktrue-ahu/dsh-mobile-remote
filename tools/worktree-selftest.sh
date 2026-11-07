@@ -891,6 +891,21 @@ p,b0=sys.argv[1:3]; d=json.load(open(p)); sys.exit(0 if d.get("baseline")==b0 el
 PY6
 run "登记授权（不确定提交态用例）" 0 env DSH_WT_ROLE=integrator bash "$WT" authorize 908 refresh-baseline "替换后确认失败用例"
 run_fail_with "替换后确认失败时不谎报成功" "不确定" env DSH_WT_TEST_REFRESH_WRITE_FAIL=uncertain bash "$WT" refresh-baseline 908
+run "备份登记文件（损坏夹具用）" 0 cp "$DSH_WT_STATE/tasks/908.json" "$TMP/task908.bak"
+run "重置基线为 B0（损坏用例）" 0 python3 - "$DSH_WT_STATE/tasks/908.json" "$B0" <<'PYC'
+import json,sys
+p,b0=sys.argv[1:3]; d=json.load(open(p)); d["baseline"]=b0
+json.dump(d,open(p,"w",encoding="utf-8"),ensure_ascii=False,indent=2)
+PYC
+run "登记授权（损坏登记用例）" 0 env DSH_WT_ROLE=integrator bash "$WT" authorize 908 refresh-baseline "损坏登记用例"
+run_fail_with "登记被写坏/不可解析时不得声称可重试" "不确定" env DSH_WT_TEST_REFRESH_WRITE_FAIL=corrupt bash "$WT" refresh-baseline 908
+run "恢复损坏的登记文件" 0 cp "$TMP/task908.bak" "$DSH_WT_STATE/tasks/908.json"
+run "恢复基线为 B1（后续用例依赖）" 0 python3 - "$DSH_WT_STATE/tasks/908.json" "$B1" <<'PYD'
+import json,sys
+p,b1=sys.argv[1:3]; d=json.load(open(p)); d["baseline"]=b1
+json.dump(d,open(p,"w",encoding="utf-8"),ensure_ascii=False,indent=2)
+PYD
+
 run "不确定态下登记已更新（用于人工核对提示）" 0 python3 - "$DSH_WT_STATE/tasks/908.json" "$B1" <<'PY7'
 import json,sys
 p,b1=sys.argv[1:3]; d=json.load(open(p)); sys.exit(0 if d.get("baseline")==b1 else 1)
@@ -908,6 +923,10 @@ p,b0=sys.argv[1:3]; d=json.load(open(p)); d["baseline"]=b0
 json.dump(d,open(p,"w",encoding="utf-8"),ensure_ascii=False,indent=2)
 PYR
 run "登记授权（注入拒绝用例）" 0 env DSH_WT_ROLE=integrator bash "$WT" authorize 908 refresh-baseline "注入拒绝用例"
+TASK_DIGEST_BEFORE="$(sha256sum "$DSH_WT_STATE/tasks/908.json" | awk '{print $1}')"
+run_fail_with "非合成上下文拒绝 WRITE_FAIL 注入（写前 fail-closed）" "测试注入" env -u DSH_WT_ALLOW_SYNTHETIC -u DSH_WT_SYNTHETIC_GATES DSH_WT_TEST_REFRESH_WRITE_FAIL=1 bash "$WT" refresh-baseline 908
+run_fail_with "非合成上下文拒绝 AUDIT_FAIL 注入（写前 fail-closed）" "测试注入" env -u DSH_WT_ALLOW_SYNTHETIC -u DSH_WT_SYNTHETIC_GATES DSH_WT_TEST_REFRESH_AUDIT_FAIL=1 bash "$WT" refresh-baseline 908
+run "注入拒绝后登记摘要不变、无刷新" 0 bash -c '[ "$1" = "$2" ]' _ "$(sha256sum "$DSH_WT_STATE/tasks/908.json" | awk '{print $1}')" "$TASK_DIGEST_BEFORE"
 run_fail_with "非合成上下文拒绝测试注入变量（不得在生产伪造写/审计失败）" "测试注入" env -u DSH_WT_ALLOW_SYNTHETIC -u DSH_WT_SYNTHETIC_GATES DSH_WT_TEST_REFRESH_WRITE_FAIL=1 bash "$WT" refresh-baseline 908
 # 第三祖先：远端 tip 前进但 HEAD 尚未包含 → 必须拒绝。
 cd "$CLONE"

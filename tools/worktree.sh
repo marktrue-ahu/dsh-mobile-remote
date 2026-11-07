@@ -126,6 +126,10 @@ atomic_json_write() { # atomic_json_write <文件>；通过 stdin 接收 JSON，
   if [ "$inject" != "0" ]; then
     synthetic_gate_allowed || die "拒绝在真实仓库/真实状态目录使用 refresh-baseline 测试注入变量（DSH_WT_TEST_REFRESH_*）；仅合成门禁自测可用"
     [ "$inject" = "1" ] && return 1
+    if [ "$inject" = "corrupt" ]; then
+      printf 'not json\n' >"$1"
+      return 1
+    fi
   fi
   python3 -c 'import json,os,sys,tempfile
 path=sys.argv[1]; obj=json.loads(sys.stdin.read()); directory=os.path.dirname(path) or "."
@@ -1421,6 +1425,12 @@ cmd_refresh_baseline() {
   [[ "$issue" =~ ^[1-9][0-9]{0,9}$ ]] || die "issue 必须是正整数"
   [ -z "$candidate" ] || [[ "$candidate" =~ ^[0-9a-f]{40}$ ]] || \
     die "新基线必须是完整 40 位提交 SHA（或省略以采用 github/<目标分支> 最新）"
+  # 测试注入必须在任何状态读取/写入之前 fail-closed：否则 AUDIT_FAIL 会在"已更新登记、
+  # 已清证据"之后才在 audit() 里被拒绝，等于生产里伪造了一次真实刷新（issue #58 评审）。
+  if [ "${DSH_WT_TEST_REFRESH_WRITE_FAIL:-0}" != "0" ] || [ "${DSH_WT_TEST_REFRESH_AUDIT_FAIL:-0}" = "1" ]; then
+    synthetic_gate_allowed || \
+      die "拒绝在真实仓库/真实状态目录使用 refresh-baseline 测试注入变量（DSH_WT_TEST_REFRESH_*）；仅合成门禁自测可用"
+  fi
   require_task "$issue"
   task_lock_acquire "$issue"
   local task; task="$(task_file "$issue")"
@@ -1478,8 +1488,13 @@ cmd_refresh_baseline() {
   require_clean_tree "$path" "refresh-baseline（写入前）"
   require_clean_tree "$MAIN_DIR" "refresh-baseline（写入前）"
   local reason; reason="$(json_get "$task" authorizations.refresh-baseline.note)"
-  # 写前快照：失败时用字节比较判断登记是否真的未变（不能把 json_get 读失败当成"未更新"）。
-  local task_before; task_before="$(cat "$task" 2>/dev/null || true)"
+  # 写前快照：用 sha256 摘要 + JSON 可解析性双重校验（不能把读失败/尾部换行差异当成"未变"）。
+  local task_before_digest="" task_before_valid=0
+  if task_before_digest="$(sha256sum "$task" 2>/dev/null | awk '{print $1}')" && [ -n "$task_before_digest" ]; then
+    if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$task" 2>/dev/null; then
+      task_before_valid=1
+    fi
+  fi
   local write_rc=0
   if ! { python3 - "$task" "$old_baseline" "$baseline_ref" "$new_baseline" "$WHOAMI_ID" "$reason" "$head_start" <<'PY' | atomic_json_write "$task"
 import datetime,json,sys
@@ -1515,10 +1530,16 @@ json.dump(d,sys.stdout,ensure_ascii=False)
 PY
   }; then write_rc=1; fi
   if [ "$write_rc" -ne 0 ]; then
-    local task_after; task_after="$(cat "$task" 2>/dev/null || true)"
-    if [ -n "$task_before" ] && [ "$task_after" = "$task_before" ]; then
+    local task_after_digest="" task_after_valid=0
+    if task_after_digest="$(sha256sum "$task" 2>/dev/null | awk '{print $1}')" && [ -n "$task_after_digest" ]; then
+      if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$task" 2>/dev/null; then
+        task_after_valid=1
+      fi
+    fi
+    if [ "$task_before_valid" = "1" ] && [ "$task_after_valid" = "1" ] && \
+       [ "$task_after_digest" = "$task_before_digest" ]; then
       audit refresh-baseline "issue=$issue result=write-failed old=$old_baseline new=$new_baseline head=$head_start" || true
-      die "刷新基线写入失败：登记文件字节未变（旧基线/旧证据保留），可修复后重试"
+      die "刷新基线写入失败：登记文件摘要未变且可解析（旧基线/旧证据保留），可修复后重试"
     fi
     audit refresh-baseline "issue=$issue result=write-uncertain old=$old_baseline new=$new_baseline head=$head_start" || true
     die "刷新写入结果不确定（登记文件已变化或无法读取）：请人工核对 tasks/$issue.json 与旧证据后重新 verify"
