@@ -682,6 +682,9 @@ test('install worker packs the plugin so bundled runtime dependencies are presen
   assert.match(script,/pack/);
   // The installed artifact must be the tarball, not the source directory.
   assert.match(script,/plugin-dist/);
+  // npm pack does not create its destination directory; without an explicit mkdir
+  // it exits non-zero (observed 254) and the whole install stage fails.
+  assert.match(script,/mkdirSync\('\/tmp\/plugin-dist'/);
   assert.match(script,/\.tgz/);
   // Still isolated from the host closure, and no link-based install remains.
   assert.match(script,/--legacy-peer-deps/);

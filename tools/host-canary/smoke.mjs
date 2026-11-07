@@ -964,6 +964,8 @@ try {
   // so dependencies must exist BEFORE packing: install them in place, pack, then
   // install the tarball. That reproduces how a real published package behaves.
   execFileSync('npm',['install','--ignore-scripts','--no-audit','--no-fund'],{cwd:'/tmp/plugin',stdio:'ignore',timeout:300000});
+  // npm pack does not create its destination: without this it exits non-zero (254).
+  mkdirSync('/tmp/plugin-dist',{recursive:true,mode:0o700});
   execFileSync('npm',['pack','--silent','--pack-destination','/tmp/plugin-dist'],{cwd:'/tmp/plugin',stdio:'ignore',timeout:120000});
   const packed = (await import('node:fs')).readdirSync('/tmp/plugin-dist').filter(f => f.endsWith('.tgz'));
   if (packed.length !== 1) fail('probe-input-invalid');
