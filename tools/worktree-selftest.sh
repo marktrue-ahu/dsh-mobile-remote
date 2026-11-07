@@ -28,6 +28,18 @@ run() { # run <描述> <期望退出码0|非0> <命令...>
   fi
 }
 section() { say ""; say "── $* ──"; }
+run_fail_with() { # run_fail_with <描述> <期望输出片段> <命令...>：既要求失败，又要求失败原因匹配
+  local desc="$1" want="$2"; shift 2
+  local out rc
+  out="$("$@" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF -- "$want"; then
+    PASS=$((PASS+1)); say "  PASS  $desc"
+    [ "$VERBOSE" = "-v" ] && printf '%s\n' "$out" | sed 's/^/        /'
+  else
+    FAIL=$((FAIL+1)); say "  FAIL  $desc (期望失败且包含「$want」，实际 exit=$rc)"
+    printf '%s\n' "$out" | sed 's/^/        /'
+  fi
+}
 slot_is_locked() { # exclusive try fails while any shared/exclusive holder owns the lock
   local f="$1"
   exec 5>"$f"
@@ -603,13 +615,46 @@ cd "$WT_UPSTREAM"
 printf 'upstream contribution\n' > upstream-contribution.txt
 git add upstream-contribution.txt >/dev/null 2>&1
 git -c user.email=t@t -c user.name=t commit -qm "feat: upstream contribution fixture"
-run "upstream-main 分支 verify" 0 bash "$WT" verify
-run "upstream-main 分支 deliver" 0 bash "$WT" deliver
+# issue #58：上游 main 前进后 rebase，upstream-main 任务的基线必须能刷新到 github/main（不是 develop）。
+cd "$CLONE"
+git checkout --quiet -b advance-github-main main
+mkdir -p docs/agents
+printf 'upstream doc advance\n' >> docs/agents/issue-tracker.md
+git add -A >/dev/null 2>&1
+git -c user.email=t@t -c user.name=t commit -qm "docs: upstream main advance fixture"
+ADV_MAIN="$(git rev-parse HEAD)"
+git push --quiet --force "$GITHUB_BARE" advance-github-main:refs/heads/main
+git checkout --quiet develop
+git branch -D advance-github-main >/dev/null 2>&1
+git fetch --quiet github main
+cd "$WT_UPSTREAM"
+git -c user.email=t@t -c user.name=t rebase --quiet github/main
+run_fail_with "upstream 任务未授权 refresh-baseline 被拒（fail-closed）" "授权" bash "$WT" refresh-baseline 904
+run "登记 upstream refresh-baseline 授权（绑定 rebase 后 HEAD）" 0 bash "$WT" authorize 904 refresh-baseline "用户批准 rebase 后刷新上游基线"
+run_fail_with "upstream 任务拒绝 develop 上的提交作为新基线" "github/main" bash "$WT" refresh-baseline 904 "$(git -C "$CLONE" rev-parse develop)"
+run "upstream 刷新基线到前进后的 github/main" 0 bash "$WT" refresh-baseline 904
+run "upstream 基线已前进且旧证据清空" 0 python3 - "$DSH_WT_STATE/tasks/904.json" "$ADV_MAIN" <<'PY'
+import json,sys
+p,new=sys.argv[1:3]
+d=json.load(open(p))
+assert d.get("baseline")==new, ("baseline",d.get("baseline"),new)
+assert d.get("baseline_ref")=="main", d.get("baseline_ref")
+assert d.get("baseline_updated_by")=="selftest-writer", d.get("baseline_updated_by")
+hist=d.get("baseline_history") or []
+assert hist and hist[-1].get("baseline")!=new and hist[-1].get("new_baseline")==new, hist
+for key in ("verification_state","last_verified_sha","last_report","delivered_sha","delivered_at"):
+    assert key not in d, key
+assert d.get("authorizations",{}).get("refresh-baseline",{}).get("used_at"), "授权未标记已使用"
+PY
+run_fail_with "upstream 刷新后未重新 verify 时 deliver 被拒" "验证报告" bash "$WT" deliver
+run "upstream 刷新后重新 verify" 0 bash "$WT" verify
+run "upstream 刷新后 deliver 按新基线通过" 0 bash "$WT" deliver
+run "upstream 交付摘要记录新基线" 0 bash -c 'grep -q "$2" "$1"/904-delivery-*.md' _ "$DSH_WT_STATE/reports" "$ADV_MAIN"
 UPSTREAM_DELIVERED_SHA="$(git rev-parse HEAD)"
 cd "$CLONE"
 UPSTREAM_DEVELOP_BEFORE="$(git rev-parse develop)"
 run "授权 upstream-main integrate" 0 env DSH_WT_ROLE=integrator bash "$WT" authorize 904 integrate "用户批准核验 upstream main PR"
-UPSTREAM_MAIN_BASE="$(git rev-parse main)"
+UPSTREAM_MAIN_BASE="$ADV_MAIN"
 git checkout --quiet -b simulate-upstream-pr "$UPSTREAM_MAIN_BASE"
 git merge --no-ff --no-edit upstream/upstream-probe >/dev/null
 git push --quiet --force "$GITHUB_BARE" simulate-upstream-pr:refs/heads/main
@@ -664,6 +709,98 @@ run "本地 develop 落后 github/develop → create 被拒" fail bash "$WT" cre
 git push --quiet --force "$GITHUB_BARE" develop:refs/heads/develop
 git fetch --quiet github
 git branch -D github-develop-advanced >/dev/null 2>&1
+
+section "refresh-baseline：授权后刷新任务基线（issue #58）"
+cd "$CLONE"
+run "同步测试 develop 与 github/develop" 0 bash -c \
+  'git -C "$1" push --quiet --force "$2" develop:refs/heads/develop && git -C "$1" fetch --quiet "$3" develop' \
+  _ "$CLONE" "$GITHUB_BARE" github
+run "建 refresh 测试树（基线为当前 develop）" 0 bash "$WT" create 907 refresh-probe
+WT_REF="$DSH_WT_ROOT/issue-907-refresh-probe"
+BASE_OLD="$(git -C "$CLONE" rev-parse develop)"
+cd "$WT_REF"
+printf 'refresh probe\n' > refresh-probe.txt
+git add refresh-probe.txt >/dev/null 2>&1
+git -c user.email=t@t -c user.name=t commit -qm "test: refresh-baseline fixture"
+run "刷新前 verify 通过" 0 bash "$WT" verify
+run "刷新前 deliver 通过（旧基线）" 0 bash "$WT" deliver
+run "旧基线交付记录已写入" 0 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("delivered_sha") and d.get("last_verified_sha") and d.get("verification_state")=="passed" else 1)' "$DSH_WT_STATE/tasks/907.json"
+# 目标远端 develop 前进（含禁止路径 docs/agents 的上游继承改动），本地 develop 保持旧 tip；
+# 随后在功能树里 rebase —— 这正是 issue #58 的现场（rebase 需用户批准，这里作为夹具模拟）。
+cd "$CLONE"
+git checkout --quiet -b advance-github-develop develop
+printf 'upstream doc\n' >> docs/agents/issue-tracker.md
+git add -A >/dev/null 2>&1
+git -c user.email=t@t -c user.name=t commit -qm "docs: github develop advance fixture"
+ADV_DEVELOP="$(git rev-parse HEAD)"
+git push --quiet --force "$GITHUB_BARE" advance-github-develop:refs/heads/develop
+git checkout --quiet develop
+git branch -D advance-github-develop >/dev/null 2>&1
+git fetch --quiet github develop
+cd "$WT_REF"
+git -c user.email=t@t -c user.name=t rebase --quiet github/develop
+HEAD_AFTER_REBASE="$(git rev-parse HEAD)"
+run "rebase 后 HEAD 已前进" 0 bash -c '[ "$1" != "$2" ]' _ "$HEAD_AFTER_REBASE" "$BASE_OLD"
+# 复现 #58：未刷新基线时 deliver 把上游继承的 docs/agents 当成分支改动而误拦。
+run_fail_with "rebase 后未刷新基线的 deliver 误报 docs/agents（#58 复现）" "docs/agents" bash "$WT" deliver
+run_fail_with "未授权 refresh-baseline 被拒（fail-closed）" "授权" bash "$WT" refresh-baseline 907
+run "未登记 issue 的 refresh-baseline 被拒" fail bash "$WT" refresh-baseline 999
+run_fail_with "非法 issue 参数的 refresh-baseline 被拒" "正整数" bash "$WT" refresh-baseline 0
+run "登记 refresh-baseline 授权（绑定 rebase 后 HEAD）" 0 bash "$WT" authorize 907 refresh-baseline "用户批准 rebase 后刷新基线"
+# 脏树拒绝（工作树 / 主目录），失败尝试不得消耗授权。
+printf 'dirty\n' >> refresh-probe.txt
+run_fail_with "工作树脏时 refresh-baseline 被拒" "干净" bash "$WT" refresh-baseline 907
+git checkout -- refresh-probe.txt
+printf 'main dirty\n' > "$CLONE/main-dirty.txt"
+run_fail_with "主目录脏时 refresh-baseline 被拒" "干净" bash "$WT" refresh-baseline 907
+rm -f "$CLONE/main-dirty.txt"
+# 授权绑定 HEAD：HEAD 变化后旧授权失效。
+git -c user.email=t@t -c user.name=t commit --allow-empty -qm "test: head moves after authorization"
+run_fail_with "授权绑定 HEAD：HEAD 变化后 refresh 被拒" "授权" bash "$WT" refresh-baseline 907
+git reset --hard --quiet "$HEAD_AFTER_REBASE"
+run "失败尝试未消耗授权" 0 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if not d.get("authorizations",{}).get("refresh-baseline",{}).get("used_at") else 1)' "$DSH_WT_STATE/tasks/907.json"
+# 新基线必须在 github/develop 历史内；旧基线必须是新基线的祖先（防任意跳变）。
+run_fail_with "不在 github/develop 历史中的提交被拒" "github/develop" bash "$WT" refresh-baseline 907 "$HEAD_AFTER_REBASE"
+ORPHAN_SHA="$(git -C "$WT_REF" -c user.email=t@t -c user.name=t commit-tree "$HEAD_AFTER_REBASE^{tree}" -m "selftest orphan baseline")"
+run "把登记基线改成与 develop 无关联的孤立提交" 0 python3 - "$DSH_WT_STATE/tasks/907.json" "$ORPHAN_SHA" <<'PY'
+import json,sys
+p,orphan=sys.argv[1:3]
+d=json.load(open(p)); d["baseline"]=orphan
+json.dump(d,open(p,"w",encoding="utf-8"),ensure_ascii=False,indent=2)
+PY
+run_fail_with "旧基线不是新基线祖先时被拒（防任意跳变）" "不是新基线" bash "$WT" refresh-baseline 907
+run "恢复登记基线以便成功刷新" 0 python3 - "$DSH_WT_STATE/tasks/907.json" "$BASE_OLD" <<'PY'
+import json,sys
+p,base=sys.argv[1:3]
+d=json.load(open(p)); d["baseline"]=base
+json.dump(d,open(p,"w",encoding="utf-8"),ensure_ascii=False,indent=2)
+PY
+run "授权后刷新基线成功" 0 bash "$WT" refresh-baseline 907
+run "刷新后基线/历史正确且旧证据全部清空" 0 python3 - "$DSH_WT_STATE/tasks/907.json" "$ADV_DEVELOP" "$BASE_OLD" <<'PY'
+import json,sys
+p,new,old=sys.argv[1:4]
+d=json.load(open(p))
+assert d.get("baseline")==new, ("baseline",d.get("baseline"),new)
+assert d.get("baseline_ref")=="develop", d.get("baseline_ref")
+assert d.get("baseline_updated_by")=="selftest-writer", d.get("baseline_updated_by")
+assert d.get("baseline_updated_at"), "缺少 baseline_updated_at"
+hist=d.get("baseline_history") or []
+assert hist and hist[-1].get("baseline")==old and hist[-1].get("new_baseline")==new, hist
+for key in ("verification_state","verification_attempt_sha","last_verified_sha","last_report",
+            "last_failed_sha","last_failed_gates","baseline_verification_state","baseline_attempt_sha",
+            "last_baseline_report","last_baseline_sha","last_baseline_failed_gates",
+            "delivered_sha","delivered_at"):
+    assert key not in d, key
+assert d.get("status")=="baseline-refreshed", d.get("status")
+assert d.get("authorizations",{}).get("refresh-baseline",{}).get("used_at"), "授权未标记已使用"
+PY
+run "刷新基线写审计" 0 grep -q "refresh-baseline" "$DSH_WT_STATE/audit.log"
+run_fail_with "刷新后未重新 verify 时 deliver 被拒（旧证据已作废）" "验证报告" bash "$WT" deliver
+run_fail_with "同一份授权不能二次使用" "授权" bash "$WT" refresh-baseline 907
+run "刷新后重新 verify" 0 bash "$WT" verify
+run "刷新后 deliver 使用新基线通过（不再误报 docs）" 0 bash "$WT" deliver
+run "交付摘要记录新基线" 0 bash -c 'grep -q "$2" "$1"/907-delivery-*.md' _ "$DSH_WT_STATE/reports" "$ADV_DEVELOP"
+run "新基线下 PR diff 不含继承的 docs/agents" 0 bash -c 'git -C "$1" diff --quiet "$2" HEAD -- docs/agents' _ "$WT_REF" "$ADV_DEVELOP"
 
 section "结果"
 say "通过 $PASS / 失败 $FAIL"
