@@ -53,6 +53,10 @@ class PluginUpdateStatus {
     required this.remoteContentSha256,
     this.release,
     this.checkLog = const [],
+    this.updateChannel = '',
+    this.updateChannelDescription = '',
+    this.canRestartHost = false,
+    this.hostManagerHmrAvailable,
   });
 
   const PluginUpdateStatus.unknown()
@@ -66,7 +70,11 @@ class PluginUpdateStatus {
       remoteVersion = '',
       remoteContentSha256 = '',
       release = null,
-      checkLog = const [];
+      checkLog = const [],
+      updateChannel = '',
+      updateChannelDescription = '',
+      canRestartHost = false,
+      hostManagerHmrAvailable = null;
 
   /// 检查结论：`up-to-date` / `update-available` / `local-ahead` / `unavailable` / `disabled` / `unknown`。
   final String state;
@@ -82,6 +90,33 @@ class PluginUpdateStatus {
 
   /// 最近一次检查的脱敏诊断（npm 查询命令与结果），与桌面端显示同一份内容。
   final List<String> checkLog;
+
+  /// 实际使用的更新通道（v3.5）：
+  /// `host-manager` = 宿主原生插件管理器在进程内更新，**不重启**；
+  /// `restart` = 传统通道，安装后重启宿主；`guidance` = 只能人工处理。
+  /// 空串表示旧宿主未下发该字段（按 `canSelfUpdate` 的旧语义解释）。
+  final String updateChannel;
+
+  /// 通道的一句话说明（服务端给出，两端共用同一文案，避免漂移）。
+  final String updateChannelDescription;
+
+  /// 传统重启通道是否可用（旧宿主用 `canSelfUpdate` 表达同一件事）。
+  final bool canRestartHost;
+
+  /// 宿主是否报告 HMR：`true` 表示宿主管理器更新可免重启生效；
+  /// `false` 表示装了但要重启；`null` 表示旧宿主未下发。
+  final bool? hostManagerHmrAvailable;
+
+  /// 本次更新会不会重启宿主（决定界面是否要预告"连接会短暂断开"）。
+  bool get updateRestartsHost {
+    if (updateChannel == 'host-manager') return hostManagerHmrAvailable == false;
+    if (updateChannel == 'restart') return true;
+    // 旧宿主没有通道字段：沿用「能自更新就意味着会重启」的旧语义。
+    return updateChannel.isEmpty && canSelfUpdate;
+  }
+
+  /// 是否由宿主管理器在进程内完成（免重启）。
+  bool get usesHostManager => updateChannel == 'host-manager';
   bool get retryableFailure =>
       state == 'update-failed' ||
       const {'failed', 'rolled-back'}.contains(transaction?.phase);
@@ -130,6 +165,13 @@ class PluginUpdateStatus {
           : '',
       release: ReleaseSnapshot.fromJson(json['release']),
       checkLog: _checkLogFromJson(json['checkLog']),
+      updateChannel: (json['updateChannel'] as String?) ?? '',
+      updateChannelDescription:
+          (json['updateChannelDescription'] as String?) ?? '',
+      canRestartHost: json['canRestartHost'] == true,
+      hostManagerHmrAvailable: (json['hostManager'] is Map)
+          ? (json['hostManager'] as Map)['hmrAvailable'] == true
+          : null,
     );
   }
 }

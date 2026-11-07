@@ -25,10 +25,19 @@
 | 桌面宠物前台联动（build 27） | `MainActivity.onStart/onStop` → 服务根视图 `GONE`：App 在前台时收起宠物与状态气泡/迷你面板；`设置 → 桌面宠物 → App 在前台时收起` 可关。旧系统不涉及（仅原生层行为） |
 | 图标主题化与圆形图标 | **已知缺口**：`mipmap-anydpi-v26` 未提供 `<monochrome>` 层，Android 13 主题图标不生效；未声明 `android:roundIcon`，圆形图标机型退化为方形。计划在后续版本补齐，不影响功能 |
 | Flutter 构建环境 | Flutter 3.35+（Dart SDK ^3.13） |
+| 插件自更新通道（v3.5） | 按**能力**分两条通道，不按宿主版本号门禁：宿主提供 `pluginManager.updateBundle` 且本插件可被它更新 → **`host-manager`**（进程内热更新，**不重启宿主**；HMR 可用时立即生效，否则装完需重启）；否则退回传统通道（改依赖 → pnpm install → 重启 → 健康确认），再不行给人工指引。`0.2.2` 之前的宿主没有该服务，自动走传统通道，行为与旧版一致 |
 
 **声明式兼容范围（`peerDependencies`）**：`@deepseek-ai/dsh-{credentials,llm,sandbox-policy,scope}` 声明 `>=0.1.0-rc.6 <=0.2.2 || >=0.2.0-0 <0.2.0 || >=0.2.1-0 <0.2.1 || >=0.2.2-0 <0.2.2`。稳定版上限为 `0.2.2`；三个显式预发布分支分别纳入已发布的 `0.2.0-rc.*`、`0.2.1-rc.*`、`0.2.2-alpha/rc.*` 系列（npm 默认 semver 语义不会把裸 `<=0.2.2` 认作覆盖预发布版本）。`0.2.3+` 与 `0.3.0+` 会被判为不兼容。
 
 注意两条判定通道语义不同：宿主 `@deepseek-ai/dsh-app-boot` 的 `evaluatePluginCompatibility()` 用 `semver.satisfies(runtimeVersion, range, { includePrerelease: true })`（运行时放行预发布）；npm / pnpm 安装期的 peer 解析用默认语义，所以预发布宿主必须在范围里显式出现。上界**只用于声明可安装边界**，功能路径仍按能力探测（ADR 0017），不按版本号做功能门禁。
+
+**更新通道路由（v3.5，DSH 0.2.2+）**：`/m/api/bootstrap` 的 `pluginUpdate.updateChannel` 给出本机实际使用的通道，`updateChannelDescription` 是给用户的一句话说明（两端共用同一文案）：
+
+- `host-manager`：宿主原生插件管理器在进程内卸载旧版、安装新版。HMR 可用时**连接不中断**；`pluginUpdate.hostManager.hmrAvailable` 表示这一点。失败时宿主会自己把旧版本装回，并把结果如实报出。
+- `restart`：传统通道（`<0.2.2` 或宿主管理器不可用时）。安装后重启宿主，重启形态由 `restartForm` 给出（`web-systemd` / `web-foreground`）；前台 web 形态的 respawn **复用本进程原命令行**，因此 `--port` 等参数不会丢。
+- `guidance`：两条通道都不可用，只能给人工指引。
+
+`services` 一节同时新增 `pluginManager` / `hmr` 两项，可直接看到宿主是否提供这两项能力。
 
 **快速自检**：手机 App → 设置 → 环境诊断。`services` 一节列出每个内核服务是否存在；**v3.1.3+ 看 `checks.approvalMode`**（生效策略）与 **`checks.remoteEvents`**（`true` = `$events` 双端呈现通道就绪，`false` = both 降级 mobile 或配置即 mobile/desktop）；`notes` 说明当前审批策略实际语义与**任何非全绿的宿主能力**。
 
