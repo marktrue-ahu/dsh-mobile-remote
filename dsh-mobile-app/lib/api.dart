@@ -12,6 +12,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'download.dart';
 import 'logger.dart';
 import 'models.dart';
+import 'turn_tail.dart';
 import 'git_models.dart';
 import 'turn_outline.dart';
 import 'plugin_update_status.dart';
@@ -215,6 +216,10 @@ class Api implements GitReadApi {
   /// 预览也不发 Range（由调用方判断）。
   bool fileRangeSupported = false;
 
+  /// issue #53（§6.20）：轮末产出物能力位。旧插件不下发 → 三项皆假，App 隐藏两卡
+  /// 与展示模式设置；`changed/changesDiff` 由电脑端按 `workspaceChanges` 服务真实存在判定。
+  TurnTailCapabilities turnTailCapabilities = const TurnTailCapabilities();
+
   /// 电脑的全部候选地址（局域网 IP / Tailscale IP / 127.0.0.1）。
   /// 连接失败时按顺序轮换（外出自动切 Tailscale，回家自动切回局域网）。
   List<String> baseUrls = [];
@@ -391,6 +396,12 @@ class Api implements GitReadApi {
         capabilities is Map &&
         capabilities['fileRange'] is Map &&
         (capabilities['fileRange'] as Map)['supported'] == true;
+    // issue #53：轮末产出物能力位（旧插件缺失 → available=false，两卡与设置隐藏）。
+    turnTailCapabilities = TurnTailCapabilities.fromJson(
+      capabilities is Map && capabilities['turnTail'] is Map
+          ? Map<String, dynamic>.from(capabilities['turnTail'] as Map)
+          : null,
+    );
     // 正在运行的内容标识 + 插件自更新状态 + 三角色发布快照：接续/门禁/App 安装的依据
     _absorbUpdateFields(d);
     // 统一接续入口：所有吸收 bootstrap 的路径（首连/自动重连/刷新/探测）都走到这里
@@ -568,8 +579,8 @@ class Api implements GitReadApi {
   /// 注意：这里刻意**不用** `resp.stream.timeout(...)` —— 它内部的定时器不在
   /// 调用方 zone，widget 测试推进假时钟时事件永远不派发（表现为界面一直转圈）。
   /// 需要空闲超时请用 [downloadFilePrefix] 里那套手动 Timer。
-  Future<DownloadResult> downloadFileToFile(
-    String remotePath,
+  Future<DownloadResult> _downloadToFileUri(
+    Uri uri,
     File target, {
     DownloadCancelToken? cancel,
     void Function(DownloadProgress)? onProgress,
@@ -625,10 +636,7 @@ class Api implements GitReadApi {
 
     try {
       if (cancel?.cancelled ?? false) throw const DownloadCancelled();
-      final req = http.Request(
-        'GET',
-        _uri('/api/files?path=${Uri.encodeQueryComponent(remotePath)}'),
-      );
+      final req = http.Request('GET', uri);
       req.headers.addAll(_headers);
       req.headers.remove('content-type');
       req.headers['accept-encoding'] = 'identity';
@@ -732,8 +740,8 @@ class Api implements GitReadApi {
   /// - `fileRangeSupported` 为 true 时发 Range，服务端回 206；
   /// - 旧插件回 200 时最多读 [maxBytes] 后主动断开，避免整文件进内存；
   /// - [DownloadPrefix.total] 来自 `Content-Range`（206）或 `Content-Length`（200）。
-  Future<DownloadPrefix> downloadFilePrefix(
-    String remotePath,
+  Future<DownloadPrefix> _downloadPrefixFrom(
+    Uri uri,
     int maxBytes, {
     Duration connectTimeout = const Duration(seconds: 15),
     Duration idleTimeout = const Duration(seconds: 30),
@@ -742,10 +750,7 @@ class Api implements GitReadApi {
     if (maxBytes <= 0) throw ArgumentError.value(maxBytes, 'maxBytes');
     final client = downloadClient ?? _client;
     try {
-      final req = http.Request(
-        'GET',
-        _uri('/api/files?path=${Uri.encodeQueryComponent(remotePath)}'),
-      );
+      final req = http.Request('GET', uri);
       req.headers.addAll(_headers);
       req.headers.remove('content-type');
       if (fileRangeSupported) {
@@ -781,6 +786,127 @@ class Api implements GitReadApi {
       rethrow;
     }
   }
+
+  /// `/api/files?path=` 的流式下载入口（保留既有签名/语义）。
+  Future<DownloadResult> downloadFileToFile(
+    String remotePath,
+    File target, {
+    DownloadCancelToken? cancel,
+    void Function(DownloadProgress)? onProgress,
+    Future<void> Function(DownloadMetadata)? onMetadata,
+    int startOffset = 0,
+    String? expectedEtag,
+    bool keepPartialOnCancel = false,
+    Duration connectTimeout = const Duration(seconds: 15),
+    Duration idleTimeout = const Duration(seconds: 30),
+    http.Client? downloadClient,
+  }) =>
+      _downloadToFileUri(
+        _uri('/api/files?path=${Uri.encodeQueryComponent(remotePath)}'),
+        target,
+        cancel: cancel,
+        onProgress: onProgress,
+        onMetadata: onMetadata,
+        startOffset: startOffset,
+        expectedEtag: expectedEtag,
+        keepPartialOnCancel: keepPartialOnCancel,
+        connectTimeout: connectTimeout,
+        idleTimeout: idleTimeout,
+        downloadClient: downloadClient,
+      );
+
+  /// `/api/files?path=` 的前缀读取入口（保留既有签名/语义）。
+  Future<DownloadPrefix> downloadFilePrefix(
+    String remotePath,
+    int maxBytes, {
+    Duration connectTimeout = const Duration(seconds: 15),
+    Duration idleTimeout = const Duration(seconds: 30),
+    http.Client? downloadClient,
+  }) =>
+      _downloadPrefixFrom(
+        _uri('/api/files?path=${Uri.encodeQueryComponent(remotePath)}'),
+        maxBytes,
+        connectTimeout: connectTimeout,
+        idleTimeout: idleTimeout,
+        downloadClient: downloadClient,
+      );
+
+  /// `/turn-file` 坐标 URI：客户端只给记录坐标，不给路径（§6.23）。
+  Uri _turnFileUri(TurnFileCoordinate coordinate) => _uri(
+    '/api/turn-file?sessionId=${Uri.encodeQueryComponent(coordinate.sessionId)}'
+    '&kind=${coordinate.kindParam}&seq=${coordinate.seq}&index=${coordinate.index}',
+  );
+
+  /// 本轮改动文件摘要（§6.21）。三态是**正常响应**，不抛异常；只有网络/协议错误才抛。
+  Future<ChangesSummary> changesSummary(
+    String sessionId,
+    int turn, {
+    Duration timeout = const Duration(seconds: 15),
+  }) async {
+    final data = await getJson(
+      '/api/changes/summary?sessionId=${Uri.encodeQueryComponent(sessionId)}&turn=$turn',
+      timeout: timeout,
+    );
+    return ChangesSummary.fromJson(data);
+  }
+
+  /// 本轮单文件对比（§6.22）。404 → `ApiException(code: diff-not-found)`，由调用方提示。
+  Future<ChangesDiff> changesDiff(
+    String sessionId,
+    int turn,
+    int index, {
+    Duration timeout = const Duration(seconds: 20),
+  }) async {
+    final data = await getJson(
+      '/api/changes/diff?sessionId=${Uri.encodeQueryComponent(sessionId)}&turn=$turn&index=$index',
+      timeout: timeout,
+    );
+    final diff = data['diff'];
+    if (diff is! Map) {
+      throw ApiException('change diff unavailable', code: 'diff-not-found');
+    }
+    return ChangesDiff.fromJson(Map<String, dynamic>.from(diff));
+  }
+
+  /// 按轮末记录坐标读取文件前缀（文本/图片预览底座，§6.23）。
+  Future<DownloadPrefix> turnFilePrefix(
+    TurnFileCoordinate coordinate,
+    int maxBytes, {
+    Duration connectTimeout = const Duration(seconds: 15),
+    Duration idleTimeout = const Duration(seconds: 30),
+    http.Client? downloadClient,
+  }) =>
+      _downloadPrefixFrom(
+        _turnFileUri(coordinate),
+        maxBytes,
+        connectTimeout: connectTimeout,
+        idleTimeout: idleTimeout,
+        downloadClient: downloadClient,
+      );
+
+  /// 按轮末记录坐标流式下载到临时文件（⋮ 打开/分享/保存到手机）。
+  Future<DownloadResult> turnFileToFile(
+    TurnFileCoordinate coordinate,
+    File target, {
+    DownloadCancelToken? cancel,
+    void Function(DownloadProgress)? onProgress,
+    Future<void> Function(DownloadMetadata)? onMetadata,
+    int startOffset = 0,
+    Duration connectTimeout = const Duration(seconds: 15),
+    Duration idleTimeout = const Duration(seconds: 30),
+    http.Client? downloadClient,
+  }) =>
+      _downloadToFileUri(
+        _turnFileUri(coordinate),
+        target,
+        cancel: cancel,
+        onProgress: onProgress,
+        onMetadata: onMetadata,
+        startOffset: startOffset,
+        connectTimeout: connectTimeout,
+        idleTimeout: idleTimeout,
+        downloadClient: downloadClient,
+      );
 
   /// 读取 [stream] 的前 [maxBytes] 字节；空闲超过 [idleTimeout] 抛 [TimeoutException]。
   ///
@@ -1333,6 +1459,7 @@ class Api implements GitReadApi {
           .whereType<Map>()
           .map((e) => ChatEvent.fromJson(Map<String, dynamic>.from(e)))
           .toList(),
+      turnTails: turnTailsFromJson(data['turnTails']),
       hasMore: data['hasMore'] == true,
       // v3.1.5：休眠会话降级读取标记（current surface）——历史可能不完整
       degraded: data['degraded'] == true,
