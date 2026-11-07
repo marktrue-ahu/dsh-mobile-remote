@@ -1,5 +1,35 @@
 # Changelog
 
+## v3.2.4-alpha.7（build 39，issues #52 / #53 / #54）— 轮末两卡与工具卡结构化
+
+> 插件 `3.2.4-alpha.7` / App `3.2.4+39` / 载体 `3.2.4-alpha.7-app`。
+
+### 服务端：轮末产出物契约与三端点（#53 / M2）
+
+- 新增 `capabilities.turnTail`：`{ version: 1, presented, changed, changesDiff }`；`changed` / `changesDiff` 仅当宿主**真的注册** `workspaceChanges` 服务时为真（bootstrap 与 SSE `hello` 同判据、同形状），旧宿主按缺失能力位降级。
+- `GET /m/api/history` 增量 `turnTails`（按轮摘要 `changes/presented`，单次遍历已加载事件得出，不调用宿主服务）。
+- 新增三端点：`GET /m/api/changes/summary`（本轮改动摘要）、`GET /m/api/changes/diff`（单文件最小闭环 diff）、`GET /m/api/turn-file`（按轮末记录坐标预览/下载，支持 HEAD/区间读取）。
+- `workspace/changes` 事件不再进入移动时间线（由轮末两卡承载），旧 App 不会渲染裸类型空卡。
+
+### App：轮末两卡、按坐标预览与展示模式（#52 / #53 / M1+M2）
+
+- 轮末新增「产出物 / 改动」两卡：产出物卡按宿主记录坐标打开预览，改动卡展示本轮变更文件与 diff；无 `turnTail` 能力位时两卡与相关设置不渲染。
+- 新增按坐标文件预览（`/turn-file`）与改动 diff 预览入口，沿用既有只读、鉴权与路径校验边界。
+- 补全四档展示策略表（简洁 / 标准 / 详细 / 完全展开）的折叠与步骤分组语义，与桌面 `presentation-policy.js` 同构（ADR 0027 增补）。
+
+### 服务端 + App：工具卡结构化（#54 / M3 Batch 1）
+
+- 能力位 `capabilities.toolCards = { version: 1, tools: [...] }`，声明本插件实际投影的 10 类工具（bash/pwsh/read/write/edit/grep/glob/web_fetch/web_search/read_image）；App 逐工具决定专用卡，未列入或字段异常一律回退通用卡。
+- `tool/call` 摘要派生命名参数：`kind`（command/file/search/web/image）、命令、显示路径、`sizeKb`、行范围、pattern、URL、查询、后台标志、write/edit 内联 diff（≤ 8 KiB，超出标记 `diffTruncated`）；路径统一经 `mobileDisplayPath`，**不下发绝对路径**。
+- `tool/result` 摘要从原始未截断文本解析 `exitCode` / `signal` / `stopped` / `resultCount`（长输出尾部标记不被摘要截断吃掉）；解析不到时缺省，不猜。
+- 全部字段 fail-open：非法 JSON、未知工具、异常字段忽略并回退通用卡，不影响事件摘要/历史/SSE。
+
+### 工具链
+
+- `tools/proxy-env.sh` 增加 `NO_PROXY` 注入，修复 `flutter-test` 门禁在代理环境下卡死；`worktree.sh` / 自测同步调整。
+- `tools/timeline-contract-check.mjs` 扩展轮末与工具卡契约断言（turn-tail / tool-cards 路由与投影测试同时入库）。
+- 补齐 `/changes/summary`、`/changes/diff`、`/turn-file` 的端点登记（ADR 0019 登记强制化），并把 `proxy-env` 门禁测试指向重构后的 `tools/proxy-env.sh`；Node 全量门禁恢复无真实失败。
+
 ## v3.2.4-alpha.6（build 38，issues #40 / #52 / #53 / #56 / #59）— 吸收上游 main、轮次过程折叠与兼容性 canary
 
 > 插件 `3.2.4-alpha.6` / App `3.2.4+38` / 载体 `3.2.4-alpha.6-app`。
