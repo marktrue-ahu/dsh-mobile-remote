@@ -78,6 +78,11 @@ FORBIDDEN_PATHS=(AGENTS.md AGENT-RULES.md CONTEXT.md docs/adr docs/agents docs/d
 init_state_dirs() { mkdir -p "$TASKS_DIR" "$LOCK_DIR" "$REPORTS_DIR"; }
 
 audit() { # audit <事件> <详情...>
+  # 自测注入：只允许在合成门禁上下文；生产设置该变量会被拒绝，用于验证"审计失败"检查本身。
+  if [ "${DSH_WT_TEST_REFRESH_AUDIT_FAIL:-0}" = "1" ]; then
+    synthetic_gate_allowed || die "拒绝在真实仓库/真实状态目录使用 refresh-baseline 测试注入变量（DSH_WT_TEST_REFRESH_*）；仅合成门禁自测可用"
+    return 1
+  fi
   init_state_dirs
   printf '%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$WHOAMI_ID" "$1" "${2:-}" >>"$AUDIT_LOG"
 }
@@ -114,6 +119,14 @@ branch_matches_target() { # <develop|upstream-main> <branch>
 }
 
 atomic_json_write() { # atomic_json_write <文件>；通过 stdin 接收 JSON，原子替换
+  # 自测注入（仅合成门禁上下文；生产设置即拒绝）：
+  #   =1         模拟替换前失败（不写文件，返回非 0）
+  #   =uncertain 正常写入后返回非 0（模拟 replace 后 fsync/确认失败）
+  local inject="${DSH_WT_TEST_REFRESH_WRITE_FAIL:-0}"
+  if [ "$inject" != "0" ]; then
+    synthetic_gate_allowed || die "拒绝在真实仓库/真实状态目录使用 refresh-baseline 测试注入变量（DSH_WT_TEST_REFRESH_*）；仅合成门禁自测可用"
+    [ "$inject" = "1" ] && return 1
+  fi
   python3 -c 'import json,os,sys,tempfile
 path=sys.argv[1]; obj=json.loads(sys.stdin.read()); directory=os.path.dirname(path) or "."
 fd,tmp=tempfile.mkstemp(prefix="."+os.path.basename(path)+".",suffix=".tmp",dir=directory)
@@ -127,6 +140,10 @@ except BaseException:
  try: os.unlink(tmp)
  except OSError: pass
  raise' "$1"
+  local rc=$?
+  [ "$rc" -ne 0 ] && return "$rc"
+  [ "$inject" = "uncertain" ] && return 1
+  return 0
 }
 
 json_set() { # json_set <文件> <点路径> <值>；原子更新，调用者应持任务锁
@@ -1453,19 +1470,18 @@ cmd_refresh_baseline() {
   gitq -C "$path" merge-base --is-ancestor "$new_baseline" "$head_start" || \
     die "新基线 ${new_baseline:0:12} 不是当前 HEAD 的祖先：分支并未 rebase 到该基线"
 
-  # 写入前再确认现场未变（fetch 是耗时段），随后原子更新登记并清空旧证据。
+  # 写入前再确认现场未变（fetch 是耗时段）：HEAD、干净树、实际分支都要重查。
   [ "$(gitq -C "$path" rev-parse HEAD)" = "$head_start" ] || die "刷新期间 HEAD 变化，拒绝写入"
+  local branch_now; branch_now="$(gitq -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  [ "$branch_now" = "$branch" ] || die "刷新期间工作树分支变化（${branch_now:-detached}），拒绝写入"
+  [ "$(branch_head "$branch")" = "$head_start" ] || die "刷新期间登记分支 $branch 的头部变化，拒绝写入"
   require_clean_tree "$path" "refresh-baseline（写入前）"
   require_clean_tree "$MAIN_DIR" "refresh-baseline（写入前）"
   local reason; reason="$(json_get "$task" authorizations.refresh-baseline.note)"
-  # 测试注入（selftest 用；生产不设）：模拟登记写入失败/替换后确认失败/审计不可写。
-  local inject_write="${DSH_WT_TEST_REFRESH_WRITE_FAIL:-0}"
-  local inject_audit="${DSH_WT_TEST_REFRESH_AUDIT_FAIL:-0}"
+  # 写前快照：失败时用字节比较判断登记是否真的未变（不能把 json_get 读失败当成"未更新"）。
+  local task_before; task_before="$(cat "$task" 2>/dev/null || true)"
   local write_rc=0
-  if [ "$inject_write" = "1" ]; then
-    write_rc=1
-  else
-    if ! { python3 - "$task" "$old_baseline" "$baseline_ref" "$new_baseline" "$WHOAMI_ID" "$reason" "$head_start" <<'PY' | atomic_json_write "$task"
+  if ! { python3 - "$task" "$old_baseline" "$baseline_ref" "$new_baseline" "$WHOAMI_ID" "$reason" "$head_start" <<'PY' | atomic_json_write "$task"
 import datetime,json,sys
 f,old,old_ref,new,by,reason,head=sys.argv[1:8]
 now=datetime.datetime.now().strftime("%F %T")
@@ -1498,23 +1514,26 @@ d["status"]=prev if prev in ("created","initialized") else "baseline-refreshed"
 json.dump(d,sys.stdout,ensure_ascii=False)
 PY
   }; then write_rc=1; fi
-    [ "$inject_write" = "uncertain" ] && write_rc=1
-  fi
   if [ "$write_rc" -ne 0 ]; then
-    local now_baseline; now_baseline="$(json_get "$task" baseline 2>/dev/null || true)"
-    if [ "$now_baseline" = "$new_baseline" ]; then
-      audit refresh-baseline "issue=$issue result=write-uncertain old=$old_baseline new=$new_baseline head=$head_start" || true
-      die "刷新登记已替换为新基线，但写入确认失败（fsync/替换不确定）：旧证据可能未清空；请人工核对 tasks/$issue.json 后重新 verify"
+    local task_after; task_after="$(cat "$task" 2>/dev/null || true)"
+    if [ -n "$task_before" ] && [ "$task_after" = "$task_before" ]; then
+      audit refresh-baseline "issue=$issue result=write-failed old=$old_baseline new=$new_baseline head=$head_start" || true
+      die "刷新基线写入失败：登记文件字节未变（旧基线/旧证据保留），可修复后重试"
     fi
-    audit refresh-baseline "issue=$issue result=write-failed old=$old_baseline new=$new_baseline head=$head_start" || true
-    die "刷新基线写入失败：登记未更新（旧基线/旧证据保留），可修复后重试"
+    audit refresh-baseline "issue=$issue result=write-uncertain old=$old_baseline new=$new_baseline head=$head_start" || true
+    die "刷新写入结果不确定（登记文件已变化或无法读取）：请人工核对 tasks/$issue.json 与旧证据后重新 verify"
   fi
   local head_end; head_end="$(gitq -C "$path" rev-parse HEAD)"
+  local branch_end; branch_end="$(gitq -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  if [ "$branch_end" != "$branch" ]; then
+    audit refresh-baseline "issue=$issue result=branch-changed old=$old_baseline new=$new_baseline head=$head_start" || true
+    die "刷新写入期间工作树分支变化（$branch → ${branch_end:-detached}）：基线已更新且旧证据已清空；请确认现场后重新 verify"
+  fi
   if [ "$head_end" != "$head_start" ]; then
     audit refresh-baseline "issue=$issue result=head-changed old=$old_baseline new=$new_baseline"
     die "刷新写入期间 HEAD 变化（${head_start:0:12} → ${head_end:0:12}）：基线已更新且旧证据已清空；请确认现场后重新 verify"
   fi
-  if [ "$inject_audit" = "1" ] || ! audit refresh-baseline "issue=$issue target=$target ref=$baseline_ref old=$old_baseline new=$new_baseline head=$head_start by=$WHOAMI_ID note=$reason"; then
+  if ! audit refresh-baseline "issue=$issue target=$target ref=$baseline_ref old=$old_baseline new=$new_baseline head=$head_start by=$WHOAMI_ID note=$reason"; then
     die "登记已刷新且旧证据已清空，但审计写入失败（audit.log 不可写）；请人工补记 refresh-baseline 审计后再继续"
   fi
   ok "已刷新基线：${old_baseline:0:12} → ${new_baseline:0:12}（github/$baseline_ref，绑定当前 HEAD ${head_start:0:12}）"

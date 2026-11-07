@@ -902,6 +902,13 @@ json.dump(d,open(p,"w",encoding="utf-8"),ensure_ascii=False,indent=2)
 PY8
 run "登记授权（审计失败用例）" 0 env DSH_WT_ROLE=integrator bash "$WT" authorize 908 refresh-baseline "审计失败用例"
 run_fail_with "审计写入失败时非零退出并明确提示" "审计" env DSH_WT_TEST_REFRESH_AUDIT_FAIL=1 bash "$WT" refresh-baseline 908
+run "重置基线为 B0（注入拒绝用例）" 0 python3 - "$DSH_WT_STATE/tasks/908.json" "$B0" <<'PYR'
+import json,sys
+p,b0=sys.argv[1:3]; d=json.load(open(p)); d["baseline"]=b0
+json.dump(d,open(p,"w",encoding="utf-8"),ensure_ascii=False,indent=2)
+PYR
+run "登记授权（注入拒绝用例）" 0 env DSH_WT_ROLE=integrator bash "$WT" authorize 908 refresh-baseline "注入拒绝用例"
+run_fail_with "非合成上下文拒绝测试注入变量（不得在生产伪造写/审计失败）" "测试注入" env -u DSH_WT_ALLOW_SYNTHETIC -u DSH_WT_SYNTHETIC_GATES DSH_WT_TEST_REFRESH_WRITE_FAIL=1 bash "$WT" refresh-baseline 908
 # 第三祖先：远端 tip 前进但 HEAD 尚未包含 → 必须拒绝。
 cd "$CLONE"
 git checkout --quiet -b review-advance2 "$B1"
