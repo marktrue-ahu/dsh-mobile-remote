@@ -342,6 +342,14 @@ synthetic_gate_allowed() {
   is_real_repo_context && return 1
   return 0
 }
+# 测试注入（refresh-baseline selftest 用）只允许在合成门禁上下文；任何命令入口统一拒绝，
+# 否则全局 audit/atomic_json_write 的钩子会让 deliver/authorize 等命令在真实仓库里
+# 在"已写摘要/已更新登记"之后才失败（issue #58 评审）。
+if [ "${DSH_WT_TEST_REFRESH_WRITE_FAIL:-0}" != "0" ] || [ "${DSH_WT_TEST_REFRESH_AUDIT_FAIL:-0}" = "1" ]; then
+  synthetic_gate_allowed || \
+    die "拒绝在真实仓库/真实状态目录使用 refresh-baseline 测试注入变量（DSH_WT_TEST_REFRESH_*）；仅合成门禁自测可用"
+fi
+
 gate_mode_expected() { # 当前上下文允许/期望的门禁模式
   if synthetic_gate_allowed; then printf 'synthetic'; else printf 'required'; fi
 }
