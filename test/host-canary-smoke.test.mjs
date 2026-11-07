@@ -866,6 +866,23 @@ test('probe rejects exit during diagnostics even with valid responses', async ()
   await assert.rejects(probeMobile({token:'secret',version:'1.0.0',pid:9,delay:async () => {},childState:() => state,request:async () => { const response = pending.shift(); if (response === diagnostics) state='starting'; return response; }}),e => e.code === 'host-process-state-inconclusive' && e.status === 'infrastructure-failure');
 });
 
+test('generated workers define every module-level constant they reference', () => {
+  // Regression guard: workers are built by string-concatenating function bodies, so a
+  // newly extracted constant is referenced but never defined, producing a runtime
+  // ReferenceError that degrades to a generic failure code. Assert each worker that
+  // references one of our shared constants also DEFINES it.
+  const shared = ['HINT_CODES','MISSING_DEPENDENCY_SPECIFIERS','sessionGatedCapabilityNames','capabilityNames'];
+  for (const [label, script] of [['install',makeInstallWorker('0.2.2-rc.1')],['runtime',makeRuntimeWorker()]]) {
+    for (const name of shared) {
+      if (!script.includes(name)) continue;
+      const defined = new RegExp(`(?:const|let|var)\\s+${name}\\s*=`).test(script);
+      assert.ok(defined, `${label} worker references ${name} but never defines it`);
+    }
+    const checked = spawnSync(process.execPath,['--check','--input-type=module'],{input:script,encoding:'utf8'});
+    assert.equal(checked.status,0,`${label} worker syntax: ${checked.stderr}`);
+  }
+});
+
 test('startup failures on stdout or stderr both yield a fixed hint code', () => {
   // The host CLI may report a startup failure on either stream; stdout used to be
   // discarded entirely, leaving only a catch-all code with no actionable signal.

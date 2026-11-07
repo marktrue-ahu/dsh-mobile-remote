@@ -952,7 +952,9 @@ export async function probeMobile(options) {
 }
 export function makeInstallWorker(version) {
   if (typeof version !== 'string' || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) fail('docker-plan-invalid');
-  return `import { execFileSync } from 'node:child_process';
+  return `
+const MISSING_DEPENDENCY_SPECIFIERS = ${JSON.stringify(MISSING_DEPENDENCY_SPECIFIERS)};
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, symlinkSync } from 'node:fs';
 try {
   mkdirSync('/tmp/plugin',{recursive:true,mode:0o700});
