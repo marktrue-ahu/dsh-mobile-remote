@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, symlink, lstat, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, isAbsolute, join } from 'node:path';
-import { DOCKER_IMAGE, RUNTIME_LIFECYCLE_MS, checkHostedRunner, createChildExitObserver, createDockerExecutor, createLinuxChildMonitor, createSourceArchive, createStderrCollector, dockerCliDriver, dockerCreatePlan, dockerModelAdapter, evaluateResponses, gitArchiveArgs, hostedDockerAdapter, libSnapshot, makeInstallWorker, makeRuntimeWorker, managedDocker, probeMobile, profileFiles, prepareContainerProfile, removeSourceArchive, readLinuxProcessStat, resolveExitedChildHint, runCanary, stderrExitHint, validateDockerMounts, verifyDockerInspection, verifyInstalled, verifyPluginSource, verifyRequiredBundles } from '../tools/host-canary/smoke.mjs';
+import { DOCKER_IMAGE, HINT_CODES, RUNTIME_LIFECYCLE_MS, checkHostedRunner, createChildExitObserver, createDockerExecutor, createLinuxChildMonitor, createSourceArchive, createStderrCollector, dockerCliDriver, dockerCreatePlan, dockerModelAdapter, evaluateResponses, gitArchiveArgs, hostedDockerAdapter, libSnapshot, makeInstallWorker, makeRuntimeWorker, managedDocker, probeMobile, profileFiles, prepareContainerProfile, removeSourceArchive, readLinuxProcessStat, resolveExitedChildHint, runCanary, stderrExitHint, validateDockerMounts, verifyDockerInspection, verifyInstalled, verifyPluginSource, verifyRequiredBundles } from '../tools/host-canary/smoke.mjs';
 
 const imageEnv = ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin','NODE_VERSION=24.1.0','YARN_VERSION=1.22.22'];
 const profileEnvFor = phase => { const base = phase === 'install' ? '/profile' : '/tmp/canary'; return [`HOME=${base}/home`,`DSH_HOME=${base}/dsh`,`XDG_CONFIG_HOME=${base}/xdg-config`,`XDG_CACHE_HOME=${base}/xdg-cache`,`XDG_DATA_HOME=${base}/xdg-data`,`XDG_STATE_HOME=${base}/xdg-state`,`XDG_RUNTIME_DIR=${base}/xdg-runtime`,`NPM_CONFIG_USERCONFIG=${base}/npmrc`,`NPM_CONFIG_GLOBALCONFIG=${base}/npm-globalrc`]; };
@@ -22,8 +22,15 @@ test('proposed container worker generates token only in runtime tmpfs', () => {
   assert.doesNotMatch(script,/readFile\('\/profile\/token'/);
   assert.match(script,/127\.0\.0\.1/);
   assert.doesNotMatch(script,/3080|console\.log|process\.env\..*TOKEN/);
-  assert.match(script,/stdio:\['ignore','ignore','pipe'\]/);
-  assert.match(script,/prefix\.length < 4096/);
+  // stdout is captured as well as stderr: a startup failure may be reported on
+  // stdout, and discarding it left only a catch-all code with no signal.
+  assert.match(script,/stdio:\['ignore','pipe','pipe'\]/);
+  // The collector must be constructed over BOTH streams.
+  assert.match(script,/createStderrCollector\(child\.stderr, child\.stdout\)/);
+  // Buffer stays bounded (4096) but retains the NEWEST bytes, so a failure at the
+  // end of a long stream is still visible.
+  assert.match(script,/const LIMIT = 4096;/);
+  assert.match(script,/prefix = \(prefix \+ chunk\)\.slice\(-LIMIT\);/);
   assert.match(script,/stderrCollector\?\.destroy\(\)/);
   assert.doesNotMatch(script,/JSON\.stringify\([^\n]*prefix/);
   for (const code of ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-exited-hint-startup-audit','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive']) assert.ok(script.includes(`'${code}'`));
@@ -831,6 +838,55 @@ test('probe rejects exit during diagnostics even with valid responses', async ()
   await assert.rejects(probeMobile({token:'secret',version:'1.0.0',pid:9,delay:async () => {},childState:() => state,request:async () => { const response = pending.shift(); if (response === diagnostics) state='starting'; return response; }}),e => e.code === 'host-process-state-inconclusive' && e.status === 'infrastructure-failure');
 });
 
+test('startup failures on stdout or stderr both yield a fixed hint code', () => {
+  // The host CLI may report a startup failure on either stream; stdout used to be
+  // discarded entirely, leaving only a catch-all code with no actionable signal.
+  const mk = () => { const h = {}; return { readableEnded:false, destroyed:false,
+    setEncoding(){}, on(e,f){ (h[e] ??= []).push(f); }, off(){}, destroy(){ this.destroyed = true; },
+    emit(e,c){ (h[e] ?? []).forEach(f => f(c)); } }; };
+  const stdout = mk(), stderr = mk();
+  const collector = createStderrCollector(stderr, stdout);
+  stdout.emit('data','banner\nError: listen EADDRINUSE: address already in use\n');
+  assert.equal(collector.hint(),'host-process-exited-hint-port-in-use');
+  collector.destroy();
+  assert.equal(stdout.destroyed,true); assert.equal(stderr.destroyed,true);
+
+  // The retained window is BOUNDED and keeps the newest bytes, so a failure at the
+  // end of a long stream is still detected (a first-4KB buffer would miss it).
+  const noisyOut = mk(), noisyErr = mk();
+  const noisy = createStderrCollector(noisyErr, noisyOut);
+  for (let i = 0; i < 200; i++) noisyOut.emit('data','x'.repeat(1000));
+  noisyOut.emit('data','\nFATAL ERROR: Reached heap limit Allocation failed\n');
+  assert.equal(noisy.hint(),'host-process-exited-hint-out-of-memory');
+  noisy.destroy();
+});
+
+test('every emitted hint code is a fixed constant and never carries raw text', () => {
+  // Security invariant: widening capture must not widen what leaves the process.
+  const samples = [
+    'Error: listen EADDRINUSE',
+    'FATAL ERROR: Reached heap limit Allocation failed',
+    'npm ERR! code EBADENGINE Unsupported engine',
+    'dsh: profile \"canary\" does not exist',
+    'Error: EACCES /private/path/secret-token',
+    'Error: EPERM /private/path/secret-token',
+    'Error: EROFS /private/path',
+    'Error: ENOSPC /private/path',
+    'plain unrelated output /private/path secret-token',
+  ];
+  for (const sample of samples) {
+    const hint = stderrExitHint(sample);
+    if (hint !== null) {
+      assert.match(hint,/^host-process-exited-hint-[a-z-]+$/);
+      assert.doesNotMatch(hint,/secret|private|\//);
+    }
+  }
+  // Newly recognised causes stay within the declared closed set.
+  for (const code of ['host-process-exited-hint-port-in-use','host-process-exited-hint-out-of-memory','host-process-exited-hint-engine-mismatch','host-process-exited-hint-bad-invocation']) {
+    assert.ok(HINT_CODES.includes(code), code);
+  }
+});
+
 test('startup audit hint requires a complete authentic-shaped stderr line', async () => {
   const one = 'dsh: startup failed: 1 required plugin did not activate\n';
   const many = 'dsh: startup failed: 27 required plugins did not activate\r\n';
@@ -990,9 +1046,12 @@ test('Linux proc monitor rejects PID reuse, invalid stat and missing proc', () =
 
 test('actual stderr collector bounds memory and detaches listeners', async () => {
   const stream = new PassThrough(), collector = createStderrCollector(stream);
+  // The retained window is bounded but keeps the NEWEST bytes, so a failure that
+  // arrives after a long preamble is still recognised (that is the point of the
+  // window: startup failures are reported at the end of the stream).
   stream.write('x'.repeat(4096) + ' EACCES secret-token'); stream.end();
   await collector.drain(25);
-  assert.equal(collector.hint(),null);
+  assert.equal(collector.hint(),'host-process-exited-hint-eacces');
   assert.equal(stream.listenerCount('end'),0); assert.equal(stream.listenerCount('close'),0);
   collector.destroy();
   assert.equal(stream.listenerCount('data'),0); assert.equal(stream.listenerCount('error'),0);
