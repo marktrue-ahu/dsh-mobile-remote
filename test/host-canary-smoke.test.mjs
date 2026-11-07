@@ -687,8 +687,11 @@ test('install worker packs the plugin so bundled runtime dependencies are presen
   assert.match(script,/mkdirSync\('\/tmp\/plugin-dist'/);
   assert.match(script,/\.tgz/);
   // Still isolated from the host closure, and no link-based install remains.
-  assert.match(script,/--legacy-peer-deps/);
   assert.doesNotMatch(script,/'--install-links'/);
+  // Peer resolution MUST stay enabled: this plugin declares peers the host provides
+  // (e.g. @deepseek-ai/schemastery). --legacy-peer-deps skips them and the host then
+  // dies at startup with module-not-found.
+  assert.doesNotMatch(script,/'--legacy-peer-deps'/);
 });
 
 test('runtime worker restores the bundle declaration that npm install overwrites', () => {

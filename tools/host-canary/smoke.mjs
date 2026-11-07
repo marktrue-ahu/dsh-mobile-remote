@@ -969,7 +969,12 @@ try {
   execFileSync('npm',['pack','--silent','--pack-destination','/tmp/plugin-dist'],{cwd:'/tmp/plugin',stdio:'ignore',timeout:120000});
   const packed = (await import('node:fs')).readdirSync('/tmp/plugin-dist').filter(f => f.endsWith('.tgz'));
   if (packed.length !== 1) fail('probe-input-invalid');
-  execFileSync('npm',['install','--prefix','/profile/dsh/profiles/plugin','--ignore-scripts','--no-audit','--no-fund','--legacy-peer-deps','/tmp/plugin-dist/' + packed[0]],{stdio:'ignore',timeout:300000});
+  // Do NOT pass --legacy-peer-deps here. It skips peer resolution, and this plugin
+  // declares peers the host does provide (@deepseek-ai/schemastery etc.); without
+  // them the host dies at startup with module-not-found. Peers are installed in the
+  // scaffolding prefix and the plugin's own nested deps travel with it; the host's
+  // tree still wins for anything resolved upward from the profile.
+  execFileSync('npm',['install','--prefix','/profile/dsh/profiles/plugin','--ignore-scripts','--no-audit','--no-fund','/tmp/plugin-dist/' + packed[0]],{stdio:'ignore',timeout:300000});
   const srcPlugin = '/profile/dsh/profiles/plugin/node_modules/@marktrue/dsh-mobile-remote';
   const dstScope = '/profile/dsh/profiles/canary/node_modules/@marktrue';
   const dstPlugin = dstScope + '/dsh-mobile-remote';
