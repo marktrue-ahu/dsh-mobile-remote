@@ -36,6 +36,12 @@ class NotifyDiag {
   /// 保活服务本次启动的时间（用于显示已运行多久）。
   static DateTime? keepAliveStartedAt;
 
+  /// 通知总开关是否开启（`NotificationManager.areNotificationsEnabled()`）。
+  ///
+  /// 被永久拒绝时保活仍在跑，但常驻通知与审批提醒都不可见——设置页据此给出
+  /// 「去系统设置开启」的入口（`requestNotificationsPermission()` 只在第一次有效）。
+  static bool notificationsEnabled = true;
+
   /// 原生服务心跳（服务自己每 30 秒 +1）。
   static int serviceBeats = 0;
   static DateTime? lastServiceBeatAt;
@@ -85,8 +91,8 @@ class NotifyDiag {
     final alive = keepAliveRunning
         ? '保活在跑${_uptime()}'
         : (keepAliveEnabled
-            ? '保活未运行${keepAliveError == null ? "" : "（$keepAliveError）"}'
-            : '保活关');
+              ? '保活未运行${keepAliveError == null ? "" : "（$keepAliveError）"}'
+              : '保活关');
     // 这是判定保活是否有效的硬指标：后台帧数 > 0 说明 FGS + Dart SSE 成立。
     final bg = framesBackground > 0
         ? '后台收到 $framesBackground 帧'
@@ -95,7 +101,7 @@ class NotifyDiag {
     final frameText = last == null
         ? '本次启动未收到帧'
         : '${_ago(DateTime.now().difference(last))}前收到 ${lastFrameKind ?? "帧"}'
-            '（${lastFrameInForeground == true ? "前台" : "后台"}）';
+              '（${lastFrameInForeground == true ? "前台" : "后台"}）';
     final dec = lastDecision == null ? '' : ' · $lastDecision';
     final show = lastShowResult == null ? '' : ' · 展示:$lastShowResult';
     // 心跳对比：服务心跳 > 0 而 Dart 心跳 = 0，说明只有 Dart 被冻结（该把网络下沉到原生）；

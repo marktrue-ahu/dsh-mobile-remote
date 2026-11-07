@@ -26,6 +26,7 @@ class MainActivity : FlutterActivity() {
     private var filesChannel: MethodChannel? = null
     private var iconChannel: MethodChannel? = null
     private var keepAliveChannel: MethodChannel? = null
+    private var downloadBridge: DownloadBridge? = null
     // v3.1.2（csborbbnc 反馈）：系统文件选择器（ACTION_OPEN_DOCUMENT）结果回传暂存
     private var pendingPick: MethodChannel.Result? = null
     private val pickFileRequestCode = 2001
@@ -58,6 +59,7 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        downloadBridge = DownloadBridge(this, flutterEngine)
         floatingChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "dsh/floating")
         // v3.1.2（csborbbnc 反馈）：文件下载/上传原生通道
         filesChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "dsh/files")
@@ -150,6 +152,35 @@ class MainActivity : FlutterActivity() {
                         ),
                     )
                 }
+                // 通知权限被永久拒绝后没有出口：Android 的 requestNotificationsPermission()
+                // 只在第一次生效，用户点过「拒绝」之后代码再调只返回 false。这里给一个直达入口，
+                // 设置页在 notificationsEnabled == false 时显示「去开启」。
+                "notificationsEnabled" -> {
+                    val nm = getSystemService(android.app.NotificationManager::class.java)
+                    result.success(nm?.areNotificationsEnabled() ?: false)
+                }
+                "openNotificationSettings" -> {
+                    val ok = try {
+                        startActivity(
+                            Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                                .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, packageName)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                        true
+                    } catch (e: Exception) {
+                        // 极个别 ROM 不认上面的 action，退回应用详情页
+                        try {
+                            startActivity(
+                                Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                                    .setData(android.net.Uri.parse("package:$packageName")),
+                            )
+                            true
+                        } catch (e2: Exception) {
+                            false
+                        }
+                    }
+                    result.success(ok)
+                }
                 // 多数国产 ROM（MIUI/HyperOS 等）默认会冻结后台应用，连前台服务也照冻。
                 // 用户把本应用设为「不受限制」后才能真正常驻，这里给一个直达入口。
                 "openBatterySettings" -> {
@@ -226,6 +257,14 @@ class MainActivity : FlutterActivity() {
                     result.success(true)
                 }
                 "isRunning" -> result.success(FloatingBubbleService.running)
+                "syncUnread" -> {
+                    if (FloatingBubbleService.running) {
+                        val count = (call.argument<Int>("count") ?: 0).coerceAtLeast(0)
+                        startServiceCompat(Intent(this, FloatingBubbleService::class.java)
+                            .putExtra("notification_unread", count))
+                    }
+                    result.success(true)
+                }
                 "canDrawOverlay" -> result.success(Settings.canDrawOverlays(this))
                 "openOverlaySettings" -> {
                     openOverlaySettingsPage()
@@ -273,12 +312,20 @@ class MainActivity : FlutterActivity() {
     // onStop 而非 onDestroy：进程被杀时 onDestroy 不保证回调，onStop 一定会到。
     override fun onStart() {
         super.onStart()
+        downloadBridge?.foreground = true
         FloatingBubbleService.onAppVisibilityChanged(true)
     }
 
     override fun onStop() {
         super.onStop()
+        downloadBridge?.foreground = false
         FloatingBubbleService.onAppVisibilityChanged(false)
+    }
+
+    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        downloadBridge?.close()
+        downloadBridge = null
+        super.cleanUpFlutterEngine(flutterEngine)
     }
 
     /** 解析悬浮球面板动作 extra；onCreate（冷启动）与 onNewIntent（热启动）共用。 */

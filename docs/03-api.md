@@ -307,6 +307,7 @@
 | `mobile/notify` | `{ notification: { id, kind, sessionId, title, detail, time } }`——插件"真结束"判定后推送的通知（completed / failed / needs-answer），桌面宠物/App 与通知中心同源渲染（v2.7.2） |
 | `mobile/frame` | 内核瞬态帧（问询/审批）。`frame` 字段为 `question/requested`（含 `rpcId`、`questions[]`）、`question/resolved`（`questionRpcId`）、`approval/requested`（`rpcId`、`approvalId`、`toolName`、`reason?`）、`approval/resolved`（`approvalId`）。**App 断线重连时服务端补发挂起的待答帧**（`pendingFrames` 回放） |
 | `mobile/queue` | `{ sessionId, rows: [{ id, text, placement }] }`——内核队列快照（`agent/inbox/spliced` 即时镜像，v3.0.2）：认领/删除/编辑实时反映，App 端 dock 以此为权威源（`placement`: `queued` / `steering` / `context`，与 GET /queue 同款形状）；断线重连时 mux 回放当前队列 |
+| `attention/snapshot` | `{ version: 1, pending: [{ kind, sessionId, identity }] }`——在断线重连的 `mobile/frame` 挂起帧回放**之后**、同一有序 SSE 流上追加的**完整待办快照边界**（v3.3）。App 只据此撤销该宿主已不在 pending 中的业务通知，不得凭超时猜测待办已结束；旧宿主无此帧时保留既有行为 |
 | `git/changed`（规划中） | 设计目标为 `{ repositoryId }`；当前版本未实现 Git provider，也不会推送此帧 |
 
 客户端应按 `type` 分派；未知 type 使用通用事件卡保留顺序（前向兼容）。当前服务端故意不给未知 type 详情指针，按需详情端点对其返回 `404 event-not-found`，避免未经审查地暴露事件载荷。
@@ -844,6 +845,9 @@ fetch/push 序列化 common domain，pull/sync/abort 同时序列化 common 与 
 - 响应：`200` 文件流（`content-type` 按扩展名推断、`content-disposition: attachment` 带 UTF-8 文件名）；路径不存在或非文件 → `404 file-not-found`；缺 `path` → `400 bad-request`
 - 与目录选择器（§6.2）同信任模型：口令鉴权 + 现有限流，路径由手机显式指定；服务端先打开句柄、`fstat` 复核为普通文件，再按 descriptor 真实路径做工作区包含校验，符号链接/越界路径一律 `404`
 - 平台范围：descriptor-relative 保护需 procfs/devfs，**仅 Linux/macOS 提供**；Windows 返回 `503 files-unavailable`（安全 fail-closed，见 docs/04 §6）
+- 支持 `HEAD`、单区间 `Range`、`ETag`、`If-None-Match`；有效区间返回 `206 + Content-Range`，越界返回 `416`。续传携带 `Range: bytes=N-` 与此前保存的 `If-Range: <ETag>`；只有标记一致才返回区间，不一致、弱标记或日期标记均返回完整 `200`，客户端截断旧文件后从头写。
+- App 侧断点保存在私有支持目录，按地址、API 路径与认证身份摘要隔离（不持久化口令）；恢复时核对 ETag、实际本地长度、完整区间和最终总长度，旧宿主缺标记时从头下载。暂停、断网、锁屏中断与进程退出后可从下载入口继续；保存到系统下载目录失败时保留已下载文件以便重试保存。恢复列表最多八项，七天后清理，可手动删除。
+- Android 用户发起下载后启动专用 `dataSync` 前台服务（通知提供进度与暂停，完成、失败或暂停后退出）；服务不可用或通知关闭时明确退回前台下载。服务与宠物 / 提醒保活开关独立，不传递 URL、口令或远端路径。Android 15+ 累计后台时限由系统管理，`onTimeout` 立即停止服务并通知 Dart 暂停、保留私有断点，不通过重启服务绕过预算。
 
 **POST `/m/api/files/upload`** — 上传文件到电脑（写会话工作目录）
 ```json
@@ -1109,7 +1113,7 @@ graph 的每个提交与 commit 详情都**保留旧的** `refs: string[]`（dep
 | `no-history` | 仓库尚无提交（空仓库） |
 | `path-invalid` | 越界（`..`、仓库外绝对路径、无法映射的 Windows 绝对路径）或无法归一化的路径 |
 
-- **路径归一化由宿主负责**：接受工作区绝对路径或仓库相对路径，归一化到仓库根内；越界/仓库外返回 `path-invalid`。目录路径（含仓库根、`.`）返回 `400 path-invalid`；只接受文件路径。
+- **路径归一化由宿主负责**：接受工作区绝对路径或仓库相对路径，归一化到仓库根内；越界/仓库外返回 `path-invalid`。目录路径（含仓库根、`.`）返回 `400 path-invalid`；只接受文件路径。Windows 客户端可能提交 8.3 短别名，宿主会把最近的存在父目录规范化到长名、保留文件名，同一仓库的两种写法视为同一路径。
 - `reason: "path-invalid"` 的 200 响应中，`path` 为客户端提交的原值（便于回填/纠错）；这是客户端输入的回显，不是宿主发现的新路径信息。
 - **有界**：单次最多扫描 5000 条提交或 20 秒软超时；达到上限时返回已取部分并 `truncated: true`（客户端可提示「仅显示最近 N 条提交」）。
 - 缺失 `path` → `400 bad-request`。

@@ -15,6 +15,8 @@ import '../api.dart';
 import '../chat_copy.dart';
 import '../download.dart';
 import '../download_error.dart';
+import '../download_foreground.dart';
+import '../resumable_download.dart';
 import '../logger.dart';
 import '../l10n.dart';
 import '../models.dart';
@@ -32,6 +34,7 @@ import 'git_browser_sheet.dart';
 import '../widgets/git_logo.dart';
 import '../widgets/turn_navigator_rail.dart';
 import 'sheets.dart';
+import 'download_resume_picker.dart';
 import 'session_files_screen.dart';
 import 'session_tools_sheet.dart';
 
@@ -4488,32 +4491,41 @@ class _ChatScreenState extends State<ChatScreen> {
   /// v3.1.2（csborbbnc 反馈）：下载文件——可视化文件选择器（盘符/目录树/点文件）
   /// → 保存到手机「下载」目录。
   /// v3.2.2：流式下载——临时文件 + 原生按路径保存，大文件不再整块进内存。
-  Future<void> _downloadFile() async {
-    final path = await showFilePicker(context);
-    if (path == null || path.isEmpty || !mounted) return;
-
-    final name =
-        path.split(RegExp(r'[\\/]')).where((s) => s.isNotEmpty).lastOrNull ??
-        'file';
-    Directory tempDir;
+  Future<void> _downloadFile({String? resumePath}) async {
+    late ResumableDownloads downloads;
+    String? path = resumePath;
     try {
-      tempDir = await getTemporaryDirectory();
-    } catch (e) {
-      if (mounted) {
-        // 拿不到临时目录通常是没有可用存储：给一句人话，不丢原始异常
-        final f = describeDownloadError(e);
-        showToast(context, f.summary);
+      final support = await getApplicationSupportDirectory();
+      downloads = ResumableDownloads(
+        Directory('${support.path}/downloads'),
+        _api,
+      );
+      final pending = await downloads.pending();
+      if (!mounted) return;
+      if (path == null && pending.isNotEmpty) {
+        path = await showDownloadResumePicker(context, downloads, pending);
+        if (path == null || !mounted) return;
       }
+      if (path == null || path.isEmpty) {
+        path = await showFilePicker(context);
+      }
+    } catch (e) {
+      if (mounted) showToast(context, describeDownloadError(e).summary);
       return;
     }
-    final target = File(
-      '${tempDir.path}/dsh-dl-${DateTime.now().microsecondsSinceEpoch}-$name',
-    );
-    if (!mounted) return; // 取临时目录期间页面可能已被销毁
+    if (path == null || path.isEmpty || !mounted) return;
+    final remotePath = path;
+    final name =
+        remotePath
+            .split(RegExp(r'[\\/]'))
+            .where((s) => s.isNotEmpty)
+            .lastOrNull ??
+        'file';
     final progress = ValueNotifier<DownloadProgress>(
       const DownloadProgress(received: 0),
     );
     final cancel = DownloadCancelToken();
+    DownloadForegroundLease? foreground;
     var dialogVisible = true;
 
     unawaited(
@@ -4528,6 +4540,17 @@ class _ChatScreenState extends State<ChatScreen> {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                Text(
+                  L10n.t(
+                    foreground?.backgroundActive == true
+                        ? '后台下载已开启，可从通知暂停。系统中断后可从下载入口继续。'
+                        : '当前为前台下载；切后台可能暂停，可从下载入口继续。',
+                    foreground?.backgroundActive == true
+                        ? 'Background download is active. Pause from its notification; resume after interruption from Downloads.'
+                        : 'Foreground download. Backgrounding may pause it; resume from Downloads.',
+                  ),
+                ),
+                const SizedBox(height: 10),
                 LinearProgressIndicator(value: p.fraction),
                 const SizedBox(height: 10),
                 Text(
@@ -4543,7 +4566,7 @@ class _ChatScreenState extends State<ChatScreen> {
           actions: [
             TextButton(
               onPressed: cancel.cancel,
-              child: Text(L10n.t('取消', 'Cancel')),
+              child: Text(L10n.t('暂停', 'Pause')),
             ),
           ],
         ),
@@ -4557,37 +4580,64 @@ class _ChatScreenState extends State<ChatScreen> {
     Object? failure;
     var cancelled = false;
     try {
-      result = await _api.downloadFileToFile(
-        path,
-        target,
+      foreground = await DownloadForeground.instance.start(cancel);
+      if (!foreground.backgroundActive &&
+          foreground.unavailableReason != null &&
+          mounted) {
+        showToast(
+          context,
+          L10n.t(
+            '后台下载不可用，本次保持前台下载',
+            'Background download unavailable. Keep the app open.',
+          ),
+        );
+      }
+      result = await downloads.download(
+        remotePath,
         cancel: cancel,
-        onProgress: (p) => progress.value = p,
+        onProgress: (p) {
+          progress.value = p;
+          foreground?.progress(p);
+        },
       );
-      saved = await _filesChannel.invokeMethod<String>(
-        'saveFileFromPath',
-        {'path': result.file.path, 'name': name},
-      );
+      if (cancel.cancelled) throw const DownloadCancelled();
+      saved = await _filesChannel.invokeMethod<String>('saveFileFromPath', {
+        'path': result.file.path,
+        'name': name,
+      });
+      // 保存失败时也保留完整私有文件，下次继续入口可直接重试保存。
+      try {
+        await downloads.discard(remotePath);
+      } on FileSystemException {
+        // 私有缓存后续按保留期限清理。
+      }
     } on DownloadCancelled {
       cancelled = true;
     } catch (e) {
       failure = e;
     } finally {
+      await foreground?.close();
       // 先把进度弹窗关掉，再弹结果——否则结果弹窗会盖在"下载中"上面
       if (mounted && dialogVisible) {
         Navigator.of(context, rootNavigator: true).pop();
       }
-      try {
-        await target.delete();
-      } catch (_) {}
     }
 
     if (!mounted) return;
     if (cancelled) {
-      showToast(context, L10n.t('已取消下载', 'Download cancelled'));
+      showToast(
+        context,
+        foreground?.pauseReason == 'system-time-limit'
+            ? L10n.t(
+                '系统后台下载时限已到，进度已保留',
+                'The system background limit was reached. Progress is saved.',
+              )
+            : L10n.t('已暂停，可从下载入口继续', 'Paused. Resume from Downloads'),
+      );
       return;
     }
     if (failure != null) {
-      await _showDownloadFailure(failure, remotePath: path);
+      await _showDownloadFailure(failure, remotePath: remotePath);
       return;
     }
     final mime = (result?.contentType ?? 'application/octet-stream')
@@ -4605,7 +4655,7 @@ class _ChatScreenState extends State<ChatScreen> {
     required String remotePath,
   }) async {
     final f = describeDownloadError(error);
-    await showDialog<void>(
+    final retry = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: Text(L10n.t('下载失败', 'Download failed')),
@@ -4658,12 +4708,17 @@ class _ChatScreenState extends State<ChatScreen> {
             child: Text(L10n.t('复制详情', 'Copy details')),
           ),
           TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: Text(L10n.t('继续下载', 'Resume download')),
+          ),
+          TextButton(
             onPressed: () => Navigator.of(ctx).pop(),
             child: Text(L10n.t('关闭', 'Close')),
           ),
         ],
       ),
     );
+    if (retry == true && mounted) await _downloadFile(resumePath: remotePath);
   }
 
   /// 下载完成：告诉用户存到哪了，并给「查看 / 关闭」两个出口。

@@ -12,6 +12,7 @@ import 'api.dart';
 import 'app_icon_switcher.dart';
 import 'store.dart';
 import 'attention.dart';
+import 'attention_storage.dart';
 import 'floating.dart';
 import 'keep_alive.dart';
 import 'local_notifications.dart';
@@ -115,6 +116,38 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
 
   /// M1a：通知去重/撤销的唯一写者。
   final AttentionLedger _ledger = AttentionLedger();
+  final AttentionStorage _attentionStorage = AttentionStorage();
+  late final Future<void> _attentionReady;
+  Future<void> _attentionQueue = Future<void>.value();
+
+  /// 通知初始化：恢复按宿主隔离的账本，并补上系统里仍在但本地没记录的活跃行。
+  Future<void> _initNotifications() async {
+    await LocalNotifier.instance.init();
+    await _attentionStorage.restore(_ledger);
+    final saved = _ledger.toJson();
+    final keys = saved.map((r) => r['key']).toSet();
+    final active = await LocalNotifier.instance.activeLedgerRows();
+    _ledger.restore([
+      ...saved,
+      ...active.where((r) => !keys.contains(r['key'])),
+    ]);
+  }
+
+  /// 通知账本的单写者队列：restore → event → persist（回放、结算、快照对账都串行）。
+  void _queueAttention(Future<void> Function() action) {
+    _attentionQueue = _attentionQueue
+        .then((_) async {
+          await _attentionReady;
+          if (!mounted) return;
+          await action();
+          await _attentionStorage.save(_ledger);
+        })
+        .catchError((Object error) {
+          AppLog.instance.log(
+            '通知：处理未完成，等待下一次宿主对账（${error.runtimeType}）',
+          );
+        });
+  }
 
   /// 当前是否在前台（判据输入之一）。
   bool _resumed = true;
@@ -128,7 +161,7 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
     // issue #46：连接状态下的系统本地通知（pushUrls 仅作离线兜底）。
     // 只在 App 不在前台时真正弹出；点击通知走统一 openChat 入口。
     WidgetsBinding.instance.addObserver(this);
-    unawaited(LocalNotifier.instance.init());
+    _attentionReady = _initNotifications();
     // M2：后台保活（默认关；开启后 onResume 会拉起前台服务）。
     unawaited(_initKeepAlive());
     LocalNotifier.instance.onOpenSession = (id) =>
@@ -141,36 +174,25 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
         _handleFloatingAction('session:$pendingOpen');
       });
     }
-    store.onAttention = (kind, sessionId, rpcId, toolName, reason, prompt) {
-      String? title;
-      for (final s in store.sessions) {
-        if (s.id == sessionId) {
-          title = s.title;
-          break;
-        }
-      }
-      unawaited(
-        LocalNotifier.instance.showAttention(
-          kind: kind,
-          rpcId: rpcId,
-          sessionId: sessionId,
-          toolName: toolName,
-          reason: reason,
-          prompt: prompt,
-          sessionTitle: title,
-        ),
-      );
-    };
-    // M1a：结构化事件 → 判据 → ledger → 展示（取代上面那条旧路径，旧路径保留兜底）。
-    store.onAttentionEvent = (event) {
-      unawaited(_handleAttention(event));
-    };
+    // v3.3（吸收上游 #64）：通知账本单写者——恢复 → 事件 → 持久化；回放与结算同样串行。
+    store.onAttentionEvent = (event) =>
+        _queueAttention(() => _handleAttention(event));
     store.onAttentionResolved = (identity) {
-      final id = _ledger.resolveByIdentity(identity);
-      if (id != null) {
-        unawaited(LocalNotifier.instance.cancel(id));
-        AppLog.instance.log('通知：结算撤销 identity=$identity id=$id');
-      }
+      final source = api.notificationScope;
+      _queueAttention(() async {
+        final id = _ledger.resolveByIdentity(identity, source: source);
+        if (id != null) {
+          await LocalNotifier.instance.cancel(id);
+          AppLog.instance.log('通知：结算撤销 identity=$identity id=$id');
+        }
+      });
+    };
+    store.onAttentionSnapshot = (source, pendingKeys) {
+      _queueAttention(() async {
+        for (final id in _ledger.reconcile(source, pendingKeys)) {
+          await LocalNotifier.instance.cancel(id);
+        }
+      });
     };
     // S1：进入会话 → 收掉横幅（未读标已读由 store 负责）。
     store.onChatOpened = (sessionId) {
@@ -289,9 +311,9 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
     _bgBeatTimer?.cancel();
     _bgBeatTimer = null;
     WidgetsBinding.instance.removeObserver(this);
-    store.onAttention = null;
     store.onAttentionEvent = null;
     store.onAttentionResolved = null;
+    store.onAttentionSnapshot = null;
     store.onChatOpened = null;
     store.removeListener(_onStore);
     super.dispose();
@@ -346,15 +368,16 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
 
   /// M1a：一条审批/问询事件的完整处理链路（判据 → 去重 → 展示 → 回写 ledger）。
   Future<void> _handleAttention(AttentionEvent event) async {
+    final available = await LocalNotifier.instance.availability();
     final snapshot = AttentionSnapshot(
       phase: _resumed ? AppPhase.foreground : AppPhase.background,
-      permissionGranted: LocalNotifier.instance.ready,
-      // TODO(M4)：用 getNotificationChannels 读渠道 importance，目前假定未静音。
-      channelEnabled: true,
+      permissionGranted: available.permission,
+      channelEnabled: available.channel,
       visibleSession: LocalNotifier.instance.visibleSession,
     );
-    final now = DateTime.now();
-    final seen = _ledger.seenRecently(event.key, now: now);
+    final entry = _ledger.byKey(event.key);
+    if (entry?.status == AttentionStatus.resolved) return;
+    final seen = entry != null && entry.status != AttentionStatus.blocked;
     final decision = decideAttention(event, snapshot, seenRecently: seen);
     final reserved = _ledger.reserve(event);
     NotifyDiag.onFrame(event.kind.wire, inForeground: _resumed);
@@ -366,8 +389,16 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
       '通知：判据 key=${event.key} reason=${decision.reason} '
       'system=${decision.system} banner=${decision.banner} reserve=$reserved',
     );
-    if (!decision.system) return;
-    if (!reserved && !event.isReplay) return;
+    if (decision.banner) {
+      _showBanner(1, event.sessionId, null);
+    }
+    if (!decision.system) {
+      if (!decision.any && !seen && decision.reason == 'no-permission') {
+        _ledger.mark(event.key, AttentionStatus.blocked);
+      }
+      return;
+    }
+    if (!reserved && entry?.status != AttentionStatus.blocked) return;
     String? title;
     for (final s in store.sessions) {
       if (s.id == event.sessionId) {
@@ -378,6 +409,8 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
     final result = await LocalNotifier.instance.showAttentionEvent(
       id: event.notificationId,
       key: event.key,
+      source: event.source,
+      at: event.at,
       kind: event.kind.wire,
       sessionId: event.sessionId,
       toolName: event.toolName,
@@ -398,21 +431,31 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
   /// 新增未读通知横幅：顶部滑入，4 秒自动消失（可左右滑动手动关闭），点击直达会话；10 秒内不重复。
   /// force=true（悬浮球跳转/回前台）时绕过防抖——"错过的也提醒"。
   void _onNewNotifications(int count, {bool force = false}) {
+    if (!_resumed) return;
+    final latest = store.latestUnreadNotif;
+    if (latest?.sessionId == LocalNotifier.instance.visibleSession) return;
+    // 审批/问询卡片走结构化事件路径，那里会再判渠道状态。
+    if (latest?.kind == 'needs-answer') return;
     final now = DateTime.now();
     if (!force && now.difference(_lastBannerAt).inSeconds < 10) {
-      AppLog.instance.log('Banner: 防抖拦截（距上次 ${now.difference(_lastBannerAt).inSeconds}s）');
+      AppLog.instance.log(
+        'Banner: 防抖拦截（距上次 ${now.difference(_lastBannerAt).inSeconds}s）',
+      );
       return;
     }
     _lastBannerAt = now;
     _bannerTimer?.cancel();
     _bannerTimer = null;
     if (!mounted) return;
-    // S2：横幅按会话合并——记下"最新一条未读属于哪个会话"，文案与点击都用它。
-    final latest = store.latestUnreadNotif;
-    _bannerSessionId = latest?.sessionId;
-    _bannerSessionTitle = (latest != null && latest.title.isNotEmpty)
-        ? latest.title
-        : null;
+    _showBanner(count, latest?.sessionId, latest?.title);
+  }
+
+  /// 显示全局横幅（未读通知路径与结构化 attention 路径共用）。
+  void _showBanner(int count, String? sessionId, String? title) {
+    if (!mounted || !_resumed) return;
+    _bannerTimer?.cancel();
+    _bannerSessionId = sessionId;
+    _bannerSessionTitle = (title != null && title.isNotEmpty) ? title : null;
     setState(() => _bannerCount = count);
     AppLog.instance.log(
       'Banner: 出现 count=$count session=${_bannerSessionId ?? "未知"}',

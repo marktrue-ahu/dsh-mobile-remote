@@ -1452,21 +1452,15 @@ class AppStore extends ChangeNotifier {
   void Function(int count, {bool force})? onNewNotifications;
 
   /// 审批/问询帧到达回调（issue #46 旧签名，保留兼容）。
-  void Function(
-    String kind,
-    String sessionId,
-    String rpcId,
-    String? toolName,
-    String? reason,
-    String? prompt,
-  )?
-  onAttention;
-
   /// M1a：结构化事件（带 approvalId，身份稳定、可精确撤销）。
   void Function(AttentionEvent event)? onAttentionEvent;
 
   /// M1a：事件已结算（`approval/resolved` / `question/resolved`），参数是 identity。
   void Function(String identity)? onAttentionResolved;
+
+  /// v3.3：重连时挂起帧回放后的完整待办快照（source, pendingKeys）——
+  /// 只据此撤销该宿主已不在待办中的业务通知，不凭超时猜测。
+  void Function(String source, Set<String> pendingKeys)? onAttentionSnapshot;
 
   /// S1：用户打开了某个会话——调用方应清掉该会话的横幅并标已读。
   void Function(String sessionId)? onChatOpened;
@@ -2803,6 +2797,32 @@ class AppStore extends ChangeNotifier {
       refreshNotifs();
       return;
     }
+    if (type == 'attention/snapshot') {
+      // 重连：宿主在 pending 帧回放之后、同一有序 SSE 流上追加的完整待办快照。
+      // 只撤销该宿主已不在 pending 中的业务通知，其它宿主与常驻通知不受影响。
+      final entries = frame['pending'];
+      if (frame['version'] != 1 || entries is! List) return;
+      final source = api.notificationScope;
+      final keys = <String>{};
+      for (final item in entries) {
+        if (item is! Map ||
+            item['kind'] is! String ||
+            item['sessionId'] is! String ||
+            item['identity'] is! String) {
+          return;
+        }
+        keys.add(
+          attentionKey(
+            kind: item['kind'] as String,
+            sessionId: item['sessionId'] as String,
+            identity: item['identity'] as String,
+            source: source,
+          ),
+        );
+      }
+      onAttentionSnapshot?.call(source, keys);
+      return;
+    }
     if (type == 'mobile/frame') {
       // 内核问询/审批瞬态帧（question|approval requested/resolved）
       final f = frame['frame'];
@@ -2826,16 +2846,9 @@ class AppStore extends ChangeNotifier {
             data: {'rpcId': request.rpcId, 'sessionId': request.sessionId},
           ),
         );
-        onAttention?.call(
-          'question',
-          request.sessionId,
-          request.rpcId,
-          null,
-          null,
-          request.questions.isEmpty ? null : request.questions.first.question,
-        );
         onAttentionEvent?.call(AttentionEvent(
           kind: AttentionKind.question,
+          source: api.notificationScope,
           sessionId: request.sessionId,
           identity: request.rpcId,
           at: DateTime.now(),
@@ -2890,16 +2903,9 @@ class AppStore extends ChangeNotifier {
             data: {'rpcId': request.rpcId, 'sessionId': request.sessionId},
           ),
         );
-        onAttention?.call(
-          'approval',
-          request.sessionId,
-          request.rpcId,
-          request.toolName,
-          request.reason,
-          null,
-        );
         onAttentionEvent?.call(AttentionEvent(
           kind: AttentionKind.approval,
+          source: api.notificationScope,
           sessionId: request.sessionId,
           identity: request.approvalId.isEmpty
               ? request.rpcId

@@ -21,3 +21,9 @@ AGENT-RULES.md
 # 本机/本容器的环境特定配置（代理开关与地址等），不进版本库
 .env
 .env.local
+
+# Kotlin 增量编译会话状态（本机/CI 均不提交）
+dsh-mobile-app/android/.kotlin/
+
+# Python 工具缓存（宠物资源脚本）
+__pycache__/
