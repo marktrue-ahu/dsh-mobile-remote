@@ -523,4 +523,40 @@ void main() {
       expect(tracker.build(), isEmpty);
     });
   });
+
+  group('R04 部分轮次（历史窗口缺 turn/start）', () {
+    test('缺 turn/start 仍保留轮次身份与合成锚点，页脚可用且不猜用时', () {
+      final events = <ChatEvent>[
+        for (var i = 0; i < 6; i += 1)
+          ev(100 + i * 2, 'tool/call', {
+            'turn': 1,
+            'step': 1,
+            'callId': 'c$i',
+            'name': 'bash',
+          }),
+        ev(120, 'assistant/message', {
+          'turn': 1,
+          'step': 1,
+          'messageId': 'a1',
+          'text': 'done',
+        }),
+        ev(121, 'turn/end', {
+          'turn': 1,
+          'reason': {'kind': 'completed'},
+        }),
+      ];
+      final tracker = TurnProcessTracker();
+      for (final event in events) {
+        tracker.observe(event);
+      }
+      final turns = tracker.build();
+      expect(turns, hasLength(1), reason: '缺 start 的部分轮次不得整轮丢弃');
+      final turn = turns.single;
+      expect(turn.partial, isTrue);
+      expect(turn.startSeq, 100, reason: '合成锚点取该轮最早可观察事件 seq');
+      expect(turn.toolCount, 6);
+      expect(turn.ended, isTrue);
+      expect(turnFooterText(turn), '已完成', reason: '缺 time 时按既有规则不显示用时');
+    });
+  });
 }
