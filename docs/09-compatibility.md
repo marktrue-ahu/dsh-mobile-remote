@@ -26,7 +26,9 @@
 | 图标主题化与圆形图标 | **已知缺口**：`mipmap-anydpi-v26` 未提供 `<monochrome>` 层，Android 13 主题图标不生效；未声明 `android:roundIcon`，圆形图标机型退化为方形。计划在后续版本补齐，不影响功能 |
 | Flutter 构建环境 | Flutter 3.35+（Dart SDK ^3.13） |
 
-**声明式兼容范围（`peerDependencies`）**：`@deepseek-ai/dsh-{credentials,llm,sandbox-policy,scope}` 声明 `>=0.1.0-rc.6 <0.3.0`。宿主 `@deepseek-ai/dsh-app-boot` 的 `evaluatePluginCompatibility()` 用 `semver.satisfies(runtimeVersion, range, { includePrerelease: true })` 判定（**prerelease 参与比较**），因此该范围同时覆盖 `0.1.x`、`0.2.0-rc.*` 与 `0.2.x` 正式版，而 `0.3.0+` 会被判为不兼容。上界**只用于声明可安装边界**，功能路径仍按能力探测（ADR 0017），不按版本号做功能门禁。
+**声明式兼容范围（`peerDependencies`）**：`@deepseek-ai/dsh-{credentials,llm,sandbox-policy,scope}` 声明 `>=0.1.0-rc.6 <=0.2.2 || >=0.2.0-0 <0.2.0 || >=0.2.1-0 <0.2.1 || >=0.2.2-0 <0.2.2`。稳定版上限为 `0.2.2`；三个显式预发布分支分别纳入已发布的 `0.2.0-rc.*`、`0.2.1-rc.*`、`0.2.2-alpha/rc.*` 系列（npm 默认 semver 语义不会把裸 `<=0.2.2` 认作覆盖预发布版本）。`0.2.3+` 与 `0.3.0+` 会被判为不兼容。
+
+注意两条判定通道语义不同：宿主 `@deepseek-ai/dsh-app-boot` 的 `evaluatePluginCompatibility()` 用 `semver.satisfies(runtimeVersion, range, { includePrerelease: true })`（运行时放行预发布）；npm / pnpm 安装期的 peer 解析用默认语义，所以预发布宿主必须在范围里显式出现。上界**只用于声明可安装边界**，功能路径仍按能力探测（ADR 0017），不按版本号做功能门禁。
 
 **快速自检**：手机 App → 设置 → 环境诊断。`services` 一节列出每个内核服务是否存在；**v3.1.3+ 看 `checks.approvalMode`**（生效策略）与 **`checks.remoteEvents`**（`true` = `$events` 双端呈现通道就绪，`false` = both 降级 mobile 或配置即 mobile/desktop）；`notes` 说明当前审批策略实际语义与**任何非全绿的宿主能力**。
 

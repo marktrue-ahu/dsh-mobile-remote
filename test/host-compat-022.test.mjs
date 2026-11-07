@@ -23,6 +23,9 @@ test('declared DSH peer range and lock agree with latest 0.2.2-rc.1 prerelease d
     }
     assert.equal(semver.satisfies('0.1.0-rc.5', range), false, `${name} must keep its lower bound`);
     assert.equal(semver.satisfies('0.1.0-rc.10', range), true, `${name} should accept later 0.1.0 release candidates`);
+    assert.equal(semver.satisfies('0.2.2', range), true, `${name} must accept the capped stable release`);
+    assert.equal(semver.satisfies('0.2.3', range), false, `${name} must cap the stable line at 0.2.2`);
+    assert.equal(semver.satisfies('0.2.3-rc.1', range), false, `${name} must cap the prerelease line at 0.2.2`);
     assert.equal(semver.satisfies('0.3.0-rc.1', range), false, `${name} must keep the next-major boundary`);
   }
   assert.equal(semver.satisfies('3.19.0', manifest.peerDependencies['@deepseek-ai/schemastery']), true);
