@@ -371,7 +371,11 @@ run "登记树切换到另一 feature 分支后 deliver 被拒" fail bash "$WT" 
 git switch -q feature/selftest-one
 git branch -D feature/wrong-branch >/dev/null 2>&1
 
-section "真实多进程槽位上限与 shared/exclusive 互斥"
+# gradle 已从 exclusive 改为 slots:2（见 worktree.sh 并发限额注释），因此：
+#  - 外部持有 legacy exclusive 仍必须挡住 flutter 的 shared；
+#  - 外部持有 shared 只表示"某 flutter-test 在跑"，不再挡住 gradle 槽位，
+#    这正是本次要放开的并发（gradle 与 flutter-test 可叠加）。
+section "真实多进程槽位上限与 gradle/flutter 叠加"
 LOCK="$DSH_WT_STATE/locks"
 mkdir -p "$LOCK"
 run "无外部占用时合成门禁无死锁" 0 bash "$WT" verify
@@ -379,34 +383,53 @@ exec 9>"$LOCK/gradle-build.lock"; flock -x -n 9
 run "外部 exclusive 阻止 flutter shared 门禁" fail env DSH_WT_SLOT_TIMEOUT=2 bash "$WT" verify
 exec 9>&-
 exec 8>"$LOCK/gradle-build.lock"; flock -s -n 8
-run "外部 shared 阻止 gradle exclusive 门禁" fail env DSH_WT_SLOT_TIMEOUT=2 bash "$WT" verify
+run "外部 shared（有 flutter-test 在跑）不阻止 gradle 槽位门禁" 0 env DSH_WT_SLOT_TIMEOUT=2 bash "$WT" verify
 exec 8>&-
+# gradle 槽位本身仍需限流：占满 2 个槽后，第三个 gradle 门禁必须等待超时。
+exec 8>"$LOCK/gradle-build.1.lock"; flock -x -n 8
+exec 9>"$LOCK/gradle-build.2.lock"; flock -x -n 9
+run "两个 gradle 槽位占满时 gradle 门禁等锁超时" fail env DSH_WT_SLOT_TIMEOUT=2 bash "$WT" verify
+exec 8>&- 9>&-
 TIMEOUT_MARKER="$TMP/timeout-injection-ran"
 run "并发锁 timeout 环境值拒绝表达式注入" fail env DSH_WT_SLOT_TIMEOUT="\$(touch $TIMEOUT_MARKER)" bash "$WT" verify
 [ ! -e "$TIMEOUT_MARKER" ] && { PASS=$((PASS+1)); say "  PASS  非数字 timeout 未执行命令替换"; } || { FAIL=$((FAIL+1)); say "  FAIL  timeout 值执行了命令"; }
 
-# 三个不同 issue 的 verify 进程同时竞争 slots:2；第三个不得进入 synthetic-flutter，
-# 直到前两个释放至少一个槽位。marker 是门禁命令真实开始时才创建的。
+# Flutter 全量槽位 = 5（2026-11 由 2 提高，理由见 worktree.sh 并发限额注释）。
+# 判据：前 5 个 verify 能同时进入 synthetic-flutter；第 6 个必须等到有槽位释放。
+# marker 是门禁命令真实开始时才创建的。
 cd "$CLONE"
-run "创建并发测试树 A" 0 bash "$WT" create 910 slot-a
-run "创建并发测试树 B" 0 bash "$WT" create 911 slot-b
-run "创建并发测试树 C" 0 bash "$WT" create 912 slot-c
-A="$DSH_WT_ROOT/issue-910-slot-a"; B="$DSH_WT_ROOT/issue-911-slot-b"; C="$DSH_WT_ROOT/issue-912-slot-c"
-(cd "$A" && env DSH_WT_TEST_GATE_SLEEP=1 DSH_WT_TEST_GATE_MARKER="$TMP/A.started" bash "$WT" verify >"$TMP/A.log" 2>&1) & PA=$!
-(cd "$B" && env DSH_WT_TEST_GATE_SLEEP=1 DSH_WT_TEST_GATE_MARKER="$TMP/B.started" bash "$WT" verify >"$TMP/B.log" 2>&1) & PB=$!
-BOTH=0
-for _ in $(seq 1 120); do
-  if slot_is_locked "$LOCK/flutter-test.1.lock" && slot_is_locked "$LOCK/flutter-test.2.lock"; then BOTH=1; break; fi
+IDX=910
+for n in a b c d e f; do
+  run "创建并发测试树 $n" 0 bash "$WT" create "$IDX" "slot-$n"
+  IDX=$((IDX+1))
+done
+A5="$DSH_WT_ROOT/issue-910-slot-a"; B5="$DSH_WT_ROOT/issue-911-slot-b"; C5="$DSH_WT_ROOT/issue-912-slot-c"
+D5="$DSH_WT_ROOT/issue-913-slot-d"; E5="$DSH_WT_ROOT/issue-914-slot-e"; F5="$DSH_WT_ROOT/issue-915-slot-f"
+PIDS=()
+LETTERS=(a b c d e)
+IDX=910
+for n in "${LETTERS[@]}"; do
+  (cd "$DSH_WT_ROOT/issue-$IDX-slot-$n" && env DSH_WT_TEST_GATE_SLEEP=2 DSH_WT_TEST_GATE_MARKER="$TMP/$n.started" bash "$WT" verify >"$TMP/$n.log" 2>&1) &
+  PIDS+=($!)
+  IDX=$((IDX+1))
+done
+FIVE=0
+for _ in $(seq 1 200); do
+  held=0
+  for i in 1 2 3 4 5; do slot_is_locked "$LOCK/flutter-test.$i.lock" && held=$((held+1)); done
+  [ "$held" -ge 5 ] && { FIVE=1; break; }
   sleep 0.05
 done
-[ "$BOTH" -eq 1 ] && { PASS=$((PASS+1)); say "  PASS  两个 verify 进程同时占用两个 Flutter slots"; } || { FAIL=$((FAIL+1)); say "  FAIL  未观察到两个并发 slot 持有者"; }
-(cd "$C" && env DSH_WT_SLOT_TIMEOUT=10 DSH_WT_TEST_GATE_MARKER="$TMP/C.started" bash "$WT" verify >"$TMP/C.log" 2>&1) & PC=$!
-sleep 0.2
-[ ! -e "$TMP/C.started" ] && { PASS=$((PASS+1)); say "  PASS  第三个 Flutter 门禁在两个 slots 占满时未启动"; } || { FAIL=$((FAIL+1)); say "  FAIL  第三个 Flutter 门禁越过 slots:2 上限"; }
-wait "$PA"; RCA=$?; wait "$PB"; RCB=$?; wait "$PC"; RCC=$?
-[ "$RCA" -eq 0 ] && [ "$RCB" -eq 0 ] && [ "$RCC" -eq 0 ] \
-  && { PASS=$((PASS+1)); say "  PASS  前两个完成后第三个取得释放的 slot 并通过"; } \
-  || { FAIL=$((FAIL+1)); say "  FAIL  并发 verify exit=$RCA/$RCB/$RCC"; cat "$TMP/A.log" "$TMP/B.log" "$TMP/C.log"; }
+[ "$FIVE" -eq 1 ] && { PASS=$((PASS+1)); say "  PASS  五个 verify 进程同时占用五个 Flutter slots"; } || { FAIL=$((FAIL+1)); say "  FAIL  未观察到五个并发 slot 持有者"; }
+(cd "$F5" && env DSH_WT_SLOT_TIMEOUT=10 DSH_WT_TEST_GATE_MARKER="$TMP/f.started" bash "$WT" verify >"$TMP/f.log" 2>&1) & PF=$!
+sleep 0.3
+[ ! -e "$TMP/f.started" ] && { PASS=$((PASS+1)); say "  PASS  第六个 Flutter 门禁在五槽占满时未启动"; } || { FAIL=$((FAIL+1)); say "  FAIL  第六个 Flutter 门禁越过 slots:5 上限"; }
+ALLRC=0
+for pid in "${PIDS[@]}"; do wait "$pid" || ALLRC=1; done
+wait "$PF" || ALLRC=1
+[ "$ALLRC" -eq 0 ] \
+  && { PASS=$((PASS+1)); say "  PASS  五个并发 verify 全部通过"; } \
+  || { FAIL=$((FAIL+1)); say "  FAIL  并发 verify 有失败"; cat "$TMP"/[a-e].log "$TMP/f.log"; }
 run "从未 deliver 的任务禁止 integrate" fail env DSH_WT_ROLE=integrator bash "$WT" integrate 910
 
 section "基线例外必须有同 SHA、同门禁的基线实测报告"
