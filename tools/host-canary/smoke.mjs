@@ -955,7 +955,19 @@ try {
   //    (and verifyInstalled deliberately rejects plugin symlinks anyway).
   // So: resolve the plugin's own dependencies in a separate prefix, then
   // materialize it into the profile tree the runtime container mounts read-only.
-  execFileSync('npm',['install','--prefix','/profile/dsh/profiles/plugin','--ignore-scripts','--install-links','--no-audit','--no-fund','--legacy-peer-deps','/tmp/plugin'],{stdio:'ignore',timeout:300000});
+  //
+  // IMPORTANT: the plugin must be PACKED, not linked. 'npm install <local-path>'
+  // (with or without --install-links) only records the directory and never installs
+  // that package's own "dependencies" — the plugin would then be missing runtime
+  // deps such as qrcode and every host start would die with module-not-found.
+  // npm pack honours "bundleDependencies" (qrcode IS bundled by the real release),
+  // so dependencies must exist BEFORE packing: install them in place, pack, then
+  // install the tarball. That reproduces how a real published package behaves.
+  execFileSync('npm',['install','--ignore-scripts','--no-audit','--no-fund'],{cwd:'/tmp/plugin',stdio:'ignore',timeout:300000});
+  execFileSync('npm',['pack','--silent','--pack-destination','/tmp/plugin-dist'],{cwd:'/tmp/plugin',stdio:'ignore',timeout:120000});
+  const packed = (await import('node:fs')).readdirSync('/tmp/plugin-dist').filter(f => f.endsWith('.tgz'));
+  if (packed.length !== 1) fail('probe-input-invalid');
+  execFileSync('npm',['install','--prefix','/profile/dsh/profiles/plugin','--ignore-scripts','--no-audit','--no-fund','--legacy-peer-deps','/tmp/plugin-dist/' + packed[0]],{stdio:'ignore',timeout:300000});
   const srcPlugin = '/profile/dsh/profiles/plugin/node_modules/@marktrue/dsh-mobile-remote';
   const dstScope = '/profile/dsh/profiles/canary/node_modules/@marktrue';
   const dstPlugin = dstScope + '/dsh-mobile-remote';

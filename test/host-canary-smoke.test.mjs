@@ -669,6 +669,25 @@ test('install worker keeps the host closure isolated from plugin peer ranges', (
   assert.doesNotMatch(script,/dsh@\$\{JSON\.stringify\([^)]*\)\}[^\n]*\/tmp\/plugin'/);
 });
 
+test('install worker packs the plugin so bundled runtime dependencies are present', () => {
+  // Regression: installing the plugin as a local PATH only records the directory and
+  // never installs its own "dependencies". The plugin imports qrcode (bundled via
+  // "bundleDependencies"), so the host died with module-not-found on every start.
+  // Fix: install deps in place, `npm pack`, then install the tarball.
+  const script = makeInstallWorker('0.2.2-rc.1');
+  const checked = spawnSync(process.execPath,['--check','--input-type=module'],{input:script,encoding:'utf8'});
+  assert.equal(checked.status,0,checked.stderr);
+  // Dependencies must exist before packing (npm pack bundles from node_modules).
+  assert.match(script,/cwd:'\/tmp\/plugin'/);
+  assert.match(script,/pack/);
+  // The installed artifact must be the tarball, not the source directory.
+  assert.match(script,/plugin-dist/);
+  assert.match(script,/\.tgz/);
+  // Still isolated from the host closure, and no link-based install remains.
+  assert.match(script,/--legacy-peer-deps/);
+  assert.doesNotMatch(script,/'--install-links'/);
+});
+
 test('runtime worker restores the bundle declaration that npm install overwrites', () => {
   // Regression: `npm install --prefix <profile>` rewrites the profile manifest
   // into a dependency list and drops dsh.profile.bundles. The host then loads no
