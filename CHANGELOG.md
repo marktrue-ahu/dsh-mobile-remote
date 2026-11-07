@@ -24,6 +24,11 @@
 - worktree 门禁：并发槽位提到 5（Gradle 与 Flutter 测试可叠加，#56）；门禁输出改为流式落盘，修复大输出导致挂起（#59）。
 - 容器化工具链：出网 / GitLab 统一走 SOCKS5 代理，代理配置改由 gitignored 的 `.env` 驱动；补充 curl 调 GitLab API 的必要条件文档。
 
+### 发布链路修复（alpha.6 重新发布）
+
+- 补齐 `semver` devDependency 与 `package-lock.json`：首次 alpha.6 发布流水在 Node 测试阶段因 `ERR_MODULE_NOT_FOUND: semver` 失败，未进入构建/发布步骤；本次为修复后的重新发布。
+- DSH peer 依赖上限收紧到 `0.2.2` 行：`>=0.1.0-rc.6 <=0.2.2 || >=0.2.0-0 <0.2.0 || >=0.2.1-0 <0.2.1 || >=0.2.2-0 <0.2.2`，显式保留 `0.2.0-rc.*` / `0.2.1-rc.*` / `0.2.2-alpha|rc.*`（含当前宿主 `0.2.2-rc.1`），拒绝 `0.2.3+` 与 `0.3.0+`；`host-compat-022` 契约测试与 `docs/09-compatibility.md` 同步更新。
+
 ## v3.2.4-alpha.5（build 37，issue #42）— 文件历史路径归一化修复
 
 > 插件 `3.2.4-alpha.5` / App `3.2.4+37` / 载体 `3.2.4-alpha.5-app`。
