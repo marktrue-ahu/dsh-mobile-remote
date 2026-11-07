@@ -630,7 +630,7 @@ git fetch --quiet github main
 cd "$WT_UPSTREAM"
 git -c user.email=t@t -c user.name=t rebase --quiet github/main
 run_fail_with "upstream 任务未授权 refresh-baseline 被拒（fail-closed）" "授权" bash "$WT" refresh-baseline 904
-run "登记 upstream refresh-baseline 授权（绑定 rebase 后 HEAD）" 0 bash "$WT" authorize 904 refresh-baseline "用户批准 rebase 后刷新上游基线"
+run "登记 upstream refresh-baseline 授权（绑定 rebase 后 HEAD）" 0 env DSH_WT_ROLE=integrator bash "$WT" authorize 904 refresh-baseline "用户批准 rebase 后刷新上游基线"
 run_fail_with "upstream 任务拒绝 develop 上的提交作为新基线" "github/main" bash "$WT" refresh-baseline 904 "$(git -C "$CLONE" rev-parse develop)"
 run "upstream 刷新基线到前进后的 github/main" 0 bash "$WT" refresh-baseline 904
 run "upstream 基线已前进且旧证据清空" 0 python3 - "$DSH_WT_STATE/tasks/904.json" "$ADV_MAIN" <<'PY'
@@ -746,7 +746,7 @@ run_fail_with "rebase 后未刷新基线的 deliver 误报 docs/agents（#58 复
 run_fail_with "未授权 refresh-baseline 被拒（fail-closed）" "授权" bash "$WT" refresh-baseline 907
 run "未登记 issue 的 refresh-baseline 被拒" fail bash "$WT" refresh-baseline 999
 run_fail_with "非法 issue 参数的 refresh-baseline 被拒" "正整数" bash "$WT" refresh-baseline 0
-run "登记 refresh-baseline 授权（绑定 rebase 后 HEAD）" 0 bash "$WT" authorize 907 refresh-baseline "用户批准 rebase 后刷新基线"
+run "登记 refresh-baseline 授权（绑定 rebase 后 HEAD）" 0 env DSH_WT_ROLE=integrator bash "$WT" authorize 907 refresh-baseline "用户批准 rebase 后刷新基线"
 # 脏树拒绝（工作树 / 主目录），失败尝试不得消耗授权。
 printf 'dirty\n' >> refresh-probe.txt
 run_fail_with "工作树脏时 refresh-baseline 被拒" "干净" bash "$WT" refresh-baseline 907
@@ -794,13 +794,126 @@ for key in ("verification_state","verification_attempt_sha","last_verified_sha",
 assert d.get("status")=="baseline-refreshed", d.get("status")
 assert d.get("authorizations",{}).get("refresh-baseline",{}).get("used_at"), "授权未标记已使用"
 PY
-run "刷新基线写审计" 0 grep -q "refresh-baseline" "$DSH_WT_STATE/audit.log"
+run "刷新基线写审计（事件列 + issue/old/new，而非仅命中 authorize 行）" 0 bash -c '
+  awk -F"\t" -v old="$2" -v new="$3" '"'"'$3=="refresh-baseline" && $0 ~ ("issue=907") && index($0, old) && index($0, new) {found=1} END{exit found?0:1}'"'"' "$1"
+' _ "$DSH_WT_STATE/audit.log" "$BASE_OLD" "$ADV_DEVELOP"
 run_fail_with "刷新后未重新 verify 时 deliver 被拒（旧证据已作废）" "验证报告" bash "$WT" deliver
 run_fail_with "同一份授权不能二次使用" "授权" bash "$WT" refresh-baseline 907
 run "刷新后重新 verify" 0 bash "$WT" verify
 run "刷新后 deliver 使用新基线通过（不再误报 docs）" 0 bash "$WT" deliver
 run "交付摘要记录新基线" 0 bash -c 'grep -q "$2" "$1"/907-delivery-*.md' _ "$DSH_WT_STATE/reports" "$ADV_DEVELOP"
 run "新基线下 PR diff 不含继承的 docs/agents" 0 bash -c 'git -C "$1" diff --quiet "$2" HEAD -- docs/agents' _ "$WT_REF" "$ADV_DEVELOP"
+
+
+section "refresh-baseline：评审补强（#58 major/minor）"
+cd "$CLONE"
+# 远端与本地 develop 对齐到当前 develop（作为 B0），再建 908。
+run "同步测试 develop 到 github/develop" 0 bash -c \
+  'git -C "$1" push --quiet --force "$2" develop:refs/heads/develop && git -C "$1" fetch --quiet "$3" develop' \
+  _ "$CLONE" "$GITHUB_BARE" github
+B0="$(git -C "$CLONE" rev-parse develop)"
+run "建评审补强测试树 908（基线 B0）" 0 bash "$WT" create 908 refresh-review
+WT_RV="$DSH_WT_ROOT/issue-908-refresh-review"
+cd "$WT_RV"
+printf 'review probe\n' > review-probe.txt
+git add review-probe.txt >/dev/null 2>&1
+git -c user.email=t@t -c user.name=t commit -qm "test: refresh review fixture"
+# 目标远端前进到 B1（含禁止路径 docs/agents 改动），功能树 rebase 后 HEAD 含 B1。
+cd "$CLONE"
+git checkout --quiet -b review-advance develop
+printf 'upstream doc B1\n' >> docs/agents/issue-tracker.md
+git add -A >/dev/null 2>&1
+git -c user.email=t@t -c user.name=t commit -qm "docs: review advance B1"
+B1="$(git rev-parse HEAD)"
+git push --quiet --force "$GITHUB_BARE" review-advance:refs/heads/develop
+git checkout --quiet develop
+git branch -D review-advance >/dev/null 2>&1
+cd "$WT_RV"
+git fetch --quiet github develop
+git -c user.email=t@t -c user.name=t rebase --quiet github/develop
+H_RV="$(git rev-parse HEAD)"
+BR_RV="$(git rev-parse --abbrev-ref HEAD)"
+run "908 的 HEAD 已含 B1" 0 git merge-base --is-ancestor "$B1" "$H_RV"
+# 非 integrator 不能登记 refresh-baseline 授权。
+run_fail_with "非集成角色不能登记 refresh-baseline 授权" "集成" env -u DSH_WT_ROLE bash "$WT" authorize 908 refresh-baseline "非集成角色尝试"
+# 先按 B1 生成有效证据（模拟刷新后的状态），再把登记基线改回 B0 以模拟 stale baseline。
+run "把登记基线设为 B1 以便生成有效证据" 0 python3 - "$DSH_WT_STATE/tasks/908.json" "$B1" <<'PY2'
+import json,sys
+p,b=sys.argv[1:3]; d=json.load(open(p)); d["baseline"]=b
+json.dump(d,open(p,"w",encoding="utf-8"),ensure_ascii=False,indent=2)
+PY2
+run "908 verify" 0 bash "$WT" verify
+run "908 deliver" 0 bash "$WT" deliver
+run "把登记基线改回 B0（保留 HEAD 与有效证据，模拟 stale baseline）" 0 python3 - "$DSH_WT_STATE/tasks/908.json" "$B0" "$B1" <<'PY3'
+import json,sys
+p,b0,b1=sys.argv[1:4]; d=json.load(open(p))
+d["baseline"]=b0
+d["authorizations"].setdefault("exception",{})["baseline_report"]="/tmp/fake-report.md"
+d["baseline_verification_state"]="complete"
+json.dump(d,open(p,"w",encoding="utf-8"),ensure_ascii=False,indent=2)
+PY3
+run "登记 refresh-baseline 授权（integrator，绑定 HEAD）" 0 env DSH_WT_ROLE=integrator bash "$WT" authorize 908 refresh-baseline "用户批准同 HEAD 刷新基线"
+# 分支归属：同 SHA 其它分支 / detached HEAD 必须被拒。
+git checkout --quiet -b review-other-branch
+run_fail_with "同 SHA 其它分支被拒（分支归属）" "不一致" bash "$WT" refresh-baseline 908
+git checkout --quiet "$BR_RV"
+git checkout --quiet --detach
+run_fail_with "detached HEAD 被拒（分支归属）" "分离" bash "$WT" refresh-baseline 908
+git checkout --quiet "$BR_RV"
+# 非写入者被拒。
+run_fail_with "非写入者被拒（require_writer）" "写入者" env DSH_SESSION_ID=intruder bash "$WT" refresh-baseline 908
+# 同 HEAD 刷新：证据必须被清空，deliver 因缺证据被拒（而非 SHA 不匹配）。
+run "同 HEAD 刷新基线（B0 → B1）" 0 bash "$WT" refresh-baseline 908
+run "同 HEAD 刷新后 HEAD 未变" 0 bash -c '[ "$1" = "$2" ]' _ "$(git rev-parse HEAD)" "$H_RV"
+run "同 HEAD 刷新后证据与 exception 全部清空、status 回到未验证" 0 python3 - "$DSH_WT_STATE/tasks/908.json" "$B1" <<'PY4'
+import json,sys
+p,b1=sys.argv[1:3]; d=json.load(open(p))
+assert d.get("baseline")==b1, d.get("baseline")
+for k in ("verification_state","last_report","last_verified_sha","delivered_sha","delivered_at",
+          "baseline_verification_state","last_baseline_report","last_baseline_sha"):
+    assert k not in d, k
+assert "exception" not in d.get("authorizations",{}), d.get("authorizations")
+assert d.get("status")=="baseline-refreshed", d.get("status")
+assert d.get("authorizations",{}).get("refresh-baseline",{}).get("used_at")
+PY4
+run_fail_with "同 HEAD 刷新后 deliver 因缺证据被拒（不是 SHA 不匹配）" "验证报告" bash "$WT" deliver
+# 写失败 / 替换后不确定 / 审计失败三条失败路径（测试注入）。
+run "重置基线为 B0 以复用刷新路径" 0 python3 - "$DSH_WT_STATE/tasks/908.json" "$B0" <<'PY5'
+import json,sys
+p,b0=sys.argv[1:3]; d=json.load(open(p)); d["baseline"]=b0
+json.dump(d,open(p,"w",encoding="utf-8"),ensure_ascii=False,indent=2)
+PY5
+run "登记授权（写失败用例）" 0 env DSH_WT_ROLE=integrator bash "$WT" authorize 908 refresh-baseline "写失败用例"
+run_fail_with "登记写入失败时明确报错" "写入失败" env DSH_WT_TEST_REFRESH_WRITE_FAIL=1 bash "$WT" refresh-baseline 908
+run "写失败后登记仍是旧基线" 0 python3 - "$DSH_WT_STATE/tasks/908.json" "$B0" <<'PY6'
+import json,sys
+p,b0=sys.argv[1:3]; d=json.load(open(p)); sys.exit(0 if d.get("baseline")==b0 else 1)
+PY6
+run "登记授权（不确定提交态用例）" 0 env DSH_WT_ROLE=integrator bash "$WT" authorize 908 refresh-baseline "替换后确认失败用例"
+run_fail_with "替换后确认失败时不谎报成功" "不确定" env DSH_WT_TEST_REFRESH_WRITE_FAIL=uncertain bash "$WT" refresh-baseline 908
+run "不确定态下登记已更新（用于人工核对提示）" 0 python3 - "$DSH_WT_STATE/tasks/908.json" "$B1" <<'PY7'
+import json,sys
+p,b1=sys.argv[1:3]; d=json.load(open(p)); sys.exit(0 if d.get("baseline")==b1 else 1)
+PY7
+run "重置基线为 B0（审计失败用例）" 0 python3 - "$DSH_WT_STATE/tasks/908.json" "$B0" <<'PY8'
+import json,sys
+p,b0=sys.argv[1:3]; d=json.load(open(p)); d["baseline"]=b0
+json.dump(d,open(p,"w",encoding="utf-8"),ensure_ascii=False,indent=2)
+PY8
+run "登记授权（审计失败用例）" 0 env DSH_WT_ROLE=integrator bash "$WT" authorize 908 refresh-baseline "审计失败用例"
+run_fail_with "审计写入失败时非零退出并明确提示" "审计" env DSH_WT_TEST_REFRESH_AUDIT_FAIL=1 bash "$WT" refresh-baseline 908
+# 第三祖先：远端 tip 前进但 HEAD 尚未包含 → 必须拒绝。
+cd "$CLONE"
+git checkout --quiet -b review-advance2 "$B1"
+git -c user.email=t@t -c user.name=t commit --allow-empty -qm "test: review advance B2"
+B2="$(git rev-parse HEAD)"
+git push --quiet --force "$GITHUB_BARE" review-advance2:refs/heads/develop
+git checkout --quiet develop
+git branch -D review-advance2 >/dev/null 2>&1
+cd "$WT_RV"
+run "同步 github/develop 到 B2" 0 git fetch --quiet github develop
+run "登记授权（第三祖先用例）" 0 env DSH_WT_ROLE=integrator bash "$WT" authorize 908 refresh-baseline "第三祖先用例"
+run_fail_with "新基线不是 HEAD 祖先时被拒（第三祖先）" "不是当前 HEAD 的祖先" bash "$WT" refresh-baseline 908 "$B2"
 
 section "结果"
 say "通过 $PASS / 失败 $FAIL"

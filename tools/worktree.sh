@@ -1357,7 +1357,7 @@ cmd_authorize() {
     *) die "未知动作：$action" ;;
   esac
   case "$action" in
-    integrate|cleanup|branch-delete|release|deploy|restart|force-push|takeover) require_role_integrator ;;
+    integrate|cleanup|branch-delete|release|deploy|restart|force-push|takeover|refresh-baseline) require_role_integrator ;;
   esac
   require_task "$issue"
   task_lock_acquire "$issue"
@@ -1415,7 +1415,17 @@ cmd_refresh_baseline() {
   case "$baseline_ref" in develop|main) ;; *) die "任务目标分支无效：$baseline_ref" ;; esac
   status="$(json_get "$task" status)"
   case "$status" in integrated|cleaned) die "任务已集成/清理，不再接受功能树基线刷新" ;; esac
-  require_wrapup_or_writer "$issue" "$path" "$branch" refresh-baseline
+  # 分支归属：读工作树**实际**分支，拒绝 detached HEAD / 同 SHA 的其它分支（issue #58 评审）。
+  local actual_branch
+  actual_branch="$(gitq -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  [ -n "$actual_branch" ] && [ "$actual_branch" != "HEAD" ] || \
+    die "工作树处于分离 HEAD（detached）；refresh-baseline 只接受登记分支 $branch"
+  [ "$actual_branch" = "$branch" ] || \
+    die "工作树当前分支 $actual_branch 与登记分支 $branch 不一致；拒绝刷新基线"
+  [ "$(branch_head "$branch")" = "$(gitq -C "$path" rev-parse HEAD)" ] || \
+    die "登记分支 $branch 的头部与工作树 HEAD 不一致；拒绝刷新基线"
+  # 刷新会清空证据并改共享登记，与 init 同级只允许登记写入者（或已记录的 takeover）。
+  require_writer "$issue" "$path" "$branch"
 
   # 前置：主目录与工作树都干净；HEAD 固定；授权必须绑定这个 HEAD。
   require_clean_tree "$MAIN_DIR" "refresh-baseline（主目录）"
@@ -1448,7 +1458,14 @@ cmd_refresh_baseline() {
   require_clean_tree "$path" "refresh-baseline（写入前）"
   require_clean_tree "$MAIN_DIR" "refresh-baseline（写入前）"
   local reason; reason="$(json_get "$task" authorizations.refresh-baseline.note)"
-  python3 - "$task" "$old_baseline" "$baseline_ref" "$new_baseline" "$WHOAMI_ID" "$reason" "$head_start" <<'PY' | atomic_json_write "$task"
+  # 测试注入（selftest 用；生产不设）：模拟登记写入失败/替换后确认失败/审计不可写。
+  local inject_write="${DSH_WT_TEST_REFRESH_WRITE_FAIL:-0}"
+  local inject_audit="${DSH_WT_TEST_REFRESH_AUDIT_FAIL:-0}"
+  local write_rc=0
+  if [ "$inject_write" = "1" ]; then
+    write_rc=1
+  else
+    if ! { python3 - "$task" "$old_baseline" "$baseline_ref" "$new_baseline" "$WHOAMI_ID" "$reason" "$head_start" <<'PY' | atomic_json_write "$task"
 import datetime,json,sys
 f,old,old_ref,new,by,reason,head=sys.argv[1:8]
 now=datetime.datetime.now().strftime("%F %T")
@@ -1480,12 +1497,26 @@ prev=d.get("status")
 d["status"]=prev if prev in ("created","initialized") else "baseline-refreshed"
 json.dump(d,sys.stdout,ensure_ascii=False)
 PY
+  }; then write_rc=1; fi
+    [ "$inject_write" = "uncertain" ] && write_rc=1
+  fi
+  if [ "$write_rc" -ne 0 ]; then
+    local now_baseline; now_baseline="$(json_get "$task" baseline 2>/dev/null || true)"
+    if [ "$now_baseline" = "$new_baseline" ]; then
+      audit refresh-baseline "issue=$issue result=write-uncertain old=$old_baseline new=$new_baseline head=$head_start" || true
+      die "刷新登记已替换为新基线，但写入确认失败（fsync/替换不确定）：旧证据可能未清空；请人工核对 tasks/$issue.json 后重新 verify"
+    fi
+    audit refresh-baseline "issue=$issue result=write-failed old=$old_baseline new=$new_baseline head=$head_start" || true
+    die "刷新基线写入失败：登记未更新（旧基线/旧证据保留），可修复后重试"
+  fi
   local head_end; head_end="$(gitq -C "$path" rev-parse HEAD)"
   if [ "$head_end" != "$head_start" ]; then
     audit refresh-baseline "issue=$issue result=head-changed old=$old_baseline new=$new_baseline"
     die "刷新写入期间 HEAD 变化（${head_start:0:12} → ${head_end:0:12}）：基线已更新且旧证据已清空；请确认现场后重新 verify"
   fi
-  audit refresh-baseline "issue=$issue target=$target ref=$baseline_ref old=$old_baseline new=$new_baseline head=$head_start by=$WHOAMI_ID note=$reason"
+  if [ "$inject_audit" = "1" ] || ! audit refresh-baseline "issue=$issue target=$target ref=$baseline_ref old=$old_baseline new=$new_baseline head=$head_start by=$WHOAMI_ID note=$reason"; then
+    die "登记已刷新且旧证据已清空，但审计写入失败（audit.log 不可写）；请人工补记 refresh-baseline 审计后再继续"
+  fi
   ok "已刷新基线：${old_baseline:0:12} → ${new_baseline:0:12}（github/$baseline_ref，绑定当前 HEAD ${head_start:0:12}）"
   warn "旧验证/交付证据已清空、交付状态回到未验证/未交付；必须重新 verify 才能 deliver"
   info "下一步：tools/worktree.sh verify（若新基线有红灯，再 verify-baseline + authorize-exception）"
