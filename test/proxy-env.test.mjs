@@ -5,17 +5,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-// tools/worktree.sh reads proxy settings from a gitignored .env in the main
+// tools/proxy-env.sh reads proxy settings from a gitignored .env in the main
 // checkout. These tests exercise that parser in isolation: the real script must
 // never bake host-specific proxy addresses into version control, and an absent
 // or disabled .env must leave the environment completely untouched.
-const SCRIPT = new URL('../tools/worktree.sh', import.meta.url).pathname;
+const SCRIPT = new URL('../tools/proxy-env.sh', import.meta.url).pathname;
 
 function extractHelpers() {
   const text = spawnSync('cat', [SCRIPT], { encoding: 'utf8' }).stdout;
   const grab = (name) => {
     const start = text.indexOf(`\n${name}() {`);
-    assert.ok(start >= 0, `${name} must exist in tools/worktree.sh`);
+    assert.ok(start >= 0, `${name} must exist in tools/proxy-env.sh`);
     const end = text.indexOf('\n}\n', start);
     assert.ok(end > start, `${name} must be a complete function`);
     return text.slice(start + 1, end + 2);
