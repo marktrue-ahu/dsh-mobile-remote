@@ -1001,6 +1001,18 @@ try {
   // The separate prefix is scaffolding only; drop it so it cannot be mistaken for
   // part of the installed tree.
   execFileSync('rm',['-rf','/profile/dsh/profiles/plugin'],{stdio:'ignore',timeout:60000});
+  // Resolve every dependency the plugin imports in the exact layout the runtime
+  // container will mount. Without this, a missing package only surfaces later as a
+  // generic host-exit code; here it becomes one specific, attributable install code.
+  {
+    const { createRequire } = await import('node:module');
+    const req = createRequire(dstPlugin + '/lib/index.js');
+    for (const [specifier, code] of MISSING_DEPENDENCY_SPECIFIERS) {
+      let resolved = true;
+      try { req.resolve(specifier); } catch { resolved = false; }
+      if (!resolved) { process.stdout.write(JSON.stringify({ok:false,errorCode:code}) + '\\n'); process.exitCode = 2; throw new Error('dependency-preflight'); }
+    }
+  }
   process.stdout.write('{"ok":true}\\n');
 } catch { process.stdout.write('{"ok":false,"errorCode":"install-failed"}\\n'); process.exitCode = 2; }
 `;
