@@ -156,9 +156,10 @@ function createClient({ token, fetchImpl, sleepImpl }) {
 			if (response.ok) return true;
 			if (await rateLimit(response)) throw new SyncError("rate-limited", "GitHub API 已限流，本次不重发写请求，请等待恢复后重试。");
 			if (response.status >= 500 || response.status === 408) return false;
-			// 已知本次区间改了 workflow 文件，且写入被 403/422 拒绝：这是 workflows 权限规则，
-			// 不是并发修改或非快进历史。给出独立原因与清单，避免与 permission-denied/update-rejected 混淆。
-			if (hasWorkflowChanges && [403, 422].includes(response.status)) {
+			// issue #60 R18：只有 **403 + 本次区间改了 workflow 文件** 才能归因为 workflows
+			// 权限（GitHub 的 workflows 权限拒绝是 403）。422 可能是非快进/分支保护/校验失败，
+			// 必须保留 apiError 的可区分原因（update-rejected），不得一律诱导用户提权。
+			if (hasWorkflowChanges && response.status === 403) {
 				throw workflowPermissionError(workflowPaths, workflowTruncated, response.status);
 			}
 			throw apiError(response.status);

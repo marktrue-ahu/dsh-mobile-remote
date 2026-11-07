@@ -432,25 +432,35 @@ test("#48 workflowChanges 只取 .github/workflows/ 下的文件，且排序稳�
 	assert.equal(workflowChanges({ ...comparison, files: new Array(300).fill({ filename: "x" }) }).truncated, true);
 });
 
-test("#48 写入被拒且区间含 workflow 变更 → 专门原因、带文件清单、不重发写请求", async () => {
-	for (const status of [403, 422]) {
-		const h = setup([json(ref(BEFORE)), json(ref(UPSTREAM)), json(withFiles([
-			".github/workflows/release.yml", ".github/workflows/check.yml", "CHANGELOG.md",
-		])), json({}, status)]);
-		let failure;
-		try { await h.run({ dryRun: false }); } catch (error) { failure = safeFailure(error); }
-		assert.equal(failure.reason, "workflow-permission-required");
-		assert.deepEqual(failure.workflowChanges, [".github/workflows/check.yml", ".github/workflows/release.yml"]);
-		assert.match(failure.message, /\.github\/workflows\//);
-		assert.match(failure.message, /UPSTREAM_SYNC_TOKEN/);
-		assert.match(failure.message, /Workflows:write/);
-		// 带上真实 HTTP 状态，便于与日志中的响应码对照。
-		assert.ok(failure.message.includes(`HTTP ${status}`), `message 应包含 HTTP ${status}`);
-		// 失败语义不变：仍然只发了一次写请求，不做回读、不回滚、不强推。
-		assert.equal(writes(h.calls).length, 1);
-		assert.equal(h.calls.length, 4);
-		assert.equal(failure.afterSha, undefined);
-	}
+test("#48 403 + workflow 变更 → 专门原因、带文件清单、不重发写请求", async () => {
+	const status = 403;
+	const h = setup([json(ref(BEFORE)), json(ref(UPSTREAM)), json(withFiles([
+		".github/workflows/release.yml", ".github/workflows/check.yml", "CHANGELOG.md",
+	])), json({}, status)]);
+	let failure;
+	try { await h.run({ dryRun: false }); } catch (error) { failure = safeFailure(error); }
+	assert.equal(failure.reason, "workflow-permission-required");
+	assert.deepEqual(failure.workflowChanges, [".github/workflows/check.yml", ".github/workflows/release.yml"]);
+	assert.match(failure.message, /\.github\/workflows\//);
+	assert.match(failure.message, /UPSTREAM_SYNC_TOKEN/);
+	assert.match(failure.message, /Workflows:write/);
+	// 带上真实 HTTP 状态，便于与日志中的响应码对照。
+	assert.ok(failure.message.includes(`HTTP ${status}`), `message 应包含 HTTP ${status}`);
+	// 失败语义不变：仍然只发了一次写请求，不做回读、不回滚、不强推。
+	assert.equal(writes(h.calls).length, 1);
+	assert.equal(h.calls.length, 4);
+	assert.equal(failure.afterSha, undefined);
+});
+
+test("R18 422 + workflow 变更仍归 update-rejected（非快进/分支保护不得诱导提权）", async () => {
+	const h = setup([json(ref(BEFORE)), json(ref(UPSTREAM)), json(withFiles([
+		".github/workflows/release.yml",
+	])), json({ message: "Update is not a fast forward" }, 422)]);
+	let failure;
+	try { await h.run({ dryRun: false }); } catch (error) { failure = safeFailure(error); }
+	assert.equal(failure.reason, "update-rejected", `422 非快进不得归因为 workflows 权限：${JSON.stringify(failure)}`);
+	assert.match(failure.message, /非快进|并发/);
+	assert.equal(writes(h.calls).length, 1, "仍然 fail-closed：只发一次写请求、不强推");
 });
 
 test("#48 无 workflow 变更时，同样的 403/422 仍按原有原因分类（不误判）", async () => {
