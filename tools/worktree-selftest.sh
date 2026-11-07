@@ -54,8 +54,8 @@ else git remote add github "$GITHUB_BARE"; fi
 
 # 被测脚本可能是尚未提交的新文件：拷进克隆的 tools/ 并提交到 **develop**（不是 main）
 mkdir -p "$CLONE/tools"
-cp -p "$REPO_SRC/tools/worktree.sh" "$REPO_SRC/tools/worktree-selftest.sh" "$CLONE/tools/"
-git add tools/worktree.sh tools/worktree-selftest.sh >/dev/null 2>&1
+cp -p "$REPO_SRC/tools/worktree.sh" "$REPO_SRC/tools/worktree-selftest.sh" "$REPO_SRC/tools/proxy-env.sh" "$CLONE/tools/"
+git add tools/worktree.sh tools/worktree-selftest.sh tools/proxy-env.sh >/dev/null 2>&1
 git -c user.email=selftest@local -c user.name=selftest commit -qm "test: selftest fixture" >/dev/null 2>&1
 
 # main 始终只是 origin/main 的镜像；生命周期工具只从 develop 版本化与运行。
@@ -82,6 +82,33 @@ WT="$CLONE/tools/worktree.sh"
 
 say "worktree.sh 自测（临时克隆：$CLONE）"
 say "feature 基线 develop = $(git rev-parse --short develop)"
+
+section "代理环境：NO_PROXY 自动补本机回环（issue #57）"
+PROXY_HELPER="$CLONE/tools/proxy-env.sh"
+mkdir -p "$TMP/proxy"
+printf 'DSH_PROXY_ENABLED=1\nDSH_PROXY_HTTP=http://proxy.local:8080\n' > "$TMP/proxy/http.env"
+printf 'DSH_PROXY_ENABLED=1\nDSH_PROXY_SOCKS=socks5://proxy.local:1080\n' > "$TMP/proxy/socks.env"
+printf 'DSH_PROXY_ENABLED=0\nDSH_PROXY_HTTP=http://proxy.local:8080\n' > "$TMP/proxy/disabled.env"
+run "未配置 .env 时不设置任何代理变量" 0 \
+  env -i PATH="$PATH" HOME="$TMP/proxy" bash -c \
+  '. "$1"; apply_proxy_env "$2"; test -z "${HTTP_PROXY:-}" && test -z "${NO_PROXY:-}" && test -z "${ALL_PROXY:-}"' \
+  _ "$PROXY_HELPER" "$TMP/proxy/missing.env"
+run "HTTP 代理时补 NO_PROXY 的 127.0.0.1/localhost/::1" 0 \
+  env -i PATH="$PATH" HOME="$TMP/proxy" bash -c \
+  '. "$1"; apply_proxy_env "$2"; [ "$HTTP_PROXY" = "http://proxy.local:8080" ] && [ "$NO_PROXY" = "127.0.0.1,localhost,::1" ]' \
+  _ "$PROXY_HELPER" "$TMP/proxy/http.env"
+run "已有 NO_PROXY 保留并且只追加缺失项" 0 \
+  env -i PATH="$PATH" HOME="$TMP/proxy" NO_PROXY="corp.example.com,127.0.0.1" bash -c \
+  '. "$1"; apply_proxy_env "$2"; [ "$NO_PROXY" = "corp.example.com,127.0.0.1,localhost,::1" ]' \
+  _ "$PROXY_HELPER" "$TMP/proxy/http.env"
+run "SOCKS 代理同样补 NO_PROXY 并设置 Gradle socks 参数" 0 \
+  env -i PATH="$PATH" HOME="$TMP/proxy" bash -c \
+  '. "$1"; apply_proxy_env "$2"; [ "$ALL_PROXY" = "socks5://proxy.local:1080" ] && [ "$NO_PROXY" = "127.0.0.1,localhost,::1" ] && printf "%s" "$GRADLE_OPTS" | grep -q -- "-DsocksProxyHost=proxy.local"' \
+  _ "$PROXY_HELPER" "$TMP/proxy/socks.env"
+run "DSH_PROXY_ENABLED=0 时完全不设代理" 0 \
+  env -i PATH="$PATH" HOME="$TMP/proxy" bash -c \
+  '. "$1"; apply_proxy_env "$2"; test -z "${HTTP_PROXY:-}" && test -z "${NO_PROXY:-}" && test -z "${ALL_PROXY:-}"' \
+  _ "$PROXY_HELPER" "$TMP/proxy/disabled.env"
 
 section "create 输入边界与并发登记"
 INJECTION_MARKER="$TMP/python-injection-ran"

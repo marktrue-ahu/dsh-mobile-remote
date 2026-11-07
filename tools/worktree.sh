@@ -41,51 +41,13 @@ for c in git python3 flock; do need "$c"; done
 gitq() { git --no-optional-locks "$@"; }
 
 # ── 环境特定配置（代理）──
-# 代理地址与开关属于本机/本容器信息，**不进版本库**：放在主目录的 .env（已 gitignore）。
-# 支持两类写法（值可带引号）：
-#   DSH_PROXY_ENABLED=1|0          总开关，缺省 0（不设代理）
-#   DSH_PROXY_HTTP=http://host:port   HTTP(S) 代理，用于环境变量形式
-#   DSH_PROXY_SOCKS=socks5://host:port   SOCKS5 代理，用于 Gradle -DsocksProxy*
-# 只解析这三个键，忽略其余内容；不 source，避免执行任意代码。
-read_proxy_env() {
-  local file="$1"
-  DSH_PROXY_ENABLED=""; DSH_PROXY_HTTP=""; DSH_PROXY_SOCKS=""
-  [ -f "$file" ] || return 0
-  local line key val
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in ''|'#'*) continue ;; esac
-    key="${line%%=*}"; val="${line#*=}"
-    key="$(printf '%s' "$key" | tr -d '[:space:]')"
-    val="$(printf '%s' "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^["'\'']//' -e 's/["'\'']$//')"
-    case "$key" in
-      DSH_PROXY_ENABLED) DSH_PROXY_ENABLED="$val" ;;
-      DSH_PROXY_HTTP) DSH_PROXY_HTTP="$val" ;;
-      DSH_PROXY_SOCKS) DSH_PROXY_SOCKS="$val" ;;
-      *) : ;;
-    esac
-  done < "$file"
-}
-
-# 把 .env 的代理意图落到当前 shell；无 .env 或未启用则完全不设代理。
-apply_proxy_env() {
-  local envfile="$1"
-  read_proxy_env "$envfile"
-  [ "${DSH_PROXY_ENABLED:-0}" = "1" ] || return 0
-  if [ -n "${DSH_PROXY_HTTP:-}" ]; then
-    export HTTP_PROXY="$DSH_PROXY_HTTP" HTTPS_PROXY="$DSH_PROXY_HTTP"
-    export http_proxy="$DSH_PROXY_HTTP" https_proxy="$DSH_PROXY_HTTP"
-  fi
-  if [ -n "${DSH_PROXY_SOCKS:-}" ]; then
-    export ALL_PROXY="$DSH_PROXY_SOCKS" all_proxy="$DSH_PROXY_SOCKS"
-    # Gradle/JVM 不认 ALL_PROXY，需要拆成 -DsocksProxyHost/Port。
-    local hp="${DSH_PROXY_SOCKS#*://}"
-    local host="${hp%%:*}"; local port="${hp##*:}"
-    if [ -n "$host" ] && [ -n "$port" ] && [ "$port" != "$host" ]; then
-      export GRADLE_OPTS="${GRADLE_OPTS:--DsocksProxyHost=$host -DsocksProxyPort=$port}"
-    fi
-  fi
-  return 0
-}
+# 解析与应用代理在 tools/proxy-env.sh（issue #57：唯一实现，便于自测直接断言）。
+# 本脚本用绝对路径 source 它；NO_PROXY 会自动补本机回环（flutter_tester / Gradle / Node
+# 的本机回连不能走代理，否则 verify 门禁会永久卡死）。
+TOOLS_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+[ -f "$TOOLS_DIR/proxy-env.sh" ] || die "缺少 tools/proxy-env.sh；无法解析代理环境"
+# shellcheck source=tools/proxy-env.sh
+. "$TOOLS_DIR/proxy-env.sh"
 
 # 主目录：git worktree list 的第一项恒为主工作树
 detect_main() {
