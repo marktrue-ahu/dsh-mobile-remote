@@ -120,6 +120,15 @@
       "createdAt": "2026-11-07T10:29:05.756Z",
       "note": "dist-tags verified",
       "updatedAt": "2026-11-07T10:39:55.941Z"
+    },
+    {
+      "tag": "v3.2.4-alpha.7",
+      "pluginVersion": "3.2.4-alpha.7",
+      "carrierVersion": "3.2.4-alpha.7-app",
+      "build": 39,
+      "integrity": "sha512-Ekyb8WDnwS+mCSDy2Pfng4u2b9P9FVBnCYmjoC4Rj3Dg8xf2DulW8/Kup9cbOWGejDc3lWQEBMMmz8lInHCrww==",
+      "status": "submitted",
+      "createdAt": "2026-11-07T13:04:21.435Z"
     }
   ]
 }
