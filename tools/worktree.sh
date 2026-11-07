@@ -870,10 +870,16 @@ run_gates() { # run_gates <工作树> <报告临时文件> <required|synthetic>
       fi
     fi
     report_printf '### %s\n\n```\n$ %s\n' "$name" "$*" || true
-    # Gate children/daemons must not inherit locks: the gate shell owns them for the full
-    # command lifetime; an inherited FD could let a long-lived Gradle daemon retain a lock.
-    out="$(for held_fd in "${SLOT_FDS[@]}"; do eval "exec $held_fd>&-"; done; exec 6>&- 7>&-; "$@" 2>&1)" || rc=$?
-    report_printf '%s\n```\n\n退出码：%s\n\n' "$out" "$rc" || true
+    # 门禁输出必须**流式落盘**，不能用 out="$(...)" 进内存变量：
+    # flutter test 会持续输出逐行进度，写进被命令替换缓冲的管道会让子进程阻塞
+    # （实测：重定向到文件 2 分钟推进 698 条，$(...) 捕获 8 分钟零进展），
+    # 且大输出会把整份日志驻留内存。改为边跑边写临时文件，结束后再并入报告。
+    local outfile; outfile="$(mktemp "${TMPDIR:-/tmp}/dsh-wt-gate.XXXXXX")" || { report_error=1; outfile=/dev/null; }
+    ( for held_fd in "${SLOT_FDS[@]}"; do eval "exec $held_fd>&-"; done; exec 6>&- 7>&-; "$@" ) >"$outfile" 2>&1 || rc=$?
+    # 报告只保留尾部，避免单份报告被超长输出撑爆；完整输出仍在 outfile 里。
+    tail -n 2000 "$outfile" >>"$report" 2>/dev/null || { report_error=1; }
+    rm -f "$outfile" 2>/dev/null || true
+    report_printf '\n```\n\n退出码：%s\n\n' "$rc" || true
     release_locks
     if [ "$rc" -eq 0 ]; then record "$name" pass executed; else record "$name" fail executed "exit=$rc"; fi
   }
