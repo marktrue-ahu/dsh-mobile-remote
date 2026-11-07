@@ -67,6 +67,9 @@
       "optional": true
     }
   },
+  "devDependencies": {
+    "semver": "^7.7.4"
+  },
   "publishConfig": {
     "registry": "https://registry.npmjs.org",
     "access": "public"
