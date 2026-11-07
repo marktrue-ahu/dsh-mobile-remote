@@ -291,7 +291,10 @@ export function parseWorkerOutput(phase, exitCode, data) {
   if (!['install','runtime'].includes(phase) || ![0,1,2].includes(exitCode)) fail('docker-output-invalid');
   if (phase === 'install') {
     if (exitCode === 0 && exactKeys(data,['ok']) && data.ok === true) return {exitCode,ok:true,checks:[],errorCode:null};
-    if (exitCode === 2 && exactKeys(data,['ok','errorCode']) && data.ok === false && data.errorCode === 'install-failed') return {exitCode,ok:false,checks:[],errorCode:'install-failed'};
+    // Install may report the generic failure OR a specific missing-dependency code
+    // discovered by the post-install resolution preflight. Both stay within the
+    // closed allowlist; anything else is a malformed payload.
+    if (exitCode === 2 && exactKeys(data,['ok','errorCode']) && data.ok === false && (data.errorCode === 'install-failed' || HINT_CODES.includes(data.errorCode))) return {exitCode,ok:false,checks:[],errorCode:data.errorCode};
     fail('docker-output-invalid');
   }
   // A successful run may still report a session-gated capability as missing/drift:
