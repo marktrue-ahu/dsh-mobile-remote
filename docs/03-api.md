@@ -127,6 +127,7 @@
 - `capabilities.turnOutline`：轮次大纲能力位（轮次导航）。宿主**真的注册了** `turnOutline` 投影单元、且投影感知观察面（`sessionQuery.observeSession`）可用时，返回 `{ "version": 1, "supported": true, "unloaded": true, "truncated": true }`——`unloaded` 表示未加载轮次也可跳转、`truncated` 表示超过体积上限会显式截断；否则返回 `{ "version": 1, "supported": false }`。**不按宿主版本号推断**：旧宿主/裁剪宿主显式声明不支持，App 据此退回「只用已加载轮次」的降级行为。SSE hello 的同名字段与该处**同判据、同形状**（见 §3.6 与 §6.18）。
 
 - `capabilities.turnTail`：轮末页脚能力位（v3.3，issue #52/#53）：宿主注册了 `workspaceChanges` 服务时返回 `{ "version": 1, "presented": true, "changed": true, "changesDiff": true }`，否则 `presented` 仍可为真而 `changed`/`changesDiff` 为假；旧插件不下发该字段，App 据此不渲染轮末卡片与展示模式设置。判据与字段详见 §6.20，SSE hello 同名字段与之同判据、同形状。
+- `capabilities.toolCards`：工具卡结构化能力位（v3.3，issue #54）：`{ "version": 1, "tools": [本插件实际投影的工具名…] }`；bootstrap 与 SSE hello 同判据，App 逐工具决定专用卡或通用卡，缺失时全部通用卡（见 §6.24）。
 
 - 未认证：`401`（见通用约定）。
 ### 3.2 POST /m/api/send
@@ -1279,3 +1280,57 @@ graph 的每个提交与 commit 详情都**保留旧的** `refs: string[]`（dep
 **与 `/m/api/files` 的边界**：本端点**不接受客户端指定路径**，路径由服务端从会话记录解析；只允许该记录内的文件（GitLab #16 的收紧方向）。读取失败不泄露主机路径。
 
 - 稳定错误：`400 bad-request`、`404 record-not-found`（事件不存在/不属于该会话/下标越界）、`404 file-not-found`（记录内的文件已被删除）、`503 changes-unavailable`（改动摘要已失效）。
+
+### 6.24 工具卡结构化投影（v3.3，issue #54 / M3 Batch 1）
+
+手机端工具卡从「通用卡」升级为「按工具类型专用卡」。服务端只做**结构化投影**，不改变工具执行语义；所有字段只增不改，旧 App 忽略。
+
+**能力位**（`GET /m/api/bootstrap` 与 SSE `hello` 同判据、同形状）：
+
+```json
+"capabilities": {
+  "toolCards": { "version": 1, "tools": ["bash","pwsh","read","write","edit","grep","glob","web_fetch","web_search","read_image"] }
+}
+```
+
+- `tools` 是本插件**实际能投影**的工具名集合；App 逐工具决定是否使用专用卡，不在集合内一律回退通用卡。
+- 旧插件不下发该字段 → 新 App 全部通用卡（不按版本号推断，ADR 0017）。
+
+**`tool/call` 摘要增量 `summary`**（从原始 `arguments` 解析，先解析后 clamp；非法 JSON/未知工具 fail-open）：
+
+| 字段 | 类型 | 适用 | 说明 |
+|---|---|---|---|
+| `kind` | string | 全部 | `command` / `file` / `search` / `web` / `image` |
+| `tool` | string | 全部 | 工具名 |
+| `command` | string | bash/pwsh | 单行化命令，≤200 字 |
+| `workdir` | string? | bash/pwsh | 显示用目录（`mobileDisplayPath`），非绝对路径 |
+| `background` | bool? | bash/pwsh | 后台调用标志 |
+| `description` | string? | bash/pwsh | 工具自带的说明，≤120 字 |
+| `filePath` | string | read/write/edit/read_image | 显示用路径，**绝不下发可拼接绝对路径** |
+| `offset` / `limit` | number? | read | 行范围（正整数，可缺省） |
+| `sizeKb` | number? | write/edit | `ceil(UTF-16 长度/1024)`，与桌面 `NKB` 同口径 |
+| `added` / `deleted` | number? | write/edit | 折叠行行数统计；write 为新增行数，edit 为**行数近似**（见口径） |
+| `diff` | string? | write/edit | 统一 diff 文本，仅 ≤8 KiB 时下发 |
+| `diffTruncated` | bool? | write/edit | diff 超过上限而为缺省时为 `true`（不截半段） |
+| `pattern` | string | grep/glob | 搜索模式，≤200 字 |
+| `path` | string? | grep/glob | 搜索路径显示名 |
+| `include` | string? | grep | include 过滤 |
+| `url` | string? | web_fetch | 目标 URL |
+| `query` | string? | web_search | 首个查询词 |
+
+**`tool/result` 摘要增量 `summary`**（从未 clamp 的原始结果文本/宿主 meta 解析，解析不到缺省）：
+
+| 字段 | 类型 | 适用 | 说明 |
+|---|---|---|---|
+| `exitCode` | number? | bash/pwsh | 从结果文本 `[exit code: N]` 标记解析 |
+| `signal` | string? | bash/pwsh | 从 `[killed by signal: X]` 解析 |
+| `stopped` | string? | bash/pwsh | 从 `[stopped: …]` 解析；App 显示「已停止」胶囊 |
+| `resultCount` | number? | grep/glob | 匹配总数：优先宿主 `meta.total`（meta 本身不透传），缺失时按稳定文本句式解析 |
+
+**显式口径**：
+
+1. `summary.stopped` 为契约外新增的**可选**字段（需求只要求解析 `[stopped: …]`），保留并作为「已停止」语义。
+2. write 的 `diff` 为「全新增」统一 diff；edit 的 `added`/`deleted` 是 **old/new 行数近似**，不承诺与宿主精确行级统计一致。
+3. `resultCount` 的文本兜底是启发式（如 glob 在结果上限内按非空行计数）；无 meta 且无工具名时保守缺省，不猜。
+4. 全部字段 fail-open：字段异常/超长/非法 JSON 一律忽略并回退通用卡，不得让摘要、历史或 SSE 出错。
+5. 路径安全：`filePath`/`workdir`/`path` 只下发 `mobileDisplayPath` 派生结果，不提供可直接读取的主机路径。

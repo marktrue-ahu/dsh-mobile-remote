@@ -1,6 +1,6 @@
 # 0027 手机端会话内容对齐桌面：轮次过程折叠与轮末产出物
 
-状态：已接受（2026-11-06）。实现追踪 GitLab issue #52（M1 轮次过程与展示模式）、#53（M2 轮末产出物与文件预览）、#54（M3 工具卡结构化，本期只出草案）。关联：ADR 0006、0010、0016、0017，以及 issue #1 的需求变更记录（本 ADR 修订其边界）。
+状态：已接受（2026-11-06）。实现追踪 GitLab issue #52（M1 轮次过程与展示模式）、#53（M2 轮末产出物与文件预览）、#54（M3 工具卡结构化，Batch 1 已实施）。关联：ADR 0006、0010、0016、0017，以及 issue #1 的需求变更记录（本 ADR 修订其边界）。
 
 ## 背景
 
@@ -21,6 +21,18 @@ issue #1 当年决定「assistant/tool 产出文件的元数据不再下发，�
 - 三层折叠：整轮（turn）→ 过程组（按事件 `step` 派生；缺 step 时退化为整轮一组）→ 单卡。
 - 强制展开（不看策略）：轮次未结束、轮内有插话、`turn/end` 的 reason.kind ∈ `aborted`/`interrupted`/`error`；底部最新组延后收起。
 - 四档展示模式：简洁、标准、详细、完全展开；两档收起时机：回答结束后、下次有新消息时。默认「标准」+「回答结束后」，偏好只存手机本地（不新增宿主设置端点）。
+
+  四档策略表（与桌面 `presentation-policy.js` 同构，M1 已按此实现并验收）：
+
+  | 档位 | foldCompletedTurns | stepGrouping | liveProcessDetail | settledReasoningPreview |
+  |---|---|---|---|---|
+  | 简洁 | 是 | collapsed（运行中与历史都按组） | 否（抬头只显示通用状态） | 否 |
+  | 标准 | 是 | collapsed | 是（抬头显示当前工具细节） | 是 |
+  | 详细 | 是 | history（运行中不分组，完成后按组） | 是 | 是 |
+  | 完全展开 | 否 | none（从不分组） | 否 | 是 |
+
+  `liveProcessDetail` 只控制运行中过程组抬头的附加细节文本，**不隐藏过程行**；单张工具卡在所有档位默认收起（桌面 `useDisclosure` 亦默认关闭），「完全展开」只影响整轮/过程组可见性；`settledReasoningPreview` 只作用于已结束的思考行，不进入整轮折叠摘要。
+- 收起时机的等价实现：桌面用「底部节点 + 收起时机」决定最新一轮是否延后收起；手机实现为「下次有新消息时」档下**最新一轮保持展开**，直到下一条真人 `user/message`；「回答结束后」档完成即收起（含最新轮）。
 - 过程组抬头位于过程块原位；运行中显示「正在调用工具…」，完成态显示「N 次工具调用」，**不显示用时**；整轮「已完成 · 用时 X」只出现在轮次页脚，且 aborted/interrupted/error 不显示用时。这与桌面「抬头与页脚都显示用时」是有意简化。
 - 收起时机的触发 = 新的 `user/message` 进入时间线（含电脑端或另一台手机发来的）；切页、重进会话、历史回放按策略重算。手动展开只存内存，离开会话即失。
 - 思维链从「钉在正文上方的聚合块」改为过程行：先作为过程组首成员并保留折叠态首行预览，验收通过后再与工具按 step 交错。
@@ -43,7 +55,16 @@ issue #1 当年决定「assistant/tool 产出文件的元数据不再下发，�
 ### 5. 记录与交付
 
 - CONTEXT.md 术语、本 ADR、`docs/03-api.md` 新章节在 develop 主目录提交；功能分支只改代码与测试，不携带决策文档。
-- M1/M2 各自发 alpha（插件 + APK）并附真机截图；M3 只出 issue 草案，实施另行排期。
+- M1/M2 各自发 alpha（插件 + APK）并附真机截图；M3 Batch 1 已实施（issue #54），真机验收随下一个 alpha 与 M2 一起做。
+
+### 6. 工具卡结构化（M3 Batch 1，issue #54）
+
+- 服务端新增能力位 `capabilities.toolCards = {version:1, tools:[…]}`（bootstrap 与 SSE hello 同判据），并声明本插件实际投影的工具集合；App 以该集合逐工具决定是否使用专用卡，未列入即回退通用卡（ADR 0017）。
+- `tool/call` 摘要从**原始** `data.arguments` 派生 `summary`（先解析后 clamp）：`kind`（command/file/search/web/image）+ 命令/显示路径/`sizeKb`/行范围/pattern/URL/查询/后台标志/write-edit 内联 diff（≤8 KiB，超出 `diffTruncated`）。文件路径一律经 `mobileDisplayPath` 派生，**不下发绝对路径**。
+- `tool/result` 摘要从**未 clamp 的原始结果文本**解析 `exitCode`/`signal`/`stopped`（长输出的尾部标记不被 2000 字截断吃掉），search 命中数优先宿主 `meta.total`、缺失时按稳定文本句式解析，解析不到缺省。
+- 三处显式口径：① `summary.stopped` 是契约外新增的可选字段（App 显示「已停止」胶囊），保留；② write 的 diff 为全新增，edit 的 `added/deleted` 为行数**近似**（old/new 行数，不作精确行级 diff 统计）；③ `resultCount` 文本兜底是启发式，宁可缺省不猜。
+- 全部字段 fail-open：非法 JSON、未知工具、字段异常一律忽略并回退通用卡，不得让事件摘要/历史/SSE 出错。
+- **Batch 2 / 非目标**：todo/question/skill 专用行、PTC `subCalls` 子调用、工具卡文件路径可点进预览、图片图库增强；Inspect / Trajectory 检查器、hover 浮层与多列布局明确不做。
 
 ## 后果
 
