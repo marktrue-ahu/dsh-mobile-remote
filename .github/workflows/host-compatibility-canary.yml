@@ -1,0 +1,185 @@
+name: DSH host compatibility canary
+
+on:
+  schedule:
+    # 每日北京时间约 11:17；每周日约 11:47，均为 UTC cron。
+    - cron: '17 3 * * *'
+    - cron: '47 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'daily 检查 latest/next/alpha；weekly 检查固定版本及 latest'
+        required: true
+        type: choice
+        default: daily
+        options:
+          - daily
+          - weekly
+
+permissions:
+  contents: read
+
+# 单 workflow 全局串行，包含全部版本报告；不让两个 run 并发创建相同 issue。
+# GitHub 并发组不是完整队列：最多保留一个 pending，后来的 pending 可替换它。
+# 因此它防止并发重复写入，但不保证每一次 cron 都执行；调度本身亦可延迟/丢弃。
+concurrency:
+  group: host-compatibility-canary
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate canary context
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+      - name: Reject incorrect repository, branch or event
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REPOSITORY:-}" != 'marktrue-ahu/dsh-mobile-remote' || "${GITHUB_REF:-}" != 'refs/heads/develop' ]]; then
+            echo '::error::Run only on marktrue-ahu/dsh-mobile-remote develop.'
+            exit 1
+          fi
+          case "${GITHUB_EVENT_NAME:-}" in
+            schedule|workflow_dispatch) ;;
+            *) echo '::error::Unsupported event.'; exit 1 ;;
+          esac
+  resolve:
+    name: Freeze DSH version snapshot
+    needs: validate
+    if: github.repository == 'marktrue-ahu/dsh-mobile-remote' && github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      mode: ${{ steps.mode.outputs.mode }}
+    steps:
+      - name: Check out develop commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Determine check mode
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          DISPATCH_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == 'workflow_dispatch' && "$DISPATCH_MODE" =~ ^(daily|weekly)$ ]]; then
+            mode="$DISPATCH_MODE"
+          elif [[ "$EVENT" == 'schedule' && "$SCHEDULE" == '17 3 * * *' ]]; then
+            mode=daily
+          elif [[ "$EVENT" == 'schedule' && "$SCHEDULE" == '47 3 * * 0' ]]; then
+            mode=weekly
+          else
+            echo '::error::Invalid event or schedule; no canary executed.'
+            exit 1
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+      - name: Resolve one immutable dist-tag snapshot
+        id: resolve
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
+        run: node tools/host-canary/resolve.mjs "$MODE"
+
+  smoke:
+    name: DSH ${{ matrix.hostVersion }}
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    steps:
+      - name: Check out exact develop commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Isolated host smoke and independent retry
+        shell: bash
+        env:
+          HOST_VERSION: ${{ matrix.hostVersion }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          # GitHub 对 `shell: bash` 默认加 `-e`，首轮非零会立刻终止脚本，
+          # 导致 `first=$?` 与第二轮都不可达（独立重试失效）。这里显式关闭 errexit，
+          # 由脚本自己捕获每轮退出码并决定是否重试。
+          set +e
+          set -u
+          mkdir -p "$RUNNER_TEMP/canary-results"
+          # 不上传或输出被测宿主的原始日志；smoke 负责超时、脱敏及只清理自己的进程。
+          node tools/host-canary/smoke.mjs --host-version "$HOST_VERSION" --plugin-root "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/canary-results/first.json" > /dev/null 2>&1
+          first=$?
+          if [ "$first" -ne 0 ]; then
+            node tools/host-canary/smoke.mjs --host-version "$HOST_VERSION" --plugin-root "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/canary-results/second.json" > /dev/null 2>&1
+            second=$?
+          else
+            second='not-attempted'
+          fi
+          # 后续报告 job 校验 JSON 与身份；缺失/畸形结果归类为基础设施故障。
+          # 两个 artifact 的存在性决定"是否完成了两次独立尝试"，故把结论写进日志。
+          printf 'Attempt(s) completed for %s (first=%s second=%s); inspect structured report in Summary.\n' "$HOST_VERSION" "$first" "$second"
+      - name: Upload structured results only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: host-canary-${{ matrix.hostVersion }}
+          path: ${{ runner.temp }}/canary-results/*.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # 信任边界：报告 job 执行当前 develop 提交中的代码并持有 issue 写权限；
+  # 必须由仓库所有者保护 develop 与 workflow 权限，SHA 绑定不等于独立审计。
+  # artifact 仅作数据校验，不执行其内容；schema 合法也不能证明被测宿主观测真实。
+  report:
+    name: Validate and publish canary report
+    needs: [resolve, smoke]
+    if: always() && github.repository == 'marktrue-ahu/dsh-mobile-remote' && github.ref == 'refs/heads/develop' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Check out reporting code from same develop commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Download data-only results
+        if: needs.resolve.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: host-canary-*
+          path: ${{ runner.temp }}/canary-artifacts
+      - name: Validate data, summarize and update deduplicated issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANARY_MATRIX: ${{ needs.resolve.outputs.matrix }}
+          CANARY_MODE: ${{ needs.resolve.outputs.mode }}
+          CANARY_ARTIFACTS: ${{ runner.temp }}/canary-artifacts
+          RESOLVE_RESULT: ${{ needs.resolve.result }}
+          SMOKE_RESULT: ${{ needs.smoke.result }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: node tools/host-canary/collect.mjs
