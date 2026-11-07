@@ -361,4 +361,31 @@ void main() {
       expect(ledger.byKey(newer.key), isNotNull);
     });
   });
+
+  group('R16 审批身份（每次实际请求唯一）', () {
+    test('同一 callId 的两次审批 approvalId 不同 → 互不早退', () {
+      final first = _approval(approvalId: 's1:call-1:uuid-1111');
+      final second = _approval(approvalId: 's1:call-1:uuid-2222');
+      expect(first.key, isNot(second.key), reason: 'App 通知身份必须按 approvalId 区分');
+      final ledger = AttentionLedger();
+      expect(ledger.reserve(first), isTrue);
+      expect(ledger.reserve(second), isTrue, reason: '第二次新审批必须再次提醒');
+      // 第一条先 resolved：main._handleAttention 的 resolved 早退只应命中第一条。
+      ledger.resolveByIdentity('s1:call-1:uuid-1111');
+      expect(ledger.byKey(first.key)?.status, AttentionStatus.resolved);
+      expect(
+        ledger.byKey(second.key)?.status,
+        isNot(AttentionStatus.resolved),
+        reason: '第二条不得被第一条的 resolved 身份永久拦截',
+      );
+    });
+
+    test('同一 eventId 的重放身份不变 → 保留去重', () {
+      final first = _approval(approvalId: 's1:evt-1');
+      final replay = _approval(approvalId: 's1:evt-1', isReplay: true);
+      final ledger = AttentionLedger();
+      expect(ledger.reserve(first), isTrue);
+      expect(ledger.reserve(replay), isFalse, reason: '同一请求重放不得重复提醒');
+    });
+  });
 }

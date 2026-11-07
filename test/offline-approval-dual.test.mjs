@@ -152,6 +152,19 @@ const approvalRequest = (sessionId = "session-A") => ({
 	reason: "needs approval",
 });
 
+/**
+ * 从 SSE 回放帧里取当前待答审批的 approvalId/rpcId（issue #60 R16：身份每次请求唯一）。
+ * 打开连接读取 pendingFrames 回放后立即关闭，不改变"手机离线"的判定。
+ */
+async function pendingApprovalIds(harness) {
+	const res = new FakeResponse();
+	harness.route("/m/api")(new FakeRequest("/m/api/events"), res);
+	await sleep(10);
+	const text = res.chunks.join("");
+	res.destroy();
+	return [...text.matchAll(/"type":"approval\/requested"[^}]*?"approvalId":"([^"]+)"/g)].map((m) => m[1]);
+}
+
 /** 手机端应答（与 App 相同的那条 HTTP 通路）。 */
 const respond = (harness, sessionId, rpcId, outcome) =>
 	call(harness.route("/m/api"), {
@@ -178,8 +191,10 @@ test("离线审批：没有手机连接时也建条目（旧行为是立刻 next
 		assert.equal(diag.checks.pendingFrames, 1, "离线时必须写回放帧，供重连补发");
 		assert.equal(nextCalled, 1, "桌面兜底仍应被放行（双端呈现）");
 
-		// 手机应答后：拿到的就是手机的值，条目清空
-		const answered = await respond(harness, "session-A", "session-A:call-1", "allowed-once");
+		// 手机应答后：拿到的就是手机的值，条目清空。
+		const [approvalId] = await pendingApprovalIds(harness);
+		assert.ok(approvalId, "回放帧必须带 approvalId");
+		const answered = await respond(harness, "session-A", approvalId, "allowed-once");
 		assert.equal(answered.status, 200, "手机应答应被接受");
 		assert.equal(await pending, "allowed-once");
 		assert.equal((await diagnostics(harness)).checks.pendingApprovals, 0);
@@ -200,7 +215,8 @@ test("离线审批：mobile 模式下 with offlineAlsoDesktop=false 时独占，
 		assert.equal(nextCalled, 0, "独占模式下不得调用 next()（否则桌面会弹卡）");
 		assert.equal((await diagnostics(harness)).checks.pendingApprovals, 1);
 
-		const answered = await respond(harness, "session-A", "session-A:call-1", "rejected");
+		const [approvalId] = await pendingApprovalIds(harness);
+		const answered = await respond(harness, "session-A", approvalId, "rejected");
 		assert.equal(answered.status, 200, `手机应答应被接受：${JSON.stringify(answered.body)}`);
 		assert.equal(await pending, "rejected");
 	} finally {
@@ -258,7 +274,8 @@ test("双端竞速：没有桌面客户端（下游 unavailable）时仍等手�
 		assert.equal(before.checks.pendingFrames, 1, "回放帧同样不能被提前清掉");
 
 		// 手机作答后，最终结果必须是手机的值，而不是 unavailable
-		const answered = await respond(harness, "session-A", "session-A:call-1", "allowed-once");
+		const [approvalId] = await pendingApprovalIds(harness);
+		const answered = await respond(harness, "session-A", approvalId, "allowed-once");
 		assert.equal(answered.status, 200, `手机应答应被接受：${JSON.stringify(answered.body)}`);
 		assert.equal(await pending, "allowed-once", "手机作答应胜过下游的 unavailable");
 		await sleep(30);
@@ -331,4 +348,50 @@ test("双端同显：approvalMode=both 且手机在线时，桌面仍应收到�
 	} finally {
 		harness.clean();
 	}
+
+// ───────── R16：同一 callId 的连续新审批必须再次提醒 ─────────
+
+test("R16：同一 callId 的两次新审批身份不同，先解决一次不影响另一次", async () => {
+	const harness = createHarness({ config: { approvalMode: "mobile", offlineAlsoDesktop: false } });
+	try {
+		const handler = harness.approval();
+		const firstPending = handler(approvalRequest(), async () => "next");
+		await sleep(20);
+		// 同一工具在工具体内再次发起 sandbox escalation：callId 相同、reason 不同。
+		const secondPending = handler({ ...approvalRequest(), reason: "sandbox escalation" }, async () => "next");
+		await sleep(20);
+
+		const ids = await pendingApprovalIds(harness);
+		assert.equal(ids.length, 2, `两条新审批都必须有回放帧：${JSON.stringify(ids)}`);
+		assert.notEqual(ids[0], ids[1], "同一 callId 的两次审批身份必须不同");
+		assert.equal((await diagnostics(harness)).checks.pendingApprovals, 2);
+
+		// 解决第一条：第二条必须仍然待答（不被 resolved 身份误杀）。
+		const first = await respond(harness, "session-A", ids[0], "allowed-once");
+		assert.equal(first.status, 200);
+		assert.equal(await firstPending, "allowed-once");
+		assert.equal((await diagnostics(harness)).checks.pendingApprovals, 1, "第二条新审批不得被第一条的 resolved 身份吞掉");
+		const second = await respond(harness, "session-A", ids[1], "rejected");
+		assert.equal(second.status, 200);
+		assert.equal(await secondPending, "rejected");
+	} finally {
+		harness.clean();
+	}
+});
+
+test("R16：同一请求断线重连回放仍用同一身份（保留重放去重）", async () => {
+	const harness = createHarness({ config: { approvalMode: "mobile", offlineAlsoDesktop: false } });
+	try {
+		const handler = harness.approval();
+		const pending = handler(approvalRequest(), async () => "next");
+		await sleep(20);
+		const first = await pendingApprovalIds(harness);
+		const replay = await pendingApprovalIds(harness);
+		assert.deepEqual(replay, first, "同一待答请求的回放必须复用 identity");
+		await respond(harness, "session-A", first[0], "rejected");
+		assert.equal(await pending, "rejected");
+	} finally {
+		harness.clean();
+	}
+});
 });
