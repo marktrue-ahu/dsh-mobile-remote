@@ -758,6 +758,9 @@ export const HINT_CODES = Object.freeze([
   'host-process-exited-hint-engine-mismatch',
   'host-process-exited-hint-bad-invocation',
   ...MISSING_DEPENDENCY_SPECIFIERS.map(([, code]) => code),
+  'host-plugin-import-failed',
+  'host-plugin-import-missing-module',
+  'host-plugin-import-native-load',
 ]);
 export function stderrExitHint(text) {
   if (typeof text !== 'string') return null;
@@ -1074,6 +1077,25 @@ try {
   await new Promise((ok,bad) => reservation.once('error',bad).listen(0,'127.0.0.1',ok));
   const port = reservation.address().port;
   await new Promise(ok => reservation.close(ok));
+  // Self-check BEFORE spawning the host: actually import the plugin entry exactly as
+  // the host would, in this container. A failure here is attributable to a fixed code
+  // instead of the generic host-exit one, and it distinguishes "plugin cannot load in
+  // THIS container" from "host starts and dies later".
+  {
+    let importError = null;
+    try { await import('/profile/dsh/profiles/canary/node_modules/@marktrue/dsh-mobile-remote/lib/index.js'); }
+    catch (error) { importError = error; }
+    if (importError) {
+      const message = typeof importError?.message === 'string' ? importError.message.slice(0,4096) : '';
+      let code = 'host-plugin-import-failed';
+      for (const [specifier, specific] of MISSING_DEPENDENCY_SPECIFIERS) {
+        if (message.includes("'" + specifier + "'")) { code = specific; break; }
+      }
+      if (code === 'host-plugin-import-failed' && /ERR_MODULE_NOT_FOUND/.test(message)) code = 'host-plugin-import-missing-module';
+      if (code === 'host-plugin-import-failed' && /ERR_DLOPEN_FAILED/.test(message)) code = 'host-plugin-import-native-load';
+      fail(code);
+    }
+  }
   // Capture stdout as well as stderr: the CLI may report a startup failure on either
   // stream, and the canary only ever emits FIXED codes derived from a bounded prefix
   // (never raw text), so widening capture does not widen what leaves the process.

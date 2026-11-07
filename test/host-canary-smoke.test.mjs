@@ -74,6 +74,10 @@ test('generated worker emits a sanitized hint using only a fake host', async t =
   await writeFile(join(fixtureProfile,'package.json'),JSON.stringify({name:'fixture',private:true}),{flag:'wx',mode:0o600});
   await writeFile(join(host,'package.json'),JSON.stringify({type:'module'}),{flag:'wx',mode:0o600});
   await writeFile(join(plugin,'package.json'),JSON.stringify({name:'@marktrue/dsh-mobile-remote',version:'1.2.3'}),{flag:'wx',mode:0o600});
+  // The runtime worker imports the plugin entry as a preflight self-check; give this
+  // fixture a loadable module so the check exercises the fake host, not the fixture.
+  await mkdir(join(plugin,'lib'),{recursive:true,mode:0o700});
+  await writeFile(join(plugin,'lib','index.js'),'export const fixture = true;\n',{flag:'wx',mode:0o600});
   // No loop: record identity first, then exit after a short lived window so the
   // worker can read a baseline identity before this process disappears. Timeout
   // mode stays alive past the worker deadline, then self-exits after 1.8s
