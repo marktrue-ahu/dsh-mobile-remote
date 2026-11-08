@@ -6,6 +6,8 @@ import { EventEmitter } from "node:events";
 import { mkdtempSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { apply, hostIdentityFile, resolveHostIdentity } from "../lib/index.js";
 
 const CONFIG = {
@@ -111,4 +113,35 @@ test("R15：bootstrap 暴露 plugin.hostId（与 instanceId 不同、跨重启�
 	const bodyB = await bootstrap(b.route);
 	assert.equal(bodyB.plugin?.hostId, hostA, "同一宿主重启后 hostId 稳定");
 	b.clean();
+});
+
+/** 并发启动 N 个子进程共同解析同一状态目录的宿主身份。 */
+async function resolveConcurrently(home, count) {
+	const pluginUrl = pathToFileURL(new URL("../lib/index.js", import.meta.url).pathname).href;
+	const code = `const m = await import(process.env.PLUGIN_URL); process.stdout.write(m.resolveHostIdentity({ home: process.env.TEST_HOME }));`;
+	const jobs = Array.from({ length: count }, () => new Promise((resolve, reject) => {
+		const child = spawn(process.execPath, ["--input-type=module", "-e", code], {
+			env: { ...process.env, PLUGIN_URL: pluginUrl, TEST_HOME: home },
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		let out = "";
+		let err = "";
+		child.stdout.on("data", (chunk) => { out += String(chunk); });
+		child.stderr.on("data", (chunk) => { err += String(chunk); });
+		child.on("error", reject);
+		child.on("close", (status) => status === 0 ? resolve(out.trim()) : reject(new Error(`child exit ${status}: ${err}`)));
+	}));
+	return Promise.all(jobs);
+}
+
+test("recheck-7：并发初始化/自愈身份文件只有一个赢家（所有进程返回同一 UUID）", async () => {
+	const home = mkdtempSync(join(tmpdir(), "r15-concurrent-"));
+	const identities = await resolveConcurrently(home, 8);
+	assert.equal(new Set(identities).size, 1, `并发进程必须得到同一身份：${JSON.stringify(identities)}`);
+	assert.equal(readFileSync(hostIdentityFile(home), "utf8").trim(), identities[0]);
+	// 文件已存在且损坏为空：多进程同时修复也必须收敛到同一个新身份。
+	writeFileSync(hostIdentityFile(home), "");
+	const repaired = await resolveConcurrently(home, 6);
+	assert.equal(new Set(repaired).size, 1, `损坏修复也必须单赢家：${JSON.stringify(repaired)}`);
+	assert.equal(readFileSync(hostIdentityFile(home), "utf8").trim(), repaired[0]);
 });
