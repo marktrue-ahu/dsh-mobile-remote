@@ -5,9 +5,10 @@ import { EventEmitter, once } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, symlink, lstat, chmod } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, isAbsolute, join } from 'node:path';
-import { DOCKER_IMAGE, HINT_CODES, MISSING_DEPENDENCY_SPECIFIERS, RUNTIME_LIFECYCLE_MS, checkHostedRunner, createChildExitObserver, createDockerExecutor, createLinuxChildMonitor, createSourceArchive, createStderrCollector, dockerCliDriver, dockerCreatePlan, dockerModelAdapter, evaluateResponses, gitArchiveArgs, hostedDockerAdapter, libSnapshot, makeInstallWorker, makeRuntimeWorker, managedDocker, parseWorkerOutput, probeMobile, profileFiles, prepareContainerProfile, removeSourceArchive, readLinuxProcessStat, resolveExitedChildHint, runCanary, stderrExitHint, validateDockerMounts, verifyDockerInspection, verifyInstalled, verifyPluginSource, verifyRequiredBundles } from '../tools/host-canary/smoke.mjs';
+import { DOCKER_IMAGE, HINT_CODES, MISSING_DEPENDENCY_SPECIFIERS, RUNTIME_LIFECYCLE_MS, checkHostedRunner, createChildExitObserver, createDockerExecutor, createLinuxChildMonitor, createSourceArchive, createStderrCollector, dockerCliDriver, dockerCreatePlan, dockerModelAdapter, evaluateResponses, gitArchiveArgs, hostedDockerAdapter, libSnapshot, makeInstallWorker, makeRuntimeWorker, managedDocker, parseWorkerOutput, probeMobile, RUNTIME_ERROR_CODES, profileFiles, prepareContainerProfile, removeSourceArchive, readLinuxProcessStat, resolveExitedChildHint, runCanary, stderrExitHint, validateDockerMounts, verifyDockerInspection, verifyInstalled, verifyPluginSource, verifyRequiredBundles } from '../tools/host-canary/smoke.mjs';
 
 const imageEnv = ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin','NODE_VERSION=24.1.0','YARN_VERSION=1.22.22'];
 const profileEnvFor = phase => { const base = phase === 'install' ? '/profile' : '/tmp/canary'; return [`HOME=${base}/home`,`DSH_HOME=${base}/dsh`,`XDG_CONFIG_HOME=${base}/xdg-config`,`XDG_CACHE_HOME=${base}/xdg-cache`,`XDG_DATA_HOME=${base}/xdg-data`,`XDG_STATE_HOME=${base}/xdg-state`,`XDG_RUNTIME_DIR=${base}/xdg-runtime`,`NPM_CONFIG_USERCONFIG=${base}/npmrc`,`NPM_CONFIG_GLOBALCONFIG=${base}/npm-globalrc`]; };
@@ -1316,4 +1317,38 @@ test("recheck-9：runtime 缺依赖具体码在下游白名单中可归因", asy
 	const worker = makeRuntimeWorker();
 	assert.match(worker, /\.\.\.MISSING_DEPENDENCY_SPECIFIERS\.map/);
 	assert.match(worker, /host-process-exited-hint-missing-qrcode|MISSING_DEPENDENCY_SPECIFIERS/);
+});
+
+test("round4-3 F3：runtime 诊断码单一来源覆盖 host-plugin-import-* 与 missing-dep", async () => {
+	const codes = [
+		"host-plugin-import-failed",
+		"host-plugin-import-missing-module",
+		"host-plugin-import-native-load",
+		"host-process-exited-hint-missing-schemastery",
+		"host-process-exited-hint-missing-dsh-llm",
+		"host-process-exited-hint-missing-dsh-sandbox-policy",
+		"host-process-exited-hint-missing-dsh-credentials",
+		"host-process-exited-hint-missing-dsh-scope",
+		"host-process-exited-hint-missing-qrcode",
+	];
+	for (const code of codes) {
+		assert.ok(RUNTIME_ERROR_CODES.includes(code), `${code} 必须在 RUNTIME_ERROR_CODES`);
+		const parsed = parseWorkerOutput("runtime", 2, { ok: false, errorCode: code, checks: ["auth", "bootstrap", "diagnostics"] });
+		assert.equal(parsed.errorCode, code, `${code} 必须原样透传而不是 worker-failed`);
+	}
+	// 生成的 runtime worker 使用注入常量（不再硬编码数组）。
+	const worker = makeRuntimeWorker();
+	assert.match(worker, /const RUNTIME_ERROR_CODES = \[/);
+	assert.match(worker, /const codes = RUNTIME_ERROR_CODES;/);
+	assert.doesNotMatch(worker, /const codes = \['host-process-spawn-failed'/);
+	// adapter 的 infrastructure 判定引用同一常量（单一来源，新增码不再漏四处）。
+	const smokeSource = readFileSync(new URL("../tools/host-canary/smoke.mjs", import.meta.url), "utf8");
+	assert.match(smokeSource, /if \(RUNTIME_ERROR_CODES\.includes\(result\.errorCode\)\) throw new CanaryError\(result\.errorCode,'infrastructure-failure'/);
+	// install 语义仍保持独立封闭集合：runtime 专用码不得混入 install 判定。
+	assert.throws(
+		() => parseWorkerOutput("install", 2, { ok: false, errorCode: "worker-failed" }),
+		(error) => error?.code === "docker-output-invalid",
+	);
+	const installMissing = parseWorkerOutput("install", 2, { ok: false, errorCode: "host-process-exited-hint-missing-qrcode" });
+	assert.equal(installMissing.errorCode, "host-process-exited-hint-missing-qrcode");
 });
