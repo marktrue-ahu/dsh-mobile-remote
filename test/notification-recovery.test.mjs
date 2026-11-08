@@ -54,9 +54,19 @@ test('reconnect snapshot follows replay and excludes approvals already answered 
   const requested = frames.findIndex(f => f.type === 'mobile/frame' && f.frame.type === 'approval/requested');
   const snapshot = frames.findIndex(f => f.type === 'attention/snapshot');
   assert.ok(requested >= 0 && snapshot > requested);
-  assert.deepEqual(frames[snapshot].pending, [{ kind: 'approval', identity: 's:call', sessionId: 's' }]);
+  // issue #60 recheck-1（R16）：审批身份是每次实际请求唯一的 `session:call:<uuid>`，
+  // 不能硬编码旧 `s:call`；从真实 requested frame 读取 approvalId/rpcId 再断言与应答。
+  const requestedFrame = frames[requested].frame;
+  assert.match(requestedFrame.approvalId, /^s:call:[0-9a-f-]{36}$/i, JSON.stringify(requestedFrame));
+  assert.deepEqual(frames[snapshot].pending, [{ kind: 'approval', identity: requestedFrame.approvalId, sessionId: 's' }]);
   stream.destroy(); // Page/phone may disappear; host keeps the pending interaction.
-  const answer = await h.call('/m/api/respond', 'POST', { kind: 'approval', sessionId: 's', rpcId: 's:call', outcome: 'allowed-once' });
+  const answer = await h.call('/m/api/respond', 'POST', {
+    kind: 'approval',
+    sessionId: 's',
+    approvalId: requestedFrame.approvalId,
+    rpcId: requestedFrame.rpcId,
+    outcome: 'allowed-once',
+  });
   assert.equal(answer.code, 200); assert.equal(await pending, 'allowed-once');
   const next = new Response(); h.route(new Request('/m/api/events'), next);
   assert.deepEqual(next.frames().find(f => f.type === 'attention/snapshot').pending, []);

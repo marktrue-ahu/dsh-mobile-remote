@@ -86,6 +86,15 @@ async function call(route, { url, method = "GET", body } = {}) {
 	return { status: res.statusCode, body: JSON.parse(res.chunks.join("") || "{}") };
 }
 
+/** 从 SSE 回放帧读取当前待答审批的 approvalId（issue #60 R16：$events 路径身份）。 */
+function pendingApprovalIds(h) {
+	const res = new FakeResponse();
+	h.route(new FakeRequest("/m/api/events"), res);
+	const text = res.chunks.join("");
+	res.destroy();
+	return [...text.matchAll(/"type":"approval\/requested"[^}]*?"approvalId":"([^"]+)"/g)].map((m) => m[1]);
+}
+
 /** 进程内 Peer 的假实现：形状对齐 0.2.1 的 PeerScope（signal / principal / interactions / dispose）。 */
 let peerSeq = 0;
 function makePeer(options) {
@@ -515,4 +524,44 @@ test("插件卸载时释放进程内 Peer（不随重连/重载累积）", async
 		h.clean();
 		assert.equal(peer.disposed, true, "dispose 必须被调用，否则 Peer scope 泄漏");
 	} finally { h.clean(); }
+
+// ───────────────────── R16：$events 路径审批身份 ─────────────────────
+
+const waterfallApproval = (eventId, callId = "call-1", reason = "needs approval") => ({
+	type: "waterfall",
+	eventId,
+	event: "approval/request",
+	agentId: "session-A",
+	request: { callId, toolName: "write", reason },
+});
+
+test("R16：$events 同一 callId 的两次新审批 eventId 不同 → 两个待办、两个身份", async () => {
+	const h = createHarness({
+		generation: "0.2.1",
+		frames: [waterfallApproval("evt-1", "call-1", "first"), waterfallApproval("evt-2", "call-1", "second")],
+	});
+	try {
+		assert.ok(await h.until(async () => {
+			const probe = await call(h.route, { url: "/m/api/diagnostics" });
+			return (probe.body.checks?.pendingApprovals ?? 0) === 2;
+		}), "同一 callId 的两次实际审批必须各自建条目（身份不能用 callId）");
+		const ids = pendingApprovalIds(h);
+		assert.equal(ids.length, 2, `两次审批都应回放：${JSON.stringify(ids)}`);
+		assert.notEqual(ids[0], ids[1], "同一 callId 的两次新审批 approvalId 必须不同");
+	} finally { h.clean(); }
+});
+
+test("R16：$events 同一 eventId 重放 → 只建一个待办（保留 replay 去重）", async () => {
+	const frame = waterfallApproval("evt-replay", "call-1");
+	const h = createHarness({ generation: "0.2.1", frames: [frame, frame] });
+	try {
+		assert.ok(await h.until(async () => {
+			const probe = await call(h.route, { url: "/m/api/diagnostics" });
+			return (probe.body.checks?.pendingApprovals ?? 0) === 1;
+		}), "同一个 eventId 的重放只能有一个待办");
+		const ids = pendingApprovalIds(h);
+		assert.equal(ids.length, 1);
+		assert.equal(ids[0], "session-A:evt-replay", "身份必须是稳定的 sessionId:eventId");
+	} finally { h.clean(); }
+});
 });

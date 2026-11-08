@@ -11,10 +11,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, realpathSync, symlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { apply, mobileDisplayPath, renderUnifiedDiffText, turnTailCapabilityOf, turnTailOf, turnTailsOf } from "../lib/index.js";
+import { apply, mobileDisplayPath, recordFileId, renderUnifiedDiffText, turnTailCapabilityOf, turnTailOf, turnTailsOf } from "../lib/index.js";
 
 const CONFIG = {
 	path: "/m",
@@ -199,7 +199,8 @@ test("summary 投影：deliverables/presented 只下发 name/display/description
 	assert.ok(presented, "presented 事件应进入移动时间线");
 	assert.deepEqual(presented.data.files.map((file) => file.name), ["a.ts", "秘密报告.pdf", "inside.txt", "gone.txt"]);
 	const first = presented.data.files[0];
-	assert.deepEqual(Object.keys(first).sort(), ["description", "display", "name"], "只允许 name/display/description");
+	assert.deepEqual(Object.keys(first).sort(), ["description", "display", "id", "name"], "只允许 id/name/display/description（id 为不泄路径的稳定身份）");
+	assert.match(first.id, /^[0-9a-f]{16}$/, "id 是路径摘要，不得含主机路径");
 	assert.equal(first.display, "src/a.ts", "工作目录内给相对路径");
 	assert.equal(presented.data.files[1].display, "秘密报告.pdf", "工作区外只给 basename");
 	assert.equal(presented.data.files[2].display, "rel/inside.txt");
@@ -278,7 +279,8 @@ test("SSE：hello 带同判据 turnTail，turn/end 摘要带 tail", async () => 
 
 test("changes/summary：available 映射（seq/index 坐标、截断、不泄露 path/cwd）", async () => {
 	const f = makeFixture();
-	const res = await call(createHarness({ sessions: f.sessions, workspaceChanges: f.changes.service }).route, {
+	const { route } = createHarness({ sessions: f.sessions, workspaceChanges: f.changes.service });
+	const res = await call(route, {
 		url: "/m/api/changes/summary?sessionId=s1&turn=2",
 	});
 	assert.equal(res.status, 200);
@@ -287,12 +289,134 @@ test("changes/summary：available 映射（seq/index 坐标、截断、不泄露
 	assert.equal(res.body.files[0].index, 0);
 	assert.equal(res.body.files[0].display, "src/a.ts");
 	assert.equal(res.body.files[0].name, "a.ts");
+	// round4-2 / round6-3 F2：summary files 与 presented 共用路径摘要 id（16 hex，不含
+	// 可拼路径）；本 fixture 正是 presented 绝对路径 + changed 相对路径的混合形状。
+	assert.match(res.body.files[0].id, /^[0-9a-f]{16}$/);
+	assert.equal(res.body.files[0].id, res.body.files[0].id.toLowerCase());
+	const history = await call(route, { url: "/m/api/history?sessionId=s1&limit=100" });
+	const presented = history.body.events.find((event) => event.type === "deliverables/presented");
+	assert.equal(
+		res.body.files[0].id,
+		presented.data.files[0].id,
+		"abs(presented)/rel(changed) 混合路径必须得到同一逻辑身份 id",
+	);
+	assert.ok(!JSON.stringify(res.body).includes(f.root));
 	assert.equal(res.body.files[0].added, 12);
 	assert.equal(res.body.files[1].binary, true);
 	assert.equal(res.body.total, 2);
 	assert.equal(res.body.truncated, false);
 	assert.ok(!("cwd" in res.body), "不得下发宿主 cwd");
 	assert.ok(!("path" in res.body.files[0]), "不得下发可拼接 path");
+});
+
+test("round6-3 F2：abs/rel 与 rel/abs 混合形状的 presented/changed id 相等", async () => {
+	for (const shape of ["abs_presented_rel_changed", "rel_presented_abs_changed"]) {
+		const root = makeWorkspace();
+		const absPath = join(root, "src", "a.ts");
+		const relPath = "src/a.ts";
+		const presentedPath = shape === "abs_presented_rel_changed" ? absPath : relPath;
+		const changedPath = shape === "abs_presented_rel_changed" ? relPath : absPath;
+		const events = [
+			{ seq: 1, type: "turn/start", data: { turn: 2 } },
+			{ seq: 2, type: "workspace/changes", data: { turn: 2 } },
+			{ seq: 3, type: "deliverables/presented", data: { turn: 2, files: [{ path: presentedPath }] } },
+			{ seq: 4, type: "turn/end", data: { turn: 2, reason: { kind: "completed" } } },
+		];
+		const live = { id: "s1", header: { createdAt: 1, cwd: root }, events, snapshotEvents() { return this.events; } };
+		const sessions = { get: (id) => (id === "s1" ? live : undefined), list: () => [live] };
+		const changes = {
+			summary: () => ({ cwd: root, files: [{ path: changedPath, display: "src/a.ts", added: 1, deleted: 0 }], total: 1, added: 1, deleted: 0 }),
+			async diff() { return undefined; },
+		};
+		const { route } = createHarness({ sessions, workspaceChanges: changes });
+		const history = await call(route, { url: "/m/api/history?sessionId=s1&limit=100" });
+		const summary = await call(route, { url: "/m/api/changes/summary?sessionId=s1&turn=2" });
+		const presented = history.body.events.find((event) => event.type === "deliverables/presented");
+		assert.equal(presented.data.files[0].id, summary.body.files[0].id, `${shape}: 两份投影 id 必须相等`);
+		assert.equal(summary.body.files[0].display, "src/a.ts");
+		assert.ok(!JSON.stringify({ history: history.body, summary: summary.body }).includes(root), `${shape}: 不得泄露绝对路径`);
+	}
+});
+
+/**
+ * round7-1 F2：用可配置的 presented/changed 路径与两处 cwd 驱动真实 apply() 路由。
+ * 返回 presented/changed 的投影、拼合文本（用于断言无绝对路径泄露）与释放函数。
+ */
+async function driveF2({ presentedPath, changedPath, headerCwd, summaryCwd, omitSummaryCwd = false }) {
+	const root = makeWorkspace();
+	const hCwd = headerCwd ?? root;
+	const sCwd = summaryCwd ?? root;
+	const events = [
+		{ seq: 1, type: "turn/start", data: { turn: 2 } },
+		{ seq: 2, type: "workspace/changes", data: { turn: 2 } },
+		{ seq: 3, type: "deliverables/presented", data: { turn: 2, files: [{ path: presentedPath }] } },
+		{ seq: 4, type: "turn/end", data: { turn: 2, reason: { kind: "completed" } } },
+	];
+	const live = { id: "s1", header: { createdAt: 1, cwd: hCwd }, events, snapshotEvents() { return this.events; } };
+	const sessions = { get: (id) => (id === "s1" ? live : undefined), list: () => [live] };
+	const summaryShape = { turn: 2, files: [{ path: changedPath, display: "src/a.ts", added: 1, deleted: 0 }], total: 1, added: 1, deleted: 0 };
+	if (!omitSummaryCwd) summaryShape.cwd = sCwd;
+	const changes = {
+		summary: () => summaryShape,
+		async diff() { return undefined; },
+	};
+	const harness = createHarness({ sessions, workspaceChanges: changes });
+	const history = await call(harness.route, { url: "/m/api/history?sessionId=s1&limit=100" });
+	const summary = await call(harness.route, { url: "/m/api/changes/summary?sessionId=s1&turn=2" });
+	const pf = history.body?.events?.find((e) => e.type === "deliverables/presented")?.data?.files?.[0];
+	const cf = summary.body?.files?.[0];
+	harness.clean();
+	return { root, hCwd, sCwd, pf, cf, text: history.text + summary.text };
+}
+
+test("round7-1 F2：rel/rel 同文本但两处 cwd 文本/基准不同 → presented.id == changed.id", async () => {
+	// 复现 /tmp/f2-review/repro.mjs 2a/2c：header.cwd=root、summary.cwd=root/src，
+	// 两处都记录相对文本 "src/a.ts"。round6 用两处各自 cwd 展开 → 发散；
+	// round7 用会话 base（sessionCwdOf 优先）→ 收敛。
+	const root = makeWorkspace();
+	const nested = join(root, "src");
+	const { pf, cf, text } = await driveF2({
+		presentedPath: "src/a.ts", changedPath: "src/a.ts",
+		headerCwd: root, summaryCwd: nested,
+	});
+	assert.match(pf?.id ?? "", /^[0-9a-f]{16}$/);
+	assert.match(cf?.id ?? "", /^[0-9a-f]{16}$/);
+	assert.equal(pf.id, cf.id, "同一逻辑文件在 rel/rel + cwd 文本/基准不同也必须同一 id");
+	assert.ok(!text.includes(root), "响应不得泄露 root 绝对路径");
+	assert.ok(!text.includes(nested), "响应不得泄露 nested 绝对路径");
+});
+
+test("round7-1 F2：symlinked cwd（presented realpath 绝对 / changed 相对）→ id 相等、display 一致、无泄露", async () => {
+	const physical = realpathSync(makeWorkspace());
+	const aliasParent = mkdtempSync(join(tmpdir(), "turn-tail-alias-"));
+	const alias = join(aliasParent, "link");
+	symlinkSync(physical, alias, "dir");
+	// 真宿主形状：header.cwd=含 symlink 的别名；presented 记录 realpath 绝对路径；
+	// summary.cwd 同为别名（真宿主冻结同值）；changed 记录相对路径。
+	const { pf, cf, text } = await driveF2({
+		presentedPath: join(physical, "src", "a.ts"),
+		changedPath: "src/a.ts",
+		headerCwd: alias,
+		summaryCwd: alias,
+	});
+	assert.equal(pf.id, cf.id, "symlink 别名 vs realpath 绝对路径也必须归一到同一逻辑 id");
+	assert.equal(pf.display, cf.display, "两处 display 必须一致，App 精确链接不丢失");
+	assert.equal(pf.display, "src/a.ts");
+	assert.ok(!text.includes(physical), "响应不得泄露物理真实路径");
+	assert.ok(!text.includes(alias), "响应不得泄露 symlink 别名文本");
+});
+
+test("round7-1 F2：summary.cwd 缺失时用会话 cwd 兜底 → 两 id 相等", async () => {
+	const root = makeWorkspace();
+	// 裁剪/旧宿主不给 summary.cwd：/changes/summary 必须回落到 sessionCwdOf(session)。
+	const { pf, cf, text } = await driveF2({
+		presentedPath: join(root, "src", "a.ts"),
+		changedPath: "src/a.ts",
+		headerCwd: root,
+		omitSummaryCwd: true,
+	});
+	assert.equal(pf.id, cf.id, "summary.cwd 缺失时 changed 必须与 presented 共享会话 cwd 基准");
+	assert.ok(!text.includes(root), "响应不得泄露 root 绝对路径");
 });
 
 test("changes/summary：absent / unavailable（休眠、服务缺失、摘要失效）", async () => {
@@ -337,6 +461,70 @@ test("changes/summary：200 上限截断并保留全量 total", async () => {
 	assert.equal(res.body.truncated, true);
 });
 
+test("R05：changes/summary 不信任宿主绝对 display（重新派生）", async () => {
+	const f = makeFixture();
+	const service = {
+		summary(sessionId, seq) {
+			if (sessionId !== "s1" || seq !== 2) return undefined;
+			return {
+				turn: 2,
+				cwd: f.root,
+				files: [
+					// 合法宿主形状：工作区外文件的 display 可能是绝对路径。
+					{ path: "/var/shared/customer-a/private/report.txt", display: "/var/shared/customer-a/private/report.txt", added: 1, deleted: 0 },
+					{ path: "src/a.ts", display: "/var/shared/also/absolute/a.ts", added: 2, deleted: 1 },
+				],
+				total: 2,
+				added: 3,
+				deleted: 1,
+			};
+		},
+		async diff() { return undefined; },
+	};
+	const res = await call(createHarness({ sessions: f.sessions, workspaceChanges: service }).route, {
+		url: "/m/api/changes/summary?sessionId=s1&turn=2",
+	});
+	assert.equal(res.status, 200);
+	assert.ok(!res.text.includes("/var/shared"), `summary 不得泄露宿主绝对路径：${res.text}`);
+	assert.equal(res.body.files[0].display, "report.txt", "工作区外只给 basename");
+	assert.equal(res.body.files[1].display, "src/a.ts", "cwd 内重新派生相对路径");
+});
+
+test("R05：changes/diff 的 display 与 ---/+++ 标头不信任宿主绝对路径", async () => {
+	const f = makeFixture();
+	const service = {
+		async diff(sessionId, seq, index) {
+			if (sessionId !== "s1" || seq !== 2 || index !== 0) return undefined;
+			return {
+				kind: "text",
+				path: "/var/shared/customer-b/secret/a.ts",
+				display: "/var/shared/customer-b/secret/a.ts",
+				before: true,
+				after: true,
+				coarse: false,
+				hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ["-old", "+new"] }],
+			};
+		},
+		summary() { return undefined; },
+	};
+	const route = createHarness({ sessions: f.sessions, workspaceChanges: service }).route;
+	const text = await call(route, { url: "/m/api/changes/diff?sessionId=s1&turn=2&index=0" });
+	assert.equal(text.status, 200);
+	assert.ok(!text.text.includes("/var/shared"), `diff 响应不得泄露宿主绝对路径：${text.text}`);
+	assert.equal(text.body.diff.display, "a.ts");
+	assert.ok(text.body.diff.diff.startsWith("--- a/a.ts\n+++ b/a.ts\n"), text.body.diff.diff);
+	const binary = await call(createHarness({
+		sessions: f.sessions,
+		workspaceChanges: {
+			summary() { return undefined; },
+			async diff() { return { kind: "binary", path: "/var/shared/secret/bin.dat", display: "/var/shared/secret/bin.dat" }; },
+		},
+	}).route, { url: "/m/api/changes/diff?sessionId=s1&turn=2&index=0" });
+	assert.equal(binary.status, 200);
+	assert.equal(binary.body.diff.display, "bin.dat", "binary 分支同样重派生");
+	assert.ok(!binary.text.includes("/var/shared"));
+});
+
 test("changes/diff：hunks 渲染为统一 diff 文本", async () => {
 	const f = makeFixture();
 	const res = await call(createHarness({ sessions: f.sessions, workspaceChanges: f.changes.service }).route, {
@@ -370,6 +558,24 @@ test("changes/diff：binary / 404 / 400 / 503", async () => {
 	assert.equal((await call(noService, { url: "/m/api/changes/diff?sessionId=s1&turn=2&index=0" })).status, 503);
 });
 
+test("R14：/history 用 callId→tool/call.name 关联后只给命令工具下发终止状态", async () => {
+	const root = makeWorkspace();
+	const events = [
+		{ seq: 1, type: "tool/call", data: { turn: 1, step: 1, callId: "c-bash", name: "bash", arguments: '{"command":"x"}' } },
+		{ seq: 2, type: "tool/result", data: { turn: 1, step: 1, callId: "c-bash", message: { content: [{ type: "text", text: "boom\n[exit code: 7]" }] } } },
+		{ seq: 3, type: "tool/call", data: { turn: 1, step: 1, callId: "c-read", name: "read", arguments: '{"file_path":"a.txt"}' } },
+		{ seq: 4, type: "tool/result", data: { turn: 1, step: 1, callId: "c-read", message: { content: [{ type: "text", text: "内容里恰好有 [exit code: 3]" }] } } },
+	];
+	const live = { id: "s-tools", header: { createdAt: 1, cwd: root }, events, snapshotEvents() { return this.events; } };
+	const res = await call(createHarness({ sessions: { get: (id) => (id === "s-tools" ? live : undefined), list: () => [live] } }).route, {
+		url: "/m/api/history?sessionId=s-tools&limit=100",
+	});
+	assert.equal(res.status, 200);
+	const byCall = new Map(res.body.events.filter((event) => event.type === "tool/result").map((event) => [event.data.callId, event.data.summary]));
+	assert.equal(byCall.get("c-bash")?.exitCode, 7, "命令工具按 callId 关联后应下发真实退出码");
+	assert.equal(byCall.get("c-read"), undefined, "非命令工具不得从内容猜终止状态");
+});
+
 test("turn-file：presented 文本字节 + Range/HEAD/ETag，且不接受客户端路径", async () => {
 	const f = makeFixture();
 	const route = createHarness({ sessions: f.sessions, workspaceChanges: f.changes.service }).route;
@@ -388,6 +594,19 @@ test("turn-file：presented 文本字节 + Range/HEAD/ETag，且不接受客户�
 	const etag = String(head.headers.etag);
 	const cached = await call(route, { url, headers: { "if-none-match": etag } });
 	assert.equal(cached.status, 304);
+});
+
+test("R02 recheck-2：/turn-file 真实方法契约 = GET/HEAD（POST 不落到该端点）", async () => {
+	const f = makeFixture();
+	const route = createHarness({ sessions: f.sessions, workspaceChanges: f.changes.service }).route;
+	const url = "/m/api/turn-file?sessionId=s1&kind=presented&seq=3&index=0";
+	const head = await call(route, { url, method: "HEAD" });
+	assert.equal(head.status, 200);
+	assert.ok(Number(head.headers["content-length"]) > 0);
+	const post = await call(route, { url, method: "POST" });
+	assert.equal(post.status, 404, `POST /turn-file 不得被当作 GET 处理：${JSON.stringify(post.body)}`);
+	const get = await call(route, { url });
+	assert.equal(get.status, 200);
 });
 
 test("turn-file：presented 工作区外绝对路径、相对记录路径与休眠会话", async () => {
@@ -459,4 +678,90 @@ test("纯函数：mobileDisplayPath / renderUnifiedDiffText", () => {
 	});
 	assert.equal(truncated.truncated, true);
 	assert.ok(truncated.text.startsWith("--- /dev/null\n+++ b/a.txt\n@@ -1,0 +1,1 @@"));
+});
+
+test("R14 recheck-4：真实 tool/result 形状经 /history 关联后恢复 exitCode", async () => {
+	const root = makeWorkspace();
+	const events = [
+		{ seq: 1, type: "tool/call", data: { turn: 1, step: 1, callId: "call-real", name: "bash", arguments: '{"command":"false"}' } },
+		{
+			seq: 2,
+			type: "tool/result",
+			data: {
+				turn: 1,
+				step: 1,
+				message: {
+					role: "tool",
+					toolCallId: "call-real",
+					source: { kind: "tool", callId: "call-real" },
+					content: [{
+						type: "tool-result",
+						toolCallId: "call-real",
+						content: [{ type: "text", text: "boom\n[exit code: 7]" }],
+					}],
+				},
+			},
+		},
+	];
+	const live = { id: "s-real", header: { createdAt: 1, cwd: root }, events, snapshotEvents() { return this.events; } };
+	const res = await call(createHarness({ sessions: { get: (id) => (id === "s-real" ? live : undefined), list: () => [live] } }).route, {
+		url: "/m/api/history?sessionId=s-real&limit=100",
+	});
+	assert.equal(res.status, 200);
+	const result = res.body.events.find((event) => event.type === "tool/result");
+	assert.equal(result.data.callId, "call-real", "真实形状的 callId 必须被解析");
+	assert.equal(result.data.summary?.exitCode, 7, "callId→name 关联后应下发真实退出码");
+});
+
+test("issue #60：符号链接条目与目标的改动身份不同，cwd 别名保持一致", async () => {
+ const f = makeFixture();
+ mkdirSync(join(f.root, "one")); mkdirSync(join(f.root, "two"));
+ writeFileSync(join(f.root, "two", "a.txt"), "target\n");
+ symlinkSync("../two/a.txt", join(f.root, "one", "a.txt"));
+ f.changes.summary.files = [
+  {path:"one/a.txt", added:1, deleted:0}, {path:"two/a.txt", added:1, deleted:0},
+ ];
+ f.changes.summary.total = 2;
+ f.events[2].data.files = [{path: join(f.root,"one","a.txt")}];
+ const {route} = createHarness({sessions:f.sessions, workspaceChanges:f.changes.service});
+ const history = await call(route,{url:"/m/api/history?sessionId=s1&limit=100"});
+ const changes = await call(route,{url:"/m/api/changes/summary?sessionId=s1&turn=2"});
+ const delivered = history.body.events.find(e => e.type === "deliverables/presented").data.files[0];
+ const [link,target] = changes.body.files;
+ assert.equal(link.display,"one/a.txt"); assert.equal(target.display,"two/a.txt");
+ assert.notEqual(link.id,target.id,"Git symlink entry and target are distinct");
+ assert.equal(delivered.id,link.id,"absolute and relative link entry refer to same record");
+ assert.equal(delivered.display,link.display);
+ assert.ok(!JSON.stringify({history:history.body,changes:changes.body}).includes(f.root));
+});
+
+test("issue #60：绝对路径通过另一 cwd 别名仍与相对记录共享身份", async () => {
+ const parent=mkdtempSync(join(tmpdir(),"cwd-alias-"));const root=join(parent,"physical");const alias=join(parent,"alias");
+ mkdirSync(root);mkdirSync(join(root,"src"));writeFileSync(join(root,"src","a.ts"),"ok\n");symlinkSync(root,alias,"dir");
+ const events=[{seq:1,type:"turn/start",data:{turn:2}},{seq:2,type:"workspace/changes",data:{turn:2}},{seq:3,type:"deliverables/presented",data:{turn:2,files:[{path:join(alias,"src","a.ts")}]}},{seq:4,type:"turn/end",data:{turn:2}}];
+ const live={id:"s1",header:{cwd:root},events,snapshotEvents(){return this.events;}};
+ const sessions={get:id=>id==="s1"?live:undefined,list:()=>[live]};
+ const workspaceChanges={summary:()=>({cwd:root,files:[{path:"src/a.ts",added:1,deleted:0}],total:1,added:1,deleted:0}),async diff(){}};
+ const {route}=createHarness({sessions,workspaceChanges});
+ const history=await call(route,{url:"/m/api/history?sessionId=s1&limit=100"});
+ const summary=await call(route,{url:"/m/api/changes/summary?sessionId=s1&turn=2"});
+ const presented=history.body.events.find(e=>e.type==="deliverables/presented").data.files[0];
+ assert.equal(presented.id,summary.body.files[0].id);assert.equal(presented.display,"src/a.ts");
+ assert.ok(!JSON.stringify({history:history.body,summary:summary.body}).includes(parent));
+});
+
+test("issue #60：另一 cwd 别名保留中间符号链接和缺失路径的词法身份", () => {
+ const parent=mkdtempSync(join(tmpdir(),"cwd-alias-nested-"));const root=join(parent,"physical");const alias=join(parent,"alias");
+ mkdirSync(root);mkdirSync(join(root,"target"));writeFileSync(join(root,"target","a.ts"),"ok\n");
+ symlinkSync(root,alias,"dir");symlinkSync("target",join(root,"entry"),"dir");
+ for (const relativePath of ["entry/a.ts","entry/missing/old.ts"]) {
+  const absoluteAlias=join(alias,relativePath);
+  assert.equal(recordFileId(absoluteAlias,root),recordFileId(relativePath,root),relativePath);
+  assert.equal(mobileDisplayPath(absoluteAlias,root),relativePath);
+ }
+ assert.notEqual(recordFileId("entry/a.ts",root),recordFileId("target/a.ts",root),"workspace symlink directory entry must not collapse into target");
+ symlinkSync(".",join(root,"loop"),"dir");writeFileSync(join(root,"a.ts"),"root entry\n");
+ assert.equal(recordFileId(join(alias,"loop","a.ts"),root),recordFileId("loop/a.ts",root),"nested link to cwd is an entry, not the cwd alias");
+ assert.notEqual(recordFileId(join(alias,"loop","a.ts"),root),recordFileId("a.ts",root));
+ assert.equal(mobileDisplayPath(join(alias,"loop","a.ts"),root),"loop/a.ts");
 });

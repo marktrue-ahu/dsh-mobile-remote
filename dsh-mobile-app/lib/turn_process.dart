@@ -1,3 +1,4 @@
+import 'l10n.dart';
 import 'models.dart';
 import 'timeline.dart' show timelineIsInjectedNoise;
 
@@ -100,10 +101,14 @@ class TurnProcess {
   final int turn;
 
   /// 该轮 `turn/start` 的持久序号（渲染锚点，也是轮次导航的边界键）。
+  /// [partial] 为真时该值是**该轮最早可观察事件**的合成锚点（历史窗口缺 turn/start）。
   final int startSeq;
 
   /// 该轮 `turn/end` 的持久序号；历史截断/仍在运行时为 null。
   final int? endSeq;
+
+  /// issue #60 R04：部分轮次（初次 50 条窗口只含中后段事件、缺 `turn/start`）。
+  final bool partial;
 
   final bool ended;
 
@@ -123,6 +128,7 @@ class TurnProcess {
     required this.turn,
     required this.startSeq,
     this.endSeq,
+    this.partial = false,
     this.ended = false,
     this.endReasonKind,
     this.startedAtMs,
@@ -297,10 +303,15 @@ class ProcessSegment {
   /// 段折叠摘要（整段收起时替代过程块的一行）。
   String get summary {
     final parts = <String>[];
-    if (reasoningChars > 0) parts.add('思考 $reasoningChars 字');
+    if (reasoningChars > 0) {
+      parts.add(L10n.t('思考 $reasoningChars 字', '$reasoningChars chars of thinking'));
+    }
     parts.add(toolCount == 0
-        ? '${groups.length} 个过程组'
-        : '${groups.length} 组 · $toolCount 次工具调用');
+        ? L10n.t('${groups.length} 个过程组', '${groups.length} process groups')
+        : L10n.t(
+            '${groups.length} 组 · $toolCount 次工具调用',
+            '${groups.length} groups · $toolCount tool calls',
+          ));
     return parts.join(' · ');
   }
 }
@@ -395,40 +406,53 @@ String processGroupHeader(
           }
         }
       }
-      if (name != null && name.isNotEmpty) return '正在调用工具…（$name）';
+      if (name != null && name.isNotEmpty) {
+        return L10n.t('正在调用工具…（$name）', 'Calling tool… ($name)');
+      }
     }
-    return '正在调用工具…';
+    return L10n.t('正在调用工具…', 'Calling tool…');
   }
-  return '${group.toolCount} 次工具调用';
+  return L10n.t('${group.toolCount} 次工具调用', '${group.toolCount} tool calls');
 }
 
 /// 轮次页脚文案：已完成（可用时带用时）/ 中止 / 中断 / 出错。
 String turnFooterText(TurnProcess turn) {
   final kind = turn.endReasonKind;
   final label = switch (kind) {
-    'aborted' => '已中止',
-    'interrupted' => '已中断',
-    'error' => '出错',
-    _ => '已完成',
+    'aborted' => L10n.t('已中止', 'Aborted'),
+    'interrupted' => L10n.t('已中断', 'Interrupted'),
+    'error' => L10n.t('出错', 'Error'),
+    _ => L10n.t('已完成', 'Completed'),
   };
   final duration = turn.durationMs;
   if (duration == null) return label;
-  return '$label · 用时 ${formatTurnDuration(duration)}';
+  return L10n.t(
+    '$label · 用时 ${formatTurnDuration(duration)}',
+    '$label · took ${formatTurnDuration(duration)}',
+  );
 }
 
 /// 用时格式：<1s 保留一位小数秒，<60s 保留一位小数秒，<1h 用「分 秒」，否则「小时 分」。
 String formatTurnDuration(int milliseconds) {
   final seconds = milliseconds / 1000;
-  if (seconds < 60) return '${seconds.toStringAsFixed(1)} 秒';
+  if (seconds < 60) {
+    return L10n.t('${seconds.toStringAsFixed(1)} 秒', '${seconds.toStringAsFixed(1)}s');
+  }
   final total = seconds.round();
   if (total < 3600) {
     final minutes = total ~/ 60;
     final rest = total % 60;
-    return '$minutes 分 ${rest.toString().padLeft(2, '0')} 秒';
+    return L10n.t(
+      '$minutes 分 ${rest.toString().padLeft(2, '0')} 秒',
+      '${minutes}m ${rest.toString().padLeft(2, '0')}s',
+    );
   }
   final hours = total ~/ 3600;
   final minutes = (total % 3600) ~/ 60;
-  return '$hours 小时 ${minutes.toString().padLeft(2, '0')} 分';
+  return L10n.t(
+    '$hours 小时 ${minutes.toString().padLeft(2, '0')} 分',
+    '${hours}h ${minutes.toString().padLeft(2, '0')}m',
+  );
 }
 
 /// 从服务端事件折叠出的轮次过程跟踪器。
@@ -618,7 +642,27 @@ class TurnProcessTracker {
   int? turnOfEndSeq(int seq) => _turnOfEndSeq[seq];
 
   /// 该轮的首个起点序号（重试边界会有多个 turn/start，过程块只在首个上渲染一次）。
-  int? startSeqOfTurn(int turn) => _turns[turn]?.startSeq;
+  ///
+  /// issue #60 R04：历史窗口缺 `turn/start` 的**部分轮次**没有真实起点；这里返回该轮
+  /// 最早可观察事件的序号作为合成锚点，让过程块/页脚/M2 两卡仍能定位与渲染。
+  int? startSeqOfTurn(int turn) => _anchorOf(_turns[turn]);
+
+  /// 该轮的渲染锚点：真实 startSeq 优先；否则取已知的最早事件序号。
+  int? _anchorOf(_MutableTurn? turn) {
+    if (turn == null) return null;
+    if (turn.startSeq != null) return turn.startSeq;
+    int? anchor = turn.endSeq;
+    for (final row in turn.rows) {
+      if (anchor == null || row.seq < anchor) anchor = row.seq;
+    }
+    for (final tool in _tools.values) {
+      if (tool.turn != turn.turn) continue;
+      final seq = tool.reportedSeq;
+      if (seq == null) continue;
+      if (anchor == null || seq < anchor) anchor = seq;
+    }
+    return anchor;
+  }
 
   /// 该轮的末个结束序号（同一轮多次 turn/end 时页脚只渲染一次）。
   int? endSeqOfTurn(int turn) => _turns[turn]?.endSeq;
@@ -655,9 +699,12 @@ class TurnProcessTracker {
   /// 折叠成按 `turn/start` 顺序排列的轮次过程列表。
   List<TurnProcess> build() {
     final result = <TurnProcess>[];
-    final turns = _turns.values.where((t) => t.startSeq != null).toList()
-      ..sort((a, b) => a.startSeq!.compareTo(b.startSeq!));
+    // issue #60 R04：缺 turn/start 的部分轮次不能整轮丢弃——保留轮次身份（合成锚点），
+    // 否则最新长轮次的页脚、M2 两卡与折叠策略要等用户上翻取回开头才生效。
+    final turns = _turns.values.where((t) => _anchorOf(t) != null).toList()
+      ..sort((a, b) => _anchorOf(a)!.compareTo(_anchorOf(b)!));
     for (final t in turns) {
+      final anchor = t.startSeq ?? _anchorOf(t)!;
       final rows = <ProcessRow>[
         for (final row in t.rows)
           if (row.kind == ProcessRowKind.reasoning)
@@ -694,14 +741,15 @@ class TurnProcessTracker {
       // 早到的 steer 误判成提示词，导致本应强制展开的轮被收起）。
       final inRange = <int>[
         for (final seq in _humanUserSeqs)
-          if (seq > t.startSeq! && (t.endSeq == null || seq < t.endSeq!)) seq,
+          if (seq > anchor && (t.endSeq == null || seq < t.endSeq!)) seq,
       ]..sort();
       final human = inRange.isEmpty
           ? const <int>[]
           : inRange.sublist(1);
       result.add(TurnProcess(
         turn: t.turn,
-        startSeq: t.startSeq!,
+        startSeq: anchor,
+        partial: t.startSeq == null,
         endSeq: t.endSeq,
         ended: t.ended,
         endReasonKind: t.endReasonKind,

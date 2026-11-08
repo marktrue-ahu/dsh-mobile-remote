@@ -5,9 +5,10 @@ import { EventEmitter, once } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, symlink, lstat, chmod } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, isAbsolute, join } from 'node:path';
-import { DOCKER_IMAGE, HINT_CODES, MISSING_DEPENDENCY_SPECIFIERS, RUNTIME_LIFECYCLE_MS, checkHostedRunner, createChildExitObserver, createDockerExecutor, createLinuxChildMonitor, createSourceArchive, createStderrCollector, dockerCliDriver, dockerCreatePlan, dockerModelAdapter, evaluateResponses, gitArchiveArgs, hostedDockerAdapter, libSnapshot, makeInstallWorker, makeRuntimeWorker, managedDocker, probeMobile, profileFiles, prepareContainerProfile, removeSourceArchive, readLinuxProcessStat, resolveExitedChildHint, runCanary, stderrExitHint, validateDockerMounts, verifyDockerInspection, verifyInstalled, verifyPluginSource, verifyRequiredBundles } from '../tools/host-canary/smoke.mjs';
+import { DOCKER_IMAGE, HINT_CODES, MISSING_DEPENDENCY_SPECIFIERS, RUNTIME_LIFECYCLE_MS, checkHostedRunner, createChildExitObserver, createDockerExecutor, createLinuxChildMonitor, createSourceArchive, createStderrCollector, dockerCliDriver, dockerCreatePlan, dockerModelAdapter, evaluateResponses, gitArchiveArgs, hostedDockerAdapter, libSnapshot, makeInstallWorker, makeRuntimeWorker, managedDocker, parseWorkerOutput, probeMobile, profileFiles, prepareContainerProfile, removeSourceArchive, readLinuxProcessStat, resolveExitedChildHint, runCanary, stderrExitHint, validateDockerMounts, verifyDockerInspection, verifyInstalled, verifyPluginSource, verifyRequiredBundles } from '../tools/host-canary/smoke.mjs';
 
 const imageEnv = ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin','NODE_VERSION=24.1.0','YARN_VERSION=1.22.22'];
 const profileEnvFor = phase => { const base = phase === 'install' ? '/profile' : '/tmp/canary'; return [`HOME=${base}/home`,`DSH_HOME=${base}/dsh`,`XDG_CONFIG_HOME=${base}/xdg-config`,`XDG_CACHE_HOME=${base}/xdg-cache`,`XDG_DATA_HOME=${base}/xdg-data`,`XDG_STATE_HOME=${base}/xdg-state`,`XDG_RUNTIME_DIR=${base}/xdg-runtime`,`NPM_CONFIG_USERCONFIG=${base}/npmrc`,`NPM_CONFIG_GLOBALCONFIG=${base}/npm-globalrc`]; };
@@ -82,7 +83,7 @@ test('generated worker emits a sanitized hint using only a fake host', async t =
   // worker can read a baseline identity before this process disappears. Timeout
   // mode stays alive past the worker deadline, then self-exits after 1.8s
   // without relying on a signal.
-  const fakeCode = `import {readFileSync,writeFileSync,writeSync} from 'node:fs'; const text=readFileSync('/proc/self/stat','utf8'); const fields=text.slice(text.lastIndexOf(')')+2).trim().split(/\\s+/); if (!/^\\d+$/.test(fields[19])) process.exit(3); writeFileSync(process.env.FAKE_HOST_IDENTITY,JSON.stringify({pid:process.pid,startTime:fields[19]}),{flag:'wx',mode:0o600}); const finish=()=>{try {writeSync(2,'ERR_MODULE_NOT_FOUND secret-token /private/path');} catch {} process.exit(1);}; const mode=process.env.FAKE_HOST_MODE; const exitSoon=action=>setTimeout(action,250); const linger=()=>setTimeout(()=>{},1200); if (mode === 'exit-zero') { exitSoon(()=>process.exit(0)); linger(); } else if (mode === 'exit-nonzero') { exitSoon(()=>process.exit(17)); linger(); } else if (mode === 'exit-signal') { exitSoon(()=>process.kill(process.pid,'SIGTERM')); linger(); } else if (mode === 'startup-audit') { exitSoon(()=>{ writeSync(2,'dsh: startup failed: 2 required plugins did not activate\\nsecret-token /private/path\\n'); process.exit(1); }); linger(); } else if (mode === 'worker-timeout') setTimeout(finish,1800); else { exitSoon(finish); linger(); }`;
+  const fakeCode = `import {readFileSync,writeFileSync,writeSync,renameSync} from 'node:fs'; const text=readFileSync('/proc/self/stat','utf8'); const fields=text.slice(text.lastIndexOf(')')+2).trim().split(/\\s+/); if (!/^\\d+$/.test(fields[19])) process.exit(3); const payload=JSON.stringify({pid:process.pid,startTime:fields[19]}); const record=process.env.FAKE_HOST_IDENTITY; const mode=process.env.FAKE_HOST_MODE; const finish=()=>{try {writeSync(2,'ERR_MODULE_NOT_FOUND secret-token /private/path');} catch {} process.exit(1);}; const exitSoon=action=>setTimeout(action,250); const linger=()=>setTimeout(()=>{},1200); if (mode === 'torn-identity') { writeFileSync(record,payload.slice(0,8),{flag:'wx',mode:0o600}); setTimeout(()=>writeFileSync(record,payload),200); exitSoon(finish); linger(); } else { const tmp=record+'.tmp-'+process.pid; writeFileSync(tmp,payload,{flag:'wx',mode:0o600}); renameSync(tmp,record); } if (mode === 'exit-zero') { exitSoon(()=>process.exit(0)); linger(); } else if (mode === 'exit-nonzero') { exitSoon(()=>process.exit(17)); linger(); } else if (mode === 'exit-signal') { exitSoon(()=>process.kill(process.pid,'SIGTERM')); linger(); } else if (mode === 'startup-audit') { exitSoon(()=>{ writeSync(2,'dsh: startup failed: 2 required plugins did not activate\\nsecret-token /private/path\\n'); process.exit(1); }); linger(); } else if (mode === 'worker-timeout') setTimeout(finish,1800); else if (mode === 'torn-identity') { } else { exitSoon(finish); linger(); }`;
   const fakeBin = join(host,'lib/bin.js');
   await writeFile(fakeBin,fakeCode,{flag:'wx',mode:0o600});
   assert.equal(await readFile(fakeBin,'utf8'),fakeCode);
@@ -129,16 +130,16 @@ test('generated worker emits a sanitized hint using only a fake host', async t =
     }
     throw Error('fake host exit unconfirmed; fixture retained');
   }
-  for (const mode of ['normal','startup-audit','worker-error','worker-timeout','exit-zero','exit-nonzero','exit-signal']) {
+  for (const mode of ['normal','torn-identity','startup-audit','worker-error','worker-timeout','exit-zero','exit-nonzero','exit-signal']) {
     const record = join(root,`identity-${mode}.json`);
     // Every run receives a fresh tmpfs-like runtime directory.
     const runPath = join(root,`runtime-${mode}`);
     const runScript = script.replaceAll(runtime,runPath);
-    const waitForRecord = `await (async () => { const {access}=await import('node:fs/promises'); for(let i=0;i<100;i++){ try {await access(${JSON.stringify(record)});return;} catch {} await new Promise(ok=>setTimeout(ok,10)); } throw Error('fake-host-record-missing'); })();`;
+    const waitForRecord = `await (async () => { const {readFile}=await import('node:fs/promises'); for(let i=0;i<100;i++){ try { const parsed=JSON.parse(await readFile(${JSON.stringify(record)},'utf8')); if (Number.isSafeInteger(parsed.pid) && typeof parsed.startTime === 'string' && /^\\d+$/.test(parsed.startTime)) return; } catch {} await new Promise(ok=>setTimeout(ok,10)); } throw Error('fake-host-record-missing'); })();`;
     // Every mode must wait for the fake host to record its identity before the
     // worker can finish and kill it. Otherwise the worker's teardown races the
     // host's identity write and confirmFakeExited fails on scheduler luck alone.
-    const mockRequest = ['normal','startup-audit','exit-zero','exit-nonzero','exit-signal'].includes(mode) ? `  const request = async () => ({status:0,body:null}); ${waitForRecord}` :
+    const mockRequest = ['normal','torn-identity','startup-audit','exit-zero','exit-nonzero','exit-signal'].includes(mode) ? `  const request = async () => ({status:0,body:null}); ${waitForRecord}` :
       mode === 'worker-error' ? `  const request = async () => ({status:0,body:null}); ${waitForRecord} throw Error('synthetic-worker-fault');` :
       `  const request = async () => ({status:0,body:null}); ${waitForRecord} Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10000);`;
     const mocked = replaceOne(runScript,request,mockRequest);
@@ -152,7 +153,7 @@ test('generated worker emits a sanitized hint using only a fake host', async t =
       else {
         assert.equal(worker.error,undefined); assert.equal(worker.status,2);
         assert.equal(worker.stderr,'', 'raw host output and temporary diagnostics must not leave the worker');
-        const expectedCode = {normal:'host-process-exited-hint-module-not-found','startup-audit':'host-process-exited-hint-startup-audit','worker-error':'worker-failed','exit-zero':'host-process-exited-zero','exit-nonzero':'host-process-exited-nonzero','exit-signal':'host-process-exited-signal'}[mode];
+        const expectedCode = {normal:'host-process-exited-hint-module-not-found','torn-identity':'host-process-exited-hint-module-not-found','startup-audit':'host-process-exited-hint-startup-audit','worker-error':'worker-failed','exit-zero':'host-process-exited-zero','exit-nonzero':'host-process-exited-nonzero','exit-signal':'host-process-exited-signal'}[mode];
         assert.deepEqual(JSON.parse(worker.stdout),{ok:false,errorCode:expectedCode,checks:[]});
         assert.doesNotMatch(worker.stdout,/SIGTERM|\b17\b/);
       }

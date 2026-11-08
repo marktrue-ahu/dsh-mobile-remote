@@ -102,17 +102,25 @@ class DeliverableFile {
   final int seq;
   final int index;
 
+  /// 服务端下发的**不泄路径稳定身份**（路径摘要）。旧服务端/旧事件可能缺省。
+  final String? id;
+
   const DeliverableFile({
     required this.name,
     required this.display,
     this.description,
     required this.seq,
     required this.index,
+    this.id,
   });
 
-  /// 同轮多次 present 的去重键：优先显示路径（工作区外文件 display 可能是裸
-  /// basename，因此不能再退化成 basename 去重，否则不同目录同名文件会被误合并）。
-  String get dedupeKey => display.isNotEmpty ? display : name;
+  /// 同轮多次 present 的去重键（issue #60 R08）：
+  /// - 有稳定 id：同一文件跨声明合并；
+  /// - 无 id：只能用坐标作身份，**保守保留多条**（display 是脱敏展示值，不同目录
+  ///   同名文件可能相同，不能拿它当唯一身份静默丢掉合法坐标）。
+  String get dedupeKey => id != null && id!.isNotEmpty
+      ? 'id:$id'
+      : 'coord:$seq:$index';
 }
 
 /// 从 `deliverables/presented` 摘要 data 解析交付文件（保持事件内下标）。
@@ -139,6 +147,9 @@ List<DeliverableFile> deliverableFilesOf(
             : null,
         seq: eventSeq ?? 0,
         index: index,
+        id: (item['id'] ?? '').toString().isNotEmpty
+            ? item['id'].toString()
+            : null,
       ),
     );
   }
@@ -146,18 +157,40 @@ List<DeliverableFile> deliverableFilesOf(
 }
 
 /// 同轮多次 `present` 的合并：按路径去重、说明取该轮**最后一次**声明（§6.20）。
+///
+/// issue #60 R07：历史回放是倒序/分页到达的，"最后一次声明"必须按**持久坐标**
+/// (seq, index) 判定，而不是按到达顺序覆盖；实时/初载/补页因此收敛到同一结果。
+/// 输出按 (seq, index) 升序，保证不同到达顺序得到相同列表。
 List<DeliverableFile> mergeDeliverableDeclarations(
   List<DeliverableFile> existing,
   List<DeliverableFile> incoming,
 ) {
   final merged = <String, DeliverableFile>{};
+  void absorb(DeliverableFile file) {
+    final current = merged[file.dedupeKey];
+    if (current == null || _isLaterDeclaration(file, current)) {
+      merged[file.dedupeKey] = file;
+    }
+  }
+
   for (final file in existing) {
-    merged[file.dedupeKey] = file;
+    absorb(file);
   }
   for (final file in incoming) {
-    merged[file.dedupeKey] = file;
+    absorb(file);
   }
-  return merged.values.toList(growable: false);
+  final out = merged.values.toList(growable: false)
+    ..sort((a, b) {
+      final bySeq = a.seq.compareTo(b.seq);
+      return bySeq != 0 ? bySeq : a.index.compareTo(b.index);
+    });
+  return List.unmodifiable(out);
+}
+
+/// 持久坐标更晚（seq 优先、同 seq 比 index）的声明胜出。
+bool _isLaterDeclaration(DeliverableFile candidate, DeliverableFile current) {
+  if (candidate.seq != current.seq) return candidate.seq > current.seq;
+  return candidate.index > current.index;
 }
 
 /// 本轮改动文件（`/changes/summary` 的 `files[]`，§6.21）。
@@ -171,6 +204,9 @@ class ChangedFile {
   final bool binary;
   final bool oversized;
 
+  /// issue #60 round4-2：服务端路径摘要身份（与 presented 同一 helper）；旧插件缺省。
+  final String? id;
+
   const ChangedFile({
     required this.seq,
     required this.index,
@@ -180,6 +216,7 @@ class ChangedFile {
     required this.deleted,
     this.binary = false,
     this.oversized = false,
+    this.id,
   });
 
   static ChangedFile? fromJson(Object? json) {
@@ -196,6 +233,7 @@ class ChangedFile {
       deleted: (json['deleted'] as num?)?.toInt() ?? 0,
       binary: json['binary'] == true,
       oversized: json['oversized'] == true,
+      id: (json['id'] ?? '').toString().isNotEmpty ? json['id'].toString() : null,
     );
   }
 }
@@ -309,8 +347,13 @@ bool isPreviewableImageName(String name) {
 /// 规则：**精确路径优先**（display / name 精确匹配），唯一 basename 次之，
 /// 有歧义或未记录一律不链接（不猜测、不链接未记录文件）。
 class TurnFileLinkResolver {
-  final Map<String, TurnFileCoordinate> _exact = {};
-  final Map<String, Set<TurnFileCoordinate>> _byBasename = {};
+  /// issue #60 round4-2（R08）：display 是脱敏展示值，不能当文件身份。按**逻辑身份**
+  /// （优先服务端路径摘要 id；旧数据用 kind+seq+index 兼容）分组：
+  /// - 同一 display 下所有候选同一 logicalId → 合并为一个逻辑文件（代表坐标优先 presented，
+  ///   其次更大 (seq,index)），可链接；
+  /// - 同 display 出现不同 logicalId（不同目录同名文件）→ 歧义返回 null。
+  final Map<String, List<_LinkCandidate>> _exact = {};
+  final Map<String, List<_LinkCandidate>> _byBasename = {};
 
   TurnFileLinkResolver({
     required String sessionId,
@@ -318,7 +361,7 @@ class TurnFileLinkResolver {
     List<ChangedFile> changed = const [],
   }) {
     for (final file in presented) {
-      _add(file.display, file.name, TurnFileCoordinate(
+      _add(file.display, file.name, file.id, TurnFileCoordinate(
         sessionId: sessionId,
         kind: TurnFileKind.presented,
         seq: file.seq,
@@ -326,7 +369,7 @@ class TurnFileLinkResolver {
       ));
     }
     for (final file in changed) {
-      _add(file.display, file.name, TurnFileCoordinate(
+      _add(file.display, file.name, file.id, TurnFileCoordinate(
         sessionId: sessionId,
         kind: TurnFileKind.changed,
         seq: file.seq,
@@ -351,31 +394,97 @@ class TurnFileLinkResolver {
     return slash >= 0 ? text.substring(slash + 1) : text;
   }
 
-  void _add(String display, String name, TurnFileCoordinate coordinate) {
+  void _add(String display, String name, String? serverId, TurnFileCoordinate coordinate) {
     final path = _normalize(display);
-    if (path.isNotEmpty) _exact.putIfAbsent(path, () => coordinate);
+    final candidate = _LinkCandidate(
+      coordinate: coordinate,
+      serverId: serverId != null && serverId.isNotEmpty ? serverId : null,
+    );
+    if (path.isNotEmpty) {
+      _exact.putIfAbsent(path, () => <_LinkCandidate>[]).add(candidate);
+    }
     final rawName = _normalize(name);
     if (rawName.isNotEmpty) {
-      // basename 精确匹配只作为次优候选；同一坐标不重复计数。
-      _byBasename.putIfAbsent(_basenameOf(path.isNotEmpty ? path : rawName), () => <TurnFileCoordinate>{})
-          .add(coordinate);
+      final base = _basenameOf(path.isNotEmpty ? path : rawName);
+      if (base.isNotEmpty) {
+        _byBasename.putIfAbsent(base, () => <_LinkCandidate>[]).add(candidate);
+      }
       final nameBase = _basenameOf(rawName);
-      if (nameBase.isNotEmpty) {
-        _byBasename.putIfAbsent(nameBase, () => <TurnFileCoordinate>{}).add(coordinate);
+      if (nameBase.isNotEmpty && nameBase != base) {
+        _byBasename.putIfAbsent(nameBase, () => <_LinkCandidate>[]).add(candidate);
       }
     }
   }
 
-  /// 行内代码文本 → 预览坐标；未命中/歧义返回 null。
+  /// 行内代码文本 → 预览坐标；未命中/存在不同逻辑文件歧义返回 null。
   TurnFileCoordinate? resolve(String code) {
     final token = _normalize(code);
     if (token.isEmpty) return null;
     final exact = _exact[token];
-    if (exact != null) return exact;
-    final candidates = _byBasename[_basenameOf(token)];
-    if (candidates == null || candidates.length != 1) return null;
-    return candidates.single;
+    if (exact != null) {
+      return _resolveCandidates(exact, legacyExactDisplayMerge: true);
+    }
+    return _resolveCandidates(_byBasename[_basenameOf(token)]);
   }
+
+  TurnFileCoordinate? _resolveCandidates(
+    List<_LinkCandidate>? candidates, {
+    bool legacyExactDisplayMerge = false,
+  }) {
+    if (candidates == null || candidates.isEmpty) return null;
+    final withId = candidates.where((c) => c.serverId != null).toList();
+    if (withId.length == candidates.length) {
+      final ids = withId.map((c) => c.serverId!).toSet();
+      if (ids.length != 1) return null;
+      return _representative(candidates);
+    }
+    if (withId.isNotEmpty) {
+      // 新旧混合：无法证明是同一文件，保守不链接。
+      return null;
+    }
+    // 旧数据无 id：**仅精确 display 命中**时，presented + changed 可保守视作同一逻辑
+    // 文件；basename 命中不同路径的同名文件仍按歧义处理（不跨路径合并）。
+    if (legacyExactDisplayMerge) {
+      // issue #60 round5-2：旧插件无 id 时只允许「presented 恰好 1 个去重坐标 +
+      // changed 恰好 1 个去重坐标」保守视作同一逻辑文件；多个同源坐标（如两个
+      // presented report.pdf）仍是歧义，绝不能合并后打开较新的那个错误文件。
+      final presentedCoords = candidates
+          .where((c) => c.coordinate.kind == TurnFileKind.presented)
+          .map((c) => '${c.coordinate.seq}:${c.coordinate.index}')
+          .toSet();
+      final changedCoords = candidates
+          .where((c) => c.coordinate.kind == TurnFileKind.changed)
+          .map((c) => '${c.coordinate.seq}:${c.coordinate.index}')
+          .toSet();
+      if (presentedCoords.length + changedCoords.length == 1) {
+        // 只有一个来源的一个坐标：就是它本身（精确 display 命中）。
+        return _representative(candidates);
+      }
+      if (presentedCoords.length == 1 && changedCoords.length == 1) {
+        return _representative(candidates);
+      }
+      return null;
+    }
+    return candidates.length == 1 ? candidates.single.coordinate : null;
+  }
+
+  /// 代表坐标：presented 优先；同类取更大 (seq,index)。
+  static TurnFileCoordinate _representative(List<_LinkCandidate> candidates) {
+    final sorted = [...candidates]..sort((a, b) {
+      final aPresented = a.coordinate.kind == TurnFileKind.presented;
+      final bPresented = b.coordinate.kind == TurnFileKind.presented;
+      if (aPresented != bPresented) return aPresented ? -1 : 1;
+      final bySeq = b.coordinate.seq.compareTo(a.coordinate.seq);
+      return bySeq != 0 ? bySeq : b.coordinate.index.compareTo(a.coordinate.index);
+    });
+    return sorted.first.coordinate;
+  }
+}
+
+class _LinkCandidate {
+  const _LinkCandidate({required this.coordinate, this.serverId});
+  final TurnFileCoordinate coordinate;
+  final String? serverId;
 }
 
 /// 改动摘要的负结果短 TTL 缓存（issue #53 §7）。
@@ -386,16 +495,20 @@ class TurnTailSummaryCache {
   TurnTailSummaryCache({
     this.negativeTtl = const Duration(seconds: 60),
     this.availableTtl = const Duration(minutes: 5),
-  });
+    DateTime Function()? clock,
+  }) : _clock = clock ?? DateTime.now;
 
   final Duration negativeTtl;
   final Duration availableTtl;
+
+  /// 时钟注入：仅用于测试 TTL（widget 测试的假时钟不会推进 `DateTime.now()`）。
+  final DateTime Function() _clock;
   final Map<int, _CachedSummary> _entries = {};
 
   ChangesSummary? lookup(int turn) {
     final entry = _entries[turn];
     if (entry == null) return null;
-    if (entry.expiresAt.isBefore(DateTime.now())) {
+    if (entry.expiresAt.isBefore(_clock())) {
       _entries.remove(turn);
       return null;
     }
@@ -406,7 +519,7 @@ class TurnTailSummaryCache {
     final ttl = summary.state == ChangesState.available
         ? availableTtl
         : negativeTtl;
-    _entries[turn] = _CachedSummary(summary, DateTime.now().add(ttl));
+    _entries[turn] = _CachedSummary(summary, _clock().add(ttl));
   }
 
   void clear() => _entries.clear();

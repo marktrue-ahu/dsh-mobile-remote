@@ -303,6 +303,9 @@ class ChatScreen extends StatefulWidget {
   final Api? apiClient;
   final GitReadApi? gitReadApi;
   final GitBrowserControllerFactory? gitControllerFactory;
+
+  /// issue #60 R06：仅测试注入（TTL 行为需要可控时钟/短 TTL）；生产用默认缓存。
+  final TurnTailSummaryCache? changedSummaryCache;
   const ChatScreen({
     super.key,
     required this.store,
@@ -311,6 +314,7 @@ class ChatScreen extends StatefulWidget {
     this.apiClient,
     this.gitReadApi,
     this.gitControllerFactory,
+    this.changedSummaryCache,
   });
 
   @override
@@ -354,8 +358,15 @@ class _ChatScreenState extends State<ChatScreen> {
   // ── issue #53（ADR 0027 §3）：轮末产出物（两卡 + 按坐标预览） ─────────
   final Map<int, TurnTail> _turnTails = {}; // 轮号 → turnTails/tail 信号
   final Map<int, List<DeliverableFile>> _deliverablesByTurn = {};
-  final TurnTailSummaryCache _changedSummaryCache = TurnTailSummaryCache();
+  late final TurnTailSummaryCache _changedSummaryCache =
+      widget.changedSummaryCache ?? TurnTailSummaryCache();
+  /// 只表示 **in-flight**：完成/失败后移除，TTL 到期可重新拉取（issue #60 R06）。
   final Set<int> _changedSummaryRequested = {};
+  /// issue #60 recheck-11：reset/重同步会清空门闩与缓存；旧请求完成必须按代际丢弃，
+  /// 不得回填缓存或移除新请求的门闩。
+  int _tailLoadGeneration = 0;
+  /// 失败退避：避免完成后立刻被重建无限重试；仅抑制一段时间，不阻止 TTL 恢复。
+  final Map<int, DateTime> _changedSummaryRetryAfter = {};
   final Map<int, String> _changedSummaryErrors = {};
   final Map<int, ({int version, TurnFileLinkResolver resolver})> _linkResolvers = {};
   int _turnTailVersion = 0;
@@ -1227,8 +1238,10 @@ class _ChatScreenState extends State<ChatScreen> {
         _deliverablesByTurn.clear();
         _changedSummaryCache.clear();
         _changedSummaryRequested.clear();
+        _changedSummaryRetryAfter.clear();
         _changedSummaryErrors.clear();
         _linkResolvers.clear();
+        _tailLoadGeneration++;
         _turnTailVersion++;
         _processTurns = const [];
         _processTurnMap = const {};
@@ -5927,28 +5940,51 @@ class _ChatScreenState extends State<ChatScreen> {
     final sessionId = _tailSessionId;
     if (sessionId == null) return;
     if (_changedSummaryRequested.contains(turn)) return;
+    final retryAfter = _changedSummaryRetryAfter[turn];
+    if (retryAfter != null && retryAfter.isAfter(DateTime.now())) return;
     _changedSummaryRequested.add(turn);
     unawaited(_loadChangedSummary(sessionId, turn));
   }
 
+  /// 失败退避时长：只抑制短时间内的重复请求；负结果的正规节流由缓存 TTL 承担。
+  static const Duration _changedSummaryFailureBackoff = Duration(seconds: 60);
+
   Future<void> _loadChangedSummary(String sessionId, int turn) async {
-    for (var attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        final summary = await _api.changesSummary(sessionId, turn);
-        if (!mounted || sessionId != _tailSessionId) return;
-        _changedSummaryCache.store(turn, summary);
-        _changedSummaryErrors.remove(turn);
-        setState(() => _turnTailVersion++);
-        return;
-      } catch (e) {
-        _changedSummaryErrors[turn] = e.toString();
-        if (attempt == 0) {
-          await Future<void>.delayed(const Duration(milliseconds: 400));
-          if (!mounted) return;
+    final generation = _tailLoadGeneration;
+    final stillCurrent = () =>
+        mounted && generation == _tailLoadGeneration && sessionId == _tailSessionId;
+    try {
+      for (var attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          final summary = await _api.changesSummary(sessionId, turn);
+          // issue #60 recheck-11：reset/重同步后旧请求完成 → 丢弃，不回填缓存。
+          if (!stillCurrent()) return;
+          _changedSummaryCache.store(turn, summary);
+          _changedSummaryErrors.remove(turn);
+          _changedSummaryRetryAfter.remove(turn);
+          setState(() => _turnTailVersion++);
+          return;
+        } catch (e) {
+          if (!stillCurrent()) return;
+          _changedSummaryErrors[turn] = e.toString();
+          if (attempt == 0) {
+            await Future<void>.delayed(const Duration(milliseconds: 400));
+            if (!stillCurrent()) return;
+          }
         }
       }
+      if (!stillCurrent()) return;
+      // 两次都失败：记录下来并退避；**不**阻止 TTL/重建后的恢复性重试。
+      _changedSummaryRetryAfter[turn] =
+          DateTime.now().add(_changedSummaryFailureBackoff);
+      if (mounted) setState(() {});
+    } finally {
+      // in-flight 门闩必须总是释放：否则缓存 TTL 到期后卡片永久消失（issue #60 R06）。
+      // 旧代际完成不得移除 reset 后新请求的门闩（recheck-11）。
+      if (generation == _tailLoadGeneration) {
+        _changedSummaryRequested.remove(turn);
+      }
     }
-    if (mounted) setState(() {});
   }
 
   /// 轮末两卡：改动卡（懒加载摘要）→ 交付卡。无文件不占位；能力位缺失不渲染。
@@ -7162,7 +7198,9 @@ class _ToolActivityCardState extends State<_ToolActivityCard> {
     final ink3 = DshColors.ink3(context);
     final text = toolFoldText(call) ?? '';
     final stats = toolFileStats(call);
-    final exit = toolExitBadge(widget.item.resultSummary);
+    // issue #60 R14：退出码/信号只对**已关联 command 工具**的卡片展示；非命令工具即便
+    // 结果摘要带了终止字段（旧服务端/伪造内容）也不显示。
+    final exit = call.isCommand ? toolExitBadge(widget.item.resultSummary) : null;
     final count = toolResultCountBadge(call, widget.item.resultSummary);
     return Padding(
       padding: const EdgeInsets.fromLTRB(10, 0, 10, 8),
@@ -7188,9 +7226,41 @@ class _ToolActivityCardState extends State<_ToolActivityCard> {
     );
   }
 
+  /// 通用参数/结果块（issue #60 R12：无内联 diff 时普通模式也要可达参数，不只是结果）。
+  List<Widget> _genericBody({bool includeResult = true}) => [
+    if (widget.item.toolArguments.isNotEmpty)
+      _code(L10n.t('参数', 'Arguments'), widget.item.toolArguments),
+    if (includeResult && widget.item.toolResult.isNotEmpty)
+      _looksMarkdown(widget.item.toolResult) && !widget.debug
+          ? _markdownResult(widget.item.toolResult)
+          : _code(L10n.t('结果', 'Result'), widget.item.toolResult),
+  ];
+
   /// 展开态专用内容；返回空列表时由调用方回退通用参数/结果块。
   List<Widget> _specializedBody(ToolCallSummary call) {
     final resultText = widget.item.toolResult;
+    // issue #60 R11：write/edit 的内联 diff 来自**调用参数**，不代表执行成功；失败时
+    // 必须保留真实结果原因（old_string 未找到/沙箱拒绝/read_image 读取失败）。
+    // 红色 Failed 抬头不能替代失败原因。
+    final failed = widget.item.toolError || widget.item.toolStatus == 'failed';
+    if (failed) {
+      // issue #60 recheck-5（R12 交叉场景）：失败也必须是"错误原因 + 通用参数/结果"，
+      // 失败的大 write/edit（diffTruncated/无 diff）在普通模式仍要能看到参数。
+      return [
+        if (resultText.isNotEmpty)
+          _code(L10n.t('错误', 'Error'), resultText)
+        else
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Text(
+              L10n.t('工具失败（无错误详情）', 'Tool failed (no error detail)'),
+              style: TextStyle(fontSize: 11.5, color: Colors.redAccent),
+            ),
+          ),
+        // 结果已作为错误原因展示，这里只补参数，避免重复。
+        ..._genericBody(includeResult: false),
+      ];
+    }
     switch (call.kind) {
       case ToolCardKind.command:
         return [
@@ -7224,27 +7294,25 @@ class _ToolActivityCardState extends State<_ToolActivityCard> {
             ),
           ];
         }
+        // issue #60 R12：缺 diff / 超过 8 KiB 被截断时，按规格回退**通用参数+结果**
+        // （普通模式参数必须可达），而不是只给一句提示。
         if (call.diffTruncated) {
           return [
             Padding(
               padding: const EdgeInsets.only(top: 8),
               child: Text(
                 L10n.t(
-                  'diff 较大，未内联展示（可查看参数/结果）',
-                  'Diff too large to inline (see arguments/result)',
+                  'diff 较大，未内联展示；以下为参数/结果',
+                  'Diff too large to inline; showing arguments/result',
                 ),
                 style: TextStyle(fontSize: 11, color: DshColors.ink3(context)),
               ),
             ),
-            if (resultText.isNotEmpty)
-              _code(L10n.t('结果', 'Result'), resultText),
+            ..._genericBody(),
           ];
         }
-        // read 或没有 diff 的 write/edit：保留只读结果文本。
-        if (resultText.isNotEmpty) {
-          return [_code(L10n.t('结果', 'Result'), resultText)];
-        }
-        return const [];
+        // read 或没有内联 diff 的 write/edit：回退通用参数+结果。
+        return _genericBody();
       case ToolCardKind.search:
         return resultText.isEmpty
             ? const []

@@ -13,6 +13,8 @@ import {
 	summarizeEvent,
 	toolCallSummaryOf,
 	toolCardsCapabilityOf,
+	toolNamesOf,
+	toolResultCallIdOf,
 	toolResultSummaryOf,
 } from "../lib/index.js";
 
@@ -131,10 +133,44 @@ test("result：bash/pwsh 从原始文本末尾解析 exitCode/signal/stopped（�
 	assert.equal(exit.exitCode, 7);
 	assert.equal(result("pwsh", "[killed by signal: SIGTERM]").data.summary.signal, "SIGTERM");
 	assert.equal(result("bash", "[stopped: user cancelled]").data.summary.stopped, "user cancelled");
-	// 结果事件通常不带工具名：标记解析仍应成立。
-	assert.equal(summaryOf(result(undefined, "boom\n[exit code: 2]")).exitCode, 2);
+	// 结果事件不带工具名时不得从内容猜（R14）；由调用方通过 callId→name 关联后传入。
+	assert.equal(summaryOf(result(undefined, "boom\n[exit code: 2]")), undefined);
 	// 非命令工具文本里的普通数字不会被误判成退出码。
 	assert.equal(summaryOf(result("read", "[exit code: 3]")), undefined);
+});
+
+test("R13：只解析结果末尾的宿主终止 trailer（最后一条），不取 stdout 正文中的首个标记", () => {
+	// 真实命令：stdout 打印 expected marker [exit code: 0]，实际退出 7，宿主在末尾追加 7。
+	const misleading = summaryOf(result("bash", "expected marker: [exit code: 0]\nboom\n[exit code: 7]"));
+	assert.equal(misleading.exitCode, 7, "必须使用末尾真实终止状态，而不是 stdout 首个匹配");
+	// 反向：末尾 0 覆盖正文里的非零假标记。
+	const recovered = summaryOf(result("bash", "failed: [exit code: 5]\nrecovered\n[exit code: 0]"));
+	assert.equal(recovered.exitCode, 0);
+	// 标记不在末尾（命令仍在输出/被截断）→ 不猜，缺省。
+	assert.equal(summaryOf(result("bash", "still running [exit code: 7]\nmore output")), undefined);
+	// 多种终止标记互斥：最后一条是 signal 时不再给 exit/stopped。
+	const precedence = summaryOf(result("bash", "[stopped: cancelled]\n[killed by signal: SIGTERM]"));
+	assert.equal(precedence.signal, "SIGTERM");
+	assert.equal(precedence.exitCode, undefined);
+	assert.equal(precedence.stopped, undefined);
+});
+
+test("R14：无工具名/非命令工具不得从内容猜终止状态；callId→name 关联后才可用", () => {
+	// 非命令工具成功结果里正文含 marker：不得下发 exit/signal。
+	assert.equal(summaryOf(result("read", "内容 [exit code: 3]")), undefined);
+	assert.equal(summaryOf(result("grep", "x\n[exit code: 3]")), undefined);
+	// 无名字的结果事件：纯函数不猜；调用方按 callId→tool/call.name 解析后传入才允许。
+	assert.equal(summaryOf(result(undefined, "x\n[exit code: 3]")), undefined);
+	const resolved = summarizeEvent(
+		{ seq: 9, type: "tool/result", data: { callId: "call-x", message: { content: [{ type: "text", text: "x\n[exit code: 3]" }] } } },
+		{ resolvedToolName: "bash" },
+	);
+	assert.equal(resolved.data?.summary?.exitCode, 3);
+	// 结果事件无 name 但会话里有同名 tool/call：/history 用 toolNamesOf 关联。
+	assert.deepEqual([...toolNamesOf([
+		{ type: "tool/call", data: { callId: "c1", name: "bash" } },
+		{ type: "tool/call", data: { callId: "c2", name: "read" } },
+	]).entries()], [["c1", "bash"], ["c2", "read"]]);
 });
 
 test("result：grep/glob 匹配总数优先取 meta.total，缺失时按文本解析，解析不到缺省", () => {
@@ -150,4 +186,34 @@ test("result：grep/glob 匹配总数优先取 meta.total，缺失时按文本�
 
 test("result：meta 形状可识别搜索工具（结果事件无名字时）", () => {
 	assert.equal(summaryOf(result(undefined, "", { shape: "paths", total: 12 })).resultCount, 12);
+});
+
+test("recheck-4：真实 tool/result 形状（message.source.callId / content[].toolCallId）恢复命令状态", () => {
+	// 当前 DSH 的真实形状：event.data 没有 callId；callId 在 message.source.callId、
+	// message.toolCallId 与 content[].toolCallId。
+	const event = {
+		seq: 77,
+		type: "tool/result",
+		data: {
+			turn: 1,
+			step: 1,
+			message: {
+				role: "tool",
+				toolCallId: "call-real",
+				source: { kind: "tool", callId: "call-real" },
+				content: [{
+					type: "tool-result",
+					toolCallId: "call-real",
+					content: [{ type: "text", text: "boom\n[exit code: 7]" }],
+				}],
+			},
+		},
+	};
+	assert.equal(toolResultCallIdOf(event), "call-real");
+	const summarized = summarizeEvent(event, { resolvedToolName: "bash" });
+	assert.equal(summarized.data?.callId, "call-real");
+	assert.equal(summarized.data?.summary?.exitCode, 7, "真实形状必须能恢复 exitCode，否则命令状态丢失");
+	// history/SSE 用同一坐标做 callId→name 关联。
+	const names = toolNamesOf([{ type: "tool/call", data: { callId: "call-real", name: "bash" } }]);
+	assert.equal(names.get(toolResultCallIdOf(event)), "bash");
 });

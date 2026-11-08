@@ -145,10 +145,25 @@ class Api implements GitReadApi {
   String baseUrl = '';
   String token = '';
 
-  /// 同一认证宿主跨地址轮换的稳定标识（通知账本按宿主隔离）；凭据不进入账本。
-  String get notificationScope => crypto.sha256
-      .convert(utf8.encode('${token.isEmpty ? baseUrl : token}\u0000$path'))
-      .toString();
+  /// 宿主稳定身份（bootstrap `plugin.hostId`，issue #60 R15）：同一宿主跨地址轮换
+  /// 保持不变，不同宿主即使口令/挂载路径相同也不同；旧插件不下发时为空。
+  String hostIdentity = '';
+
+  /// 同一认证宿主跨地址轮换的稳定标识（通知账本按宿主隔离）。
+  ///
+  /// issue #60 R15：优先用宿主稳定身份——**不能用可能被显式配置成相同值的访问口令
+  /// 充当宿主身份**（否则两个电脑会互相撤销通知）。旧插件没有 hostId 时回退到既有
+  /// 口令/地址派生（明确降级，保持兼容）。
+  String get notificationScope {
+    if (hostIdentity.isNotEmpty) {
+      return crypto.sha256
+          .convert(utf8.encode('host:$hostIdentity'))
+          .toString();
+    }
+    return crypto.sha256
+        .convert(utf8.encode('${token.isEmpty ? baseUrl : token}\u0000$path'))
+        .toString();
+  }
 
   /// v3.0.0 review：插件挂载路径（默认 /m；由扫描地址/二维码解析，bootstrap 权威校正）。
   String path = '/m';
@@ -363,6 +378,13 @@ class Api implements GitReadApi {
       }());
     }
     final p = d['plugin'];
+    // issue #60 recheck-6（R15）：每次权威 bootstrap 都必须**替换或清空** hostId——
+    // A 新插件 → B 旧插件（即使换地址/口令）沿用 A 的 hostId 会让 B 的通知撤销 A 的。
+    if (p is Map && p['hostId'] is String) {
+      hostIdentity = (p['hostId'] as String).trim();
+    } else {
+      hostIdentity = '';
+    }
     if (p is Map && p['version'] is String) {
       pluginVersion = p['version'] as String;
       unawaited(() async {

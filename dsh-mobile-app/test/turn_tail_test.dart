@@ -77,18 +77,126 @@ void main() {
     test('同轮多次 present 按路径去重、说明取最后一次声明', () {
       final merged = mergeDeliverableDeclarations(
         [
-          const DeliverableFile(name: 'a.ts', display: 'src/a.ts', description: '旧说明', seq: 1, index: 0),
-          const DeliverableFile(name: 'x.png', display: 'x.png', seq: 1, index: 1),
+          const DeliverableFile(name: 'a.ts', display: 'src/a.ts', description: '旧说明', seq: 1, index: 0, id: 'id-a'),
+          const DeliverableFile(name: 'x.png', display: 'x.png', seq: 1, index: 1, id: 'id-x'),
         ],
         [
-          const DeliverableFile(name: 'a.ts', display: 'src/a.ts', description: '新说明', seq: 5, index: 0),
-          const DeliverableFile(name: 'y.md', display: 'docs/y.md', seq: 5, index: 1),
+          const DeliverableFile(name: 'a.ts', display: 'src/a.ts', description: '新说明', seq: 5, index: 0, id: 'id-a'),
+          const DeliverableFile(name: 'y.md', display: 'docs/y.md', seq: 5, index: 1, id: 'id-y'),
         ],
       );
       expect(merged.length, 3);
       final a = merged.firstWhere((file) => file.display == 'src/a.ts');
       expect(a.description, '新说明');
       expect(a.seq, 5);
+    });
+  });
+
+  group('R07 多次 present 按持久坐标取最新', () {
+    test('到达顺序颠倒也以 seq/index 更大的声明为准', () {
+      const newer = DeliverableFile(
+        name: 'a.ts',
+        display: 'src/a.ts',
+        description: 'NEW',
+        seq: 20,
+        index: 0,
+        id: 'same-file',
+      );
+      const older = DeliverableFile(
+        name: 'a.ts',
+        display: 'src/a.ts',
+        description: 'OLD',
+        seq: 10,
+        index: 0,
+        id: 'same-file',
+      );
+      // 实时：先旧后新。
+      final live = mergeDeliverableDeclarations(const [older], const [newer]);
+      expect(live.single.description, 'NEW');
+      expect(live.single.seq, 20);
+      // 历史倒序/补页：先新后旧（旧声明后到）——必须仍保留 NEW/seq20。
+      final replay = mergeDeliverableDeclarations(const [newer], const [older]);
+      expect(replay.single.description, 'NEW', reason: '不能按到达顺序退回旧声明');
+      expect(replay.single.seq, 20);
+      // 三次声明任意顺序都收敛。
+      const oldest = DeliverableFile(
+        name: 'a.ts',
+        display: 'src/a.ts',
+        description: 'OLDEST',
+        seq: 5,
+        index: 1,
+        id: 'same-file',
+      );
+      for (final order in <List<DeliverableFile>>[
+        const [oldest, older, newer],
+        const [newer, oldest, older],
+        const [older, newer, oldest],
+      ]) {
+        final merged = mergeDeliverableDeclarations(
+          order.take(1).toList(),
+          order.skip(1).toList(),
+        );
+        expect(merged.single.description, 'NEW');
+        expect(merged.single.seq, 20);
+      }
+    });
+  });
+
+  group('R08 display 冲突不静默合并', () {
+    test('不同目录同名文件（display 相同、id 不同）都保留', () {
+      final merged = mergeDeliverableDeclarations(
+        const [],
+        const [
+          DeliverableFile(
+            name: 'report.pdf',
+            display: 'report.pdf',
+            seq: 10,
+            index: 0,
+            id: 'id-review-a',
+          ),
+          DeliverableFile(
+            name: 'report.pdf',
+            display: 'report.pdf',
+            seq: 20,
+            index: 0,
+            id: 'id-review-b',
+          ),
+        ],
+      );
+      expect(merged.length, 2, reason: '脱敏 display 相同但身份不同，不得丢掉合法坐标');
+      expect(merged.map((file) => file.id), containsAll(['id-review-a', 'id-review-b']));
+    });
+
+    test('无稳定 id 的旧数据按坐标保守保留，而不是按 display 合并', () {
+      final merged = mergeDeliverableDeclarations(
+        const [],
+        const [
+          DeliverableFile(name: 'report.pdf', display: 'report.pdf', seq: 10, index: 0),
+          DeliverableFile(name: 'report.pdf', display: 'report.pdf', seq: 20, index: 0),
+        ],
+      );
+      expect(merged.length, 2);
+    });
+  });
+
+  group('recheck-10 R08 同名不同 id 的行内链接歧义', () {
+    test('两条同 display 不同 id 的交付文件 → report.pdf 不链接', () {
+      final resolver = TurnFileLinkResolver(
+        sessionId: 's1',
+        presented: const [
+          DeliverableFile(name: 'report.pdf', display: 'report.pdf', seq: 10, index: 0, id: 'id-a'),
+          DeliverableFile(name: 'report.pdf', display: 'report.pdf', seq: 20, index: 0, id: 'id-b'),
+        ],
+      );
+      expect(resolver.resolve('report.pdf'), isNull, reason: '同 display 不同身份是歧义，不得链接第一条');
+      // 唯一条目仍可精确命中。
+      final unique = TurnFileLinkResolver(
+        sessionId: 's1',
+        presented: const [
+          DeliverableFile(name: 'a.ts', display: 'src/a.ts', seq: 1, index: 0, id: 'id-a'),
+        ],
+      );
+      expect(unique.resolve('src/a.ts')?.seq, 1);
     });
   });
 
@@ -176,6 +284,81 @@ void main() {
       expect(isPreviewableImageName('a.gif'), isTrue);
       expect(isPreviewableImageName('a.pdf'), isFalse);
       expect(isPreviewableImageName('noext'), isFalse);
+    });
+  });
+
+  group('round4-2 F2 行内链接按逻辑身份合并', () {
+    test('符号链接条目与目标拥有不同身份，同名 basename 不链接', () {
+      final resolver = TurnFileLinkResolver(
+        sessionId: 's1',
+        presented: const [],
+        changed: const [
+          ChangedFile(seq: 20, index: 0, display: 'one/a.txt', name: 'a.txt', added: 1, deleted: 0, id: 'link-entry'),
+          ChangedFile(seq: 20, index: 1, display: 'two/a.txt', name: 'a.txt', added: 1, deleted: 0, id: 'target-entry'),
+        ],
+      );
+      expect(resolver.resolve('a.txt'), isNull);
+      expect(resolver.resolve('one/a.txt')?.index, 0);
+      expect(resolver.resolve('two/a.txt')?.index, 1);
+    });
+    test('同一 src/a.ts 的 presented+changed 同一服务端 id → 可链接且代表坐标优先 presented', () {
+      final resolver = TurnFileLinkResolver(
+        sessionId: 's1',
+        presented: const [
+          DeliverableFile(
+            name: 'a.ts',
+            display: 'src/a.ts',
+            seq: 10,
+            index: 0,
+            id: 'same-logical',
+          ),
+        ],
+        changed: const [
+          ChangedFile(
+            seq: 20,
+            index: 0,
+            display: 'src/a.ts',
+            name: 'a.ts',
+            added: 1,
+            deleted: 0,
+            id: 'same-logical',
+          ),
+        ],
+      );
+      final hit = resolver.resolve('src/a.ts');
+      expect(hit, isNotNull, reason: '同一逻辑文件跨来源不得误判歧义');
+      expect(hit?.kind, TurnFileKind.presented, reason: '代表坐标优先 presented');
+      expect(hit?.seq, 10);
+    });
+
+    test('旧插件无 id：presented+changed 精确同 display 保守合并；basename 不跨路径合并', () {
+      final legacy = TurnFileLinkResolver(
+        sessionId: 's1',
+        presented: const [
+          DeliverableFile(name: 'a.ts', display: 'src/a.ts', seq: 10, index: 0),
+        ],
+        changed: const [
+          ChangedFile(seq: 20, index: 0, display: 'src/a.ts', name: 'a.ts', added: 1, deleted: 0),
+          ChangedFile(seq: 21, index: 0, display: 'lib/a.ts', name: 'a.ts', added: 1, deleted: 0),
+        ],
+      );
+      expect(legacy.resolve('src/a.ts')?.kind, TurnFileKind.presented);
+      // basename `a.ts` 在 presented 与 changed(lib/a.ts) 间是不同路径，不得合并。
+      expect(legacy.resolve('a.ts'), isNull);
+    });
+
+    test('round5-2：两个 presented + 一个 changed 同 display 仍为歧义 → null', () {
+      final resolver = TurnFileLinkResolver(
+        sessionId: 's1',
+        presented: const [
+          DeliverableFile(name: 'report.pdf', display: 'report.pdf', seq: 10, index: 0),
+          DeliverableFile(name: 'report.pdf', display: 'report.pdf', seq: 20, index: 0),
+        ],
+        changed: const [
+          ChangedFile(seq: 30, index: 0, display: 'report.pdf', name: 'report.pdf', added: 1, deleted: 0),
+        ],
+      );
+      expect(resolver.resolve('report.pdf'), isNull, reason: '每类必须恰好一个去重坐标才允许旧数据合并');
     });
   });
 }

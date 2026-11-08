@@ -289,6 +289,22 @@ function validWorkerChecks(checks, complete = false) {
   }
   return true;
 }
+/**
+ * 阶段错误码边界（issue #60 round5-5；用户文档由 lead 合入后补，这里先固化约定）：
+ * - **install**：只允许 INSTALL_ERROR_CODES = `install-failed` + 6 个
+ *   `host-process-exited-hint-missing-*`（post-install 依赖预检）。install worker
+ *   不执行插件导入自检，因此 runtime-only 的 `host-plugin-import-*` 与其它 HINT_CODES
+ *   出现即视为载荷不可信（docker-output-invalid）。
+ * - **runtime**：只允许 RUNTIME_ERROR_CODES = 基础固定码 + HINT_CODES（含 6 个
+ *   missing-dep 与 3 个 `host-plugin-import-*`）+ `worker-failed` +
+ *   `probe-input-invalid`；`compatibility-check-failed` 必须 exitCode=1，其余非成功码
+ *   exitCode=2。
+ * 两套集合都从各自的单一来源派生；新增诊断码时必须显式选择所属阶段，不能靠
+ * "某处宽数组"自动放行。
+ * @param {'install'|'runtime'} phase 阶段。
+ * @param {number} exitCode 容器退出码（0/1/2）。
+ * @param {unknown} data Docker 日志解析后的结构化载荷。
+ */
 export function parseWorkerOutput(phase, exitCode, data) {
   if (!['install','runtime'].includes(phase) || ![0,1,2].includes(exitCode)) fail('docker-output-invalid');
   if (phase === 'install') {
@@ -942,6 +958,7 @@ export function makeInstallWorker(version) {
 const MISSING_DEPENDENCY_SPECIFIERS = ${JSON.stringify(MISSING_DEPENDENCY_SPECIFIERS)};
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, symlinkSync } from 'node:fs';
+let preflightReported = false;
 try {
   mkdirSync('/tmp/plugin',{recursive:true,mode:0o700});
   execFileSync('tar',['-xf','/source/source.tar','-C','/tmp/plugin','--no-same-owner','--no-same-permissions'],{stdio:'ignore',timeout:30000});

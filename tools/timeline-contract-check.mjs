@@ -206,7 +206,8 @@ const presentedFiles = presentedSummary.data?.files ?? [];
 check(
   "deliverables/presented 只下发 name/display/description（无 path/绝对路径）",
   presentedFiles.length === 4
-    && presentedFiles.every((file) => Object.keys(file).every((key) => ["name", "display", "description"].includes(key)))
+    && presentedFiles.every((file) => Object.keys(file).every((key) => ["id", "name", "display", "description"].includes(key)))
+    && presentedFiles.every((file) => typeof file.id === "string" && /^[0-9a-f]{16}$/.test(file.id))
     && !JSON.stringify(presentedSummary.data).includes("/home/mark")
     && !JSON.stringify(presentedSummary.data).includes("/opt/"),
   JSON.stringify(presentedSummary.data),
@@ -238,6 +239,14 @@ check(
   mod.isTimelineRecord({ seq: 41, type: "workspace/changes", data: { turn: 2 } }) === false
     && mod.isLiveTimelineRecord({ seq: 41, type: "workspace/changes", data: { turn: 2 } }) === false
     && mod.isDetailVisibleType("workspace/changes") === false,
+);
+check(
+  "recordFileId 为不可逆 16 位 hex，presented 与 changes/summary 同源",
+  typeof mod.recordFileId === "function"
+    && /^[0-9a-f]{16}$/.test(mod.recordFileId("/a/b/c.ts"))
+    && mod.recordFileId("/a/b/c.ts") === mod.recordFileId("/a/b/c.ts")
+    && mod.recordFileId("/a/b/c.ts") !== mod.recordFileId("/a/b/d.ts"),
+  String(mod.recordFileId?.("/a/b/c.ts")),
 );
 const tailSignals = mod.turnTailsOf([
   { type: "workspace/changes", data: { turn: 2 } },
@@ -313,16 +322,16 @@ check(
     && toolCallProjection("mystery", "{}") === undefined,
   JSON.stringify([toolCallProjection("bash", "{not json"), toolCallProjection("mystery", "{}")]),
 );
-const toolResultProjection = (text, meta) => mod.summarizeEvent({
+const toolResultProjection = (text, meta, name) => mod.summarizeEvent({
   seq: 51,
   type: "tool/result",
-  data: { message: { content: [{ type: "text", text }] }, ...(meta === undefined ? {} : { meta }) },
+  data: { ...(name === undefined ? {} : { name }), message: { content: [{ type: "text", text }] }, ...(meta === undefined ? {} : { meta }) },
 }).data?.summary;
 check(
   "tool/result 从原始文本标记解析 exitCode/signal（长输出不被 2000 字 clamp 截掉）",
-  toolResultProjection(`${"x".repeat(3000)}\n[exit code: 7]`)?.exitCode === 7
-    && toolResultProjection("[killed by signal: SIGTERM]")?.signal === "SIGTERM",
-  JSON.stringify([toolResultProjection(`${"x".repeat(3000)}\n[exit code: 7]`), toolResultProjection("[killed by signal: SIGTERM]")]),
+  toolResultProjection(`${"x".repeat(3000)}\n[exit code: 7]`, undefined, "bash")?.exitCode === 7
+    && toolResultProjection("[killed by signal: SIGTERM]", undefined, "bash")?.signal === "SIGTERM",
+  JSON.stringify([toolResultProjection(`${"x".repeat(3000)}\n[exit code: 7]`, undefined, "bash"), toolResultProjection("[killed by signal: SIGTERM]", undefined, "bash")]),
 );
 check(
   "tool/result grep/glob 匹配总数：meta 优先、文本兜底、解析不到缺省",
@@ -601,6 +610,8 @@ if (typeof mod.apply === "function" && typeof mod.Config === "function") {
         && tailSummary.json?.files?.[0]?.seq === 2
         && tailSummary.json?.files?.[0]?.index === 0
         && tailSummary.json?.files?.[0]?.name === "a.txt"
+        && typeof tailSummary.json?.files?.[0]?.id === "string"
+        && /^[0-9a-f]{16}$/.test(tailSummary.json?.files?.[0]?.id ?? "")
         && !JSON.stringify(tailSummary.json).includes(turnTailCwd)
         && !("cwd" in (tailSummary.json ?? {})),
       JSON.stringify(tailSummary.json),
