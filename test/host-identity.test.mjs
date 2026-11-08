@@ -289,36 +289,138 @@ test("round5-1 inode 校验：写入后路径被替换，赢家不得返回自�
 	assert.equal(readFileSync(file, "utf8").trim(), other);
 });
 
-test("round6-1 D1：有效隔离文件恢复绝不覆盖并发 wx 发布者", () => {
-	const home = mkdtempSync(join(tmpdir(), "r15-restore-"));
+/**
+ * round7-1 D1：真实 2 进程竞态夹具（与 /tmp/r15-review 的权威 repro 同源）。
+ * A（restorer）与 B（wx 赢家）都是独立子进程，用 flag 文件非阻塞协调：
+ *   A 先把陈旧空文件写成有效 X，再移入 quarantine（onQuarantined 写 Q_DONE 并等 B_WON），
+ *   B 在已释放的路径上赢得 wx（此刻文件为 EMPTY），按需「持锁一段时间后发布」或「直接崩溃」。
+ * 这样 A 的 linkSync 必然命中 EEXIST（B 的空占位文件），真正进入 round6 声称修好、
+ * 而官方旧测试从未执行到的分支；A 子进程 monkeypatch fs.linkSync 统计调用次数（>=1
+ * 证明不再空跑）。
+ * @param {{ crash?: boolean, holdMs?: number }} options
+ */
+async function d1Race({ crash = false, holdMs = 400 } = {}) {
+	const home = mkdtempSync(join(tmpdir(), "r15-r7race-"));
+	const dir = join(home, ".dsh", "mobile-remote");
+	mkdirSync(dir, { recursive: true });
 	const file = hostIdentityFile(home);
-	mkdirSync(join(home, ".dsh", "mobile-remote"), { recursive: true });
+	const X = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 	writeFileSync(file, "", { mode: 0o600 });
 	const old = new Date(Date.now() - 10_000);
 	utimesSync(file, old, old);
-	// A 的观察窗口内有人把文件写成有效身份 X → A 会把它作为 quarantine 移走。
-	const quarantined = "55555555-5555-4555-8555-555555555555";
-	let winnerFromB = null;
+	const F = (n) => join(home, n);
+	const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+	const waitFlag = async (n, ms = 12000) => {
+		const end = Date.now() + ms;
+		while (Date.now() < end) {
+			if (existsSync(F(n))) return true;
+			await sleep(5);
+		}
+		return false;
+	};
 	const pluginUrl = pathToFileURL(new URL("../lib/index.js", import.meta.url).pathname).href;
-	const childCode = `const m = await import(process.env.PLUGIN_URL); process.stdout.write(m.resolveHostIdentity({ home: process.env.TEST_HOME }));`;
-	const resolved = resolveHostIdentity({
-		home,
-		onBeforeRename: () => { writeFileSync(file, `${quarantined}\n`); },
-		onBeforeRestore: () => {
-			// A 把有效文件移入 quarantine、路径短暂空闲；真实 B 进程此刻赢得 wx 并发布 Y。
-			const child = spawnSync(process.execPath, ["--input-type=module", "-e", childCode], {
-				env: { ...process.env, PLUGIN_URL: pluginUrl, TEST_HOME: home },
-				encoding: "utf8",
-			});
-			assert.equal(child.status, 0, child.stderr);
-			winnerFromB = child.stdout.trim();
-		},
-	});
-	assert.match(winnerFromB ?? "", /^[0-9a-f-]{36}$/i, "B 必须已发布有效身份");
-	assert.equal(resolved, winnerFromB, "A 不得覆盖 B 的合法发布，必须返回 B 的 UUID");
-	assert.equal(readFileSync(file, "utf8").trim(), winnerFromB, "磁盘必须是 B 的身份");
-	const leftovers = readdirSync(join(home, ".dsh", "mobile-remote")).filter((name) => name.includes(".quarantine."));
-	assert.deepEqual(leftovers, [], "隔离文件必须被丢弃，不能残留");
+	const env = {
+		...process.env, LIB: pluginUrl, TEST_HOME: home, FILE: file, VALID_Q: X,
+		Q_DONE: F("Q_DONE.flag"), B_WON: F("B_WON.flag"),
+		A_DONE: F("A_DONE.flag"), B_DONE: F("B_DONE.flag"), LINK_COUNT: F("LINK_COUNT.flag"),
+		HOLD_MS: String(holdMs),
+	};
+	// A：restorer（钩子里只用同步等待，B 是独立进程故不阻塞编排线程）。
+	const aCode = `
+import { createRequire, syncBuiltinESMExports } from "node:module";
+import fs0 from "node:fs";
+const require = createRequire(import.meta.url);
+const fs = require("node:fs");
+let linkCalls = 0;
+const origLink = fs.linkSync;
+fs.linkSync = function (...a) { linkCalls++; return origLink.apply(this, a); };
+syncBuiltinESMExports();
+const wait = (p, ms=12000) => { const e=Date.now()+ms; while(Date.now()<e){ if(fs0.existsSync(p)) return true; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5);} return false; };
+const m = await import(process.env.LIB);
+const file = process.env.FILE;
+let outcome;
+try {
+  const id = m.resolveHostIdentity({ home: process.env.TEST_HOME,
+    onBeforeRename: () => { fs0.writeFileSync(file, process.env.VALID_Q + String.fromCharCode(10)); },
+    onQuarantined: () => { fs0.writeFileSync(process.env.Q_DONE, "1"); wait(process.env.B_WON); },
+    onBeforeRestore: () => { wait(process.env.B_WON); } });
+  outcome = "OK:" + id;
+} catch (e) { outcome = "ERR:" + (e?.code ?? e?.message); }
+fs0.writeFileSync(process.env.A_DONE, outcome);
+fs0.writeFileSync(process.env.LINK_COUNT, String(linkCalls));
+`;
+	// B：赢 wx 后「持空文件一段时间再发布」或「直接崩溃，空文件持久」。
+	const bCode = crash ? `
+import fs0 from "node:fs";
+const fd = fs0.openSync(process.env.FILE, "wx", 0o600);
+fs0.writeFileSync(process.env.B_WON, "1");
+process.exit(0);
+` : `
+import { createRequire, syncBuiltinESMExports } from "node:module";
+import fs0 from "node:fs";
+const require = createRequire(import.meta.url);
+const fs = require("node:fs");
+const origWrite = fs.writeSync;
+let patched = false;
+fs.writeSync = function (fd, ...args) {
+  if (!patched && typeof args[0] === "string") {
+    patched = true;
+    fs0.writeFileSync(process.env.B_WON, "1");
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.HOLD_MS));
+  }
+  return origWrite.call(this, fd, ...args);
+};
+syncBuiltinESMExports();
+const m = await import(process.env.LIB);
+try { const id = m.resolveHostIdentity({ home: process.env.TEST_HOME }); fs0.writeFileSync(process.env.B_DONE, "OK:" + id); }
+catch (e) { fs0.writeFileSync(process.env.B_DONE, "ERR:" + (e?.code ?? e?.message)); }
+`;
+	const aChild = spawn(process.execPath, ["--input-type=module", "-e", aCode], { env, stdio: ["ignore", "pipe", "pipe"] });
+	const aClosed = new Promise((r) => aChild.on("close", r));
+	aChild.stderr.on("data", (c) => process.stderr.write("[d1 A] " + String(c)));
+	assert.equal(await waitFlag("Q_DONE.flag"), true, "A 应完成 quarantine（X 已隔离、路径空闲）");
+	const bChild = spawn(process.execPath, ["--input-type=module", "-e", bCode], { env, stdio: ["ignore", "pipe", "pipe"] });
+	const bClosed = new Promise((r) => bChild.on("close", r));
+	bChild.stderr.on("data", (c) => process.stderr.write("[d1 B] " + String(c)));
+	assert.equal(await waitFlag("B_WON.flag"), true, "B 应赢得 wx（空占位文件）");
+	assert.equal(await waitFlag("A_DONE.flag", 9000), true, "A 应在 deadline 内收敛");
+	await aClosed;
+	await bClosed;
+	const aOutcome = readFileSync(F("A_DONE.flag"), "utf8");
+	const bOutcome = crash ? null : readFileSync(F("B_DONE.flag"), "utf8");
+	const linkCalls = Number(readFileSync(F("LINK_COUNT.flag"), "utf8") || "0");
+	const disk = existsSync(file) ? readFileSync(file, "utf8").trim() : "<missing>";
+	const leftovers = readdirSync(dir).filter((n) => n.includes(".quarantine.") || n.includes(".restore."));
+	return { aOutcome, bOutcome, linkCalls, disk, leftovers, X };
+}
+
+test("round7-1 D1：EEXIST 分支真实执行（不空跑），A 收敛到并发 wx 赢家", async () => {
+	// B 赢 wx 后先持空文件，再发布 uuid；A 必须真正走到 linkSync/EEXIST 分支。
+	const { aOutcome, bOutcome, linkCalls, disk, leftovers } = await d1Race({ holdMs: 400 });
+	assert.ok(linkCalls >= 1, `linkSync/EEXIST 分支必须被执行（实测 ${linkCalls} 次调用，0 说明官方旧测试空跑未修）`);
+	assert.match(bOutcome ?? "", /^OK:[0-9a-f-]{36}$/i, "B 必须发布有效身份");
+	const bUuid = bOutcome.slice(3);
+	assert.equal(aOutcome, "OK:" + bUuid, "A 不得覆盖 B 的合法发布，必须收敛到 B 的 UUID");
+	assert.match(disk, /^[0-9a-f-]{36}$/i, "磁盘必须是单一有效 uuid");
+	assert.equal(disk, bUuid, "磁盘身份与 A/B 一致");
+	assert.deepEqual(leftovers, [], "不得残留 quarantine/restore 临时文件");
+});
+
+test("round7-1 D1：B 赢 wx 后崩溃、空文件持久时 A 用隔离里的有效 X 收敛", async () => {
+	const { aOutcome, linkCalls, disk, leftovers, X } = await d1Race({ crash: true });
+	assert.ok(linkCalls >= 1, `崩溃场景也必须真正走到恢复分支（实测 ${linkCalls} 次）`);
+	assert.equal(aOutcome, "OK:" + X, "不得抛 HOST_IDENTITY_LOCK_UNAVAILABLE，必须用隔离里已知有效的 X 收敛");
+	assert.equal(disk, X, "磁盘必须收敛到隔离里恢复出的有效身份 X（不再停留空文件）");
+	assert.deepEqual(leftovers, [], "恢复后不得残留 quarantine/restore 临时文件");
+});
+
+test("round7-1 D1：B 在 3s 窗口内发布（较长持锁）→ A===B 且磁盘单一", async () => {
+	const { aOutcome, bOutcome, disk, leftovers } = await d1Race({ holdMs: 1500 });
+	assert.match(bOutcome ?? "", /^OK:[0-9a-f-]{36}$/i);
+	const bUuid = bOutcome.slice(3);
+	assert.equal(aOutcome, "OK:" + bUuid, "B 在 3s deadline 内发布时 A 必须收敛到 B");
+	assert.equal(disk, bUuid, "磁盘单一有效 uuid");
+	assert.deepEqual(leftovers, []);
 });
 
 test("round6-1 D2：同 inode 原地覆写时 dev+ino 校验必须回读内容，赢家不得返回自己值", () => {

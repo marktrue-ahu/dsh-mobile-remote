@@ -11,7 +11,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, realpathSync, symlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { apply, mobileDisplayPath, renderUnifiedDiffText, turnTailCapabilityOf, turnTailOf, turnTailsOf } from "../lib/index.js";
@@ -336,6 +336,87 @@ test("round6-3 F2：abs/rel 与 rel/abs 混合形状的 presented/changed id 相
 		assert.equal(summary.body.files[0].display, "src/a.ts");
 		assert.ok(!JSON.stringify({ history: history.body, summary: summary.body }).includes(root), `${shape}: 不得泄露绝对路径`);
 	}
+});
+
+/**
+ * round7-1 F2：用可配置的 presented/changed 路径与两处 cwd 驱动真实 apply() 路由。
+ * 返回 presented/changed 的投影、拼合文本（用于断言无绝对路径泄露）与释放函数。
+ */
+async function driveF2({ presentedPath, changedPath, headerCwd, summaryCwd, omitSummaryCwd = false }) {
+	const root = makeWorkspace();
+	const hCwd = headerCwd ?? root;
+	const sCwd = summaryCwd ?? root;
+	const events = [
+		{ seq: 1, type: "turn/start", data: { turn: 2 } },
+		{ seq: 2, type: "workspace/changes", data: { turn: 2 } },
+		{ seq: 3, type: "deliverables/presented", data: { turn: 2, files: [{ path: presentedPath }] } },
+		{ seq: 4, type: "turn/end", data: { turn: 2, reason: { kind: "completed" } } },
+	];
+	const live = { id: "s1", header: { createdAt: 1, cwd: hCwd }, events, snapshotEvents() { return this.events; } };
+	const sessions = { get: (id) => (id === "s1" ? live : undefined), list: () => [live] };
+	const summaryShape = { turn: 2, files: [{ path: changedPath, display: "src/a.ts", added: 1, deleted: 0 }], total: 1, added: 1, deleted: 0 };
+	if (!omitSummaryCwd) summaryShape.cwd = sCwd;
+	const changes = {
+		summary: () => summaryShape,
+		async diff() { return undefined; },
+	};
+	const harness = createHarness({ sessions, workspaceChanges: changes });
+	const history = await call(harness.route, { url: "/m/api/history?sessionId=s1&limit=100" });
+	const summary = await call(harness.route, { url: "/m/api/changes/summary?sessionId=s1&turn=2" });
+	const pf = history.body?.events?.find((e) => e.type === "deliverables/presented")?.data?.files?.[0];
+	const cf = summary.body?.files?.[0];
+	harness.clean();
+	return { root, hCwd, sCwd, pf, cf, text: history.text + summary.text };
+}
+
+test("round7-1 F2：rel/rel 同文本但两处 cwd 文本/基准不同 → presented.id == changed.id", async () => {
+	// 复现 /tmp/f2-review/repro.mjs 2a/2c：header.cwd=root、summary.cwd=root/src，
+	// 两处都记录相对文本 "src/a.ts"。round6 用两处各自 cwd 展开 → 发散；
+	// round7 用会话 base（sessionCwdOf 优先）→ 收敛。
+	const root = makeWorkspace();
+	const nested = join(root, "src");
+	const { pf, cf, text } = await driveF2({
+		presentedPath: "src/a.ts", changedPath: "src/a.ts",
+		headerCwd: root, summaryCwd: nested,
+	});
+	assert.match(pf?.id ?? "", /^[0-9a-f]{16}$/);
+	assert.match(cf?.id ?? "", /^[0-9a-f]{16}$/);
+	assert.equal(pf.id, cf.id, "同一逻辑文件在 rel/rel + cwd 文本/基准不同也必须同一 id");
+	assert.ok(!text.includes(root), "响应不得泄露 root 绝对路径");
+	assert.ok(!text.includes(nested), "响应不得泄露 nested 绝对路径");
+});
+
+test("round7-1 F2：symlinked cwd（presented realpath 绝对 / changed 相对）→ id 相等、display 一致、无泄露", async () => {
+	const physical = realpathSync(makeWorkspace());
+	const aliasParent = mkdtempSync(join(tmpdir(), "turn-tail-alias-"));
+	const alias = join(aliasParent, "link");
+	symlinkSync(physical, alias, "dir");
+	// 真宿主形状：header.cwd=含 symlink 的别名；presented 记录 realpath 绝对路径；
+	// summary.cwd 同为别名（真宿主冻结同值）；changed 记录相对路径。
+	const { pf, cf, text } = await driveF2({
+		presentedPath: join(physical, "src", "a.ts"),
+		changedPath: "src/a.ts",
+		headerCwd: alias,
+		summaryCwd: alias,
+	});
+	assert.equal(pf.id, cf.id, "symlink 别名 vs realpath 绝对路径也必须归一到同一逻辑 id");
+	assert.equal(pf.display, cf.display, "两处 display 必须一致，App 精确链接不丢失");
+	assert.equal(pf.display, "src/a.ts");
+	assert.ok(!text.includes(physical), "响应不得泄露物理真实路径");
+	assert.ok(!text.includes(alias), "响应不得泄露 symlink 别名文本");
+});
+
+test("round7-1 F2：summary.cwd 缺失时用会话 cwd 兜底 → 两 id 相等", async () => {
+	const root = makeWorkspace();
+	// 裁剪/旧宿主不给 summary.cwd：/changes/summary 必须回落到 sessionCwdOf(session)。
+	const { pf, cf, text } = await driveF2({
+		presentedPath: join(root, "src", "a.ts"),
+		changedPath: "src/a.ts",
+		headerCwd: root,
+		omitSummaryCwd: true,
+	});
+	assert.equal(pf.id, cf.id, "summary.cwd 缺失时 changed 必须与 presented 共享会话 cwd 基准");
+	assert.ok(!text.includes(root), "响应不得泄露 root 绝对路径");
 });
 
 test("changes/summary：absent / unavailable（休眠、服务缺失、摘要失效）", async () => {
