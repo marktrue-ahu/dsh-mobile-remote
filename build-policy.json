@@ -131,6 +131,15 @@
       "createdAt": "2026-11-07T13:04:21.435Z",
       "note": "dist-tags verified",
       "updatedAt": "2026-11-07T13:09:39.122Z"
+    },
+    {
+      "tag": "v3.2.4-alpha.8",
+      "pluginVersion": "3.2.4-alpha.8",
+      "carrierVersion": "3.2.4-alpha.8-app",
+      "build": 40,
+      "integrity": "sha512-UPogarSnlIihZM7PDNmKvEXUkSm1Qndr/rUyL06yK8lj3AgAOiMfoXup+TYfadktAS+i1ha8FiePl4HGF9Ob9w==",
+      "status": "submitted",
+      "createdAt": "2026-11-08T01:45:05.998Z"
     }
   ]
 }
