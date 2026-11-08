@@ -323,7 +323,11 @@ export function dockerCliDriver(execute) {
   const run = async (args, signal, cleanup = false) => {
     const result = await execute(args,signal,cleanup);
     if (!result || result.timedOut || result.overflow || result.code !== 0 || typeof result.stdout !== 'string') fail('docker-operation-failed');
-    return result.stdout.trim();
+    // TEMPORARY DIAGNOSTIC (#62): `docker logs` writes the container's own stderr to our
+    // stderr. Merge it so the worker's redacted HOST_DIAG line is visible; remove with
+    // the rest of the diagnostic.
+    const merged = typeof result.stderr === 'string' && result.stderr.length > 0 ? result.stdout + '\n' + result.stderr : result.stdout;
+    return merged.trim();
   };
   const validId = id => { if (typeof id !== 'string' || !/^[a-f0-9]{64}$/.test(id)) fail('docker-identity-invalid'); };
   return {
