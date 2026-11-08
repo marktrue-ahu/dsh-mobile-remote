@@ -473,6 +473,19 @@ test("turn-file：presented 文本字节 + Range/HEAD/ETag，且不接受客户�
 	assert.equal(cached.status, 304);
 });
 
+test("R02 recheck-2：/turn-file 真实方法契约 = GET/HEAD（POST 不落到该端点）", async () => {
+	const f = makeFixture();
+	const route = createHarness({ sessions: f.sessions, workspaceChanges: f.changes.service }).route;
+	const url = "/m/api/turn-file?sessionId=s1&kind=presented&seq=3&index=0";
+	const head = await call(route, { url, method: "HEAD" });
+	assert.equal(head.status, 200);
+	assert.ok(Number(head.headers["content-length"]) > 0);
+	const post = await call(route, { url, method: "POST" });
+	assert.equal(post.status, 404, `POST /turn-file 不得被当作 GET 处理：${JSON.stringify(post.body)}`);
+	const get = await call(route, { url });
+	assert.equal(get.status, 200);
+});
+
 test("turn-file：presented 工作区外绝对路径、相对记录路径与休眠会话", async () => {
 	const f = makeFixture();
 	const query = {

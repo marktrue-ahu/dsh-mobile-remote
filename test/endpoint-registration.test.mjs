@@ -147,4 +147,23 @@ test("本次新增的自更新端点已登记并保护 NPM check/prepare/log API
 		assert.equal(byPath.get(path)?.methods, methods, `${path} method mismatch`);
 		assert.equal(byPath.get(path)?.auth, "required", `${path} must require mobile auth`);
 	}
+
+test("R02 recheck-2：头部 GET/HEAD 抽成 GET/HEAD；块内 HEAD 分支不误判整端点", () => {
+	const fake = `
+		if (rest === "/x" && (method === "GET" || method === "HEAD")) { return; }
+		if (rest === "/y") {
+			if (method === "GET" || method === "HEAD") { return; }
+			if (method === "POST") { return; }
+		}
+	`;
+	const methods = extractEndpointDetails(fake);
+	assert.equal(methods.get("/x"), "GET/HEAD");
+	assert.equal(methods.get("/y"), "GET/POST", "含显式 POST 的端点不应只报 GET/HEAD");
+});
+
+test("R02 recheck-2：/turn-file 抽取与登记都是 GET/HEAD（真实分派含 HEAD）", () => {
+	assert.equal(extractEndpointDetails(source).get("/turn-file"), "GET/HEAD");
+	const entry = REGISTERED_ENDPOINTS.find((e) => e.path === "/turn-file");
+	assert.equal(entry?.methods, "GET/HEAD");
+});
 });
