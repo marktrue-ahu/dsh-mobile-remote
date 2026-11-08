@@ -1303,3 +1303,17 @@ test("recheck-8：install 缺依赖只输出一份 JSON 且保留具体诊断码
 	assert.equal(await driver.create(["create", "--name", name]), id);
 	assert.deepEqual(await driver.wait(id, undefined, "install"), { exitCode: 2, ok: false, checks: [], errorCode: missing });
 });
+
+test("recheck-9：runtime 缺依赖具体码在下游白名单中可归因", async () => {
+	const missingCodes = MISSING_DEPENDENCY_SPECIFIERS.map(([, code]) => code);
+	assert.equal(missingCodes.length, 6);
+	for (const code of missingCodes) {
+		// parseWorkerOutput 的 runtime 白名单必须接受具体 missing-* 码（旧实现只认通用码）。
+		const parsed = parseWorkerOutput("runtime", 2, { ok: false, errorCode: code, checks: ["auth", "bootstrap", "diagnostics"] });
+		assert.equal(parsed.errorCode, code);
+	}
+	// 生成的 runtime worker catch 白名单同样补上（否则具体码会被降级成 worker-failed）。
+	const worker = makeRuntimeWorker();
+	assert.match(worker, /\.\.\.MISSING_DEPENDENCY_SPECIFIERS\.map/);
+	assert.match(worker, /host-process-exited-hint-missing-qrcode|MISSING_DEPENDENCY_SPECIFIERS/);
+});
