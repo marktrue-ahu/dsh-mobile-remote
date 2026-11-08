@@ -124,8 +124,12 @@ jobs:
           set -u
           mkdir -p "$RUNNER_TEMP/canary-results"
           # 不上传或输出被测宿主的原始日志；smoke 负责超时、脱敏及只清理自己的进程。
-          node tools/host-canary/smoke.mjs --host-version "$HOST_VERSION" --plugin-root "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/canary-results/first.json" > /dev/null 2>&1
+          # TEMPORARY DIAGNOSTIC (#62): surface ONLY lines the canary itself marks with
+          # HOST_DIAG (already redacted inside the worker). All other stderr is discarded,
+          # preserving the original no-raw-output guarantee.
+          node tools/host-canary/smoke.mjs --host-version "$HOST_VERSION" --plugin-root "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/canary-results/first.json" > /dev/null 2>"$RUNNER_TEMP/canary-results/first.err"
           first=$?
+          grep 'HOST_DIAG: ' "$RUNNER_TEMP/canary-results/first.err" 2>/dev/null || true
           if [ "$first" -ne 0 ]; then
             node tools/host-canary/smoke.mjs --host-version "$HOST_VERSION" --plugin-root "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/canary-results/second.json" > /dev/null 2>&1
             second=$?
