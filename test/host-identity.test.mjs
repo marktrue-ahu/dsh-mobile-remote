@@ -320,3 +320,19 @@ test("round6-1 D1：有效隔离文件恢复绝不覆盖并发 wx 发布者", ()
 	const leftovers = readdirSync(join(home, ".dsh", "mobile-remote")).filter((name) => name.includes(".quarantine."));
 	assert.deepEqual(leftovers, [], "隔离文件必须被丢弃，不能残留");
 });
+
+test("round6-1 D2：同 inode 原地覆写时 dev+ino 校验必须回读内容，赢家不得返回自己值", () => {
+	const home = mkdtempSync(join(tmpdir(), "r15-inplace-"));
+	const file = hostIdentityFile(home);
+	mkdirSync(join(home, ".dsh", "mobile-remote"), { recursive: true });
+	const other = "66666666-6666-4666-8666-666666666666";
+	const resolved = resolveHostIdentity({
+		home,
+		onBeforeInodeCheck: () => {
+			// O_TRUNC 原地覆写同一 inode：dev/ino 不变，只有内容/size 变化。
+			writeFileSync(file, `${other}\n`);
+		},
+	});
+	assert.equal(resolved, other, "同 inode 原地覆写必须被回读内容发现，不能返回自己的 UUID");
+	assert.equal(readFileSync(file, "utf8").trim(), other);
+});
