@@ -55,10 +55,10 @@ export async function runCanary(options, adapter) {
 
 const children = new Set();
 let interrupted = false;
-function command(bin, args, {cwd, env, timeout = 180000, outputFd, signal, allowAfterInterrupt = false, maxOutput = 8192} = {}) {
+function command(bin, args, {cwd, env, timeout = 180000, outputFd, signal, allowAfterInterrupt = false, maxOutput = 8192, captureStderr = false} = {}) {
   return new Promise((resolvePromise, reject) => {
     if (interrupted && !allowAfterInterrupt) return reject(new CanaryError('interrupted'));
-    const child = spawn(bin, args, {cwd, env, detached:true, stdio:['ignore',outputFd ?? 'pipe','pipe']});
+    const child = spawn(bin, args, {cwd, env, detached:true, stdio:['ignore',outputFd ?? 'pipe',captureStderr ? 'pipe' : 'ignore']});
     children.add(child);
     let stdout = '', stderr = '', settled = false, timedOut = false, overflow = false;
     child.stdout?.on('data', data => {
@@ -279,7 +279,7 @@ export async function createDockerExecutor(root, runnerEnv, invoke = command) {
         args[0] === 'ps' && args.length === 7 && args[1] === '--all' && args[2] === '--no-trunc' && args[3] === '--filter' && args[4] === `id=${id}` && args[5] === '--format' && args[6] === '{{.ID}}';
       if (!valid || !authorized.has(id)) fail('docker-cleanup-unauthorized');
     }
-    return invoke('/usr/bin/docker',args,{cwd:root,env,timeout:310000,signal,allowAfterInterrupt:cleanup,maxOutput:args[0] === 'inspect' ? 65536 : 8192});
+    return invoke('/usr/bin/docker',args,{cwd:root,env,timeout:310000,signal,allowAfterInterrupt:cleanup,maxOutput:args[0] === 'inspect' ? 65536 : 8192,captureStderr:args[0] === 'logs'});
   };
   execute[CLEANUP_AUTH] = id => { if (!/^[a-f0-9]{64}$/.test(id)) fail('docker-identity-invalid'); authorized.add(id); };
   return execute;

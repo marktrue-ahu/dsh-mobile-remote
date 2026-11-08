@@ -86,7 +86,7 @@ test('real command capture -> Docker logs -> validated driver diagnostic -> work
   const outputFile = join(root,'cli.stderr');
   const harness = `import fs from 'node:fs';
     import {runMockDockerCommand,dockerCliDriver} from ${JSON.stringify(new URL('../tools/host-canary/smoke.mjs',import.meta.url).href)};
-    const driver=dockerCliDriver(args=>runMockDockerCommand(${JSON.stringify(binary)},args,{env:{PATH:process.env.PATH},timeout:3000}));
+    const driver=dockerCliDriver(args=>runMockDockerCommand(${JSON.stringify(binary)},args,{env:{PATH:process.env.PATH},timeout:3000,captureStderr:args[0]==='logs'}));
     const result=await driver.wait(${JSON.stringify(id)},undefined,'runtime');process.stdout.write(JSON.stringify(result));`;
   const result = spawnSync(process.execPath,['--input-type=module','--eval',harness],{encoding:'utf8',timeout:10000});
   assert.equal(result.status,0,result.stderr);
@@ -185,7 +185,7 @@ test('actual workflow Bash retries and filters both diagnostics without uploadin
   for(const name of ['diagnostics.mjs','print-diagnostics.mjs']) await copyFile(join(repo,'tools/host-canary',name),join(tool,name));
   await writeFile(join(tool,'smoke.mjs'),`import {writeFileSync} from 'node:fs';
     import {runMockDockerCommand,dockerCliDriver} from ${JSON.stringify(new URL('../tools/host-canary/smoke.mjs',import.meta.url).href)};
-    const driver=dockerCliDriver(args=>runMockDockerCommand(${JSON.stringify(binary)},args,{env:{PATH:process.env.PATH},timeout:3000}));
+    const driver=dockerCliDriver(args=>runMockDockerCommand(${JSON.stringify(binary)},args,{env:{PATH:process.env.PATH},timeout:3000,captureStderr:args[0]==='logs'}));
     const result=await driver.wait(${JSON.stringify(id)},undefined,'runtime');
     const out=process.argv[process.argv.indexOf('--out')+1];writeFileSync(out,JSON.stringify(result));process.exit(2);`);
   const yml=await readFile(join(repo,'.github/workflows/host-compatibility-canary.yml'),'utf8');
