@@ -78,6 +78,11 @@ FORBIDDEN_PATHS=(AGENTS.md AGENT-RULES.md CONTEXT.md docs/adr docs/agents docs/d
 init_state_dirs() { mkdir -p "$TASKS_DIR" "$LOCK_DIR" "$REPORTS_DIR"; }
 
 audit() { # audit <事件> <详情...>
+  # 自测注入：只允许在合成门禁上下文；生产设置该变量会被拒绝，用于验证"审计失败"检查本身。
+  if [ "${DSH_WT_TEST_REFRESH_AUDIT_FAIL:-0}" = "1" ]; then
+    synthetic_gate_allowed || die "拒绝在真实仓库/真实状态目录使用 refresh-baseline 测试注入变量（DSH_WT_TEST_REFRESH_*）；仅合成门禁自测可用"
+    return 1
+  fi
   init_state_dirs
   printf '%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$WHOAMI_ID" "$1" "${2:-}" >>"$AUDIT_LOG"
 }
@@ -114,6 +119,18 @@ branch_matches_target() { # <develop|upstream-main> <branch>
 }
 
 atomic_json_write() { # atomic_json_write <文件>；通过 stdin 接收 JSON，原子替换
+  # 自测注入（仅合成门禁上下文；生产设置即拒绝）：
+  #   =1         模拟替换前失败（不写文件，返回非 0）
+  #   =uncertain 正常写入后返回非 0（模拟 replace 后 fsync/确认失败）
+  local inject="${DSH_WT_TEST_REFRESH_WRITE_FAIL:-0}"
+  if [ "$inject" != "0" ]; then
+    synthetic_gate_allowed || die "拒绝在真实仓库/真实状态目录使用 refresh-baseline 测试注入变量（DSH_WT_TEST_REFRESH_*）；仅合成门禁自测可用"
+    [ "$inject" = "1" ] && return 1
+    if [ "$inject" = "corrupt" ]; then
+      printf 'not json\n' >"$1"
+      return 1
+    fi
+  fi
   python3 -c 'import json,os,sys,tempfile
 path=sys.argv[1]; obj=json.loads(sys.stdin.read()); directory=os.path.dirname(path) or "."
 fd,tmp=tempfile.mkstemp(prefix="."+os.path.basename(path)+".",suffix=".tmp",dir=directory)
@@ -127,6 +144,10 @@ except BaseException:
  try: os.unlink(tmp)
  except OSError: pass
  raise' "$1"
+  local rc=$?
+  [ "$rc" -ne 0 ] && return "$rc"
+  [ "$inject" = "uncertain" ] && return 1
+  return 0
 }
 
 json_set() { # json_set <文件> <点路径> <值>；原子更新，调用者应持任务锁
@@ -321,6 +342,14 @@ synthetic_gate_allowed() {
   is_real_repo_context && return 1
   return 0
 }
+# 测试注入（refresh-baseline selftest 用）只允许在合成门禁上下文；任何命令入口统一拒绝，
+# 否则全局 audit/atomic_json_write 的钩子会让 deliver/authorize 等命令在真实仓库里
+# 在"已写摘要/已更新登记"之后才失败（issue #58 评审）。
+if [ "${DSH_WT_TEST_REFRESH_WRITE_FAIL:-0}" != "0" ] || [ "${DSH_WT_TEST_REFRESH_AUDIT_FAIL:-0}" = "1" ]; then
+  synthetic_gate_allowed || \
+    die "拒绝在真实仓库/真实状态目录使用 refresh-baseline 测试注入变量（DSH_WT_TEST_REFRESH_*）；仅合成门禁自测可用"
+fi
+
 gate_mode_expected() { # 当前上下文允许/期望的门禁模式
   if synthetic_gate_allowed; then printf 'synthetic'; else printf 'required'; fi
 }
@@ -432,6 +461,21 @@ require_authorization() { # require_authorization <issue> <动作> <scope SHA>
   scope="$(json_get "$f" "authorizations.$2.scope_sha")"
   [ -n "$granted" ] && [ "$scope" = "$3" ] || \
     die "缺少或过期授权：$2（issue #$1，要求提交 $3）。先取得用户明确批准并登记该提交范围"
+}
+
+# 刷新基线必须是"用户批准 + 绑定当前 HEAD"的一次性授权：它清空全部验证/交付证据，
+# 因此同一份授权不能被反复使用（绑定范围没变时重复刷新要重新取得用户批准）。
+require_refresh_authorization() { # <issue> <当前 HEAD>
+  local f granted scope used
+  f="$(task_file "$1")"
+  granted="$(json_get "$f" authorizations.refresh-baseline.granted_at)"
+  scope="$(json_get "$f" authorizations.refresh-baseline.scope_sha)"
+  used="$(json_get "$f" authorizations.refresh-baseline.used_at)"
+  if [ -z "$granted" ] || [ "$scope" != "$2" ]; then
+    die "缺少或过期授权：refresh-baseline（issue #$1，要求绑定当前提交 $2）。先取得用户明确批准并登记：tools/worktree.sh authorize <issue> refresh-baseline <理由>"
+  fi
+  [ -z "$used" ] || \
+    die "refresh-baseline 授权已于 $used 使用过；再次刷新基线需要新的用户授权（绑定当前提交 $2）"
 }
 
 task_has_valid_gate_evidence() { # task_has_valid_gate_evidence <task file> <sha>
@@ -1338,11 +1382,11 @@ cmd_authorize() {
   [[ "$issue" =~ ^[1-9][0-9]{0,9}$ ]] || die "issue 必须是正整数"
   [[ "$note" != *$'\n'* && "$note" != *$'\r'* && "$note" != *$'\t'* ]] || die "理由不能包含换行或控制分隔符"
   case "$action" in
-    push|force-push|rebase|integrate|cleanup|branch-delete|release|deploy|restart|takeover) ;;
+    push|force-push|rebase|refresh-baseline|integrate|cleanup|branch-delete|release|deploy|restart|takeover) ;;
     *) die "未知动作：$action" ;;
   esac
   case "$action" in
-    integrate|cleanup|branch-delete|release|deploy|restart|force-push|takeover) require_role_integrator ;;
+    integrate|cleanup|branch-delete|release|deploy|restart|force-push|takeover|refresh-baseline) require_role_integrator ;;
   esac
   require_task "$issue"
   task_lock_acquire "$issue"
@@ -1371,6 +1415,159 @@ PY
   audit authorize "issue=$issue action=$action scope=$scope recorded_by=$WHOAMI_ID note=$note"
   ok "已记录授权意向：issue #$issue → $action，绑定 ${scope:0:12}"
   warn "脚本记录授权与调用者自述，无法验证是否确由用户批准；必须以对话中的用户明确批准为准"
+  task_lock_release
+}
+
+# ── refresh-baseline（issue #58）──
+# rebase 到前进后的目标远端分支后，任务登记里的 baseline 仍是建树时的 SHA，deliver 会把
+# **上游继承**的决策文档算作分支改动而误拦。这里提供受控入口：只允许把基线**向前**移动到
+# 目标远端分支（github/develop；upstream-main 任务为 github/main）历史内的提交，且
+# 旧基线必须是新基线的祖先（防任意跳变）、新基线必须已是当前 HEAD 的祖先（即确为 rebase）。
+# 前置：主目录/工作树干净、HEAD 与授权绑定的 SHA 一致、分支/路径与登记匹配。
+# 刷新会清空全部验证/交付证据（等同 create 后未验证），必须重新 verify 才能 deliver。
+cmd_refresh_baseline() {
+  local issue="${1:-}" candidate="${2:-}"
+  [ -n "$issue" ] || die "用法：tools/worktree.sh refresh-baseline <issue> [新基线 SHA]
+新基线省略时取 fetch 后的 github/<目标分支> 最新提交；新基线必须是目标远端分支历史内、旧基线的后代、当前 HEAD 的祖先。
+必须先由用户批准并登记：tools/worktree.sh authorize <issue> refresh-baseline <理由>"
+  [[ "$issue" =~ ^[1-9][0-9]{0,9}$ ]] || die "issue 必须是正整数"
+  [ -z "$candidate" ] || [[ "$candidate" =~ ^[0-9a-f]{40}$ ]] || \
+    die "新基线必须是完整 40 位提交 SHA（或省略以采用 github/<目标分支> 最新）"
+  # 测试注入必须在任何状态读取/写入之前 fail-closed：否则 AUDIT_FAIL 会在"已更新登记、
+  # 已清证据"之后才在 audit() 里被拒绝，等于生产里伪造了一次真实刷新（issue #58 评审）。
+  if [ "${DSH_WT_TEST_REFRESH_WRITE_FAIL:-0}" != "0" ] || [ "${DSH_WT_TEST_REFRESH_AUDIT_FAIL:-0}" = "1" ]; then
+    synthetic_gate_allowed || \
+      die "拒绝在真实仓库/真实状态目录使用 refresh-baseline 测试注入变量（DSH_WT_TEST_REFRESH_*）；仅合成门禁自测可用"
+  fi
+  require_task "$issue"
+  task_lock_acquire "$issue"
+  local task; task="$(task_file "$issue")"
+  local path branch target baseline_ref status old_baseline head_start
+  path="$(json_get "$task" path)"; branch="$(json_get "$task" branch)"
+  target="$(task_target "$task")"
+  baseline_ref="$(json_get "$task" baseline_ref)"
+  [ -n "$baseline_ref" ] || { [ "$target" = upstream-main ] && baseline_ref=main || baseline_ref=develop; }
+  case "$baseline_ref" in develop|main) ;; *) die "任务目标分支无效：$baseline_ref" ;; esac
+  status="$(json_get "$task" status)"
+  case "$status" in integrated|cleaned) die "任务已集成/清理，不再接受功能树基线刷新" ;; esac
+  # 分支归属：读工作树**实际**分支，拒绝 detached HEAD / 同 SHA 的其它分支（issue #58 评审）。
+  local actual_branch
+  actual_branch="$(gitq -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  [ -n "$actual_branch" ] && [ "$actual_branch" != "HEAD" ] || \
+    die "工作树处于分离 HEAD（detached）；refresh-baseline 只接受登记分支 $branch"
+  [ "$actual_branch" = "$branch" ] || \
+    die "工作树当前分支 $actual_branch 与登记分支 $branch 不一致；拒绝刷新基线"
+  [ "$(branch_head "$branch")" = "$(gitq -C "$path" rev-parse HEAD)" ] || \
+    die "登记分支 $branch 的头部与工作树 HEAD 不一致；拒绝刷新基线"
+  # 刷新会清空证据并改共享登记，与 init 同级只允许登记写入者（或已记录的 takeover）。
+  require_writer "$issue" "$path" "$branch"
+
+  # 前置：主目录与工作树都干净；HEAD 固定；授权必须绑定这个 HEAD。
+  require_clean_tree "$MAIN_DIR" "refresh-baseline（主目录）"
+  require_clean_tree "$path" "refresh-baseline（工作树）"
+  head_start="$(gitq -C "$path" rev-parse HEAD)"
+  require_refresh_authorization "$issue" "$head_start"
+
+  # 新基线只能来自目标远端分支：先 fetch 权威引用，再核对三条祖先关系（fail-closed）。
+  gitq -C "$path" fetch --quiet --prune github "+refs/heads/$baseline_ref:refs/remotes/github/$baseline_ref" || \
+    die "无法 fetch github/$baseline_ref；不能证明新基线来自目标分支，刷新已停止"
+  local remote_sha new_baseline
+  remote_sha="$(gitq -C "$path" rev-parse --verify -q "github/$baseline_ref^{commit}" 2>/dev/null)" || \
+    die "缺少 github/$baseline_ref；拒绝猜测新基线"
+  new_baseline="${candidate:-$remote_sha}"
+  gitq -C "$path" rev-parse --verify -q "$new_baseline^{commit}" >/dev/null || \
+    die "新基线不是可解析的提交：$new_baseline"
+  old_baseline="$(json_get "$task" baseline)"
+  [ -n "$old_baseline" ] || die "任务登记缺少 baseline，无法证明是前进而非跳变"
+  [ "$new_baseline" != "$old_baseline" ] || \
+    die "新基线与旧基线相同（$old_baseline）；无需刷新，也不会清空证据"
+  gitq -C "$path" merge-base --is-ancestor "$new_baseline" "github/$baseline_ref" || \
+    die "新基线 ${new_baseline:0:12} 不在 github/$baseline_ref 的可达历史中，拒绝登记"
+  gitq -C "$path" merge-base --is-ancestor "$old_baseline" "$new_baseline" || \
+    die "旧基线 ${old_baseline:0:12} 不是新基线 ${new_baseline:0:12} 的祖先：拒绝任意跳变"
+  gitq -C "$path" merge-base --is-ancestor "$new_baseline" "$head_start" || \
+    die "新基线 ${new_baseline:0:12} 不是当前 HEAD 的祖先：分支并未 rebase 到该基线"
+
+  # 写入前再确认现场未变（fetch 是耗时段）：HEAD、干净树、实际分支都要重查。
+  [ "$(gitq -C "$path" rev-parse HEAD)" = "$head_start" ] || die "刷新期间 HEAD 变化，拒绝写入"
+  local branch_now; branch_now="$(gitq -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  [ "$branch_now" = "$branch" ] || die "刷新期间工作树分支变化（${branch_now:-detached}），拒绝写入"
+  [ "$(branch_head "$branch")" = "$head_start" ] || die "刷新期间登记分支 $branch 的头部变化，拒绝写入"
+  require_clean_tree "$path" "refresh-baseline（写入前）"
+  require_clean_tree "$MAIN_DIR" "refresh-baseline（写入前）"
+  local reason; reason="$(json_get "$task" authorizations.refresh-baseline.note)"
+  # 写前快照：用 sha256 摘要 + JSON 可解析性双重校验（不能把读失败/尾部换行差异当成"未变"）。
+  local task_before_digest="" task_before_valid=0
+  if task_before_digest="$(sha256sum "$task" 2>/dev/null | awk '{print $1}')" && [ -n "$task_before_digest" ]; then
+    if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$task" 2>/dev/null; then
+      task_before_valid=1
+    fi
+  fi
+  local write_rc=0
+  if ! { python3 - "$task" "$old_baseline" "$baseline_ref" "$new_baseline" "$WHOAMI_ID" "$reason" "$head_start" <<'PY' | atomic_json_write "$task"
+import datetime,json,sys
+f,old,old_ref,new,by,reason,head=sys.argv[1:8]
+now=datetime.datetime.now().strftime("%F %T")
+with open(f,encoding="utf-8") as src: d=json.load(src)
+history=d.get("baseline_history")
+if not isinstance(history,list): history=[]
+history.append({"baseline":old,"baseline_ref":old_ref,"replaced_at":now,"replaced_by":by,
+                "new_baseline":new,"note":reason,"scope_head":head})
+d["baseline_history"]=history
+d["baseline"]=new
+d["baseline_ref"]=old_ref
+d["baseline_updated_at"]=now
+d["baseline_updated_by"]=by
+# 旧基线下的验证/交付证据全部作废：与 create 后未验证一致，必须重新 verify。
+for key in ("verification_state","verification_attempt_sha","verification_run_id",
+            "last_verified_sha","last_report","last_failed_sha","last_failed_gates",
+            "baseline_verification_state","baseline_attempt_sha","baseline_run_id",
+            "last_baseline_report","last_baseline_sha","last_baseline_failed_gates",
+            "delivered_sha","delivered_at"):
+    d.pop(key,None)
+# 门禁例外绑定旧基线的实测报告；基线变了就一并作废（要重新 verify-baseline + 用户授权）。
+auth=d.setdefault("authorizations",{})
+auth.pop("exception",None)
+grant=auth.setdefault("refresh-baseline",{})
+grant.update({"used_at":now,"used_by":by,"used_for_baseline":new})
+# 阶段：还没进验证阶段的任务保持 created/initialized（不阻断后续 init）；
+# 已进入验证/交付阶段的任务回到"未验证"的新状态。
+prev=d.get("status")
+d["status"]=prev if prev in ("created","initialized") else "baseline-refreshed"
+json.dump(d,sys.stdout,ensure_ascii=False)
+PY
+  }; then write_rc=1; fi
+  if [ "$write_rc" -ne 0 ]; then
+    local task_after_digest="" task_after_valid=0
+    if task_after_digest="$(sha256sum "$task" 2>/dev/null | awk '{print $1}')" && [ -n "$task_after_digest" ]; then
+      if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$task" 2>/dev/null; then
+        task_after_valid=1
+      fi
+    fi
+    if [ "$task_before_valid" = "1" ] && [ "$task_after_valid" = "1" ] && \
+       [ "$task_after_digest" = "$task_before_digest" ]; then
+      audit refresh-baseline "issue=$issue result=write-failed old=$old_baseline new=$new_baseline head=$head_start" || true
+      die "刷新基线写入失败：登记文件摘要未变且可解析（旧基线/旧证据保留），可修复后重试"
+    fi
+    audit refresh-baseline "issue=$issue result=write-uncertain old=$old_baseline new=$new_baseline head=$head_start" || true
+    die "刷新写入结果不确定（登记文件已变化或无法读取）：请人工核对 tasks/$issue.json 与旧证据后重新 verify"
+  fi
+  local head_end; head_end="$(gitq -C "$path" rev-parse HEAD)"
+  local branch_end; branch_end="$(gitq -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  if [ "$branch_end" != "$branch" ]; then
+    audit refresh-baseline "issue=$issue result=branch-changed old=$old_baseline new=$new_baseline head=$head_start" || true
+    die "刷新写入期间工作树分支变化（$branch → ${branch_end:-detached}）：基线已更新且旧证据已清空；请确认现场后重新 verify"
+  fi
+  if [ "$head_end" != "$head_start" ]; then
+    audit refresh-baseline "issue=$issue result=head-changed old=$old_baseline new=$new_baseline"
+    die "刷新写入期间 HEAD 变化（${head_start:0:12} → ${head_end:0:12}）：基线已更新且旧证据已清空；请确认现场后重新 verify"
+  fi
+  if ! audit refresh-baseline "issue=$issue target=$target ref=$baseline_ref old=$old_baseline new=$new_baseline head=$head_start by=$WHOAMI_ID note=$reason"; then
+    die "登记已刷新且旧证据已清空，但审计写入失败（audit.log 不可写）；请人工补记 refresh-baseline 审计后再继续"
+  fi
+  ok "已刷新基线：${old_baseline:0:12} → ${new_baseline:0:12}（github/$baseline_ref，绑定当前 HEAD ${head_start:0:12}）"
+  warn "旧验证/交付证据已清空、交付状态回到未验证/未交付；必须重新 verify 才能 deliver"
+  info "下一步：tools/worktree.sh verify（若新基线有红灯，再 verify-baseline + authorize-exception）"
   task_lock_release
 }
 
@@ -1553,6 +1750,8 @@ cmd_status() {
     printf 'issue #%s  [%s]\n' "$issue" "$(json_get "$f" status)"
     printf '  目标 %s\n  分支 %s\n  路径 %s\n  写入者 %s\n  基线 %s (%s)\n' \
       "$(task_target "$f")" "$(json_get "$f" branch)" "$(json_get "$f" path)" "$(json_get "$f" writer)" "$(json_get "$f" baseline)" "$(json_get "$f" baseline_ref)"
+    local bupd; bupd="$(json_get "$f" baseline_updated_at)"
+    [ -n "$bupd" ] && printf '  基线更新 %s（%s）\n' "$bupd" "$(json_get "$f" baseline_updated_by)"
     local dep; dep="$(json_get "$f" depends_on)"
     [ -n "$dep" ] && printf '  ⚠ 依赖分支 %s@%s（用户批准的例外）\n' "$dep" "$(json_get "$f" depends_on_sha | cut -c1-12)"
     local auth; auth="$(json_get "$f" authorizations)"
@@ -1577,6 +1776,8 @@ usage() {
   tools/worktree.sh init                     # 当前树：装依赖、补构建环境（不共享生成物）
   tools/worktree.sh verify                   # 当前树：干净树跑门禁，原子写证据
   tools/worktree.sh verify-baseline <issue>  # 登记的基线 SHA 同环境复跑门禁留证
+  tools/worktree.sh refresh-baseline <issue> [新基线 SHA]
+                                             # rebase 后刷新登记基线（需 authorize 授权；清空旧证据）
   tools/worktree.sh deliver                  # 必须有对应当前 SHA 的验证/批准例外证据
   tools/worktree.sh integrate <issue> <PR>   # 按任务 target 核验 PR；develop 快进，upstream-main 仅更新本地 main 镜像
   tools/worktree.sh cleanup <issue> <PR>     # 核验目标 repo/base/head/merge SHA 后清理工作树
@@ -1586,7 +1787,7 @@ usage() {
                                              # 基线报告同门禁实测后，记录指定 SHA 的例外
   tools/worktree.sh status [issue|--all]     # 查看任务登记与授权
 
-授权动作：push force-push rebase integrate cleanup branch-delete release deploy restart takeover
+授权动作：push force-push rebase refresh-baseline integrate cleanup branch-delete release deploy restart takeover
 
 环境变量（一般不设）：
   DSH_WT_ROLE=integrator    以集成/发布执行者身份运行（integrate/cleanup 必需）
@@ -1604,6 +1805,7 @@ case "${1:-}" in
   init) shift; cmd_init "$@" ;;
   verify) shift; cmd_verify "$@" ;;
   verify-baseline) shift; cmd_verify_baseline "$@" ;;
+  refresh-baseline) shift; cmd_refresh_baseline "$@" ;;
   deliver) shift; cmd_deliver "$@" ;;
   integrate) shift; cmd_integrate "$@" ;;
   cleanup) shift; cmd_cleanup "$@" ;;
