@@ -7,7 +7,6 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, symlink, lstat, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, isAbsolute, join } from 'node:path';
-import { parseHostDiagnostic } from '../tools/host-canary/diagnostics.mjs';
 import { DOCKER_IMAGE, HINT_CODES, MISSING_DEPENDENCY_SPECIFIERS, RUNTIME_LIFECYCLE_MS, checkHostedRunner, createChildExitObserver, createDockerExecutor, createLinuxChildMonitor, createSourceArchive, createStderrCollector, dockerCliDriver, dockerCreatePlan, dockerModelAdapter, evaluateResponses, gitArchiveArgs, hostedDockerAdapter, libSnapshot, makeInstallWorker, makeRuntimeWorker, managedDocker, probeMobile, profileFiles, prepareContainerProfile, removeSourceArchive, readLinuxProcessStat, resolveExitedChildHint, runCanary, stderrExitHint, validateDockerMounts, verifyDockerInspection, verifyInstalled, verifyPluginSource, verifyRequiredBundles } from '../tools/host-canary/smoke.mjs';
 
 const imageEnv = ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin','NODE_VERSION=24.1.0','YARN_VERSION=1.22.22'];
@@ -152,7 +151,7 @@ test('generated worker emits a sanitized hint using only a fake host', async t =
       if (mode === 'worker-timeout') assert.equal(worker.error?.code,'ETIMEDOUT');
       else {
         assert.equal(worker.error,undefined); assert.equal(worker.status,2);
-        for (const line of worker.stderr.trim().split('\n').filter(Boolean)) assert.ok(parseHostDiagnostic(line), 'only a closed-vocabulary diagnostic can leave stderr');
+        assert.equal(worker.stderr,'', 'raw host output and temporary diagnostics must not leave the worker');
         const expectedCode = {normal:'host-process-exited-hint-module-not-found','startup-audit':'host-process-exited-hint-startup-audit','worker-error':'worker-failed','exit-zero':'host-process-exited-zero','exit-nonzero':'host-process-exited-nonzero','exit-signal':'host-process-exited-signal'}[mode];
         assert.deepEqual(JSON.parse(worker.stdout),{ok:false,errorCode:expectedCode,checks:[]});
         assert.doesNotMatch(worker.stdout,/SIGTERM|\b17\b/);

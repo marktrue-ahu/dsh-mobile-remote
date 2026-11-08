@@ -10,7 +10,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
-import { MISSING_DEPENDENCY_SPECIFIERS, HINT_CODES, RUNTIME_ERROR_CODES, INSTALL_ERROR_CODES, formatHostDiagnostic, parseHostDiagnostic } from './diagnostics.mjs';
+import { MISSING_DEPENDENCY_SPECIFIERS, HINT_CODES, RUNTIME_ERROR_CODES, INSTALL_ERROR_CODES } from './diagnostics.mjs';
 export { MISSING_DEPENDENCY_SPECIFIERS, HINT_CODES } from './diagnostics.mjs';
 
 const self = fileURLToPath(import.meta.url);
@@ -55,33 +55,26 @@ export async function runCanary(options, adapter) {
 
 const children = new Set();
 let interrupted = false;
-function command(bin, args, {cwd, env, timeout = 180000, outputFd, signal, allowAfterInterrupt = false, maxOutput = 8192, captureStderr = false} = {}) {
+function command(bin, args, {cwd, env, timeout = 180000, outputFd, signal, allowAfterInterrupt = false, maxOutput = 8192} = {}) {
   return new Promise((resolvePromise, reject) => {
     if (interrupted && !allowAfterInterrupt) return reject(new CanaryError('interrupted'));
-    const child = spawn(bin, args, {cwd, env, detached:true, stdio:['ignore',outputFd ?? 'pipe',captureStderr ? 'pipe' : 'ignore']});
+    const child = spawn(bin, args, {cwd, env, detached:true, stdio:['ignore',outputFd ?? 'pipe','ignore']});
     children.add(child);
-    let stdout = '', stderr = '', settled = false, timedOut = false, overflow = false;
+    let stdout = '', settled = false, timedOut = false, overflow = false;
     child.stdout?.on('data', data => {
       const chunk = data.toString();
       if (stdout.length + chunk.length > maxOutput) overflow = true;
       if (stdout.length < maxOutput) stdout += chunk.slice(0, maxOutput - stdout.length);
     });
-    // TEMPORARY DIAGNOSTIC (#62): capture stderr so a worker's redacted HOST_DIAG line
-    // survives. Same bounded buffer rules as stdout; remove with the rest.
-    child.stderr?.on('data', data => {
-      const chunk = data.toString();
-      if (stderr.length + chunk.length > maxOutput) overflow = true;
-      if (stderr.length < maxOutput) stderr += chunk.slice(0, maxOutput - stderr.length);
-    });
     const stop = () => {
       timedOut = true;
       try { process.kill(-child.pid, 'SIGKILL'); } catch {}
-      if (!settled) { settled = true; children.delete(child); clearTimeout(timer); signal?.removeEventListener('abort',stop); child.stdout?.destroy(); child.stderr?.destroy(); resolvePromise({code:null, stdout, stderr, timedOut:true,overflow}); }
+      if (!settled) { settled = true; children.delete(child); clearTimeout(timer); signal?.removeEventListener('abort',stop); child.stdout?.destroy(); resolvePromise({code:null, stdout, timedOut:true,overflow}); }
     };
     const timer = setTimeout(stop,timeout);
     if (signal?.aborted) stop(); else signal?.addEventListener('abort',stop,{once:true});
     child.on('error', () => { if (!settled) { settled = true; children.delete(child); clearTimeout(timer); signal?.removeEventListener('abort',stop); reject(new CanaryError('process-start-failed')); } });
-    child.on('close', code => { if (!settled) { settled = true; children.delete(child); clearTimeout(timer); signal?.removeEventListener('abort',stop); try { process.kill(-child.pid, 'SIGKILL'); } catch {} resolvePromise({code, stdout, stderr, timedOut,overflow}); } });
+    child.on('close', code => { if (!settled) { settled = true; children.delete(child); clearTimeout(timer); signal?.removeEventListener('abort',stop); try { process.kill(-child.pid, 'SIGKILL'); } catch {} resolvePromise({code, stdout, timedOut,overflow}); } });
   });
 }
 // Explicit test seam: only a regular mock-docker binary in a dedicated /tmp
@@ -279,7 +272,7 @@ export async function createDockerExecutor(root, runnerEnv, invoke = command) {
         args[0] === 'ps' && args.length === 7 && args[1] === '--all' && args[2] === '--no-trunc' && args[3] === '--filter' && args[4] === `id=${id}` && args[5] === '--format' && args[6] === '{{.ID}}';
       if (!valid || !authorized.has(id)) fail('docker-cleanup-unauthorized');
     }
-    return invoke('/usr/bin/docker',args,{cwd:root,env,timeout:310000,signal,allowAfterInterrupt:cleanup,maxOutput:args[0] === 'inspect' ? 65536 : 8192,captureStderr:args[0] === 'logs'});
+    return invoke('/usr/bin/docker',args,{cwd:root,env,timeout:310000,signal,allowAfterInterrupt:cleanup,maxOutput:args[0] === 'inspect' ? 65536 : 8192});
   };
   execute[CLEANUP_AUTH] = id => { if (!/^[a-f0-9]{64}$/.test(id)) fail('docker-identity-invalid'); authorized.add(id); };
   return execute;
@@ -377,24 +370,11 @@ export function dockerCliDriver(execute) {
       validId(id);
       const status = await run(['wait',id],signal);
       if (!/^[012]$/.test(status)) fail('docker-operation-failed');
-      // Container stdout is the JSON protocol, stderr is a separate bounded
-      // diagnostic channel. Never concatenate Docker warnings into IDs/statuses.
-      const logs = await execute(['logs',id],signal);
-      if (!logs || logs.timedOut || logs.overflow || logs.code !== 0 || typeof logs.stdout !== 'string') fail('docker-operation-failed');
-      let data; try { data = JSON.parse(logs.stdout); } catch { fail('docker-output-invalid'); }
-      const parsed = parseWorkerOutput(phase,Number(status),data);
-      const diagnostics = [];
-      if (phase === 'runtime' && typeof logs.stderr === 'string') {
-        for (const line of logs.stderr.split('\n')) {
-          if (!line.startsWith('HOST_DIAG: ')) continue;
-          const safe = parseHostDiagnostic(line);
-          if (!safe || diagnostics.length >= 1) fail('docker-output-invalid');
-          diagnostics.push(safe);
-        }
-      }
-      // Only emit canonical, revalidated fields, after validating the result JSON.
-      for (const line of diagnostics) process.stderr.write(line + '\n');
-      return parsed;
+      // Raw container stderr is discarded by the executor. stdout contains only
+      // the strict JSON worker protocol; arbitrary output is never forwarded.
+      const logs = await run(['logs',id],signal);
+      let data; try { data = JSON.parse(logs); } catch { fail('docker-output-invalid'); }
+      return parseWorkerOutput(phase,Number(status),data);
     },
     async kill(id,signal,cleanup = false) { validId(id); if (cleanup && !authorized.has(id)) fail('docker-cleanup-unauthorized'); await run(['kill',id],signal,cleanup); },
     async remove(id,signal,cleanup = false) { validId(id); if (cleanup && !authorized.has(id)) fail('docker-cleanup-unauthorized'); await run(['rm',id],signal,cleanup); },
@@ -833,10 +813,7 @@ export function createStderrCollector(stream, ...extraStreams) {
     destroyed = true; prefix = '';
     for (const s of streams) { s.off('data',onData); s.off('error',onError); s.destroy(); }
   };
-  // TEMPORARY DIAGNOSTIC (#62): read-only snapshot of the bounded prefix. Only the
-  // worker's diagnostic path consumes it, and it is redacted before leaving the process.
-  const snapshot = () => (typeof prefix === 'string' ? prefix : '');
-  return {hint,drain,destroy,snapshot};
+  return {hint,drain,destroy};
 }
 // Testable worker contract only: the caller must run the transport inside a
 // verified container. It receives only fixed relative paths, never a host URL.
@@ -1056,7 +1033,6 @@ ${createLinuxChildMonitor.toString()}
 ${createChildExitObserver.toString()}
 ${stderrExitHint.toString()}
 ${createStderrCollector.toString()}
-${formatHostDiagnostic.toString()}
 ${probeMobileCore.toString()}
 ${resolveExitedChildHint.toString()}
 ${probeMobile.toString()}
@@ -1132,10 +1108,6 @@ try {
   const codes = RUNTIME_ERROR_CODES;
   const code = codes.includes(error?.code) ? error.code : 'worker-failed';
   const checks = Array.isArray(error?.checks) ? error.checks.filter(value => typeof value === 'string' && (/^(auth|bootstrap|diagnostics)$/.test(value) || capabilityNames.some(name => ['ok','missing','drift'].some(state => value === 'host-capability:' + name + ':' + state)))) : [];
-  // One temporary diagnostic protocol; no handwritten regex lives in this template.
-  // The host-side driver validates it again. Never print the raw snapshot.
-  const hostDiag = formatHostDiagnostic(stderrCollector?.snapshot?.());
-  if (hostDiag) process.stderr.write(hostDiag + '\\n');
   process.stdout.write(JSON.stringify({ok:false,errorCode:code,checks}) + '\\n');
   process.exitCode = code === 'compatibility-check-failed' ? 1 : 2;
 } finally { childExitObserver?.destroy(); stderrCollector?.destroy(); child?.kill('SIGKILL'); }
