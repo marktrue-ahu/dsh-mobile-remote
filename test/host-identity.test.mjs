@@ -6,7 +6,7 @@ import { EventEmitter } from "node:events";
 import { mkdtempSync, readFileSync, readdirSync, writeFileSync, mkdirSync, utimesSync, existsSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { apply, hostIdentityFile, resolveHostIdentity } from "../lib/index.js";
 
@@ -287,4 +287,36 @@ test("round5-1 inode 校验：写入后路径被替换，赢家不得返回自�
 	});
 	assert.equal(resolved, other, "路径已不是自己的 inode 时必须返回已发布值，而不是未持久化的 UUID");
 	assert.equal(readFileSync(file, "utf8").trim(), other);
+});
+
+test("round6-1 D1：有效隔离文件恢复绝不覆盖并发 wx 发布者", () => {
+	const home = mkdtempSync(join(tmpdir(), "r15-restore-"));
+	const file = hostIdentityFile(home);
+	mkdirSync(join(home, ".dsh", "mobile-remote"), { recursive: true });
+	writeFileSync(file, "", { mode: 0o600 });
+	const old = new Date(Date.now() - 10_000);
+	utimesSync(file, old, old);
+	// A 的观察窗口内有人把文件写成有效身份 X → A 会把它作为 quarantine 移走。
+	const quarantined = "55555555-5555-4555-8555-555555555555";
+	let winnerFromB = null;
+	const pluginUrl = pathToFileURL(new URL("../lib/index.js", import.meta.url).pathname).href;
+	const childCode = `const m = await import(process.env.PLUGIN_URL); process.stdout.write(m.resolveHostIdentity({ home: process.env.TEST_HOME }));`;
+	const resolved = resolveHostIdentity({
+		home,
+		onBeforeRename: () => { writeFileSync(file, `${quarantined}\n`); },
+		onBeforeRestore: () => {
+			// A 把有效文件移入 quarantine、路径短暂空闲；真实 B 进程此刻赢得 wx 并发布 Y。
+			const child = spawnSync(process.execPath, ["--input-type=module", "-e", childCode], {
+				env: { ...process.env, PLUGIN_URL: pluginUrl, TEST_HOME: home },
+				encoding: "utf8",
+			});
+			assert.equal(child.status, 0, child.stderr);
+			winnerFromB = child.stdout.trim();
+		},
+	});
+	assert.match(winnerFromB ?? "", /^[0-9a-f-]{36}$/i, "B 必须已发布有效身份");
+	assert.equal(resolved, winnerFromB, "A 不得覆盖 B 的合法发布，必须返回 B 的 UUID");
+	assert.equal(readFileSync(file, "utf8").trim(), winnerFromB, "磁盘必须是 B 的身份");
+	const leftovers = readdirSync(join(home, ".dsh", "mobile-remote")).filter((name) => name.includes(".quarantine."));
+	assert.deepEqual(leftovers, [], "隔离文件必须被丢弃，不能残留");
 });
