@@ -10,6 +10,8 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
+import { MISSING_DEPENDENCY_SPECIFIERS, HINT_CODES, RUNTIME_ERROR_CODES, INSTALL_ERROR_CODES, formatHostDiagnostic, parseHostDiagnostic } from './diagnostics.mjs';
+export { MISSING_DEPENDENCY_SPECIFIERS, HINT_CODES } from './diagnostics.mjs';
 
 const self = fileURLToPath(import.meta.url);
 class CanaryError extends Error {
@@ -53,26 +55,33 @@ export async function runCanary(options, adapter) {
 
 const children = new Set();
 let interrupted = false;
-function command(bin, args, {cwd, env, timeout = 180000, outputFd, signal, allowAfterInterrupt = false, maxOutput = 8192} = {}) {
+function command(bin, args, {cwd, env, timeout = 180000, outputFd, signal, allowAfterInterrupt = false, maxOutput = 8192, captureStderr = false} = {}) {
   return new Promise((resolvePromise, reject) => {
     if (interrupted && !allowAfterInterrupt) return reject(new CanaryError('interrupted'));
-    const child = spawn(bin, args, {cwd, env, detached:true, stdio:['ignore',outputFd ?? 'pipe','ignore']});
+    const child = spawn(bin, args, {cwd, env, detached:true, stdio:['ignore',outputFd ?? 'pipe',captureStderr ? 'pipe' : 'ignore']});
     children.add(child);
-    let stdout = '', settled = false, timedOut = false, overflow = false;
+    let stdout = '', stderr = '', settled = false, timedOut = false, overflow = false;
     child.stdout?.on('data', data => {
       const chunk = data.toString();
       if (stdout.length + chunk.length > maxOutput) overflow = true;
       if (stdout.length < maxOutput) stdout += chunk.slice(0, maxOutput - stdout.length);
     });
+    // TEMPORARY DIAGNOSTIC (#62): capture stderr so a worker's redacted HOST_DIAG line
+    // survives. Same bounded buffer rules as stdout; remove with the rest.
+    child.stderr?.on('data', data => {
+      const chunk = data.toString();
+      if (stderr.length + chunk.length > maxOutput) overflow = true;
+      if (stderr.length < maxOutput) stderr += chunk.slice(0, maxOutput - stderr.length);
+    });
     const stop = () => {
       timedOut = true;
       try { process.kill(-child.pid, 'SIGKILL'); } catch {}
-      if (!settled) { settled = true; children.delete(child); clearTimeout(timer); signal?.removeEventListener('abort',stop); child.stdout?.destroy(); resolvePromise({code:null, stdout, timedOut:true,overflow}); }
+      if (!settled) { settled = true; children.delete(child); clearTimeout(timer); signal?.removeEventListener('abort',stop); child.stdout?.destroy(); child.stderr?.destroy(); resolvePromise({code:null, stdout, stderr, timedOut:true,overflow}); }
     };
     const timer = setTimeout(stop,timeout);
     if (signal?.aborted) stop(); else signal?.addEventListener('abort',stop,{once:true});
     child.on('error', () => { if (!settled) { settled = true; children.delete(child); clearTimeout(timer); signal?.removeEventListener('abort',stop); reject(new CanaryError('process-start-failed')); } });
-    child.on('close', code => { if (!settled) { settled = true; children.delete(child); clearTimeout(timer); signal?.removeEventListener('abort',stop); try { process.kill(-child.pid, 'SIGKILL'); } catch {} resolvePromise({code, stdout, timedOut,overflow}); } });
+    child.on('close', code => { if (!settled) { settled = true; children.delete(child); clearTimeout(timer); signal?.removeEventListener('abort',stop); try { process.kill(-child.pid, 'SIGKILL'); } catch {} resolvePromise({code, stdout, stderr, timedOut,overflow}); } });
   });
 }
 // Explicit test seam: only a regular mock-docker binary in a dedicated /tmp
@@ -270,12 +279,12 @@ export async function createDockerExecutor(root, runnerEnv, invoke = command) {
         args[0] === 'ps' && args.length === 7 && args[1] === '--all' && args[2] === '--no-trunc' && args[3] === '--filter' && args[4] === `id=${id}` && args[5] === '--format' && args[6] === '{{.ID}}';
       if (!valid || !authorized.has(id)) fail('docker-cleanup-unauthorized');
     }
-    return invoke('/usr/bin/docker',args,{cwd:root,env,timeout:310000,signal,allowAfterInterrupt:cleanup,maxOutput:args[0] === 'inspect' ? 65536 : 8192});
+    return invoke('/usr/bin/docker',args,{cwd:root,env,timeout:310000,signal,allowAfterInterrupt:cleanup,maxOutput:args[0] === 'inspect' ? 65536 : 8192,captureStderr:args[0] === 'logs'});
   };
   execute[CLEANUP_AUTH] = id => { if (!/^[a-f0-9]{64}$/.test(id)) fail('docker-identity-invalid'); authorized.add(id); };
   return execute;
 }
-const runtimeWorkerErrors = new Set(['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-exited-hint-startup-audit','host-process-exited-hint-port-in-use','host-process-exited-hint-out-of-memory','host-process-exited-hint-engine-mismatch','host-process-exited-hint-bad-invocation','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive','host-identity-inconclusive','response-inconclusive','compatibility-check-failed','host-capabilities-inconclusive','probe-input-invalid','worker-failed']);
+const runtimeWorkerErrors = new Set(RUNTIME_ERROR_CODES);
 function exactKeys(value, keys) {
   return value !== null && typeof value === 'object' && !Array.isArray(value) && isDeepStrictEqual(Object.keys(value).sort(),[...keys].sort());
 }
@@ -294,11 +303,12 @@ export function parseWorkerOutput(phase, exitCode, data) {
     // Install may report the generic failure OR a specific missing-dependency code
     // discovered by the post-install resolution preflight. Both stay within the
     // closed allowlist; anything else is a malformed payload.
-    if (exitCode === 2 && exactKeys(data,['ok','errorCode']) && data.ok === false && (data.errorCode === 'install-failed' || HINT_CODES.includes(data.errorCode))) return {exitCode,ok:false,checks:[],errorCode:data.errorCode};
+    if (exitCode === 2 && exactKeys(data,['ok','errorCode']) && data.ok === false && INSTALL_ERROR_CODES.includes(data.errorCode)) return {exitCode,ok:false,checks:[],errorCode:data.errorCode};
     fail('docker-output-invalid');
   }
   // A successful run may still report a session-gated capability as missing/drift:
   // the canary never opens a browser, so those stay unavailable by construction.
+  if (!data || typeof data !== 'object' || !validWorkerChecks(data.checks)) fail('docker-output-invalid');
   const nonGatedAllOk = data.checks.slice(3).every((value,i) => value.endsWith(':ok') || sessionGatedCapabilityNames.includes(capabilityNames[i]));
   if (exitCode === 0 && exactKeys(data,['ok','checks']) && data.ok === true && validWorkerChecks(data.checks,true) && nonGatedAllOk) return {exitCode,ok:true,checks:data.checks,errorCode:null};
   if (!exactKeys(data,['ok','errorCode','checks']) || data.ok !== false || typeof data.errorCode !== 'string' || !runtimeWorkerErrors.has(data.errorCode) || !validWorkerChecks(data.checks)) fail('docker-output-invalid');
@@ -323,11 +333,7 @@ export function dockerCliDriver(execute) {
   const run = async (args, signal, cleanup = false) => {
     const result = await execute(args,signal,cleanup);
     if (!result || result.timedOut || result.overflow || result.code !== 0 || typeof result.stdout !== 'string') fail('docker-operation-failed');
-    // TEMPORARY DIAGNOSTIC (#62): `docker logs` writes the container's own stderr to our
-    // stderr. Merge it so the worker's redacted HOST_DIAG line is visible; remove with
-    // the rest of the diagnostic.
-    const merged = typeof result.stderr === 'string' && result.stderr.length > 0 ? result.stdout + '\n' + result.stderr : result.stdout;
-    return merged.trim();
+    return result.stdout.trim();
   };
   const validId = id => { if (typeof id !== 'string' || !/^[a-f0-9]{64}$/.test(id)) fail('docker-identity-invalid'); };
   return {
@@ -371,19 +377,24 @@ export function dockerCliDriver(execute) {
       validId(id);
       const status = await run(['wait',id],signal);
       if (!/^[012]$/.test(status)) fail('docker-operation-failed');
-      const logs = await run(['logs',id],signal);
-      // TEMPORARY DIAGNOSTIC (#62): the worker may emit redacted HOST_DIAG lines on
-      // stderr, which `docker logs` merges into the same stream. Strip and surface them
-      // instead of failing the whole parse; remove together with the diagnostic.
-      const diagLines = [];
-      const payload = String(logs).split('\n').filter(line => {
-        if (!line.includes('HOST_DIAG: ')) return true;
-        diagLines.push(line.slice(line.indexOf('HOST_DIAG: ') + 'HOST_DIAG: '.length));
-        return false;
-      }).join('\n');
-      if (diagLines.length > 0) process.stderr.write('HOST_DIAG: ' + diagLines.join(' | ') + '\n');
-      let data; try { data = JSON.parse(payload); } catch { fail('docker-output-invalid'); }
-      return parseWorkerOutput(phase,Number(status),data);
+      // Container stdout is the JSON protocol, stderr is a separate bounded
+      // diagnostic channel. Never concatenate Docker warnings into IDs/statuses.
+      const logs = await execute(['logs',id],signal);
+      if (!logs || logs.timedOut || logs.overflow || logs.code !== 0 || typeof logs.stdout !== 'string') fail('docker-operation-failed');
+      let data; try { data = JSON.parse(logs.stdout); } catch { fail('docker-output-invalid'); }
+      const parsed = parseWorkerOutput(phase,Number(status),data);
+      const diagnostics = [];
+      if (phase === 'runtime' && typeof logs.stderr === 'string') {
+        for (const line of logs.stderr.split('\n')) {
+          if (!line.startsWith('HOST_DIAG: ')) continue;
+          const safe = parseHostDiagnostic(line);
+          if (!safe || diagnostics.length >= 1) fail('docker-output-invalid');
+          diagnostics.push(safe);
+        }
+      }
+      // Only emit canonical, revalidated fields, after validating the result JSON.
+      for (const line of diagnostics) process.stderr.write(line + '\n');
+      return parsed;
     },
     async kill(id,signal,cleanup = false) { validId(id); if (cleanup && !authorized.has(id)) fail('docker-cleanup-unauthorized'); await run(['kill',id],signal,cleanup); },
     async remove(id,signal,cleanup = false) { validId(id); if (cleanup && !authorized.has(id)) fail('docker-cleanup-unauthorized'); await run(['rm',id],signal,cleanup); },
@@ -492,7 +503,7 @@ export function dockerModelAdapter(client, {env,uid,gid,signal}) {
       try { installed = await managedDocker(client,{...mounts,name:name(),phase:'install',uid,gid,hostVersion:options.hostVersion,imageEnv:context.imageEnv},300000,signal); }
       catch (error) { if (error?.code === 'docker-cleanup-unconfirmed') safeCleanup = false; throw error; }
       installed = validateCanonicalWorkerResult('install',installed);
-      if (installed.exitCode !== 0) fail('install-failed');
+      if (installed.exitCode !== 0) fail(installed.errorCode);
       if (await verifyPluginSource(options.pluginRoot,options.pluginSha,env) !== context.snapshot) fail('source-identity-mismatch');
       const profile = join(context.profile,'dsh/profiles/canary');
       await verifyInstalled(profile,options.hostVersion,context.snapshot,context.manifest,context.patchHash);
@@ -506,7 +517,7 @@ export function dockerModelAdapter(client, {env,uid,gid,signal}) {
       result = validateCanonicalWorkerResult('runtime',result);
       const checks = result.checks;
       if (result.errorCode === 'compatibility-check-failed' && result.exitCode === 1) throw new CanaryError('compatibility-check-failed','compatibility-failure',Array.isArray(checks) ? checks : []);
-      if (['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-exited-hint-startup-audit','host-process-exited-hint-port-in-use','host-process-exited-hint-out-of-memory','host-process-exited-hint-engine-mismatch','host-process-exited-hint-bad-invocation','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive','host-identity-inconclusive','response-inconclusive','host-capabilities-inconclusive','worker-failed','probe-input-invalid'].includes(result.errorCode)) throw new CanaryError(result.errorCode,'infrastructure-failure',Array.isArray(checks) ? checks : []);
+      if (runtimeWorkerErrors.has(result.errorCode)) throw new CanaryError(result.errorCode,'infrastructure-failure',checks);
       if (result.exitCode !== 0 || result.errorCode) fail('docker-output-invalid');
       return checks;
     },
@@ -750,32 +761,6 @@ export function createChildExitObserver(child) {
 // "Cannot find package <x>", the canary reports a SPECIFIC fixed code instead of the
 // generic module-not-found one, so a single hosted run is enough to attribute it.
 // Only these exact specifiers participate; anything else stays generic.
-export const MISSING_DEPENDENCY_SPECIFIERS = Object.freeze([
-  ['@deepseek-ai/schemastery', 'host-process-exited-hint-missing-schemastery'],
-  ['@deepseek-ai/dsh-llm', 'host-process-exited-hint-missing-dsh-llm'],
-  ['@deepseek-ai/dsh-sandbox-policy', 'host-process-exited-hint-missing-dsh-sandbox-policy'],
-  ['@deepseek-ai/dsh-credentials', 'host-process-exited-hint-missing-dsh-credentials'],
-  ['@deepseek-ai/dsh-scope', 'host-process-exited-hint-missing-dsh-scope'],
-  ['qrcode', 'host-process-exited-hint-missing-qrcode'],
-]);
-export const HINT_CODES = Object.freeze([
-  'host-process-exited-hint-eacces',
-  'host-process-exited-hint-erofs',
-  'host-process-exited-hint-enoent',
-  'host-process-exited-hint-enospc',
-  'host-process-exited-hint-user-lookup',
-  'host-process-exited-hint-module-not-found',
-  'host-process-exited-hint-native-load',
-  'host-process-exited-hint-startup-audit',
-  'host-process-exited-hint-port-in-use',
-  'host-process-exited-hint-out-of-memory',
-  'host-process-exited-hint-engine-mismatch',
-  'host-process-exited-hint-bad-invocation',
-  ...MISSING_DEPENDENCY_SPECIFIERS.map(([, code]) => code),
-  'host-plugin-import-failed',
-  'host-plugin-import-missing-module',
-  'host-plugin-import-native-load',
-]);
 export function stderrExitHint(text) {
   if (typeof text !== 'string') return null;
   const prefix = text.slice(0,4096);
@@ -830,12 +815,16 @@ export function createStderrCollector(stream, ...extraStreams) {
     const limit = Number.isFinite(budgetMs) ? Math.max(0,Math.min(250,Math.floor(budgetMs))) : 0;
     if (allDone() || limit === 0) return resolve();
     let timer, done = false;
+    const completed = new Set(), handlers = new Map();
     const finish = () => {
       if (done) return; done = true; clearTimeout(timer);
-      for (const s of streams) { s.off('end',finish); s.off('close',finish); s.off('error',finish); }
+      for (const [s, handler] of handlers) { s.off('end',handler); s.off('close',handler); s.off('error',handler); }
       resolve();
     };
-    for (const s of streams) { s.once('end',finish); s.once('close',finish); s.once('error',finish); }
+    for (const s of streams) {
+      const handler = () => { completed.add(s); if (destroyed || streams.every(x => completed.has(x) || x.readableEnded || x.destroyed)) finish(); };
+      handlers.set(s,handler); s.once('end',handler); s.once('close',handler); s.once('error',handler);
+    }
     timer = setTimeout(finish,limit);
     if (allDone()) finish();
   });
@@ -1008,9 +997,9 @@ try {
   execFileSync('npm',['install','--ignore-scripts','--no-audit','--no-fund'],{cwd:'/tmp/plugin',stdio:'ignore',timeout:300000});
   // npm pack does not create its destination: without this it exits non-zero (254).
   mkdirSync('/tmp/plugin-dist',{recursive:true,mode:0o700});
-  execFileSync('npm',['pack','--silent','--pack-destination','/tmp/plugin-dist'],{cwd:'/tmp/plugin',stdio:'ignore',timeout:120000});
+  execFileSync('npm',['pack','--ignore-scripts','--silent','--pack-destination','/tmp/plugin-dist'],{cwd:'/tmp/plugin',stdio:'ignore',timeout:120000});
   const packed = (await import('node:fs')).readdirSync('/tmp/plugin-dist').filter(f => f.endsWith('.tgz'));
-  if (packed.length !== 1) fail('probe-input-invalid');
+  if (packed.length !== 1) throw new Error('install-failed');
   // Do NOT pass --legacy-peer-deps here. It skips peer resolution, and this plugin
   // declares peers the host does provide (@deepseek-ai/schemastery etc.); without
   // them the host dies at startup with module-not-found. Peers are installed in the
@@ -1035,11 +1024,14 @@ try {
     for (const [specifier, code] of MISSING_DEPENDENCY_SPECIFIERS) {
       let resolved = true;
       try { req.resolve(specifier); } catch { resolved = false; }
-      if (!resolved) { process.stdout.write(JSON.stringify({ok:false,errorCode:code}) + '\\n'); process.exitCode = 2; throw new Error('dependency-preflight'); }
+      if (!resolved) throw Object.assign(new Error(code), {code});
     }
   }
   process.stdout.write('{"ok":true}\\n');
-} catch { process.stdout.write('{"ok":false,"errorCode":"install-failed"}\\n'); process.exitCode = 2; }
+} catch (error) {
+  const errorCode = MISSING_DEPENDENCY_SPECIFIERS.some(([,code]) => code === error?.code) ? error.code : 'install-failed';
+  process.stdout.write(JSON.stringify({ok:false,errorCode}) + '\\n'); process.exitCode = 2;
+}
 `;
 }
 // Construct a fixed container-only worker. Token and patch exist only inside
@@ -1054,6 +1046,7 @@ import { readFileSync } from 'node:fs';
 const capabilityNames = ${JSON.stringify(capabilityNames)};
 const sessionGatedCapabilityNames = ${JSON.stringify(sessionGatedCapabilityNames)};
 const HINT_CODES = ${JSON.stringify(HINT_CODES)};
+const RUNTIME_ERROR_CODES = ${JSON.stringify(RUNTIME_ERROR_CODES)};
 const MISSING_DEPENDENCY_SPECIFIERS = ${JSON.stringify(MISSING_DEPENDENCY_SPECIFIERS)};
 ${CanaryError.toString()}
 const fail = ${fail.toString()};
@@ -1063,6 +1056,7 @@ ${createLinuxChildMonitor.toString()}
 ${createChildExitObserver.toString()}
 ${stderrExitHint.toString()}
 ${createStderrCollector.toString()}
+${formatHostDiagnostic.toString()}
 ${probeMobileCore.toString()}
 ${resolveExitedChildHint.toString()}
 ${probeMobile.toString()}
@@ -1108,15 +1102,15 @@ try {
       for (const [specifier, specific] of MISSING_DEPENDENCY_SPECIFIERS) {
         if (message.includes("'" + specifier + "'")) { code = specific; break; }
       }
-      if (code === 'host-plugin-import-failed' && /ERR_MODULE_NOT_FOUND/.test(message)) code = 'host-plugin-import-missing-module';
-      if (code === 'host-plugin-import-failed' && /ERR_DLOPEN_FAILED/.test(message)) code = 'host-plugin-import-native-load';
+      if (code === 'host-plugin-import-failed' && ['ERR_MODULE_NOT_FOUND','MODULE_NOT_FOUND'].includes(importError.code)) code = 'host-plugin-import-missing-module';
+      if (code === 'host-plugin-import-failed' && importError.code === 'ERR_DLOPEN_FAILED') code = 'host-plugin-import-native-load';
       fail(code);
     }
   }
   // Capture stdout as well as stderr: the CLI may report a startup failure on either
   // stream, and the canary only ever emits FIXED codes derived from a bounded prefix
   // (never raw text), so widening capture does not widen what leaves the process.
-  child = spawn(process.execPath,['/profile/dsh/profiles/canary/node_modules/@deepseek-ai/dsh/lib/bin.js','--profile','canary','--host','127.0.0.1','--port',String(port),'--no-open'],{cwd:'/tmp/canary',stdio:['ignore','pipe','pipe']});
+  child = spawn(process.execPath,['/profile/dsh/profiles/canary/node_modules/@deepseek-ai/dsh/lib/bin.js','--profile','canary','--host','127.0.0.1','--port',String(port),'--no-open'],{cwd:'/tmp/canary',env:{...process.env,NARB_DISABLE_NATIVE_CACHE:'1'},stdio:['ignore','pipe','pipe']});
   childExitObserver = createChildExitObserver(child);
   const childState = createLinuxChildMonitor(child);
   stderrCollector = createStderrCollector(child.stderr, child.stdout);
@@ -1135,30 +1129,13 @@ try {
   if (finalState !== 'running') fail('host-process-state-inconclusive');
   process.stdout.write(JSON.stringify({ok:true,checks}) + '\\n');
 } catch (error) {
-  const codes = ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-exited-hint-startup-audit','host-process-exited-hint-port-in-use','host-process-exited-hint-out-of-memory','host-process-exited-hint-engine-mismatch','host-process-exited-hint-bad-invocation','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive','host-identity-inconclusive','response-inconclusive','compatibility-check-failed','host-capabilities-inconclusive','probe-input-invalid'];
+  const codes = RUNTIME_ERROR_CODES;
   const code = codes.includes(error?.code) ? error.code : 'worker-failed';
   const checks = Array.isArray(error?.checks) ? error.checks.filter(value => typeof value === 'string' && (/^(auth|bootstrap|diagnostics)$/.test(value) || capabilityNames.some(name => ['ok','missing','drift'].some(state => value === 'host-capability:' + name + ':' + state)))) : [];
-  // TEMPORARY DIAGNOSTIC (#62): report the first line of the host's stderr after
-  // redaction so a single hosted run reveals the missing module. Removed once the
-  // root cause is fixed. Never emits paths, tokens, or the full dump.
-  let hostDiag = null;
-  try {
-    const raw = stderrCollector && typeof stderrCollector.snapshot === 'function' ? stderrCollector.snapshot() : '';
-    if (typeof raw === 'string' && raw.length > 0) {
-      // Allowlist-only extraction: emit just the identifiers that matter for diagnosis
-      // (error codes and package specifiers). Anything not matching is dropped, so no
-      // arbitrary text — paths, tokens, hostnames, file contents — can pass through.
-      const tokens = new Set();
-      for (const match of raw.matchAll(/\b(?:ERR_[A-Z_]+|[A-Z][A-Z0-9_]{3,})\b/g)) tokens.add(match[0]);
-      for (const match of raw.matchAll(/(?:Cannot find (?:package|module) )?'(@?[a-z0-9][a-z0-9._-]*(?:" + "\\/" + "[a-z0-9][a-z0-9._-]*)?)'/g)) {
-        if (match[1] && match[1].length <= 80) tokens.add(match[1]);
-      }
-      hostDiag = [...tokens].slice(0, 12).join(' ') || null;
-    }
-  } catch { hostDiag = null; }
-  // stderr is captured by the host-side docker driver and surfaced to the workflow log;
-  // keeping it out of the validated stdout payload avoids changing the output contract.
-  if (hostDiag) process.stderr.write('HOST_DIAG: ' + hostDiag + '\\n');
+  // One temporary diagnostic protocol; no handwritten regex lives in this template.
+  // The host-side driver validates it again. Never print the raw snapshot.
+  const hostDiag = formatHostDiagnostic(stderrCollector?.snapshot?.());
+  if (hostDiag) process.stderr.write(hostDiag + '\\n');
   process.stdout.write(JSON.stringify({ok:false,errorCode:code,checks}) + '\\n');
   process.exitCode = code === 'compatibility-check-failed' ? 1 : 2;
 } finally { childExitObserver?.destroy(); stderrCollector?.destroy(); child?.kill('SIGKILL'); }

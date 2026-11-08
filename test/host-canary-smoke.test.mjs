@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, symlink, lstat, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, isAbsolute, join } from 'node:path';
+import { parseHostDiagnostic } from '../tools/host-canary/diagnostics.mjs';
 import { DOCKER_IMAGE, HINT_CODES, MISSING_DEPENDENCY_SPECIFIERS, RUNTIME_LIFECYCLE_MS, checkHostedRunner, createChildExitObserver, createDockerExecutor, createLinuxChildMonitor, createSourceArchive, createStderrCollector, dockerCliDriver, dockerCreatePlan, dockerModelAdapter, evaluateResponses, gitArchiveArgs, hostedDockerAdapter, libSnapshot, makeInstallWorker, makeRuntimeWorker, managedDocker, probeMobile, profileFiles, prepareContainerProfile, removeSourceArchive, readLinuxProcessStat, resolveExitedChildHint, runCanary, stderrExitHint, validateDockerMounts, verifyDockerInspection, verifyInstalled, verifyPluginSource, verifyRequiredBundles } from '../tools/host-canary/smoke.mjs';
 
 const imageEnv = ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin','NODE_VERSION=24.1.0','YARN_VERSION=1.22.22'];
@@ -150,7 +151,8 @@ test('generated worker emits a sanitized hint using only a fake host', async t =
       assert.doesNotMatch(worker.stderr ?? '',/secret-token|\/private\/path/);
       if (mode === 'worker-timeout') assert.equal(worker.error?.code,'ETIMEDOUT');
       else {
-        assert.equal(worker.error,undefined); assert.equal(worker.status,2); assert.equal(worker.stderr,'');
+        assert.equal(worker.error,undefined); assert.equal(worker.status,2);
+        for (const line of worker.stderr.trim().split('\n').filter(Boolean)) assert.ok(parseHostDiagnostic(line), 'only a closed-vocabulary diagnostic can leave stderr');
         const expectedCode = {normal:'host-process-exited-hint-module-not-found','startup-audit':'host-process-exited-hint-startup-audit','worker-error':'worker-failed','exit-zero':'host-process-exited-zero','exit-nonzero':'host-process-exited-nonzero','exit-signal':'host-process-exited-signal'}[mode];
         assert.deepEqual(JSON.parse(worker.stdout),{ok:false,errorCode:expectedCode,checks:[]});
         assert.doesNotMatch(worker.stdout,/SIGTERM|\b17\b/);
@@ -260,7 +262,7 @@ test('Docker CLI driver validates output and never returns raw logs', async () =
   assert.equal((await parse(2,{ok:false,errorCode:'install-failed'},'install')).errorCode,'install-failed');
   assert.equal((await parse(1,{ok:false,errorCode:'compatibility-check-failed',checks:['auth']},'runtime')).errorCode,'compatibility-check-failed');
   assert.equal((await parse(2,{ok:false,errorCode:'host-capabilities-inconclusive',checks:[...checks.slice(0,-1),'host-capability:gateway.eventsPeer:missing']},'runtime')).errorCode,'host-capabilities-inconclusive');
-  for (const code of ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-exited-hint-startup-audit','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive']) {
+  for (const code of [...HINT_CODES,'host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-exited-hint-startup-audit','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive']) {
     assert.equal((await parse(2,{ok:false,errorCode:code,checks:[]},'runtime')).errorCode,code);
   }
   await assert.rejects(parse(2,{ok:false,errorCode:'host-start-inconclusive',checks:[]},'runtime'),e => e.code === 'docker-output-invalid');
@@ -386,7 +388,7 @@ test('source identity requires exact commit and clean tracked content', async t 
     const listed = spawnSync('tar',['-tf',archived.archivePath],{encoding:'utf8'});
     assert.equal(listed.status,0); assert.match(listed.stdout,/lib\/a\.js/);
   } finally { await removeSourceArchive(archived.root); }
-  const containers = new Map(); let next = 0, runtimeFailure = null, omitBundle = false;
+  const containers = new Map(); let next = 0, runtimeFailure = null, installFailure = null, omitBundle = false;
   const names = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer'];
   const checks = ['auth','bootstrap','diagnostics',...names.map(name => `host-capability:${name}:ok`)];
   const fake = {
@@ -416,6 +418,7 @@ test('source identity requires exact commit and clean tracked content', async t 
     start: async id => { containers.get(id).running = true; },
     wait: async id => {
       const state = containers.get(id); state.running = false;
+      if (state.phase === 'install' && installFailure) return {exitCode:2,ok:false,errorCode:installFailure,checks:[]};
       if (state.phase === 'install') {
         const profile = join(state.profile,'dsh/profiles/canary/node_modules');
         const host = join(profile,'@deepseek-ai/dsh'), plugin = join(profile,'@marktrue/dsh-mobile-remote');
@@ -452,7 +455,7 @@ test('source identity requires exact commit and clean tracked content', async t 
     }
     if (command === 'ps') return {code:0,stdout:''};
     if (command === 'start') { await fake.start(id); return {code:0,stdout:id}; }
-    if (command === 'wait') { const phase = containers.get(id).phase; const value = await fake.wait(id); logs.set(id,phase === 'install' ? {ok:true} : value.ok ? {ok:true,checks:value.checks} : {ok:false,errorCode:value.errorCode,checks:value.checks}); return {code:0,stdout:String(value.exitCode)}; }
+    if (command === 'wait') { const phase = containers.get(id).phase; const value = await fake.wait(id); logs.set(id,phase === 'install' ? (value.ok ? {ok:true} : {ok:false,errorCode:value.errorCode}) : value.ok ? {ok:true,checks:value.checks} : {ok:false,errorCode:value.errorCode,checks:value.checks}); return {code:0,stdout:String(value.exitCode)}; }
     if (command === 'logs') return {code:0,stdout:JSON.stringify(logs.get(id))};
     if (command === 'kill') { await fake.kill(id); return {code:0,stdout:id}; }
     if (command === 'rm') { await fake.remove(id); return {code:0,stdout:id}; }
@@ -460,13 +463,19 @@ test('source identity requires exact commit and clean tracked content', async t 
   };
   const result = await runCanary({hostVersion:'1.2.3',pluginRoot:root,pluginSha:sha},dockerModelAdapter(dockerCliDriver(dockerExecute),{env:{...env,GITHUB_ACTIONS:'true',RUNNER_ENVIRONMENT:'github-hosted'},uid:process.getuid(),gid:process.getgid()}));
   assert.equal(result.status,'passed'); assert.deepEqual(result.checks,checks); assert.equal(containers.size,0); assert.equal(next,2);
-  for (const code of ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-exited-hint-startup-audit','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive']) {
+  for (const code of [...HINT_CODES,'host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-exited-hint-startup-audit','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive']) {
     runtimeFailure = code;
     const failure = await runCanary({hostVersion:'1.2.3',pluginRoot:root,pluginSha:sha},dockerModelAdapter(dockerCliDriver(dockerExecute),{env:{...env,GITHUB_ACTIONS:'true',RUNNER_ENVIRONMENT:'github-hosted'},uid:process.getuid(),gid:process.getgid()}));
     assert.equal(failure.status,'infrastructure-failure'); assert.equal(failure.stage,'runtime'); assert.equal(failure.errorCode,code); assert.deepEqual(failure.checks,[]);
     assert.equal(containers.size,0); assert.doesNotMatch(JSON.stringify(failure),/secret-token|\/private\/path/);
   }
-  runtimeFailure = null; omitBundle = true;
+  runtimeFailure = null;
+  for (const [,code] of MISSING_DEPENDENCY_SPECIFIERS) {
+    installFailure = code;
+    const result = await runCanary({hostVersion:'1.2.3',pluginRoot:root,pluginSha:sha},dockerModelAdapter(dockerCliDriver(dockerExecute),{env:{...env,GITHUB_ACTIONS:'true',RUNNER_ENVIRONMENT:'github-hosted'},uid:process.getuid(),gid:process.getgid()}));
+    assert.equal(result.stage,'install'); assert.equal(result.errorCode,code); assert.equal(containers.size,0);
+  }
+  installFailure = null; omitBundle = true;
   const previous = next;
   const missingBundleResult = await runCanary({hostVersion:'1.2.3',pluginRoot:root,pluginSha:sha},dockerModelAdapter(dockerCliDriver(dockerExecute),{env:{...env,GITHUB_ACTIONS:'true',RUNNER_ENVIRONMENT:'github-hosted'},uid:process.getuid(),gid:process.getgid()}));
   assert.equal(missingBundleResult.status,'infrastructure-failure'); assert.equal(missingBundleResult.stage,'install'); assert.equal(missingBundleResult.errorCode,'host-bundle-unavailable');
