@@ -45,7 +45,7 @@
 | 发布清单 | `<dist>/manifest.json` | schema 1；`app` + `plugin` 两段 + 顶层兼容镜像 |
 | 载体 tarball | `<dist>/marktrue-dsh-mobile-remote-<X.Y.Z>-app.tgz` | 同包名 `X.Y.Z-app`；内含 APK + 清单 + 说明/许可；发布到 npm 的 `app` tag |
 | 构建记录 | `<dist>/app-carrier.json` | 载体 tarball 的体积/哈希与两段身份；本地证据，不上传 |
-| Release 三资产 | GitHub Release | 上面的清单 + APK + 主插件 tarball（逐字节一致） |
+| 发布交付 | npm registry（`alpha`/`rc`/`latest` 与 `app` 通道） | 主插件 tarball 与载体 tarball（`<X.Y.Z>-app`，内含 APK + 清单）分别发布到 npm；**本链路不创建 GitHub Release**，APK 通过 npm 载体分发（逐字节一致以 `dist.integrity` 校验） |
 
 ### 1.3 环境前置
 
@@ -456,7 +456,7 @@ NODE
    # 必须看到 alpha = 本次版本、app = 本次 carrier、latest 保持原值
    ```
 
-4. **发布 Release 三资产**（同一清单、同一 APK、同一主插件 tgz；文件名/大小/哈希逐字节一致）。
+4. **分发与归档（无 GitHub Release）**：本链路不创建 GitHub Release —— 载体 tarball 已随第 2 步发布到 npm `app` tag、主插件 tarball 随第 3 步发布到对应 channel；人工兜底只需保证两次 `npm publish` 的产物与本地 `<dist>` 逐字节一致（sha256 / `dist.integrity`），并在发布记录中登记 registry URL。
 5. **记录结果**：两次发布各自的耗时/结果/公开 URL；失败与部分成功按 §10 处理。
 
 > 人工发布会话同样必须先把发布意图写入 release-meta（`node tools/release-gate.mjs record-intent ...`），发布后标记 published/failed；无法确认可见性时标记 unknown 并停止。
@@ -484,7 +484,7 @@ NODE
 3. **发布意图状态**：`git show origin/release-meta:build-policy.json` 中本次 tag 的意图应为 `published`，且没有为其它 tag 的未关闭 `submitted`/`unknown` 意图；未知状态按 §10.3 人工恢复。
 4. **镜像可取性**：在有代表性的镜像/网络环境重试上述查询与下载（记录耗时）。
 5. **全新安装冒烟**：在隔离 HOME/新目录 `pnpm add @marktrue/dsh-mobile-remote@<本次插件版本>`，确认精确别名目录存在且版本为 `<本次插件版本>-app`、APK 哈希与清单一致。
-6. **Release 三资产**：GitHub Release 的清单/APK/插件 tgz 与本地 dist 逐字节一致（sha256）。
+6. **载体产物一致性（npm 分发，无 GitHub Release）**：下载本次 carrier tarball（`npm pack @marktrue/dsh-mobile-remote@<本次载体版本>`，或按 `npm view … dist.tarball` 直接下载），解包核对其中 APK 与清单和本地 `<dist>` 产物的 sha256 / 大小逐字节一致；主插件 tarball 用 `npm view @marktrue/dsh-mobile-remote@<本次插件版本> dist.integrity` 与本地 tgz 的 sha512 对照。**当前发布链不创建 GitHub Release。**
 7. **宿主更新目录**：如使用 `UPDATE_DIR`，确认清单/APK/tgz 已落位且 `manifest.json` 可解析；宿主重启后更新入口可用。
 8. **真机**：按 `docs/06-install-run.md` 手工验证 App 更新/首装（本手册不自动化真机），记录机型、网络与结果。
 9. **回滚预案**：确认上一版本插件 tgz/载体/APK 仍可取得（本地 dist 与 Release 记录），并知道回滚操作（§10）。
