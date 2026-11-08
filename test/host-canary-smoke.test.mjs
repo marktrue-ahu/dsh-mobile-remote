@@ -154,6 +154,12 @@ test('generated worker emits a sanitized hint using only a fake host', async t =
         assert.equal(worker.error,undefined); assert.equal(worker.status,2);
         assert.equal(worker.stderr,'', 'raw host output and temporary diagnostics must not leave the worker');
         const expectedCode = {normal:'host-process-exited-hint-module-not-found','torn-identity':'host-process-exited-hint-module-not-found','startup-audit':'host-process-exited-hint-startup-audit','worker-error':'worker-failed','exit-zero':'host-process-exited-zero','exit-nonzero':'host-process-exited-nonzero','exit-signal':'host-process-exited-signal'}[mode];
+        // round5-3：模块缺失上下文现在产出**固定 allowlist token** 的 HOST_DIAG（可回显但
+        // 不含任意原文）；其余模式没有可提取的固定 token，stderr 必须为空。
+        assert.equal(
+          worker.stderr,
+          expectedCode === 'host-process-exited-hint-module-not-found' ? 'HOST_DIAG: ERR_MODULE_NOT_FOUND\n' : '',
+        );
         assert.deepEqual(JSON.parse(worker.stdout),{ok:false,errorCode:expectedCode,checks:[]});
         assert.doesNotMatch(worker.stdout,/SIGTERM|\b17\b/);
       }
