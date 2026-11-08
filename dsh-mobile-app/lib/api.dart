@@ -378,8 +378,12 @@ class Api implements GitReadApi {
       }());
     }
     final p = d['plugin'];
+    // issue #60 recheck-6（R15）：每次权威 bootstrap 都必须**替换或清空** hostId——
+    // A 新插件 → B 旧插件（即使换地址/口令）沿用 A 的 hostId 会让 B 的通知撤销 A 的。
     if (p is Map && p['hostId'] is String) {
       hostIdentity = (p['hostId'] as String).trim();
+    } else {
+      hostIdentity = '';
     }
     if (p is Map && p['version'] is String) {
       pluginVersion = p['version'] as String;

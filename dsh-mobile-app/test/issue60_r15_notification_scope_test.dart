@@ -51,4 +51,23 @@ void main() {
     });
     expect(api.hostIdentity, '33333333-3333-4333-8333-333333333333');
   });
+
+  test('recheck-6：新插件 A → 旧插件 B 的权威 bootstrap 必须清空 A 的 hostId', () {
+    final api = _api(base: 'http://host-a.test', token: 'token-a');
+    api.absorbBootstrap({
+      'plugin': {'version': '3.3.0', 'hostId': '11111111-1111-4111-8111-111111111111'},
+    });
+    final scopeA = api.notificationScope;
+    expect(api.hostIdentity, isNotEmpty);
+
+    // 切到另一台旧插件宿主（无 hostId、不同地址/口令）：不得沿用 A 的身份。
+    api.baseUrl = 'http://host-b.test';
+    api.token = 'token-b';
+    api.absorbBootstrap({'plugin': {'version': '3.2.0'}});
+    expect(api.hostIdentity, isEmpty, reason: '旧插件 bootstrap 必须清空旧 hostId');
+    expect(api.notificationScope, isNot(scopeA), reason: '不得继续用 A 的 scope 撤销/合并 B 的通知');
+    // 回退现状：B 的口令/地址派生的 scope 稳定。
+    final bAgain = _api(base: 'http://host-b.test', token: 'token-b');
+    expect(api.notificationScope, bAgain.notificationScope);
+  });
 }
