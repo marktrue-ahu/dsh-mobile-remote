@@ -3,7 +3,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, utimesSync, existsSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -144,4 +144,79 @@ test("recheck-7：并发初始化/自愈身份文件只有一个赢家（所有�
 	const repaired = await resolveConcurrently(home, 6);
 	assert.equal(new Set(repaired).size, 1, `损坏修复也必须单赢家：${JSON.stringify(repaired)}`);
 	assert.equal(readFileSync(hostIdentityFile(home), "utf8").trim(), repaired[0]);
+});
+
+/** 子进程解析身份；把结果/错误码作为唯一 stdout 输出。 */
+function resolveInChild(home) {
+	const pluginUrl = pathToFileURL(new URL("../lib/index.js", import.meta.url).pathname).href;
+	const code = `const m = await import(process.env.PLUGIN_URL); try { process.stdout.write('OK:' + m.resolveHostIdentity({ home: process.env.TEST_HOME })); } catch (error) { process.stdout.write('ERR:' + String(error?.code ?? error?.message ?? error)); }`;
+	return new Promise((resolve, reject) => {
+		const child = spawn(process.execPath, ["--input-type=module", "-e", code], {
+			env: { ...process.env, PLUGIN_URL: pluginUrl, TEST_HOME: home },
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		let out = "";
+		let err = "";
+		child.stdout.on("data", (chunk) => { out += String(chunk); });
+		child.stderr.on("data", (chunk) => { err += String(chunk); });
+		child.on("error", reject);
+		child.on("close", (status) => status === 0 ? resolve(out.trim()) : reject(new Error(`child exit ${status}: ${err}`)));
+	});
+}
+
+test("round4-1：持锁者超过等待上限未发布时，等待者不得无锁写身份", async () => {
+	const home = mkdtempSync(join(tmpdir(), "r15-held-"));
+	const file = hostIdentityFile(home);
+	mkdirSync(join(home, ".dsh", "mobile-remote"), { recursive: true });
+	// 模拟持锁者在 rename 前被 SIGSTOP：锁存在、共享身份文件尚不存在。
+	const lockFile = `${file}.lock`;
+	writeFileSync(lockFile, "", { mode: 0o600 });
+	try {
+		const result = await resolveInChild(home); // 内部等待 3s 后超时
+		assert.match(result, /^ERR:HOST_IDENTITY_LOCK_UNAVAILABLE$/, `等待者必须显式降级而不是发布：${result}`);
+		assert.equal(existsSync(file), false, "未持锁的等待者绝不能创建共享身份文件");
+		// 恢复/释放持锁者后，竞争进程必须收敛到同一个已发布 UUID。
+		unlinkSync(lockFile);
+		const identities = await resolveConcurrently(home, 4);
+		assert.equal(new Set(identities).size, 1);
+		assert.equal(readFileSync(file, "utf8").trim(), identities[0]);
+	} finally {
+		try { unlinkSync(lockFile); } catch { /* ignore */ }
+	}
+});
+
+test("round4-1：陈旧锁（mtime>5s）清理后必须重新抢锁才发布", () => {
+	const home = mkdtempSync(join(tmpdir(), "r15-stale-"));
+	const file = hostIdentityFile(home);
+	mkdirSync(join(home, ".dsh", "mobile-remote"), { recursive: true });
+	const lockFile = `${file}.lock`;
+	writeFileSync(lockFile, "", { mode: 0o600 });
+	const old = new Date(Date.now() - 10_000);
+	utimesSync(lockFile, old, old);
+	const identity = resolveHostIdentity({ home });
+	assert.match(identity, /^[0-9a-f-]{36}$/i);
+	assert.equal(readFileSync(file, "utf8").trim(), identity);
+	assert.equal(existsSync(lockFile), false, "赢家发布后应释放锁");
+});
+
+test("round4-1：open 非 EEXIST 失败且无有效文件 → 抛可诊断错误且不写文件", () => {
+	const home = mkdtempSync(join(tmpdir(), "r15-broken-"));
+	// 让插件状态目录路径被一个**文件**占用：mkdirSync 会 ENOTDIR。
+	writeFileSync(join(home, ".dsh"), "not-a-directory");
+	assert.throws(
+		() => resolveHostIdentity({ home }),
+		(error) => error?.code === "HOST_IDENTITY_LOCK_UNAVAILABLE",
+	);
+	assert.equal(existsSync(hostIdentityFile(home)), false);
+});
+
+test("round4-1：状态目录不可写时 bootstrap 降级为进程内 hostId（不写文件）", async () => {
+	const home = mkdtempSync(join(tmpdir(), "r15-degraded-"));
+	writeFileSync(join(home, ".dsh"), "not-a-directory");
+	const h = harness(home);
+	const body = await bootstrap(h.route);
+	assert.match(body.plugin?.hostId ?? "", /^[0-9a-f-]{36}$/i, "降级仍要给出非空 hostId 供 App 使用");
+	assert.equal(existsSync(hostIdentityFile(home)), false, "降级路径不得创建共享身份文件");
+	assert.equal(body.plugin?.hostId === body.plugin?.instanceId, false);
+	h.clean();
 });
