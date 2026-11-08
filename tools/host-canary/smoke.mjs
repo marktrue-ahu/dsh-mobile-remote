@@ -56,23 +56,30 @@ let interrupted = false;
 function command(bin, args, {cwd, env, timeout = 180000, outputFd, signal, allowAfterInterrupt = false, maxOutput = 8192} = {}) {
   return new Promise((resolvePromise, reject) => {
     if (interrupted && !allowAfterInterrupt) return reject(new CanaryError('interrupted'));
-    const child = spawn(bin, args, {cwd, env, detached:true, stdio:['ignore',outputFd ?? 'pipe','ignore']});
+    const child = spawn(bin, args, {cwd, env, detached:true, stdio:['ignore',outputFd ?? 'pipe','pipe']});
     children.add(child);
-    let stdout = '', settled = false, timedOut = false, overflow = false;
+    let stdout = '', stderr = '', settled = false, timedOut = false, overflow = false;
     child.stdout?.on('data', data => {
       const chunk = data.toString();
       if (stdout.length + chunk.length > maxOutput) overflow = true;
       if (stdout.length < maxOutput) stdout += chunk.slice(0, maxOutput - stdout.length);
     });
+    // TEMPORARY DIAGNOSTIC (#62): capture stderr so a worker's redacted HOST_DIAG line
+    // survives. Same bounded buffer rules as stdout; remove with the rest.
+    child.stderr?.on('data', data => {
+      const chunk = data.toString();
+      if (stderr.length + chunk.length > maxOutput) overflow = true;
+      if (stderr.length < maxOutput) stderr += chunk.slice(0, maxOutput - stderr.length);
+    });
     const stop = () => {
       timedOut = true;
       try { process.kill(-child.pid, 'SIGKILL'); } catch {}
-      if (!settled) { settled = true; children.delete(child); clearTimeout(timer); signal?.removeEventListener('abort',stop); child.stdout?.destroy(); resolvePromise({code:null, stdout, timedOut:true,overflow}); }
+      if (!settled) { settled = true; children.delete(child); clearTimeout(timer); signal?.removeEventListener('abort',stop); child.stdout?.destroy(); child.stderr?.destroy(); resolvePromise({code:null, stdout, stderr, timedOut:true,overflow}); }
     };
     const timer = setTimeout(stop,timeout);
     if (signal?.aborted) stop(); else signal?.addEventListener('abort',stop,{once:true});
     child.on('error', () => { if (!settled) { settled = true; children.delete(child); clearTimeout(timer); signal?.removeEventListener('abort',stop); reject(new CanaryError('process-start-failed')); } });
-    child.on('close', code => { if (!settled) { settled = true; children.delete(child); clearTimeout(timer); signal?.removeEventListener('abort',stop); try { process.kill(-child.pid, 'SIGKILL'); } catch {} resolvePromise({code, stdout, timedOut,overflow}); } });
+    child.on('close', code => { if (!settled) { settled = true; children.delete(child); clearTimeout(timer); signal?.removeEventListener('abort',stop); try { process.kill(-child.pid, 'SIGKILL'); } catch {} resolvePromise({code, stdout, stderr, timedOut,overflow}); } });
   });
 }
 // Explicit test seam: only a regular mock-docker binary in a dedicated /tmp
