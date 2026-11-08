@@ -124,15 +124,12 @@ jobs:
           set -u
           umask 077
           mkdir -p "$RUNNER_TEMP/canary-results"
-          # Only JSON artifacts are uploaded. Both attempts use the same strict,
-          # closed-vocabulary diagnostic filter; a HOST_DIAG marker alone is not safe.
-          node tools/host-canary/smoke.mjs --host-version "$HOST_VERSION" --plugin-root "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/canary-results/first.json" > /dev/null 2>"$RUNNER_TEMP/canary-first.err"
+          # Never log or upload raw worker or host output; only structured JSON artifacts.
+          node tools/host-canary/smoke.mjs --host-version "$HOST_VERSION" --plugin-root "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/canary-results/first.json" > /dev/null 2>&1
           first=$?
-          node tools/host-canary/print-diagnostics.mjs "$RUNNER_TEMP/canary-first.err" || true
           if [ "$first" -ne 0 ]; then
-            node tools/host-canary/smoke.mjs --host-version "$HOST_VERSION" --plugin-root "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/canary-results/second.json" > /dev/null 2>"$RUNNER_TEMP/canary-second.err"
+            node tools/host-canary/smoke.mjs --host-version "$HOST_VERSION" --plugin-root "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/canary-results/second.json" > /dev/null 2>&1
             second=$?
-            node tools/host-canary/print-diagnostics.mjs "$RUNNER_TEMP/canary-second.err" || true
           else
             second='not-attempted'
           fi
