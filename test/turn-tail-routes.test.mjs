@@ -14,7 +14,7 @@ import { EventEmitter } from "node:events";
 import { mkdtempSync, mkdirSync, writeFileSync, realpathSync, symlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { apply, mobileDisplayPath, renderUnifiedDiffText, turnTailCapabilityOf, turnTailOf, turnTailsOf } from "../lib/index.js";
+import { apply, mobileDisplayPath, recordFileId, renderUnifiedDiffText, turnTailCapabilityOf, turnTailOf, turnTailsOf } from "../lib/index.js";
 
 const CONFIG = {
 	path: "/m",
@@ -711,4 +711,57 @@ test("R14 recheck-4：真实 tool/result 形状经 /history 关联后恢复 exit
 	const result = res.body.events.find((event) => event.type === "tool/result");
 	assert.equal(result.data.callId, "call-real", "真实形状的 callId 必须被解析");
 	assert.equal(result.data.summary?.exitCode, 7, "callId→name 关联后应下发真实退出码");
+});
+
+test("issue #60：符号链接条目与目标的改动身份不同，cwd 别名保持一致", async () => {
+ const f = makeFixture();
+ mkdirSync(join(f.root, "one")); mkdirSync(join(f.root, "two"));
+ writeFileSync(join(f.root, "two", "a.txt"), "target\n");
+ symlinkSync("../two/a.txt", join(f.root, "one", "a.txt"));
+ f.changes.summary.files = [
+  {path:"one/a.txt", added:1, deleted:0}, {path:"two/a.txt", added:1, deleted:0},
+ ];
+ f.changes.summary.total = 2;
+ f.events[2].data.files = [{path: join(f.root,"one","a.txt")}];
+ const {route} = createHarness({sessions:f.sessions, workspaceChanges:f.changes.service});
+ const history = await call(route,{url:"/m/api/history?sessionId=s1&limit=100"});
+ const changes = await call(route,{url:"/m/api/changes/summary?sessionId=s1&turn=2"});
+ const delivered = history.body.events.find(e => e.type === "deliverables/presented").data.files[0];
+ const [link,target] = changes.body.files;
+ assert.equal(link.display,"one/a.txt"); assert.equal(target.display,"two/a.txt");
+ assert.notEqual(link.id,target.id,"Git symlink entry and target are distinct");
+ assert.equal(delivered.id,link.id,"absolute and relative link entry refer to same record");
+ assert.equal(delivered.display,link.display);
+ assert.ok(!JSON.stringify({history:history.body,changes:changes.body}).includes(f.root));
+});
+
+test("issue #60：绝对路径通过另一 cwd 别名仍与相对记录共享身份", async () => {
+ const parent=mkdtempSync(join(tmpdir(),"cwd-alias-"));const root=join(parent,"physical");const alias=join(parent,"alias");
+ mkdirSync(root);mkdirSync(join(root,"src"));writeFileSync(join(root,"src","a.ts"),"ok\n");symlinkSync(root,alias,"dir");
+ const events=[{seq:1,type:"turn/start",data:{turn:2}},{seq:2,type:"workspace/changes",data:{turn:2}},{seq:3,type:"deliverables/presented",data:{turn:2,files:[{path:join(alias,"src","a.ts")}]}},{seq:4,type:"turn/end",data:{turn:2}}];
+ const live={id:"s1",header:{cwd:root},events,snapshotEvents(){return this.events;}};
+ const sessions={get:id=>id==="s1"?live:undefined,list:()=>[live]};
+ const workspaceChanges={summary:()=>({cwd:root,files:[{path:"src/a.ts",added:1,deleted:0}],total:1,added:1,deleted:0}),async diff(){}};
+ const {route}=createHarness({sessions,workspaceChanges});
+ const history=await call(route,{url:"/m/api/history?sessionId=s1&limit=100"});
+ const summary=await call(route,{url:"/m/api/changes/summary?sessionId=s1&turn=2"});
+ const presented=history.body.events.find(e=>e.type==="deliverables/presented").data.files[0];
+ assert.equal(presented.id,summary.body.files[0].id);assert.equal(presented.display,"src/a.ts");
+ assert.ok(!JSON.stringify({history:history.body,summary:summary.body}).includes(parent));
+});
+
+test("issue #60：另一 cwd 别名保留中间符号链接和缺失路径的词法身份", () => {
+ const parent=mkdtempSync(join(tmpdir(),"cwd-alias-nested-"));const root=join(parent,"physical");const alias=join(parent,"alias");
+ mkdirSync(root);mkdirSync(join(root,"target"));writeFileSync(join(root,"target","a.ts"),"ok\n");
+ symlinkSync(root,alias,"dir");symlinkSync("target",join(root,"entry"),"dir");
+ for (const relativePath of ["entry/a.ts","entry/missing/old.ts"]) {
+  const absoluteAlias=join(alias,relativePath);
+  assert.equal(recordFileId(absoluteAlias,root),recordFileId(relativePath,root),relativePath);
+  assert.equal(mobileDisplayPath(absoluteAlias,root),relativePath);
+ }
+ assert.notEqual(recordFileId("entry/a.ts",root),recordFileId("target/a.ts",root),"workspace symlink directory entry must not collapse into target");
+ symlinkSync(".",join(root,"loop"),"dir");writeFileSync(join(root,"a.ts"),"root entry\n");
+ assert.equal(recordFileId(join(alias,"loop","a.ts"),root),recordFileId("loop/a.ts",root),"nested link to cwd is an entry, not the cwd alias");
+ assert.notEqual(recordFileId(join(alias,"loop","a.ts"),root),recordFileId("a.ts",root));
+ assert.equal(mobileDisplayPath(join(alias,"loop","a.ts"),root),"loop/a.ts");
 });

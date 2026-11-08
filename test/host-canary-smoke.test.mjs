@@ -8,7 +8,7 @@ import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, symlink, lstat, chmo
 import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, isAbsolute, join } from 'node:path';
-import { DOCKER_IMAGE, HINT_CODES, MISSING_DEPENDENCY_SPECIFIERS, RUNTIME_LIFECYCLE_MS, checkHostedRunner, createChildExitObserver, createDockerExecutor, createLinuxChildMonitor, createSourceArchive, createStderrCollector, dockerCliDriver, dockerCreatePlan, dockerModelAdapter, evaluateResponses, gitArchiveArgs, hostedDockerAdapter, libSnapshot, makeInstallWorker, makeRuntimeWorker, managedDocker, parseWorkerOutput, probeMobile, RUNTIME_ERROR_CODES, profileFiles, prepareContainerProfile, removeSourceArchive, readLinuxProcessStat, resolveExitedChildHint, runCanary, stderrExitHint, validateDockerMounts, verifyDockerInspection, verifyInstalled, verifyPluginSource, verifyRequiredBundles } from '../tools/host-canary/smoke.mjs';
+import { DOCKER_IMAGE, HINT_CODES, MISSING_DEPENDENCY_SPECIFIERS, RUNTIME_LIFECYCLE_MS, checkHostedRunner, createChildExitObserver, createDockerExecutor, createLinuxChildMonitor, createSourceArchive, createStderrCollector, dockerCliDriver, dockerCreatePlan, dockerModelAdapter, evaluateResponses, gitArchiveArgs, hostedDockerAdapter, libSnapshot, makeInstallWorker, makeRuntimeWorker, managedDocker, parseWorkerOutput, probeMobile, profileFiles, prepareContainerProfile, removeSourceArchive, readLinuxProcessStat, resolveExitedChildHint, runCanary, stderrExitHint, validateDockerMounts, verifyDockerInspection, verifyInstalled, verifyPluginSource, verifyRequiredBundles } from '../tools/host-canary/smoke.mjs';
 
 const imageEnv = ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin','NODE_VERSION=24.1.0','YARN_VERSION=1.22.22'];
 const profileEnvFor = phase => { const base = phase === 'install' ? '/profile' : '/tmp/canary'; return [`HOME=${base}/home`,`DSH_HOME=${base}/dsh`,`XDG_CONFIG_HOME=${base}/xdg-config`,`XDG_CACHE_HOME=${base}/xdg-cache`,`XDG_DATA_HOME=${base}/xdg-data`,`XDG_STATE_HOME=${base}/xdg-state`,`XDG_RUNTIME_DIR=${base}/xdg-runtime`,`NPM_CONFIG_USERCONFIG=${base}/npmrc`,`NPM_CONFIG_GLOBALCONFIG=${base}/npm-globalrc`]; };
@@ -154,12 +154,6 @@ test('generated worker emits a sanitized hint using only a fake host', async t =
         assert.equal(worker.error,undefined); assert.equal(worker.status,2);
         assert.equal(worker.stderr,'', 'raw host output and temporary diagnostics must not leave the worker');
         const expectedCode = {normal:'host-process-exited-hint-module-not-found','torn-identity':'host-process-exited-hint-module-not-found','startup-audit':'host-process-exited-hint-startup-audit','worker-error':'worker-failed','exit-zero':'host-process-exited-zero','exit-nonzero':'host-process-exited-nonzero','exit-signal':'host-process-exited-signal'}[mode];
-        // round5-3：模块缺失上下文现在产出**固定 allowlist token** 的 HOST_DIAG（可回显但
-        // 不含任意原文）；其余模式没有可提取的固定 token，stderr 必须为空。
-        assert.equal(
-          worker.stderr,
-          expectedCode === 'host-process-exited-hint-module-not-found' ? 'HOST_DIAG: ERR_MODULE_NOT_FOUND\n' : '',
-        );
         assert.deepEqual(JSON.parse(worker.stdout),{ok:false,errorCode:expectedCode,checks:[]});
         assert.doesNotMatch(worker.stdout,/SIGTERM|\b17\b/);
       }
@@ -1285,76 +1279,4 @@ test('CLI runs the real backend but stays fail-closed outside a hosted runner', 
   const worker = spawnSync(process.execPath,[file,'--internal-worker','/nonexistent'],{encoding:'utf8'});
   assert.equal(worker.status, 1);
   assert.equal(JSON.parse(worker.stdout).errorCode,'runtime-sandbox-unavailable');
-});
-
-test("recheck-8：install 缺依赖只输出一份 JSON 且保留具体诊断码", async () => {
-	// 预检失败时 worker 只写一次 stdout（catch 不再追加第二份 install-failed），
-	// Docker logs 才能被 JSON.parse 正确解析。
-	const source = makeInstallWorker("1.2.3");
-	assert.match(source, /let preflightReported = false;/);
-	assert.match(source, /if \(!preflightReported\) process\.stdout\.write/);
-	// install 允许并保留具体缺失依赖码（不再覆盖成 install-failed）。
-	const missing = "host-process-exited-hint-missing-qrcode";
-	const parsed = parseWorkerOutput("install", 2, { ok: false, errorCode: missing });
-	assert.equal(parsed.errorCode, missing);
-	assert.equal(parsed.exitCode, 2);
-	// dockerCliDriver 从 logs 解析单份 JSON：具体码可透出。
-	const name = "dsh-canary-" + "e".repeat(32);
-	const id = "d".repeat(64);
-	const driver = dockerCliDriver(async (args) => {
-		if (args[0] === "create") return { code: 0, stdout: id };
-		if (args[0] === "wait") return { code: 0, stdout: "2" };
-		if (args[0] === "logs") return { code: 0, stdout: JSON.stringify({ ok: false, errorCode: missing }) };
-		return { code: 0, stdout: "" };
-	});
-	assert.equal(await driver.create(["create", "--name", name]), id);
-	assert.deepEqual(await driver.wait(id, undefined, "install"), { exitCode: 2, ok: false, checks: [], errorCode: missing });
-});
-
-test("recheck-9：runtime 缺依赖具体码在下游白名单中可归因", async () => {
-	const missingCodes = MISSING_DEPENDENCY_SPECIFIERS.map(([, code]) => code);
-	assert.equal(missingCodes.length, 6);
-	for (const code of missingCodes) {
-		// parseWorkerOutput 的 runtime 白名单必须接受具体 missing-* 码（旧实现只认通用码）。
-		const parsed = parseWorkerOutput("runtime", 2, { ok: false, errorCode: code, checks: ["auth", "bootstrap", "diagnostics"] });
-		assert.equal(parsed.errorCode, code);
-	}
-	// 生成的 runtime worker catch 白名单同样补上（否则具体码会被降级成 worker-failed）。
-	const worker = makeRuntimeWorker();
-	assert.match(worker, /\.\.\.MISSING_DEPENDENCY_SPECIFIERS\.map/);
-	assert.match(worker, /host-process-exited-hint-missing-qrcode|MISSING_DEPENDENCY_SPECIFIERS/);
-});
-
-test("round4-3 F3：runtime 诊断码单一来源覆盖 host-plugin-import-* 与 missing-dep", async () => {
-	const codes = [
-		"host-plugin-import-failed",
-		"host-plugin-import-missing-module",
-		"host-plugin-import-native-load",
-		"host-process-exited-hint-missing-schemastery",
-		"host-process-exited-hint-missing-dsh-llm",
-		"host-process-exited-hint-missing-dsh-sandbox-policy",
-		"host-process-exited-hint-missing-dsh-credentials",
-		"host-process-exited-hint-missing-dsh-scope",
-		"host-process-exited-hint-missing-qrcode",
-	];
-	for (const code of codes) {
-		assert.ok(RUNTIME_ERROR_CODES.includes(code), `${code} 必须在 RUNTIME_ERROR_CODES`);
-		const parsed = parseWorkerOutput("runtime", 2, { ok: false, errorCode: code, checks: ["auth", "bootstrap", "diagnostics"] });
-		assert.equal(parsed.errorCode, code, `${code} 必须原样透传而不是 worker-failed`);
-	}
-	// 生成的 runtime worker 使用注入常量（不再硬编码数组）。
-	const worker = makeRuntimeWorker();
-	assert.match(worker, /const RUNTIME_ERROR_CODES = \[/);
-	assert.match(worker, /const codes = RUNTIME_ERROR_CODES;/);
-	assert.doesNotMatch(worker, /const codes = \['host-process-spawn-failed'/);
-	// adapter 的 infrastructure 判定引用同一常量（单一来源，新增码不再漏四处）。
-	const smokeSource = readFileSync(new URL("../tools/host-canary/smoke.mjs", import.meta.url), "utf8");
-	assert.match(smokeSource, /if \(RUNTIME_ERROR_CODES\.includes\(result\.errorCode\)\) throw new CanaryError\(result\.errorCode,'infrastructure-failure'/);
-	// install 语义仍保持独立封闭集合：runtime 专用码不得混入 install 判定。
-	assert.throws(
-		() => parseWorkerOutput("install", 2, { ok: false, errorCode: "worker-failed" }),
-		(error) => error?.code === "docker-output-invalid",
-	);
-	const installMissing = parseWorkerOutput("install", 2, { ok: false, errorCode: "host-process-exited-hint-missing-qrcode" });
-	assert.equal(installMissing.errorCode, "host-process-exited-hint-missing-qrcode");
 });

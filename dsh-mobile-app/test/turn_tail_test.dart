@@ -288,6 +288,19 @@ void main() {
   });
 
   group('round4-2 F2 行内链接按逻辑身份合并', () {
+    test('符号链接条目与目标拥有不同身份，同名 basename 不链接', () {
+      final resolver = TurnFileLinkResolver(
+        sessionId: 's1',
+        presented: const [],
+        changed: const [
+          ChangedFile(seq: 20, index: 0, display: 'one/a.txt', name: 'a.txt', added: 1, deleted: 0, id: 'link-entry'),
+          ChangedFile(seq: 20, index: 1, display: 'two/a.txt', name: 'a.txt', added: 1, deleted: 0, id: 'target-entry'),
+        ],
+      );
+      expect(resolver.resolve('a.txt'), isNull);
+      expect(resolver.resolve('one/a.txt')?.index, 0);
+      expect(resolver.resolve('two/a.txt')?.index, 1);
+    });
     test('同一 src/a.ts 的 presented+changed 同一服务端 id → 可链接且代表坐标优先 presented', () {
       final resolver = TurnFileLinkResolver(
         sessionId: 's1',
