@@ -368,7 +368,17 @@ export function dockerCliDriver(execute) {
       const status = await run(['wait',id],signal);
       if (!/^[012]$/.test(status)) fail('docker-operation-failed');
       const logs = await run(['logs',id],signal);
-      let data; try { data = JSON.parse(logs); } catch { fail('docker-output-invalid'); }
+      // TEMPORARY DIAGNOSTIC (#62): the worker may emit redacted HOST_DIAG lines on
+      // stderr, which `docker logs` merges into the same stream. Strip and surface them
+      // instead of failing the whole parse; remove together with the diagnostic.
+      const diagLines = [];
+      const payload = String(logs).split('\n').filter(line => {
+        if (!line.includes('HOST_DIAG: ')) return true;
+        diagLines.push(line.slice(line.indexOf('HOST_DIAG: ') + 'HOST_DIAG: '.length));
+        return false;
+      }).join('\n');
+      if (diagLines.length > 0) process.stderr.write('HOST_DIAG: ' + diagLines.join(' | ') + '\n');
+      let data; try { data = JSON.parse(payload); } catch { fail('docker-output-invalid'); }
       return parseWorkerOutput(phase,Number(status),data);
     },
     async kill(id,signal,cleanup = false) { validId(id); if (cleanup && !authorized.has(id)) fail('docker-cleanup-unauthorized'); await run(['kill',id],signal,cleanup); },
@@ -830,7 +840,10 @@ export function createStderrCollector(stream, ...extraStreams) {
     destroyed = true; prefix = '';
     for (const s of streams) { s.off('data',onData); s.off('error',onError); s.destroy(); }
   };
-  return {hint,drain,destroy};
+  // TEMPORARY DIAGNOSTIC (#62): read-only snapshot of the bounded prefix. Only the
+  // worker's diagnostic path consumes it, and it is redacted before leaving the process.
+  const snapshot = () => (typeof prefix === 'string' ? prefix : '');
+  return {hint,drain,destroy,snapshot};
 }
 // Testable worker contract only: the caller must run the transport inside a
 // verified container. It receives only fixed relative paths, never a host URL.
@@ -1121,6 +1134,27 @@ try {
   const codes = ['host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-exited-hint-startup-audit','host-process-exited-hint-port-in-use','host-process-exited-hint-out-of-memory','host-process-exited-hint-engine-mismatch','host-process-exited-hint-bad-invocation','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive','host-identity-inconclusive','response-inconclusive','compatibility-check-failed','host-capabilities-inconclusive','probe-input-invalid'];
   const code = codes.includes(error?.code) ? error.code : 'worker-failed';
   const checks = Array.isArray(error?.checks) ? error.checks.filter(value => typeof value === 'string' && (/^(auth|bootstrap|diagnostics)$/.test(value) || capabilityNames.some(name => ['ok','missing','drift'].some(state => value === 'host-capability:' + name + ':' + state)))) : [];
+  // TEMPORARY DIAGNOSTIC (#62): report the first line of the host's stderr after
+  // redaction so a single hosted run reveals the missing module. Removed once the
+  // root cause is fixed. Never emits paths, tokens, or the full dump.
+  let hostDiag = null;
+  try {
+    const raw = stderrCollector && typeof stderrCollector.snapshot === 'function' ? stderrCollector.snapshot() : '';
+    if (typeof raw === 'string' && raw.length > 0) {
+      // Allowlist-only extraction: emit just the identifiers that matter for diagnosis
+      // (error codes and package specifiers). Anything not matching is dropped, so no
+      // arbitrary text — paths, tokens, hostnames, file contents — can pass through.
+      const tokens = new Set();
+      for (const match of raw.matchAll(/\b(?:ERR_[A-Z_]+|[A-Z][A-Z0-9_]{3,})\b/g)) tokens.add(match[0]);
+      for (const match of raw.matchAll(/(?:Cannot find (?:package|module) )?'(@?[a-z0-9][a-z0-9._-]*(?:" + "\\/" + "[a-z0-9][a-z0-9._-]*)?)'/g)) {
+        if (match[1] && match[1].length <= 80) tokens.add(match[1]);
+      }
+      hostDiag = [...tokens].slice(0, 12).join(' ') || null;
+    }
+  } catch { hostDiag = null; }
+  // stderr is captured by the host-side docker driver and surfaced to the workflow log;
+  // keeping it out of the validated stdout payload avoids changing the output contract.
+  if (hostDiag) process.stderr.write('HOST_DIAG: ' + hostDiag + '\\n');
   process.stdout.write(JSON.stringify({ok:false,errorCode:code,checks}) + '\\n');
   process.exitCode = code === 'compatibility-check-failed' ? 1 : 2;
 } finally { childExitObserver?.destroy(); stderrCollector?.destroy(); child?.kill('SIGKILL'); }
