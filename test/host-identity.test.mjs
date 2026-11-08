@@ -3,7 +3,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, utimesSync, existsSync, unlinkSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync, mkdirSync, utimesSync, existsSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -95,6 +95,10 @@ test("R15：身份文件损坏/为空时重新生成有效值（不让半截内�
 	const home = mkdtempSync(join(tmpdir(), "r15-corrupt-"));
 	mkdirSync(join(home, ".dsh", "mobile-remote"), { recursive: true });
 	writeFileSync(hostIdentityFile(home), "");
+	// round5-1：新鲜但无效的内容视为"另一个进程写入中"，只等待不删除；
+	// 崩溃残留需 mtime>5s 才允许清理重建。
+	const old = new Date(Date.now() - 10_000);
+	utimesSync(hostIdentityFile(home), old, old);
 	const identity = resolveHostIdentity({ home });
 	assert.match(identity, /^[0-9a-f-]{36}$/i);
 	assert.equal(readFileSync(hostIdentityFile(home), "utf8").trim(), identity);
@@ -139,8 +143,10 @@ test("recheck-7：并发初始化/自愈身份文件只有一个赢家（所有�
 	const identities = await resolveConcurrently(home, 8);
 	assert.equal(new Set(identities).size, 1, `并发进程必须得到同一身份：${JSON.stringify(identities)}`);
 	assert.equal(readFileSync(hostIdentityFile(home), "utf8").trim(), identities[0]);
-	// 文件已存在且损坏为空：多进程同时修复也必须收敛到同一个新身份。
+	// 文件已存在且损坏为空（mtime 陈旧 → 崩溃残留）：多进程同时修复也必须收敛到同一新身份。
 	writeFileSync(hostIdentityFile(home), "");
+	const stale = new Date(Date.now() - 10_000);
+	utimesSync(hostIdentityFile(home), stale, stale);
 	const repaired = await resolveConcurrently(home, 6);
 	assert.equal(new Set(repaired).size, 1, `损坏修复也必须单赢家：${JSON.stringify(repaired)}`);
 	assert.equal(readFileSync(hostIdentityFile(home), "utf8").trim(), repaired[0]);
@@ -164,24 +170,23 @@ function resolveInChild(home) {
 	});
 }
 
-test("round4-1：持锁者超过等待上限未发布时，等待者不得无锁写身份", async () => {
+test("round5-1：写入者（wx 已占位）超过等待上限未发布时，等待者不得无锁写身份", async () => {
 	const home = mkdtempSync(join(tmpdir(), "r15-held-"));
 	const file = hostIdentityFile(home);
 	mkdirSync(join(home, ".dsh", "mobile-remote"), { recursive: true });
-	// 模拟持锁者在 rename 前被 SIGSTOP：锁存在、共享身份文件尚不存在。
-	const lockFile = `${file}.lock`;
-	writeFileSync(lockFile, "", { mode: 0o600 });
+	// 模拟持锁者在 writeSync 前被 SIGSTOP：身份文件已被 wx 创建但内容为空、mtime 新鲜。
+	writeFileSync(file, "", { mode: 0o600 });
 	try {
 		const result = await resolveInChild(home); // 内部等待 3s 后超时
 		assert.match(result, /^ERR:HOST_IDENTITY_LOCK_UNAVAILABLE$/, `等待者必须显式降级而不是发布：${result}`);
-		assert.equal(existsSync(file), false, "未持锁的等待者绝不能创建共享身份文件");
-		// 恢复/释放持锁者后，竞争进程必须收敛到同一个已发布 UUID。
-		unlinkSync(lockFile);
+		assert.equal(readFileSync(file, "utf8"), "", "等待者绝不能覆盖/删除新鲜的空身份文件");
+		// 持锁者恢复并写入后，后续竞争者读取同一身份。
+		const winner = "11111111-1111-4111-8111-111111111111";
+		writeFileSync(file, `${winner}\n`);
 		const identities = await resolveConcurrently(home, 4);
-		assert.equal(new Set(identities).size, 1);
-		assert.equal(readFileSync(file, "utf8").trim(), identities[0]);
+		assert.deepEqual(new Set(identities), new Set([winner]));
 	} finally {
-		try { unlinkSync(lockFile); } catch { /* ignore */ }
+		/* 临时目录由系统回收 */
 	}
 });
 
@@ -189,14 +194,12 @@ test("round4-1：陈旧锁（mtime>5s）清理后必须重新抢锁才发布", (
 	const home = mkdtempSync(join(tmpdir(), "r15-stale-"));
 	const file = hostIdentityFile(home);
 	mkdirSync(join(home, ".dsh", "mobile-remote"), { recursive: true });
-	const lockFile = `${file}.lock`;
-	writeFileSync(lockFile, "", { mode: 0o600 });
+	writeFileSync(file, "", { mode: 0o600 });
 	const old = new Date(Date.now() - 10_000);
-	utimesSync(lockFile, old, old);
+	utimesSync(file, old, old);
 	const identity = resolveHostIdentity({ home });
 	assert.match(identity, /^[0-9a-f-]{36}$/i);
-	assert.equal(readFileSync(file, "utf8").trim(), identity);
-	assert.equal(existsSync(lockFile), false, "赢家发布后应释放锁");
+	assert.equal(readFileSync(file, "utf8").trim(), identity, "崩溃残留空文件必须被替换为有效身份");
 });
 
 test("round4-1：open 非 EEXIST 失败且无有效文件 → 抛可诊断错误且不写文件", () => {
@@ -219,4 +222,69 @@ test("round4-1：状态目录不可写时 bootstrap 降级为进程内 hostId（
 	assert.equal(existsSync(hostIdentityFile(home)), false, "降级路径不得创建共享身份文件");
 	assert.equal(body.plugin?.hostId === body.plugin?.instanceId, false);
 	h.clean();
+});
+
+test("round5-1：两个 cleaner 交错清理陈旧残留也只能产生一个 UUID", async () => {
+	const home = mkdtempSync(join(tmpdir(), "r15-cleaners-"));
+	const file = hostIdentityFile(home);
+	mkdirSync(join(home, ".dsh", "mobile-remote"), { recursive: true });
+	writeFileSync(file, "", { mode: 0o600 });
+	const old = new Date(Date.now() - 10_000);
+	utimesSync(file, old, old);
+	const identities = await resolveConcurrently(home, 2);
+	assert.equal(new Set(identities).size, 1, `两个 cleaner 交错必须收敛同一 UUID：${JSON.stringify(identities)}`);
+	assert.equal(readFileSync(file, "utf8").trim(), identities[0]);
+});
+
+test("round5-1 TOCTOU：A 暂停期间 B 发布有效身份，A 的 rename 只能移到有效文件并恢复", () => {
+	const home = mkdtempSync(join(tmpdir(), "r15-toctou-"));
+	const file = hostIdentityFile(home);
+	mkdirSync(join(home, ".dsh", "mobile-remote"), { recursive: true });
+	writeFileSync(file, "", { mode: 0o600 });
+	const old = new Date(Date.now() - 10_000);
+	utimesSync(file, old, old);
+	const winner = "22222222-2222-4222-8222-222222222222";
+	// A 观察到陈旧残留后暂停；B 在此窗口完成 wx 写入并返回（路径已是有效身份）。
+	const resolved = resolveHostIdentity({
+		home,
+		onBeforeRename: () => { writeFileSync(file, `${winner}\n`); },
+	});
+	assert.equal(resolved, winner, "A 只能返回已发布的 B 身份，不能返回自己的 UUID");
+	assert.equal(readFileSync(file, "utf8").trim(), winner);
+	const leftovers = readdirSync(join(home, ".dsh", "mobile-remote")).filter((name) => name.includes(".quarantine."));
+	assert.deepEqual(leftovers, [], "有效文件被隔离后必须恢复，不能残留隔离文件");
+});
+
+test("round5-1 TOCTOU：隔离后路径已被另一个有效身份占用时安全丢弃隔离文件", () => {
+	const home = mkdtempSync(join(tmpdir(), "r15-toctou2-"));
+	const file = hostIdentityFile(home);
+	mkdirSync(join(home, ".dsh", "mobile-remote"), { recursive: true });
+	writeFileSync(file, "", { mode: 0o600 });
+	const old = new Date(Date.now() - 10_000);
+	utimesSync(file, old, old);
+	const other = "33333333-3333-4333-8333-333333333333";
+	const resolved = resolveHostIdentity({
+		home,
+		onQuarantined: () => { writeFileSync(file, `${other}\n`); },
+	});
+	assert.equal(resolved, other, "路径已被有效占用时返回路径值并丢弃隔离文件");
+	assert.equal(readFileSync(file, "utf8").trim(), other);
+	const leftovers = readdirSync(join(home, ".dsh", "mobile-remote")).filter((name) => name.includes(".quarantine."));
+	assert.deepEqual(leftovers, [], "隔离文件必须被安全丢弃");
+});
+
+test("round5-1 inode 校验：写入后路径被替换，赢家不得返回自己的 UUID", () => {
+	const home = mkdtempSync(join(tmpdir(), "r15-inode-"));
+	const file = hostIdentityFile(home);
+	mkdirSync(join(home, ".dsh", "mobile-remote"), { recursive: true });
+	const other = "44444444-4444-4444-8444-444444444444";
+	const resolved = resolveHostIdentity({
+		home,
+		onBeforeInodeCheck: () => {
+			unlinkSync(file);
+			writeFileSync(file, `${other}\n`);
+		},
+	});
+	assert.equal(resolved, other, "路径已不是自己的 inode 时必须返回已发布值，而不是未持久化的 UUID");
+	assert.equal(readFileSync(file, "utf8").trim(), other);
 });
