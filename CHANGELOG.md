@@ -1,5 +1,37 @@
 # Changelog
 
+## v3.2.4-alpha.8（build 40，issues #61 / #62）— 免重启插件更新与轮次 UI 收尾
+
+> 插件 `3.2.4-alpha.8` / App `3.2.4+40` / 载体 `3.2.4-alpha.8-app`。
+
+### 插件：宿主原生插件管理器通道（DSH 0.2.2+，免重启更新）
+
+- 新增 `lib/host-update-capabilities.js`：按**能力**探测宿主 `pluginManager` 与 `hmr`（不看宿主版本号，沿用 ADR 0017），给出通道选择 `host-manager > restart > guidance`。
+- 新增 `lib/host-manager-update.js`：委托宿主 `pluginManager.updateBundle()` 执行进程内更新；把宿主 `ChangeResult` 压成稳定原因码，**不透传** diagnostic 原文（可能含路径/凭据），失败/取消/需重启分别归因。
+- bootstrap / diagnostics 新增 `updateChannel`、`updateChannelDescription`、`canRestartHost`、`hostManager`；`services` 暴露 `pluginManager`、`hmr`。
+- `plugin-update-controller` 新增 host-manager 提交分支，与重启通道共用同一 opId/租约/事务日志，两通道互斥、不并发。
+- `detectRestartForm` 增加命令行证据（`dsh web ...` → web-foreground）；前台 respawn 复用原命令行，`--port` 等参数不再丢失。
+- 桌面连接页显示实际更新通道与「连接是否中断」；App 解析通道字段并提供「是否需要重启」的展示。
+
+### App：轮次过程 UI 收尾（issue #61，alpha.7 真机反馈）
+
+- 展开态摘要去重：摘要行只作折叠态的展开入口；展开后改为过程块末尾行内「收起过程」，强制展开（运行中/插话/异常结束）不提供收起控件。
+- 协议生命周期事件归调试可见：`job/*`、`session/jobs`、`question/*`、`approval/*` 等不再在普通模式渲染裸协议卡（待答/审批卡仍来自 store 与 `mobile/frame`）。
+- 工具名兜底：新增 session 级 callId→toolName 映射（跨加载重建保留、换会话清空）；仍无名称时标题为「工具调用」，折叠行给出参数/结果首行摘要（≤80 字）。
+- 修复「正在调用工具…」常驻：抬头运行态只信 `group.running && !process.ended`，轮次结束后不再显示 running。
+- 新增 `issue61_ui_polish_test.dart`（15 项）覆盖上述四类行为。
+
+### 宿主兼容性 canary 增强（#62）
+
+- 安装阶段预检插件依赖解析，归因到具体缺失依赖包（`install`/`runtime` 阶段各自归因）；安装保留 peer 解析、npm pack 时打包 bundled 运行时依赖并创建目标目录。
+- 启动失败诊断可归因性增强；runtime 阶段自检插件可加载性；install worker 注入缺失依赖白名单。
+- `tools/worktree.sh`：refresh-baseline 支持授权后刷新任务基线（写入/归属/授权收紧、注入写前拒绝、摘要级失败判定、自证断言），门禁自测同步扩充。
+
+### 文档与验证
+
+- `docs/10-release.md` 与当前 npm 发布链对齐：移除「GitHub Release 三资产」表述，改为 npm 载体一致性校验（本链路通过 `-app` 载体分发 APK，不创建 GitHub Release）。
+- 补跑 alpha.7 全新安装冒烟（隔离 HOME `pnpm add`）：插件/载体版本与精确别名正确，APK `87,796,802 B` sha256=`5455b78f…` 与载体清单一致，主插件 tarball sha256 与清单一致。
+
 ## v3.2.4-alpha.7（build 39，issues #52 / #53 / #54）— 轮末两卡与工具卡结构化
 
 > 插件 `3.2.4-alpha.7` / App `3.2.4+39` / 载体 `3.2.4-alpha.7-app`。
