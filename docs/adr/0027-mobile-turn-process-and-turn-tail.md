@@ -66,6 +66,13 @@ issue #1 当年决定「assistant/tool 产出文件的元数据不再下发，�
 - 全部字段 fail-open：非法 JSON、未知工具、字段异常一律忽略并回退通用卡，不得让事件摘要/历史/SSE 出错。
 - **Batch 2 / 非目标**：todo/question/skill 专用行、PTC `subCalls` 子调用、工具卡文件路径可点进预览、图片图库增强；Inspect / Trajectory 检查器、hover 浮层与多列布局明确不做。
 
+### 7. 实施后补充（2026-11-08，issue #60 复核收敛）
+
+- **路径最小披露**：轮末 summary/diff 一律由记录路径 + 会话 cwd 重新派生 display（含 binary/oversized 与 `---/+++` 标头），不直通宿主 display；presented 与 changes 共用 `recordFileId`（归一化路径的 SHA-256 前缀）作为不泄路径的逻辑身份，行内链接同 id 合并、异 id 歧义不链。
+- **宿主身份**：新增 bootstrap `plugin.hostId`（持久 UUID，与口令无关）用于通知账本隔离；身份文件采用「私有候选 + 不覆盖 hard-link 单赢家」发布，损坏占位 fail-closed，访问口令不得充当宿主身份。
+- **审批身份**：`approvalId` 标识一次实际审批请求（`$events` 路径 `sessionId+eventId`；接管路径 `callId+uuid`），`callId` 仅作关联；同一工具连续两次审批都必须提醒，重放仍需去重。
+- **本地化与临时诊断**：过程抬头/页脚/用时走既有 `L10n`；`HOST_DIAG` 临时旁路已随上游 PR #32 移除，本 ADR 不保留该通道，后续诊断需求走正式设计。
+
 ## 后果
 
 - 手机端时间线要从「扁平消息 + 工具卡」重构成「轮次（过程组 + 页脚 + 产出物）」结构，M1 与 M2 必须串行（M2 blocked_by M1），M3 在 M1 之后。

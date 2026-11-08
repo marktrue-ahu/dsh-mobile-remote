@@ -128,6 +128,7 @@
 
 - `capabilities.turnTail`：轮末页脚能力位（v3.3，issue #52/#53）：宿主注册了 `workspaceChanges` 服务时返回 `{ "version": 1, "presented": true, "changed": true, "changesDiff": true }`，否则 `presented` 仍可为真而 `changed`/`changesDiff` 为假；旧插件不下发该字段，App 据此不渲染轮末卡片与展示模式设置。判据与字段详见 §6.20，SSE hello 同名字段与之同判据、同形状。
 - `capabilities.toolCards`：工具卡结构化能力位（v3.3，issue #54）：`{ "version": 1, "tools": [本插件实际投影的工具名…] }`；bootstrap 与 SSE hello 同判据，App 逐工具决定专用卡或通用卡，缺失时全部通用卡（见 §6.24）。
+- `plugin.hostId`：宿主**稳定身份**（随机 UUID，持久化于插件状态目录；与访问口令、`instanceId` 无关，issue #60 R15）。手机用它隔离通知账本（同口令的不同宿主不得互相撤销）；旧插件缺失该字段时 App 回退既有 scope。
 
 - 未认证：`401`（见通用约定）。
 ### 3.2 POST /m/api/send
@@ -306,7 +307,7 @@
 | `agent/status` | `{ agentId, sessionId, status, child }`——`status` 只有 `running` / `idle` 两值（内核 `AgentStatus` 即为二元联合）；`sessionId` 为去 `session:` 前缀的会话 id，`child` 标记子代理会话（v2.7.2 起携带后两字段）。**不存在 `waiting`**：等待用户审批/作答时 agent 仍为 `running`，该事实由 `mobile/frame` 的挂起问询/审批承载 |
 | `notifications/changed` | 通知记录增删（如移动端删除后），客户端刷新列表与角标 |
 | `mobile/notify` | `{ notification: { id, kind, sessionId, title, detail, time } }`——插件"真结束"判定后推送的通知（completed / failed / needs-answer），桌面宠物/App 与通知中心同源渲染（v2.7.2） |
-| `mobile/frame` | 内核瞬态帧（问询/审批）。`frame` 字段为 `question/requested`（含 `rpcId`、`questions[]`）、`question/resolved`（`questionRpcId`）、`approval/requested`（`rpcId`、`approvalId`、`toolName`、`reason?`）、`approval/resolved`（`approvalId`）。**App 断线重连时服务端补发挂起的待答帧**（`pendingFrames` 回放） |
+| `mobile/frame` | 内核瞬态帧（问询/审批）。`frame` 字段为 `question/requested`（含 `rpcId`、`questions[]`）、`question/resolved`（`questionRpcId`）、`approval/requested`（`rpcId`、`approvalId`、`toolName`、`reason?`）、`approval/resolved`（`approvalId`）。**`approvalId` 标识一次实际审批请求**：同一 `callId` 的 pre-execute 与 sandbox escalation 是两个不同 `approvalId`，`callId` 仅作关联（issue #60 R16）；`$events` 路径的 `rpcId` 使用稳定的 `eventId`。**App 断线重连时服务端补发挂起的待答帧**（`pendingFrames` 回放） |
 | `mobile/queue` | `{ sessionId, rows: [{ id, text, placement }] }`——内核队列快照（`agent/inbox/spliced` 即时镜像，v3.0.2）：认领/删除/编辑实时反映，App 端 dock 以此为权威源（`placement`: `queued` / `steering` / `context`，与 GET /queue 同款形状）；断线重连时 mux 回放当前队列 |
 | `attention/snapshot` | `{ version: 1, pending: [{ kind, sessionId, identity }] }`——在断线重连的 `mobile/frame` 挂起帧回放**之后**、同一有序 SSE 流上追加的**完整待办快照边界**（v3.3）。App 只据此撤销该宿主已不在 pending 中的业务通知，不得凭超时猜测待办已结束；旧宿主无此帧时保留既有行为 |
 | `git/changed`（规划中） | 设计目标为 `{ repositoryId }`；当前版本未实现 Git provider，也不会推送此帧 |
@@ -1225,7 +1226,7 @@ graph 的每个提交与 commit 详情都**保留旧的** `refs: string[]`（dep
   "state": "available",
   "turn": 12,
   "files": [
-    { "seq": 843, "index": 0, "display": "src/a.ts", "name": "a.ts",
+    { "seq": 843, "index": 0, "id": "a1b2c3d4e5f60718", "display": "src/a.ts", "name": "a.ts",
       "added": 12, "deleted": 3, "binary": false, "oversized": false }
   ],
   "total": 5,
@@ -1237,7 +1238,8 @@ graph 的每个提交与 commit 详情都**保留旧的** `refs: string[]`（dep
 
 - `state` 三态：`available`（宿主仍有该轮摘要）、`absent`（该轮没有改动记录）、`unavailable`（宿主没有 `workspaceChanges` 服务、会话休眠、宿主重启后摘要丢失或读取超时）。后两者 `files` 为空，App 不渲染改动卡、不占位。
 - `files[].seq` 是该轮最新 `workspace/changes` 事件的持久序号（供预览与 diff 坐标）；`index` 是该文件在宿主摘要中的下标。
-- `display` 由宿主给出（工作目录内相对路径、仓库上层为 `../`、家目录为 `~`，其余为绝对路径的展示形式）；**不返回用于拼接的绝对路径字段**。
+- `files[].display` 由插件按记录路径 + 会话 cwd **重新派生**（工作目录内相对路径、家目录为 `~/…`，其余仅 basename），不透传宿主 display，因此响应**不包含可拼接的绝对路径**（issue #60 R05）。
+- `files[].id`：记录路径归一化（相对路径按 cwd 展开、realpath 别名解析）后的 SHA-256 前 16 位，只用于同一逻辑文件在 presented/changed 之间去重与行内链接；不可逆、不携带路径（issue #60 R08/F2）。旧插件无该字段时 App 按坐标保守处理。
 - `truncated`：受宿主 `maxFiles`（默认 500）与移动端上限（200）截断时为 `true`，`total` 仍是全量计数。
 - 稳定错误：`400 bad-request`（缺参/非法 turn）、`503 sessions-unavailable`。服务不可用**不**返回 5xx，按 `state: "unavailable"` 返回，便于 App 统一降级。
 
@@ -1266,6 +1268,7 @@ graph 的每个提交与 commit 详情都**保留旧的** `refs: string[]`（dep
 - 宿主返回 `{ kind, display, before, after, hunks, coarse }`；插件把 hunks 渲染成统一 diff 文本（`---`/`+++`/`@@`），供 App 复用 `GitFileViewer` 差异模式，并限制文本体积（512 KiB，超出 `truncated: true`）。
 - `kind` 为 `binary` / `oversized` 时只带 `display` 与原因式 `kind`，App 显示不可比对提示。
 - `coarse: true` 表示宿主逐行对比超时后退化为整文件替换。
+- `display` 与统一 diff 的 `---/+++` 标头同样由插件按记录 path + 会话 cwd 重新派生；`binary`/`oversized` 分支也只返回安全 display，不直通宿主 display（issue #60 R05）。
 - 稳定错误：`400 bad-request`、`404 diff-not-found`（摘要已失效或下标不存在）、`503 changes-unavailable`。
 
 ### 6.23 GET /m/api/turn-file（按轮末记录坐标读取文件，issue #53）
