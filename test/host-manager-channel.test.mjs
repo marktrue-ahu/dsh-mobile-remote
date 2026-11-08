@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Readable, Writable } from 'node:stream';
 import { once } from 'node:events';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -32,7 +32,14 @@ function harness() {
     maxConnections: 16, pushUrls: [], pushCooldownMs: 60000, doneGraceMs: 1000, pushContent: 'minimal',
     rateLimit: { maxFailures: 10, windowMs: 60000, blockMs: 60000 }, lanBridge: { enabled: false, host: '127.0.0.1', port: 39402 } };
   const docs = new Map();
-  const P = '3.2.4-alpha.8', C = `${P}-app`;
+  // 本地插件版本来自 package.json；远端候选必须严格更新，避免测试与发布版本号耦合。
+  const localVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+  const nextAlpha = (v) => {
+    const m = /^(.*-alpha\.)(\d+)$/.exec(v);
+    if (!m) throw new Error(`local version is not alpha: ${v}`);
+    return `${m[1]}${Number(m[2]) + 1}`;
+  };
+  const P = nextAlpha(localVersion), C = `${P}-app`;
   docs.set('@marktrue/dsh-mobile-remote', { 'dist-tags': { latest: '3.2.4-alpha.5', alpha: P, app: C } });
   docs.set(`@marktrue/dsh-mobile-remote@${P}`, { version: P, dist: { integrity: 'sha512-cGx1Z2lu' },
     optionalDependencies: { '@marktrue/dsh-mobile-remote-app': `npm:@marktrue/dsh-mobile-remote@${C}` } });
@@ -43,7 +50,7 @@ function harness() {
     schedule: fn => jobs.push(fn),
     runSelfUpdate: async () => { throw new Error('重启通道不应被使用'); },
     hostCapabilities: { packageName: '@marktrue/dsh-mobile-remote', managerAvailable: true, managerReason: '',
-      hmrAvailable: true, hmrReason: '', updatable: true, state: 'ready', channel: 'host-manager', installedVersion: '3.2.4-alpha.5' },
+      hmrAvailable: true, hmrReason: '', updatable: true, state: 'ready', channel: 'host-manager', installedVersion: localVersion },
     runHostUpdate: async ({ targetVersion }) => { hostUpdateCalls++; return { ok: true, channel: 'host-manager', reason: '', from: '3.2.4-alpha.5', to: targetVersion, step: 'install', restored: false }; },
   } });
   return { route: routes.find(r => r.kind === 'prefix'), jobs, profile, get calls() { return hostUpdateCalls; } };
