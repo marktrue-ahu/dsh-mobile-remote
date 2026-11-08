@@ -23,13 +23,48 @@ export class SyncError extends Error {
 	}
 }
 
-function apiError(status) {
+/** 从 GitHub 拒绝响应的 message 中提取**可区分线索**（不把原始正文带进错误/摘要，避免泄露）。 */
+function rejectionHint(detailText) {
+	const text = typeof detailText === "string" ? detailText : "";
+	if (/Changes must be made through a pull request/i.test(text)) return "branch-protection";
+	if (/protected branch/i.test(text)) return "branch-protection";
+	if (/not a fast forward|non-fast-forward/i.test(text)) return "non-fast-forward";
+	if (/repository rule|required status check/i.test(text)) return "repository-rule";
+	return "unknown";
+}
+
+function rejectionHintText(hint) {
+	switch (hint) {
+		case "branch-protection": return "分支保护要求通过 Pull Request 合并，不是 token 权限不足";
+		case "non-fast-forward": return "非快进历史，需先同步/合并上游";
+		case "repository-rule": return "仓库规则/必需状态检查拒绝，不是 token 权限不足";
+		default: return "拒绝原因需按 GitHub 响应与仓库设置排查";
+	}
+}
+
+function apiError(status, hint = "unknown") {
 	if (status === 401) return new SyncError("authentication-failed", "GitHub 认证失败，请检查同步 token。");
-	if (status === 403) return new SyncError("permission-denied", "GitHub 拒绝访问：检查 Contents 写权限、分支保护；上游含 workflow 变更时可能需要 Workflows 写权限。");
+	if (status === 403) return new SyncError("permission-denied", `GitHub 拒绝访问：${rejectionHintText(hint)}。`);
 	if (status === 429) return new SyncError("rate-limited", "GitHub API 限流，请稍后重试。");
 	if (status === 404) return new SyncError("ref-or-comparison-unavailable", "仓库、main 引用或跨 fork 提交比较不可用，请检查仓库关系与历史。");
-	if (status === 409 || status === 422) return new SyncError("update-rejected", "GitHub 拒绝更新，可能存在并发修改或非快进历史；未强推，请人工检查。");
+	if (status === 409 || status === 422) return new SyncError("update-rejected", `GitHub 拒绝更新：${rejectionHintText(hint)}；未强推，请人工检查。`);
 	return new SyncError("github-api-failed", `GitHub API 请求失败（HTTP ${status}），本次不继续同步。`);
+}
+
+/** GitHub workflow 权限拒绝的特征：message 含 workflow 且指向权限/范围/拒绝，或权限诊断头含 workflows。 */
+function isWorkflowPermissionDenial(detailText, responseHeaders) {
+	const text = typeof detailText === "string" ? detailText : "";
+	if (/workflow/i.test(text) && /(permission|scope|refus|not authorized|resource not accessible)/i.test(text)) return true;
+	try {
+		const accepted = String(responseHeaders?.get?.("x-accepted-github-permissions") ?? "");
+		if (/workflows/i.test(accepted) && /(permission|scope)/i.test(text)) return true;
+	} catch { /* 头不可读时忽略 */ }
+	return false;
+}
+
+/** 读取拒绝响应正文（只用于分类，不进入错误消息/摘要）。 */
+async function responseDetailText(response) {
+	try { return await response.text(); } catch { return ""; }
 }
 
 // 从 compare 响应提取本次区间内被新增/修改/删除的 workflow 文件。
@@ -88,7 +123,8 @@ async function rateLimit(response) {
 	let secondary = false;
 	if (response.status === 403 && !primary && !retryAfter) {
 		try {
-			const body = await response.json();
+			// clone 后再解析：拒绝响应正文随后还要用于区分 workflow 权限/分支保护等原因。
+			const body = await response.clone().json();
 			secondary = /secondary rate limit|rate limit exceeded|abuse detection/i.test(String(body?.message ?? ""));
 		} catch { /* 不公开原始错误正文。 */ }
 	}
@@ -156,13 +192,16 @@ function createClient({ token, fetchImpl, sleepImpl }) {
 			if (response.ok) return true;
 			if (await rateLimit(response)) throw new SyncError("rate-limited", "GitHub API 已限流，本次不重发写请求，请等待恢复后重试。");
 			if (response.status >= 500 || response.status === 408) return false;
-			// issue #60 R18：只有 **403 + 本次区间改了 workflow 文件** 才能归因为 workflows
-			// 权限（GitHub 的 workflows 权限拒绝是 403）。422 可能是非快进/分支保护/校验失败，
-			// 必须保留 apiError 的可区分原因（update-rejected），不得一律诱导用户提权。
-			if (hasWorkflowChanges && response.status === 403) {
+			// issue #60 recheck-3（R18）：403 不能只看"含 workflow 改动"——分支保护
+			// （"Changes must be made through a pull request"）等同样 403。结合响应正文
+			// 分类：只有正文/权限诊断明确指向 workflows 权限时才给提权指引；422 保持
+			// update-rejected，并通过 hint 区分非快进/分支保护（错误消息不含原始正文）。
+			const detailText = await responseDetailText(response);
+			const hint = rejectionHint(detailText);
+			if (hasWorkflowChanges && response.status === 403 && isWorkflowPermissionDenial(detailText, response.headers)) {
 				throw workflowPermissionError(workflowPaths, workflowTruncated, response.status);
 			}
-			throw apiError(response.status);
+			throw apiError(response.status, hint);
 		},
 	};
 }

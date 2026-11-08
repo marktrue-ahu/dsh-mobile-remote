@@ -436,7 +436,7 @@ test("#48 403 + workflow 变更 → 专门原因、带文件清单、不重发�
 	const status = 403;
 	const h = setup([json(ref(BEFORE)), json(ref(UPSTREAM)), json(withFiles([
 		".github/workflows/release.yml", ".github/workflows/check.yml", "CHANGELOG.md",
-	])), json({}, status)]);
+	])), json({ message: "refusing to allow a Personal Access Token to create or update workflow `.github/workflows/release.yml` without `workflow` scope" }, status)]);
 	let failure;
 	try { await h.run({ dryRun: false }); } catch (error) { failure = safeFailure(error); }
 	assert.equal(failure.reason, "workflow-permission-required");
@@ -491,4 +491,22 @@ test("#48 摘要含清单与截断提示，且不泄露 token", () => {
 	assert.match(summary, /check\.yml/);
 	assert.match(summary, /可能不完整/);
 	assert.ok(!summary.includes(TOKEN));
+});
+
+test("recheck-3：403 + workflow 改动但正文是分支保护/PR 要求 → 不误导提权", async () => {
+	const cases = [
+		["Changes must be made through a pull request", "branch-protection"],
+		["protected branch hook declined", "branch-protection"],
+		["Update is not a fast forward", "non-fast-forward"],
+	];
+	for (const [message] of cases) {
+		const h = setup([json(ref(BEFORE)), json(ref(UPSTREAM)), json(withFiles([
+			".github/workflows/release.yml",
+		])), json({ message }, 403)]);
+		let failure;
+		try { await h.run({ dryRun: false }); } catch (error) { failure = safeFailure(error); }
+		assert.equal(failure.reason, "permission-denied", `403 非 workflow 权限不得归因为权限缺失：${message}`);
+		assert.doesNotMatch(failure.message, /Workflows:write|UPSTREAM_SYNC_TOKEN/, `不得诱导提权/换 token：${failure.message}`);
+		assert.equal(writes(h.calls).length, 1, "仍然 fail-closed：只发一次写请求");
+	}
 });
