@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, symlink, lstat, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, isAbsolute, join } from 'node:path';
-import { DOCKER_IMAGE, HINT_CODES, MISSING_DEPENDENCY_SPECIFIERS, RUNTIME_LIFECYCLE_MS, checkHostedRunner, createChildExitObserver, createDockerExecutor, createLinuxChildMonitor, createSourceArchive, createStderrCollector, dockerCliDriver, dockerCreatePlan, dockerModelAdapter, evaluateResponses, gitArchiveArgs, hostedDockerAdapter, libSnapshot, makeInstallWorker, makeRuntimeWorker, managedDocker, probeMobile, profileFiles, prepareContainerProfile, removeSourceArchive, readLinuxProcessStat, resolveExitedChildHint, runCanary, stderrExitHint, validateDockerMounts, verifyDockerInspection, verifyInstalled, verifyPluginSource, verifyRequiredBundles } from '../tools/host-canary/smoke.mjs';
+import { DOCKER_IMAGE, HINT_CODES, MISSING_DEPENDENCY_SPECIFIERS, RUNTIME_LIFECYCLE_MS, checkHostedRunner, createChildExitObserver, createDockerExecutor, createLinuxChildMonitor, createSourceArchive, createStderrCollector, dockerCliDriver, dockerCreatePlan, dockerModelAdapter, evaluateResponses, gitArchiveArgs, hostedDockerAdapter, libSnapshot, makeInstallWorker, makeRuntimeWorker, managedDocker, parseWorkerOutput, probeMobile, profileFiles, prepareContainerProfile, removeSourceArchive, readLinuxProcessStat, resolveExitedChildHint, runCanary, stderrExitHint, validateDockerMounts, verifyDockerInspection, verifyInstalled, verifyPluginSource, verifyRequiredBundles } from '../tools/host-canary/smoke.mjs';
 
 const imageEnv = ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin','NODE_VERSION=24.1.0','YARN_VERSION=1.22.22'];
 const profileEnvFor = phase => { const base = phase === 'install' ? '/profile' : '/tmp/canary'; return [`HOME=${base}/home`,`DSH_HOME=${base}/dsh`,`XDG_CONFIG_HOME=${base}/xdg-config`,`XDG_CACHE_HOME=${base}/xdg-cache`,`XDG_DATA_HOME=${base}/xdg-data`,`XDG_STATE_HOME=${base}/xdg-state`,`XDG_RUNTIME_DIR=${base}/xdg-runtime`,`NPM_CONFIG_USERCONFIG=${base}/npmrc`,`NPM_CONFIG_GLOBALCONFIG=${base}/npm-globalrc`]; };
@@ -1278,4 +1278,28 @@ test('CLI runs the real backend but stays fail-closed outside a hosted runner', 
   const worker = spawnSync(process.execPath,[file,'--internal-worker','/nonexistent'],{encoding:'utf8'});
   assert.equal(worker.status, 1);
   assert.equal(JSON.parse(worker.stdout).errorCode,'runtime-sandbox-unavailable');
+});
+
+test("recheck-8：install 缺依赖只输出一份 JSON 且保留具体诊断码", async () => {
+	// 预检失败时 worker 只写一次 stdout（catch 不再追加第二份 install-failed），
+	// Docker logs 才能被 JSON.parse 正确解析。
+	const source = makeInstallWorker("1.2.3");
+	assert.match(source, /let preflightReported = false;/);
+	assert.match(source, /if \(!preflightReported\) process\.stdout\.write/);
+	// install 允许并保留具体缺失依赖码（不再覆盖成 install-failed）。
+	const missing = "host-process-exited-hint-missing-qrcode";
+	const parsed = parseWorkerOutput("install", 2, { ok: false, errorCode: missing });
+	assert.equal(parsed.errorCode, missing);
+	assert.equal(parsed.exitCode, 2);
+	// dockerCliDriver 从 logs 解析单份 JSON：具体码可透出。
+	const name = "dsh-canary-" + "e".repeat(32);
+	const id = "d".repeat(64);
+	const driver = dockerCliDriver(async (args) => {
+		if (args[0] === "create") return { code: 0, stdout: id };
+		if (args[0] === "wait") return { code: 0, stdout: "2" };
+		if (args[0] === "logs") return { code: 0, stdout: JSON.stringify({ ok: false, errorCode: missing }) };
+		return { code: 0, stdout: "" };
+	});
+	assert.equal(await driver.create(["create", "--name", name]), id);
+	assert.deepEqual(await driver.wait(id, undefined, "install"), { exitCode: 2, ok: false, checks: [], errorCode: missing });
 });

@@ -942,6 +942,7 @@ export function makeInstallWorker(version) {
 const MISSING_DEPENDENCY_SPECIFIERS = ${JSON.stringify(MISSING_DEPENDENCY_SPECIFIERS)};
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, symlinkSync } from 'node:fs';
+let preflightReported = false;
 try {
   mkdirSync('/tmp/plugin',{recursive:true,mode:0o700});
   execFileSync('tar',['-xf','/source/source.tar','-C','/tmp/plugin','--no-same-owner','--no-same-permissions'],{stdio:'ignore',timeout:30000});
