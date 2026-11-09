@@ -1344,7 +1344,7 @@ graph 的每个提交与 commit 详情都**保留旧的** `refs: string[]`（dep
 
 折叠行路径可点进「会话文件预览」的安全契约。服务端只做**判定与相对化**，不新增任何读取端点。
 
-1. **计算顺序即安全边界**：原始 `args.file_path`/`args.filePath` 词法校验（零 fs 调用：非空 String、无 NUL、无首尾空白、只剥一次前导 `./`、拒绝空段/`.`/`..`/含 `:` 段；UNC 归一后含空段即在此步拒绝，盘符路径按绝对路径形态处理）→ 会话 cwd `realpath` + `isDirectory`（缺失/非法 fail-closed）→ 词法夹取（绝对路径必须**词法与 realpath 都在 cwd 内**才换算成相对路径；cwd 外绝对路径**不做任何 fs 探测**）→ 候选 `realpath` containment（拒绝符号链接逃逸）→ `isFile` → `R_OK`。
+1. **计算顺序即安全边界**：原始 `args.file_path`/`args.filePath` 词法校验（零 fs 调用：非空 String、无 NUL、无首尾空白、只剥一次前导 `./`、拒绝空段/`.`/`..`/含 `:` 段；UNC 归一后含空段即在此步拒绝，盘符路径按绝对路径形态处理）→ 会话 cwd `realpath` + `isDirectory`（缺失/非法 fail-closed）→ 词法夹取（绝对路径必须**词法与 realpath 都在 cwd 内**才换算成相对路径；cwd 外绝对路径**不做任何 fs 探测**——此承诺仅指 **preview 判定**；同一摘要的 `display` 派生沿用 #54/#60 既有 `mobileDisplayPath`→`canonicalWorkspacePath`，会为合并 cwd 符号链接别名而对已给出的绝对路径祖先做 realpath，语义未改、不属于 #67 新增探测面）→ 候选 `realpath` containment（拒绝符号链接逃逸）→ `isFile` → `R_OK`。
 2. **两字段严格同现**：任一步失败 → `relative` 与 `previewable` **一起省略**（不存在 `previewable:false`）。目录/缺失/不可读/FIFO/设备/超长（>300，不截断）/非法 cwd 一律缺省；符号链接目标仍在 cwd 内则允许，`relative` 保留用户路径的**词法形状**（如 `link/x`，realpath 只当闸门）。
 3. **显示与点击分离**：折叠行显示文本仍用 `filePath`（安全 display），点击目标只用 `relative`；二者不得互相推导（display 可能被 clamp，或为 `~/…`/basename）。
 4. **App 二次夹取**：只认 `previewable === true && relative` 合法；拼路径前再拒绝绝对/盘符/反斜杠/`.`/`..`/空段/超长/首尾空白/NUL，并用会话 cwd 做 `isWithinRoot` 夹取，失败视为不可点（零请求）。唯一拼接点是与预览页共用的控制器。
