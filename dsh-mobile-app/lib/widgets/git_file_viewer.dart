@@ -563,7 +563,7 @@ class _GitFileViewerState extends State<GitFileViewer>
         ),
       );
     }
-    final rows = _diffWidgets(context, lines);
+    final rows = _diffRows(lines);
     // 关键：用 State 的 context 取「挂载点环境值」（Android≈8；测试 null→18）。
     // 不能取 LayoutBuilder 内的 context，否则会取到下面给横向识别器的 4。
     final MediaQueryData ambient = MediaQuery.of(context);
@@ -598,10 +598,25 @@ class _GitFileViewerState extends State<GitFileViewer>
             // 内层还原纵向 ListView 的挂载点阈值（Android≈8），实现非对称 4/8。
             child: MediaQuery(
               data: ambient,
-              child: ListView(
+              // 懒构建（Q21 第二个 commit）：512 KiB 上限的 diff 可达
+              // 1.3~1.7 万行，`ListView(children:)` 会一次物化全部行
+              // Widget，这里只按视口构建；`rows` 只是轻量的行描述对象。
+              child: ListView.builder(
                 key: widget.keys.sourceList,
                 padding: const EdgeInsets.symmetric(vertical: 4),
-                children: rows,
+                itemCount: rows.length,
+                itemBuilder: (context, index) {
+                  final row = rows[index];
+                  final lineIndex = row.lineIndex;
+                  if (lineIndex != null) {
+                    return _diffLine(
+                      context,
+                      lines[lineIndex],
+                      lineIndex: lineIndex,
+                    );
+                  }
+                  return _foldButton(row);
+                },
               ),
             ),
           ),
@@ -787,13 +802,17 @@ class _GitFileViewerState extends State<GitFileViewer>
     return lines;
   }
 
-  List<Widget> _diffWidgets(BuildContext context, List<_DiffLineData> lines) {
-    final result = <Widget>[];
+  /// 把解析后的行折叠成「可见行 / 折叠按钮」序列（Q21 第二个 commit）。
+  ///
+  /// 只生成轻量的 [_DiffRow] 描述对象，不物化 Widget：折叠段的可见行下标
+  /// 只算一次，`ListView.builder` 按视口懒构建真正的行。
+  List<_DiffRow> _diffRows(List<_DiffLineData> lines) {
+    final rows = <_DiffRow>[];
     var index = 0;
     var runId = 0;
     while (index < lines.length) {
       if (lines[index].marker != ' ') {
-        result.add(_diffLine(context, lines[index], lineIndex: index));
+        rows.add(_DiffRow.line(index));
         index++;
         continue;
       }
@@ -804,47 +823,53 @@ class _GitFileViewerState extends State<GitFileViewer>
       final length = index - start;
       if (length <= 6) {
         for (var i = start; i < index; i++) {
-          result.add(_diffLine(context, lines[i], lineIndex: i));
+          rows.add(_DiffRow.line(i));
         }
         continue;
       }
       final id = runId++;
       final expanded = _expandedContextRuns.contains(id);
-      final visible = expanded
-          ? List.generate(length, (offset) => start + offset)
-          : [
-              ...List.generate(3, (offset) => start + offset),
-              ...List.generate(3, (offset) => index - 3 + offset),
-            ];
-      for (final lineIndex in visible.where((lineIndex) => lineIndex < index)) {
-        result.add(_diffLine(context, lines[lineIndex], lineIndex: lineIndex));
+      if (expanded) {
+        for (var i = start; i < index; i++) {
+          rows.add(_DiffRow.line(i));
+        }
+      } else {
+        for (var offset = 0; offset < 3; offset++) {
+          rows.add(_DiffRow.line(start + offset));
+        }
+        for (var offset = index - 3; offset < index; offset++) {
+          rows.add(_DiffRow.line(offset));
+        }
       }
-      result.add(
-        TextButton.icon(
-          key: widget.keys.contextFold(id),
-          onPressed: () => setState(() {
-            if (expanded) {
-              _expandedContextRuns.remove(id);
-            } else {
-              _expandedContextRuns.add(id);
-            }
-          }),
-          icon: Icon(
-            expanded ? Icons.unfold_less : Icons.unfold_more,
-            size: 18,
-          ),
-          label: Text(
-            expanded
-                ? L10n.t('折叠未改动行', 'Fold unchanged lines')
-                : L10n.t(
-                    '展开 ${math.max(0, length - 6)} 行未改动',
-                    'Expand ${math.max(0, length - 6)} unchanged lines',
-                  ),
-          ),
-        ),
-      );
+      rows.add(_DiffRow.fold(id, length, expanded));
     }
-    return result;
+    return rows;
+  }
+
+  /// 长段未改动行的折叠/展开按钮（展开状态仍走 setState，与改造前一致）。
+  Widget _foldButton(_DiffRow row) {
+    final id = row.foldId!;
+    final expanded = row.expanded;
+    final count = row.foldCount ?? 0;
+    return TextButton.icon(
+      key: widget.keys.contextFold(id),
+      onPressed: () => setState(() {
+        if (expanded) {
+          _expandedContextRuns.remove(id);
+        } else {
+          _expandedContextRuns.add(id);
+        }
+      }),
+      icon: Icon(expanded ? Icons.unfold_less : Icons.unfold_more, size: 18),
+      label: Text(
+        expanded
+            ? L10n.t('折叠未改动行', 'Fold unchanged lines')
+            : L10n.t(
+                '展开 ${math.max(0, count - 6)} 行未改动',
+                'Expand ${math.max(0, count - 6)} unchanged lines',
+              ),
+      ),
+    );
   }
 
   Widget _diffLine(
@@ -992,6 +1017,30 @@ class _DiffLineData {
   final String text;
   final int? oldNumber;
   final int? newNumber;
+}
+
+/// diff 列表里的一行：要么是原始 diff 行（[lineIndex]），要么是折叠按钮行
+/// （[foldId]/[foldCount]）。只是数据描述，不持有 Widget（Q21 懒构建）。
+class _DiffRow {
+  const _DiffRow.line(this.lineIndex)
+    : foldId = null,
+      foldCount = null,
+      expanded = false;
+
+  const _DiffRow.fold(this.foldId, this.foldCount, this.expanded)
+    : lineIndex = null;
+
+  /// 在 `_DiffLineData` 列表里的下标；折叠按钮行为 null。
+  final int? lineIndex;
+
+  /// 折叠段的稳定 id（对应 `_expandedContextRuns` 的键）。
+  final int? foldId;
+
+  /// 折叠段的总行数（用于按钮文案）。
+  final int? foldCount;
+
+  /// 折叠按钮行是否已展开（展开后该段不再有按钮行）。
+  final bool expanded;
 }
 
 /// diff 预览整块横向滚动共享的偏移（issue #71 / Q19 方案 B）。
