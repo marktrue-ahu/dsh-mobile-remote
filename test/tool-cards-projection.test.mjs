@@ -295,6 +295,20 @@ test("issue66 todo：跳过非法元素（非对象/content 非 string），coun
 	assert.deepEqual(summary.counts, { pending: 0, inProgress: 0, completed: 1 });
 });
 
+test("issue66 todo valid-first：3 个无效项在前，仍保留前 50 个合法项（无效项不占配额）", () => {
+	// W-2（评审）：必须先过滤无效项、再按 ≤50 上限截断；无效项不得挤占配额或造成错位。
+	const invalid = [42, "x", { content: 7 }];
+	const valid = Array.from({ length: 60 }, (_, i) => ({ content: `v${i}`, status: "pending" }));
+	const summary = summaryOf(call("todo_write", { todos: [...invalid, ...valid] }));
+	assert.equal(summary.items.length, 50);
+	assert.deepEqual(
+		summary.items.map((item) => item.content),
+		Array.from({ length: 50 }, (_, i) => `v${i}`),
+		"保留的应是连续的 v0..v49，而不是被无效项挤掉/错位",
+	);
+	assert.deepEqual(summary.counts, { pending: 50, inProgress: 0, completed: 0 });
+});
+
 test("issue66 question：字段映射、id 保留、header/options/multiSelect 按需下发", () => {
 	const summary = summaryOf(call("ask_user_question", {
 		questions: [
@@ -325,6 +339,22 @@ test("issue66 question：字段映射、id 保留、header/options/multiSelect �
 		},
 		{ question: "没有有效 id 也保留" },
 	]);
+});
+
+test("issue66 question：raw id 原样保留（仅 trim 判空，不做 trim/单行化）", () => {
+	// I-1（评审）：id 是 App 关联待答的唯一依据，且要与 attention 帧里的宿主原始 id 精确匹配，
+	// 因此服务端不能用 trim/单行化改写值（只有纯空白判无效丢弃）。
+	const summary = summaryOf(call("ask_user_question", {
+		questions: [
+			{ id: " q0 ", question: "raw id" },
+			{ id: "   ", question: "whitespace-only id" },
+			{ id: 7, question: "non-string id" },
+		],
+	}));
+	assert.equal(summary.questions.length, 3);
+	assert.equal(summary.questions[0].id, " q0 ", "raw id 必须原样保留（不 trim）");
+	assert.equal("id" in summary.questions[1], false, "纯空白 id 不下发");
+	assert.equal("id" in summary.questions[2], false, "非 string id 不下发");
 });
 
 test("issue66 question：multi_select 与 multiSelect 两种形状都接受，只有 true 才下发", () => {
@@ -371,6 +401,34 @@ test("issue66 question：≤10 题 / ≤20 选项截断，无效题与无效 opt
 		{ id: "q-ok", question: "有效题", options: [{ label: "valid" }] },
 		{ id: "q-no-options", question: "无有效选项" },
 	]);
+});
+
+test("issue66 question valid-first：3 个无效题在前，仍保留前 10 个合法题（无效项不占配额）", () => {
+	// W-2（评审）：先过滤无效题、再按 ≤10 上限截断；无效题不得挤占配额或造成错位。
+	const invalid = [{ id: "bad0" }, { id: "bad1", question: 42 }, { id: "bad2", question: "  " }];
+	const valid = Array.from({ length: 12 }, (_, i) => ({ id: `q${i + 3}`, question: `question ${i + 3}` }));
+	const summary = summaryOf(call("ask_user_question", { questions: [...invalid, ...valid] }));
+	assert.equal(summary.questions.length, 10);
+	assert.deepEqual(
+		summary.questions.map((question) => question.id),
+		Array.from({ length: 10 }, (_, i) => `q${i + 3}`),
+		"首个保留题应是第 4 个输入（q3），连续 q3..q12",
+	);
+});
+
+test("issue66 question options valid-first：3 个无 label 项在前，仍保留前 20 个合法 option（无效项不占配额）", () => {
+	// W-2（评审）：无效 option 必须在截断前丢弃；否则前 3 个无效项会挤掉 o3..o5 并错位。
+	const invalid = [{ description: "no label" }, { label: "" }, { label: 7 }];
+	const valid = Array.from({ length: 25 }, (_, i) => ({ label: `o${i + 3}` }));
+	const summary = summaryOf(call("ask_user_question", {
+		questions: [{ id: "q1", question: "pick", options: [...invalid, ...valid] }],
+	}));
+	assert.equal(summary.questions[0].options.length, 20);
+	assert.deepEqual(
+		summary.questions[0].options.map((option) => option.label),
+		Array.from({ length: 20 }, (_, i) => `o${i + 3}`),
+		"首个保留 label 应是第 4 个输入（o3），连续 o3..o22",
+	);
 });
 
 test("issue66 question：header ≤80 / question ≤300 / label ≤120 / description ≤200 截断（后缀计入上限）", () => {
@@ -431,6 +489,23 @@ test("issue66 result answers：selected + custom 合并回放，空 selected 保
 		{ questionId: "q1", values: ["选项A", "选项B", "自定义答案"] },
 		{ questionId: "q2", values: [] },
 		{ questionId: "q3", values: ["仅选项"] },
+	]);
+});
+
+test("issue66 result answers：边界形状——缺 selected / selected 非数组 / selected 混合类型", () => {
+	// I-2（评审）：values 恒为 string 数组；selected 缺失或非数组 → []（不是缺省整个 answer），
+	// selected 里的非字符串项逐项丢弃。App 依赖空数组区分「显式跳过」与「无答案记录」。
+	const summary = summaryOf(result("ask_user_question", JSON.stringify({
+		answers: [
+			{ id: "q1" },
+			{ id: "q2", selected: "x" },
+			{ id: "q3", selected: ["a", 7, "b"] },
+		],
+	})));
+	assert.deepEqual(summary.answers, [
+		{ questionId: "q1", values: [] },
+		{ questionId: "q2", values: [] },
+		{ questionId: "q3", values: ["a", "b"] },
 	]);
 });
 
