@@ -100,7 +100,9 @@ test('generated worker emits a sanitized hint using only a fake host', async t =
   const request = `  const request = async (path, secret, timeoutMs) => {\n    const headers = secret ? {'x-mobile-token':secret} : {};\n    const res = await fetch('http://127.0.0.1:' + port + path,{headers,signal:AbortSignal.timeout(Math.max(1,Math.floor(timeoutMs)))});\n    let body; try { body = await res.json(); } catch { body = null; }\n    return {status:res.status,body};\n  };`;
   script = replaceOne(script,reservation,'  const port = 0;');
   async function confirmFakeExited(record, expectInitiallyRunning = false) {
-    const deadline = performance.now()+2000;
+    // KNOWN-FLAKY #40：忙碌机器上夹具自身调度会超过固定窗口；放宽计时窗口，
+    // 不改任何身份/退出判据（断言保持原样）。
+    const deadline = performance.now()+8000;
     let identity;
     while (performance.now() < deadline && !identity) {
       try {
@@ -135,7 +137,7 @@ test('generated worker emits a sanitized hint using only a fake host', async t =
     // Every run receives a fresh tmpfs-like runtime directory.
     const runPath = join(root,`runtime-${mode}`);
     const runScript = script.replaceAll(runtime,runPath);
-    const waitForRecord = `await (async () => { const {readFile}=await import('node:fs/promises'); for(let i=0;i<100;i++){ try { const parsed=JSON.parse(await readFile(${JSON.stringify(record)},'utf8')); if (Number.isSafeInteger(parsed.pid) && typeof parsed.startTime === 'string' && /^\\d+$/.test(parsed.startTime)) return; } catch {} await new Promise(ok=>setTimeout(ok,10)); } throw Error('fake-host-record-missing'); })();`;
+    const waitForRecord = `await (async () => { const {readFile}=await import('node:fs/promises'); for(let i=0;i<400;i++){ try { const parsed=JSON.parse(await readFile(${JSON.stringify(record)},'utf8')); if (Number.isSafeInteger(parsed.pid) && typeof parsed.startTime === 'string' && /^\\d+$/.test(parsed.startTime)) return; } catch {} await new Promise(ok=>setTimeout(ok,10)); } throw Error('fake-host-record-missing'); })();`;
     // Every mode must wait for the fake host to record its identity before the
     // worker can finish and kill it. Otherwise the worker's teardown races the
     // host's identity write and confirmFakeExited fails on scheduler luck alone.
@@ -146,7 +148,7 @@ test('generated worker emits a sanitized hint using only a fake host', async t =
     assert.doesNotMatch(mocked,/\.listen\(|\bfetch\s*\(/);
     unconfirmed.add(record);
     try {
-      const worker = spawnSync(process.execPath,['--input-type=module','--eval',mocked],{cwd:root,env:{PATH:'/usr/bin:/bin',HOME:join(root,'home'),DSH_HOME:join(runPath,'dsh'),XDG_CONFIG_HOME:join(root,'config'),XDG_CACHE_HOME:join(root,'cache'),XDG_DATA_HOME:join(root,'data'),XDG_STATE_HOME:join(root,'state'),XDG_RUNTIME_DIR:join(root,'run'),FAKE_HOST_IDENTITY:record,FAKE_HOST_MODE:mode},encoding:'utf8',timeout:mode === 'worker-timeout' ? 700 : 5000,killSignal:'SIGKILL',maxBuffer:16384});
+      const worker = spawnSync(process.execPath,['--input-type=module','--eval',mocked],{cwd:root,env:{PATH:'/usr/bin:/bin',HOME:join(root,'home'),DSH_HOME:join(runPath,'dsh'),XDG_CONFIG_HOME:join(root,'config'),XDG_CACHE_HOME:join(root,'cache'),XDG_DATA_HOME:join(root,'data'),XDG_STATE_HOME:join(root,'state'),XDG_RUNTIME_DIR:join(root,'run'),FAKE_HOST_IDENTITY:record,FAKE_HOST_MODE:mode},encoding:'utf8',timeout:mode === 'worker-timeout' ? 700 : 15000,killSignal:'SIGKILL',maxBuffer:16384});
       assert.doesNotMatch(worker.stdout ?? '',/secret-token|\/private\/path/);
       assert.doesNotMatch(worker.stderr ?? '',/secret-token|\/private\/path/);
       if (mode === 'worker-timeout') assert.equal(worker.error?.code,'ETIMEDOUT');

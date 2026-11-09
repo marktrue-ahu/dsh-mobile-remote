@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { networkInterfaces, tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -325,6 +325,9 @@ test("P2：默认目录不可写 → 只记诊断 update-dir-unwritable，控制
 	await withIsolatedHome(async (home) => {
 		const pluginStateDir = join(home, ".dsh", "mobile-remote");
 		await mkdir(pluginStateDir, { recursive: true });
+		// 新契约：宿主身份不可创建时拒绝启动；本用例验证 updateDir 不可写的降级，
+		// 预置合法身份文件（只读状态目录仍可读），把失败面限定在默认更新目录。
+		writeFileSync(join(pluginStateDir, "host-identity"), `${randomUUID()}\n`, { mode: 0o600 });
 		await chmod(pluginStateDir, 0o500);
 		try {
 			await withHarness({ config: { updateDir: "" } }, async ({ api }) => {
@@ -1198,6 +1201,12 @@ test("B1：auth 自动生成失败 + 端点 ready + APK ok → 下载码仍有�
 	const home = await mkdtemp(join(tmpdir(), "dsh-b1-home-"));
 	const saved = { HOME: process.env.HOME, DSH_HOME: process.env.DSH_HOME };
 	try {
+		// 新契约：宿主身份不可创建时拒绝启动。预置合法 host-identity（只读仍可读），
+		// 只让 auth-token 写入失败，保留本用例要覆盖的「认证不可用」降级语义。
+		const b1StateDir = join(home, ".dsh", "mobile-remote");
+		await mkdir(b1StateDir, { recursive: true });
+		await writeFile(join(b1StateDir, "host-identity"), `${randomUUID()}\n`, { mode: 0o600 });
+		await chmod(b1StateDir, 0o500);
 		await chmod(home, 0o500); // 状态目录不可写 → 口令自动生成失败
 		process.env.HOME = home;
 		process.env.DSH_HOME = join(home, ".dsh");
@@ -1234,6 +1243,7 @@ test("B1：auth 自动生成失败 + 端点 ready + APK ok → 下载码仍有�
 		else process.env.HOME = saved.HOME;
 		if (saved.DSH_HOME === undefined) delete process.env.DSH_HOME;
 		else process.env.DSH_HOME = saved.DSH_HOME;
+		await chmod(join(home, ".dsh", "mobile-remote"), 0o700);
 		await chmod(home, 0o700);
 		await rm(home, { recursive: true, force: true });
 		await rm(base, { recursive: true, force: true });

@@ -10,7 +10,7 @@
 // 托管区 module 建夹具（publishRelease + selectRelease），断言的是 HTTP 契约而不是实现细节。
 import assert from "node:assert/strict";
 import { appendFile, chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -654,6 +654,12 @@ test("空口令：宿主自动生成强口令（存插件状态，不写 profile
 test("空口令自动生成失败（状态目录不可写）→ 401 auth-not-configured，匿名 APK 不受影响", async () => {
 	const savedHome = process.env.HOME;
 	const readOnlyHome = await mkdtemp(join(tmpdir(), "dsh-ro-auth-home-"));
+	// 新契约：宿主身份不可创建时拒绝启动。本用例只验证「口令自动生成失败」的降级，
+	// 故预置合法 host-identity（只读目录仍可读取），把失败面限定在 auth-token 写入。
+	const pluginStateDir = join(readOnlyHome, ".dsh", "mobile-remote");
+	await mkdir(pluginStateDir, { recursive: true });
+	await writeFile(join(pluginStateDir, "host-identity"), `${randomUUID()}\n`, { mode: 0o600 });
+	await chmod(pluginStateDir, 0o500);
 	await chmod(readOnlyHome, 0o500);
 	process.env.HOME = readOnlyHome;
 	try {
@@ -680,6 +686,7 @@ test("空口令自动生成失败（状态目录不可写）→ 401 auth-not-con
 		});
 	} finally {
 		process.env.HOME = savedHome;
+		await chmod(join(readOnlyHome, ".dsh", "mobile-remote"), 0o700);
 		await chmod(readOnlyHome, 0o700);
 		await rm(readOnlyHome, { recursive: true, force: true });
 	}
