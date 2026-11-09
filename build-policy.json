@@ -142,6 +142,15 @@
       "createdAt": "2026-11-08T01:45:05.998Z",
       "note": "dist-tags verified",
       "updatedAt": "2026-11-08T01:51:22.479Z"
+    },
+    {
+      "tag": "v3.2.4-alpha.9",
+      "pluginVersion": "3.2.4-alpha.9",
+      "carrierVersion": "3.2.4-alpha.9-app",
+      "build": 41,
+      "integrity": "sha512-ySn3ALjLpkAm1vCdcKy8/O058uqrfONvUB5VIWi6Oa23UhiI9BGCUTrk8Ekh6d6/mpwPmVaCb4J9DmhaATY0NA==",
+      "status": "submitted",
+      "createdAt": "2026-11-09T01:13:21.415Z"
     }
   ]
 }
