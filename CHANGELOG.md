@@ -1,5 +1,41 @@
 # Changelog
 
+## v3.2.4-alpha.9（build 41，issues #29 / #32 / #33 等）— 身份/轮末/工具卡复核修复
+
+> 插件 `3.2.4-alpha.9` / App `3.2.4+41` / 载体 `3.2.4-alpha.9-app`。
+
+### 身份与诊断安全（attention / review 修复）
+
+- 宿主通知身份改用稳定 hostId：并发发布改为「身份文件 wx 单赢家」+ 显式状态机，无锁不得发布；bootstrap 权威必须替换或清空旧 hostId；通知 scope 改用宿主稳定身份。
+- 审批身份按**实际请求**唯一（`callId` 仅作关联），重连恢复用例从真实 requested frame 取身份；身份赢家回读校验内容，发现同 inode 原地覆写；quarantine 恢复改用 link 原子发布，不覆盖并发赢家。
+- 修复诊断信息泄露与文件身份竞态（复核 P1/P2 系列）。
+
+### 轮末两卡（turn-tail）
+
+- 交付文件用**不泄路径的稳定身份**去重；行内链接按逻辑文件身份合并 delivered/changed；`recordFileId` 归一路径后再哈希（混合 abs/rel 共享同一逻辑身份）。
+- 多次 `present` 按持久记录坐标取最新声明；旧插件兼容仅允许两类各一个去重坐标合并。
+- diff 页切换文件后按请求代际丢弃旧响应；改动摘要请求引入 load generation 与 in-flight 门闩；摘要/diff 重新派生安全 display。
+
+### 工具卡（tool-cards）
+
+- 失败态同时保留真实错误原因与通用参数；`callId` 从真实 `tool/result` 形状解析并关联命令工具；终止状态只在已关联命令工具时展示；只解析结果末尾的宿主终止 trailer；无内联 diff 时回退通用参数与结果。
+
+### turn-process 与 canary
+
+- 缺 `turn/start` 的部分轮次保留轮次身份；过程抬头与轮次页脚随语言设置本地化。
+- 宿主兼容 canary：install/runtime 错误码白名单收窄并统一为单一常量来源；缺依赖具体码纳入下游白名单；路径归一与 quarantine 恢复修复；隔离宿主原生加载与诊断链路修复；fake-host 身份文件原子发布；移除临时诊断输出。
+
+### 测试与 CI 稳定性
+
+- 宿主身份新契约（身份不可发布即拒绝启动）适配只读夹具：预置合法 host-identity 后只让 auth-token/默认更新目录写入失败，保留原有降级断言。
+- host-canary-smoke 的 fake-host 已知抖动夹具（KNOWN-FLAKY #40）仅放宽计时窗口，不改安全断言。
+
+### 工具链
+
+- `sync-upstream`：403 结合响应原因区分缺失 Workflows 权限与分支保护。
+- endpoint registry：`/turn-file` 方法契约改为 `GET/HEAD`；时间线契约检查同步更新。
+- 文档：ADR 记录展示身份、宿主/审批身份相关复核决策。
+
 ## v3.2.4-alpha.8（build 40，issues #61 / #62）— 免重启插件更新与轮次 UI 收尾
 
 > 插件 `3.2.4-alpha.8` / App `3.2.4+40` / 载体 `3.2.4-alpha.8-app`。
