@@ -1310,6 +1310,8 @@ graph 的每个提交与 commit 详情都**保留旧的** `refs: string[]`（dep
 | `background` | bool? | bash/pwsh | 后台调用标志 |
 | `description` | string? | bash/pwsh | 工具自带的说明，≤120 字 |
 | `filePath` | string | read/write/edit/read_image | 显示用路径，**绝不下发可拼接绝对路径** |
+| `relative` | string? | read/write/edit/read_image | 仅当目标完整验证通过时下发：会话 cwd 相对、POSIX `/`、无前导 `/`/盘符/`.`/`..`/空段、≤300 字且**绝不截断**；与 `previewable` 严格同现（issue #67） |
+| `previewable` | bool? | read/write/edit/read_image | 唯一值 `true`（与 `relative` 同现，**不发 `false`**）；缺省 = 不可预览（fail-closed，issue #67） |
 | `offset` / `limit` | number? | read | 行范围（正整数，可缺省） |
 | `sizeKb` | number? | write/edit | `ceil(UTF-16 长度/1024)`，与桌面 `NKB` 同口径 |
 | `added` / `deleted` | number? | write/edit | 折叠行行数统计；write 为新增行数，edit 为**行数近似**（见口径） |
@@ -1337,3 +1339,14 @@ graph 的每个提交与 commit 详情都**保留旧的** `refs: string[]`（dep
 3. `resultCount` 的文本兜底是启发式（如 glob 在结果上限内按非空行计数）；无 meta 且无工具名时保守缺省，不猜。
 4. 全部字段 fail-open：字段异常/超长/非法 JSON 一律忽略并回退通用卡，不得让摘要、历史或 SSE 出错。
 5. 路径安全：`filePath`/`workdir`/`path` 只下发 `mobileDisplayPath` 派生结果，不提供可直接读取的主机路径。
+
+**路径可预览口径（issue #67，M3 Batch 2-B）**：
+
+折叠行路径可点进「会话文件预览」的安全契约。服务端只做**判定与相对化**，不新增任何读取端点。
+
+1. **计算顺序即安全边界**：原始 `args.file_path`/`args.filePath` 词法校验（零 fs 调用：非空 String、无 NUL、无首尾空白、只剥一次前导 `./`、拒绝空段/`.`/`..`/含 `:` 段；UNC 归一后含空段即在此步拒绝，盘符路径按绝对路径形态处理）→ 会话 cwd `realpath` + `isDirectory`（缺失/非法 fail-closed）→ 词法夹取（绝对路径必须**词法与 realpath 都在 cwd 内**才换算成相对路径；cwd 外绝对路径**不做任何 fs 探测**）→ 候选 `realpath` containment（拒绝符号链接逃逸）→ `isFile` → `R_OK`。
+2. **两字段严格同现**：任一步失败 → `relative` 与 `previewable` **一起省略**（不存在 `previewable:false`）。目录/缺失/不可读/FIFO/设备/超长（>300，不截断）/非法 cwd 一律缺省；符号链接目标仍在 cwd 内则允许，`relative` 保留用户路径的**词法形状**（如 `link/x`，realpath 只当闸门）。
+3. **显示与点击分离**：折叠行显示文本仍用 `filePath`（安全 display），点击目标只用 `relative`；二者不得互相推导（display 可能被 clamp，或为 `~/…`/basename）。
+4. **App 二次夹取**：只认 `previewable === true && relative` 合法；拼路径前再拒绝绝对/盘符/反斜杠/`.`/`..`/空段/超长/首尾空白/NUL，并用会话 cwd 做 `isWithinRoot` 夹取，失败视为不可点（零请求）。唯一拼接点是与预览页共用的控制器。
+5. **边界不变**：不新增端点、不改 `/m/api/files` 语义、不改 `display`；能力位 `toolCards.version` 仍为 `1`（旧 App 忽略新字段，新 App 缺字段即纯文本）。
+6. **已知边界**：`tool/call` 摘要发生在工具执行**前**，实时 `write` 新建文件当刻不可预览，历史重投影后才可点；读取侧 realpath 夹取不在本 issue 范围（#16 独立跟踪）。
