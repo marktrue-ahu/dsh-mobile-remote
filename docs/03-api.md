@@ -1286,7 +1286,7 @@ graph 的每个提交与 commit 详情都**保留旧的** `refs: string[]`（dep
 
 - 稳定错误：`400 bad-request`、`404 record-not-found`（事件不存在/不属于该会话/下标越界）、`404 file-not-found`（记录内的文件已被删除）、`503 changes-unavailable`（改动摘要已失效）。
 
-### 6.24 工具卡结构化投影（v3.3，issue #54 / M3 Batch 1）
+### 6.24 工具卡结构化投影（v3.3–v3.4，issue #54 / #66 / #67 / #68，M3 Batch 1–2）
 
 手机端工具卡从「通用卡」升级为「按工具类型专用卡」。服务端只做**结构化投影**，不改变工具执行语义；所有字段只增不改，旧 App 忽略。
 
@@ -1296,7 +1296,7 @@ graph 的每个提交与 commit 详情都**保留旧的** `refs: string[]`（dep
 "capabilities": {
   "toolCards": {
     "version": 1,
-    "tools": ["bash","pwsh","read","write","edit","grep","glob","web_fetch","web_search","read_image"],
+    "tools": ["bash","pwsh","read","write","edit","grep","glob","web_fetch","web_search","read_image","todo_write","ask_user_question","skill"],
     "ptc": { "version": 1 }
   }
 }
@@ -1383,3 +1383,33 @@ graph 的每个提交与 commit 详情都**保留旧的** `refs: string[]`（dep
 **50 子调用上限**：按 `rootCallId` 分组、以 `callId` 去重计数（同一子调用的 start/result 只占 1 个名额）。前 50 个正常投影；第 51 个新 `callId` 的首个事件下发**最小截断通知**（仅 `rootCallId?/parentCallId/callId/name?/status` + `truncated: true`，**无 turn/step/summary/text/isError/error**），同一计数作用域最多一条；此后该 root 的其它超限事件降级为**无 `data` 的 `{seq,type}`**（事件仍保留，通用顶层 `time` 等既不删除也不改写；App 据此显示「已截断」）。计数作用域：`/history` 每响应一个，SSE 每会话一个（进程内按插入序 FIFO 有界逐出，不做触碰刷新）。
 
 **App 消费约束**：根工具卡折叠行显示「N 个子调用」；展开后每个子调用只显示名称 + 状态 + 安全摘要，**不提供** args/结果二级展开、不显示图片；子调用不进入 M1 过程行；默认收起、失败不自动展开；无 `toolCards.ptc` 能力位时完全降级（不显示计数/子行）。
+
+
+### 6.24.2 todo_write / ask_user_question / skill 专用行（v3.4，issue #66 / M3 Batch 2-A）
+
+`toolCards.tools` 追加 `todo_write`、`ask_user_question`、`skill`；三者仍走 `tool/call`/`tool/result` 的 `summary`，字段只增不改，旧 App 忽略。
+
+**`tool/call` 摘要**
+
+| 字段 | 类型 | 适用 | 说明 |
+|---|---|---|---|
+| `kind` | string | 三者 | `todo` / `question` / `skill` |
+| `tool` | string | 全部 | 工具名 |
+| `items` | array | todo_write | `[{content,status}]`，≤50 项；`content` ≤200 字、`status ∈ pending/in_progress/completed`（未知归 pending）；`counts` 与归一后的 items 一致（三项和 = items.length） |
+| `counts` | object | todo_write | `{pending,inProgress,completed}`（整数，恒带三键） |
+| `questions` | array | ask_user_question | `[{header?, question, options?:[{label,description?}], multiSelect?}]`；≤10 题、每题选项 ≤20；`header` ≤120、`question` ≤500、`label` ≤200、`description` ≤300 字 |
+| `name` | string | skill | 技能名，≤120 字 |
+
+**`tool/result` 摘要**
+
+| 字段 | 类型 | 适用 | 说明 |
+|---|---|---|---|
+| `answers` | array | ask_user_question | `[{questionId, values:[string…]}]`；只读回放，题号/取值不做解释或补全；缺失即缺省（不猜） |
+
+**口径**：非法/缺失参数 fail-open（能安全投影的字段才下发，其余省略并回退通用卡）；`todo_write` 的非数组 `todos` 只回 `{kind,tool}`；未知状态归 `pending`；不修改 attention/`/respond` 流程；`answers` 不回写、不做校验错误提示。PTC 子调用内的同名工具走 §6.24.1 的紧凑白名单摘要。
+
+### 6.24.3 客户端侧交付（无 API 变更）
+
+- **图库增强（issue #69）**：附图全屏查看器、多图分页、尺寸/名称/mediaType 元数据、保存/分享、失败重试；仍使用既有 `images[]` 元数据与 `/m/api/attachment`，服务端契约不变。
+- **实时思维链（issue #70）**：`assistant/chunk` 的 reasoning delta 仅由 App 生成 provisional 过程行并在落定后去重；无新字段/端点。
+- **diff 视图收尾（issue #71）**：整块横向滚动、固定行号列、大 diff 懒构建；`/changes/diff` 契约不变。
