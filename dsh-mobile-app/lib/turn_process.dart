@@ -703,6 +703,17 @@ String processGroupHeader(
     }
     return L10n.t('正在调用工具…', 'Calling tool…');
   }
+  // issue #75：只有思考、没有工具调用的组不能显示「0 次工具调用」——
+  // 那是没有信息量的幽灵抬头，也不符合「组抬头说明该组做了什么」的语义。
+  if (group.toolCount == 0) {
+    if (group.reasoningChars > 0) {
+      return L10n.t(
+        '思考 ${group.reasoningChars} 字',
+        '${group.reasoningChars} chars of thinking',
+      );
+    }
+    return L10n.t('思考', 'Thinking');
+  }
   return L10n.t('${group.toolCount} 次工具调用', '${group.toolCount} tool calls');
 }
 
