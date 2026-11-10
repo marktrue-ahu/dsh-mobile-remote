@@ -127,7 +127,7 @@
 - `capabilities.turnOutline`：轮次大纲能力位（轮次导航）。宿主**真的注册了** `turnOutline` 投影单元、且投影感知观察面（`sessionQuery.observeSession`）可用时，返回 `{ "version": 1, "supported": true, "unloaded": true, "truncated": true }`——`unloaded` 表示未加载轮次也可跳转、`truncated` 表示超过体积上限会显式截断；否则返回 `{ "version": 1, "supported": false }`。**不按宿主版本号推断**：旧宿主/裁剪宿主显式声明不支持，App 据此退回「只用已加载轮次」的降级行为。SSE hello 的同名字段与该处**同判据、同形状**（见 §3.6 与 §6.18）。
 
 - `capabilities.turnTail`：轮末页脚能力位（v3.3，issue #52/#53）：宿主注册了 `workspaceChanges` 服务时返回 `{ "version": 1, "presented": true, "changed": true, "changesDiff": true }`，否则 `presented` 仍可为真而 `changed`/`changesDiff` 为假；旧插件不下发该字段，App 据此不渲染轮末卡片与展示模式设置。判据与字段详见 §6.20，SSE hello 同名字段与之同判据、同形状。
-- `capabilities.toolCards`：工具卡结构化能力位（v3.3，issue #54）：`{ "version": 1, "tools": [本插件实际投影的工具名…] }`；bootstrap 与 SSE hello 同判据，App 逐工具决定专用卡或通用卡，缺失时全部通用卡（见 §6.24）。
+- `capabilities.toolCards`：工具卡结构化能力位（v3.3，issue #54）：`{ "version": 1, "tools": [本插件实际投影的工具名…] }`；bootstrap 与 SSE hello 同判据，App 逐工具决定专用卡或通用卡，缺失时全部通用卡（见 §6.24）。v3.4（issue #68）追加 `ptc: { "version": 1 }`：新 App 据此把 PTC 子调用合入根工具卡；旧 App 忽略该键，`version`/`tools` 语义不变（见 §6.24.1）。
 - `plugin.hostId`：宿主**稳定身份**（随机 UUID，持久化于插件状态目录；与访问口令、`instanceId` 无关，issue #60 R15）。手机用它隔离通知账本（同口令的不同宿主不得互相撤销）；旧插件缺失该字段时 App 回退既有 scope。
 
 - 未认证：`401`（见通用约定）。
@@ -227,7 +227,7 @@
 - `limit`（可选，默认 500，上限 1000）：最多返回条数
 **过滤规则**：返回可进入 Conversation timeline 的事件；`assistant/chunk` / `assistant/live-chunk` 只用于实时草稿，`agent/inbox/spliced` 由队列投影承载，`request/header`（含 system prompt/tool schema）、`request/context`、`session/end-seed`、`step/start`、`step/end`、`system/message`、`assistant/attempt`（重试/中断的原始 stream 记录）与 `compaction/start` / `compaction/summary` / `compaction/prune` / `compaction/end`（压缩生命周期；summary 正文即替换 shadowed 区间后的上下文快照）属于内部/重建/快照元数据，历史、实时与 3.5b 详情三处都不返回。`compaction/end` 作为不落卡片的实时控制帧通知 App 重新加载 durable snapshot。未知 type（即使带 `ignorable: true`）保留 `seq`/`type`，但不提供详情指针；由于详情端点采用 fail-closed allow-list，未知类型请求详情会返回 `404 event-not-found`。只有经审查并列入 allow-list 的可见类型可通过 3.5b 读取详情。
 
-> 客户端呈现约定：`session/title`、`model/selection`、`sandbox/mode`、`agent-preset/selected`、`subagent/*`、`team/*`、`feedback/*`、`command/*`、`approval/policy`、`tool/ptc-dispatch*`、`goal/change` 属协议/运行时元数据；普通模式不渲染，调试模式按摘要可用字段展示。只有 `user/message`、`assistant/message`、`tool/call`、`tool/result`、`todo/write`、`turn/start`、`turn/end` 在服务端详情 allow-list 中，其他事件没有详情指针（见 3.5b）。`approval/asked` / `approval/decided` 是 durable 审批记录，普通模式以可读标题呈现（历史回放的权威源；问询只有瞬态帧，不保证回放）。
+> 客户端呈现约定：`session/title`、`model/selection`、`sandbox/mode`、`agent-preset/selected`、`subagent/*`、`team/*`、`feedback/*`、`command/*`、`approval/policy`、`tool/ptc-dispatch*`、`goal/change` 属协议/运行时元数据；普通模式不渲染，调试模式按摘要可用字段展示。只有 `user/message`、`assistant/message`、`tool/call`、`tool/result`、`todo/write`、`turn/start`、`turn/end` 在服务端详情 allow-list 中，其他事件没有详情指针（见 3.5b）。`approval/asked` / `approval/decided` 是 durable 审批记录，普通模式以可读标题呈现（历史回放的权威源；问询只有瞬态帧，不保证回放）。v3.4（issue #68）：`tool/ptc-dispatch*` 在能力位 `toolCards.ptc` 存在时由新 App 消费结构化 data 合入根工具卡子调用树（普通模式仍不出现裸事件卡）；旧 App / 无能力位 / 坏 data 时保持上述调试模式行为，不伪造根卡。
 **响应 200**
 
 ```json
@@ -290,6 +290,8 @@
 | `assistant/chunk` / `assistant/live-chunk` | `{ text: string }` 文本/reasoning delta；工具参数 delta 的 canonical `chunk.id` 归一为摘要 `callId`（仅实时过程，历史过滤） |
 | `tool/call` | `{ turn, step, callId, name, arguments }`；长参数可通过详情端点获取 |
 | `tool/result` | `{ callId, name, isError, text, images? }`；长结果可通过详情端点获取；**不再下发 `files`**（issue #1 需求变更：工具产出文件不上时间线；图片仍带 `images`） |
+| `tool/ptc-dispatch-start` | PTC 子调用开始（v3.4，issue #68）：`{ turn?, step?, rootCallId?, parentCallId, callId, name?, status: "running", summary? }`；`callId` 即内核对 `subCallId`，**不下发** `arguments` 原文 / `meta`；仍属 debug-only（见 §6.24.1） |
+| `tool/ptc-dispatch` | PTC 子调用落定（v3.4，issue #68）：同上 + `{ status: "success" \| "failed", isError, text?, error? }`；`text` 仅失败时下发且只含安全错误码（`error.code` 优先、缺省 `error.name`，≤500），`error` 仅 `{ name, code }`；超 50 子调用时下发最小 `truncated: true` 通知（见 §6.24.1） |
 | `turn/start` | `{ turn: number }` |
 | `turn/end` | `{ turn: number, reason: object }` |
 | 其他可见事件 | 保留 `type`、`seq`，未知类型使用通用卡保留顺序；不提供详情指针，也不允许通过 3.5b 读取原始载荷 |
@@ -1292,12 +1294,17 @@ graph 的每个提交与 commit 详情都**保留旧的** `refs: string[]`（dep
 
 ```json
 "capabilities": {
-  "toolCards": { "version": 1, "tools": ["bash","pwsh","read","write","edit","grep","glob","web_fetch","web_search","read_image"] }
+  "toolCards": {
+    "version": 1,
+    "tools": ["bash","pwsh","read","write","edit","grep","glob","web_fetch","web_search","read_image"],
+    "ptc": { "version": 1 }
+  }
 }
 ```
 
 - `tools` 是本插件**实际能投影**的工具名集合；App 逐工具决定是否使用专用卡，不在集合内一律回退通用卡。
-- 旧插件不下发该字段 → 新 App 全部通用卡（不按版本号推断，ADR 0017）。
+- `ptc`（v3.4，issue #68）：PTC 子调用树能力位；App 仅在 `ptc.version >= 1` 时把 `tool/ptc-dispatch*` 的结构化 data 合入根工具卡（见 §6.24.1）。
+- 旧插件不下发该字段 → 新 App 全部通用卡（不按版本号推断，ADR 0017）；新插件多出的 `ptc` 键被旧 App 忽略。
 
 **`tool/call` 摘要增量 `summary`**（从原始 `arguments` 解析，先解析后 clamp；非法 JSON/未知工具 fail-open）：
 
@@ -1350,3 +1357,29 @@ graph 的每个提交与 commit 详情都**保留旧的** `refs: string[]`（dep
 4. **App 二次夹取**：只认 `previewable === true && relative` 合法；拼路径前再拒绝绝对/盘符/反斜杠/`.`/`..`/空段/超长/首尾空白/NUL，并用会话 cwd 做 `isWithinRoot` 夹取，失败视为不可点（零请求）。唯一拼接点是与预览页共用的控制器。
 5. **边界不变**：不新增端点、不改 `/m/api/files` 语义、不改 `display`；能力位 `toolCards.version` 仍为 `1`（旧 App 忽略新字段，新 App 缺字段即纯文本）。
 6. **已知边界**：`tool/call` 摘要发生在工具执行**前**，实时 `write` 新建文件当刻不可预览，历史重投影后才可点；读取侧 realpath 夹取不在本 issue 范围（#16 独立跟踪）。
+
+### 6.24.1 PTC 子调用投影（v3.4，issue #68 / M3 Batch 2-C）
+
+`run_code`（PTC 模式）里每个嵌套工具调用由内核落一对会话事件 `tool/ptc-dispatch-start` / `tool/ptc-dispatch`；本插件把它们投影为**结构化子调用事件**，供 App 挂到根 `run_code` 工具卡下。事件本身仍属 debug-only：普通模式不渲染裸事件卡，`/event-detail` 详情 allow-list **不放行**（无 detail 指针）。
+
+**事件字段**（`{ seq, type, time?, data }`；`data` 投影自内核载荷，只增不改）：
+
+| 字段 | 类型 | start | result | 说明 |
+|---|---|---|---|---|
+| `turn` / `step` | number? | ✓ | ✓ | 由原始会话事件（`turn/start`/`step/start`）派生；派生不到则省略，**不用 0 伪造** |
+| `rootCallId` | string? | ✓ | ✓ | 外层 `run_code` 的 callId；非法/缺失时省略 |
+| `parentCallId` | string | 必填 | 必填 | 直接父调用（根或另一子调用）；缺失/非法 → 整条无 `data`（事件仍在） |
+| `callId` | string | 必填 | 必填 | **内核 `subCallId`**（形如 `<parentCallId>:ptc:<n>`）；App 按它原地合并 start→result |
+| `name` | string? | ✓ | ✓ | 工具名，≤120 字 |
+| `status` | string | `"running"` | `"success"` / `"failed"` | `failed` 当且仅当内核 `isError === true` |
+| `summary` | object? | ✓ | ✓ | 复用 `tool/call` 的安全摘要（见 §6.24）经 PTC 紧凑白名单裁剪：`kind`/`tool` + command/file/search/web/image/todo/question/skill 的折叠行字段；**丢弃** `diff`/`diffTruncated`/`relative`/`previewable`；单条 `JSON ≤ 2048` 字节，超限整份降级为 `{kind,tool}` |
+| `text` | string? | — | ✓ | **仅失败时**下发，且只含安全错误码：`error.code` 优先、缺失时 `error.name`，clamp ≤120/≤500；**绝不**取 `content`/`arguments`/`meta`/`error.reason`（工具输出可能含绝对路径） |
+| `isError` | bool | — | 必填 | 成功也显式下发 `false` |
+| `error` | object? | — | 仅失败 | 只含 `{ name, code }`（两者都非空才下发，各 ≤120 字）；**无 `reason`** |
+| `truncated` | bool | 可能 | 可能 | 超 50 子调用的最小截断通知，见下 |
+
+**安全与体积**：永不下发 `arguments` 原文、`meta`、`content`/`images`、`error.reason`、绝对主机路径（`summary` 内路径均为 `mobileDisplayPath` 派生）。缺 `data`/非法 id/坏 `content`/坏 `error` 一律 fail-open 为 `{seq,type}`，绝不抛错（`/history`、SSE 与契约自检共用同一 `summarizeEvent` 分支）。
+
+**50 子调用上限**：按 `rootCallId` 分组、以 `callId` 去重计数（同一子调用的 start/result 只占 1 个名额）。前 50 个正常投影；第 51 个新 `callId` 的首个事件下发**最小截断通知**（仅 `parentCallId/callId/name?/status` + `truncated: true`，无 summary/text/isError/error/turn/step），同一计数作用域最多一条；此后该 root 的其它超限事件降级为 `{seq,type}`（事件仍保留，App 据此显示「已截断」）。计数作用域：`/history` 每响应一个，SSE 每会话一个（进程内有界）。
+
+**App 消费约束**：根工具卡折叠行显示「N 个子调用」；展开后每个子调用只显示名称 + 状态 + 安全摘要，**不提供** args/结果二级展开、不显示图片；子调用不进入 M1 过程行；默认收起、失败不自动展开；无 `toolCards.ptc` 能力位时完全降级（不显示计数/子行）。
