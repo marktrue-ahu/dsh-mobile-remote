@@ -291,7 +291,7 @@
 | `tool/call` | `{ turn, step, callId, name, arguments }`；长参数可通过详情端点获取 |
 | `tool/result` | `{ callId, name, isError, text, images? }`；长结果可通过详情端点获取；**不再下发 `files`**（issue #1 需求变更：工具产出文件不上时间线；图片仍带 `images`） |
 | `tool/ptc-dispatch-start` | PTC 子调用开始（v3.4，issue #68）：`{ turn?, step?, rootCallId?, parentCallId, callId, name?, status: "running", summary? }`；`callId` 即内核对 `subCallId`，**不下发** `arguments` 原文 / `meta`；仍属 debug-only（见 §6.24.1） |
-| `tool/ptc-dispatch` | PTC 子调用落定（v3.4，issue #68）：同上 + `{ status: "success" \| "failed", isError, text?, error? }`；`text` 仅失败时下发且只含安全错误码（`error.code` 优先、缺省 `error.name`，≤500），`error` 仅 `{ name, code }`；超 50 子调用时下发最小 `truncated: true` 通知（见 §6.24.1） |
+| `tool/ptc-dispatch` | PTC 子调用落定（v3.4，issue #68）：同上 + `{ status: "success" \| "failed", isError, text?, error? }`；`text` 仅失败时下发且只含**合法安全码**（`^[A-Za-z][A-Za-z0-9_.-]{0,63}$`：合法 `error.code` 优先、否则合法 `error.name`，≤500），`error` 仅 `{ name, code }` 且两者都合法才下发；超 50 子调用时下发最小 `truncated: true` 通知（见 §6.24.1） |
 | `turn/start` | `{ turn: number }` |
 | `turn/end` | `{ turn: number, reason: object }` |
 | 其他可见事件 | 保留 `type`、`seq`，未知类型使用通用卡保留顺序；不提供详情指针，也不允许通过 3.5b 读取原始载荷 |
@@ -1372,14 +1372,14 @@ graph 的每个提交与 commit 详情都**保留旧的** `refs: string[]`（dep
 | `callId` | string | 必填 | 必填 | **内核 `subCallId`**（形如 `<parentCallId>:ptc:<n>`）；App 按它原地合并 start→result |
 | `name` | string? | ✓ | ✓ | 工具名，≤120 字 |
 | `status` | string | `"running"` | `"success"` / `"failed"` | `failed` 当且仅当内核 `isError === true` |
-| `summary` | object? | ✓ | ✓ | 复用 `tool/call` 的安全摘要（见 §6.24）经 PTC 紧凑白名单裁剪：`kind`/`tool` + command/file/search/web/image/todo/question/skill 的折叠行字段；**丢弃** `diff`/`diffTruncated`/`relative`/`previewable`；单条 `JSON ≤ 2048` 字节，超限整份降级为 `{kind,tool}` |
-| `text` | string? | — | ✓ | **仅失败时**下发，且只含安全错误码：`error.code` 优先、缺失时 `error.name`，clamp ≤120/≤500；**绝不**取 `content`/`arguments`/`meta`/`error.reason`（工具输出可能含绝对路径） |
+| `summary` | object? | ✓ | ✓ | 复用 `tool/call` 的安全摘要（见 §6.24）经 PTC 紧凑白名单裁剪：`kind`/`tool` + command/file/search/web/image/todo/question/skill 的折叠行字段；**丢弃** `diff`/`diffTruncated`/`relative`/`previewable`；自由文本 `command`/`description` 再做主机路径脱敏（cwd→`.`、homedir→`~`、剩余绝对路径→`…/<basename>`，http(s) URL 保留）；单条 `JSON ≤ 2048` 字节，超限整份降级为 `{kind,tool}` |
+| `text` | string? | — | ✓ | **仅失败时**下发，且只含**合法安全码**（`^[A-Za-z][A-Za-z0-9_.-]{0,63}$`）：合法 `error.code` 优先、否则合法 `error.name`，≤500；两者都不合法 → 省略；**绝不**取 `content`/`arguments`/`meta`/`error.reason`（工具输出可能含绝对路径） |
 | `isError` | bool | — | 必填 | 成功也显式下发 `false` |
-| `error` | object? | — | 仅失败 | 只含 `{ name, code }`（两者都非空才下发，各 ≤120 字）；**无 `reason`** |
-| `truncated` | bool | 可能 | 可能 | 超 50 子调用的最小截断通知，见下 |
+| `error` | object? | — | 仅失败 | 只含 `{ name, code }`，且 name 与 code **都**符合安全码语法才整对象下发（各 ≤120 字）；任一不合法 → 省略；**无 `reason`** |
+| `truncated` | bool | 可能 | 可能 | 超 50 子调用的最小截断通知（无 turn/step/summary/text/isError/error），见下 |
 
-**安全与体积**：永不下发 `arguments` 原文、`meta`、`content`/`images`、`error.reason`、绝对主机路径（`summary` 内路径均为 `mobileDisplayPath` 派生）。缺 `data`/非法 id/坏 `content`/坏 `error` 一律 fail-open 为 `{seq,type}`，绝不抛错（`/history`、SSE 与契约自检共用同一 `summarizeEvent` 分支）。
+**安全与体积**：永不下发 `arguments` 原文、`meta`、`content`/`images`、`error.reason`、绝对主机路径（`summary` 内结构路径均为 `mobileDisplayPath` 派生，自由文本 `command`/`description` 另做上述脱敏）。缺 `data`/非法 id → 该事件无 `data`（`{seq,type}`，事件仍保留）；坏 `content`/坏 `error` 被**忽略并正常投影**（`content` 完全不参与投影），绝不抛错（`/history`、SSE 与契约自检共用同一 `summarizeEvent` 分支）。
 
-**50 子调用上限**：按 `rootCallId` 分组、以 `callId` 去重计数（同一子调用的 start/result 只占 1 个名额）。前 50 个正常投影；第 51 个新 `callId` 的首个事件下发**最小截断通知**（仅 `parentCallId/callId/name?/status` + `truncated: true`，无 summary/text/isError/error/turn/step），同一计数作用域最多一条；此后该 root 的其它超限事件降级为 `{seq,type}`（事件仍保留，App 据此显示「已截断」）。计数作用域：`/history` 每响应一个，SSE 每会话一个（进程内有界）。
+**50 子调用上限**：按 `rootCallId` 分组、以 `callId` 去重计数（同一子调用的 start/result 只占 1 个名额）。前 50 个正常投影；第 51 个新 `callId` 的首个事件下发**最小截断通知**（仅 `rootCallId?/parentCallId/callId/name?/status` + `truncated: true`，**无 turn/step/summary/text/isError/error**），同一计数作用域最多一条；此后该 root 的其它超限事件降级为**无 `data` 的 `{seq,type}`**（事件仍保留，通用顶层 `time` 等既不删除也不改写；App 据此显示「已截断」）。计数作用域：`/history` 每响应一个，SSE 每会话一个（进程内按插入序 FIFO 有界逐出，不做触碰刷新）。
 
 **App 消费约束**：根工具卡折叠行显示「N 个子调用」；展开后每个子调用只显示名称 + 状态 + 安全摘要，**不提供** args/结果二级展开、不显示图片；子调用不进入 M1 过程行；默认收起、失败不自动展开；无 `toolCards.ptc` 能力位时完全降级（不显示计数/子行）。
