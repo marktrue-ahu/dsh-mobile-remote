@@ -1372,8 +1372,8 @@ graph 的每个提交与 commit 详情都**保留旧的** `refs: string[]`（dep
 | `callId` | string | 必填 | 必填 | **内核 `subCallId`**（形如 `<parentCallId>:ptc:<n>`）；App 按它原地合并 start→result |
 | `name` | string? | ✓ | ✓ | 工具名，≤120 字 |
 | `status` | string | `"running"` | `"success"` / `"failed"` | `failed` 当且仅当内核 `isError === true` |
-| `summary` | object? | ✓ | ✓ | 复用 `tool/call` 的安全摘要（见 §6.24）经 PTC 紧凑白名单裁剪：`kind`/`tool` + command/file/search/web/image/todo/question/skill 的折叠行字段；**丢弃** `diff`/`diffTruncated`/`relative`/`previewable`；自由文本 `command`/`description` 再做主机路径脱敏（cwd→`.`、homedir→`~`、剩余绝对路径→`…/<basename>`，http(s) URL 保留）；单条 `JSON ≤ 2048` 字节，超限整份降级为 `{kind,tool}` |
-| `text` | string? | — | ✓ | **仅失败时**下发，且只含**合法安全码**（`^[A-Za-z][A-Za-z0-9_.-]{0,63}$`）：合法 `error.code` 优先、否则合法 `error.name`，≤500；两者都不合法 → 省略；**绝不**取 `content`/`arguments`/`meta`/`error.reason`（工具输出可能含绝对路径） |
+| `summary` | object? | ✓ | ✓ | 复用 `tool/call` 的安全摘要（见 §6.24）经 PTC 紧凑白名单裁剪：`kind`/`tool` + command/file/search/web/image/todo/question/skill 的折叠行字段；**丢弃** `diff`/`diffTruncated`/`relative`/`previewable`；自由文本 `command`/`description` 再做主机路径脱敏（cwd→`.`、homedir→`~`、剩余绝对路径→`…/<basename>`；带引号/转义空格的路径整体脱敏，`path:`/`--flag=`/`file:` 边界与盘符边界正确，http(s) URL 保留）；单条 `JSON ≤ 2048` 字节，超限整份降级为 `{kind,tool}` |
+| `text` | string? | — | ✓ | **仅失败时**下发，且只含**合法安全码**（`^[A-Za-z][A-Za-z0-9_.-]{0,63}$`，对**原串**严格验证，含空白/换行即非法）：合法 `error.code` 优先、否则合法 `error.name`，≤500；两者都不合法 → 省略；**绝不**取 `content`/`arguments`/`meta`/`error.reason`（工具输出可能含绝对路径） |
 | `isError` | bool | — | 必填 | 成功也显式下发 `false` |
 | `error` | object? | — | 仅失败 | 只含 `{ name, code }`，且 name 与 code **都**符合安全码语法才整对象下发（各 ≤120 字）；任一不合法 → 省略；**无 `reason`** |
 | `truncated` | bool | 可能 | 可能 | 超 50 子调用的最小截断通知（无 turn/step/summary/text/isError/error），见下 |
