@@ -1,5 +1,31 @@
 # Changelog
 
+## v3.2.4-alpha.12（build 44，issues #78 / #79）— 图片与折叠 hotfix
+
+> 插件 `3.2.4-alpha.12` / App `3.2.4+44` / 载体 `3.2.4-alpha.12-app`。
+
+### 图片加载修复（#78，P0）
+
+- 修复 `/m/api/attachment`：DSH `session.attachment` RPC 新 schema 要求 `{sessionId, attachment:{完整引用}}`；改为从会话原始事件解析完整 image ref 后再调用，用户附图/read_image/历史图恢复正常。
+- 非法 id/缺失 ref/存储缺失 → 404 `attachment-not-found`；LRU 缓存 + 宿主拒绝时清缓存重扫，不按路径读文件、不信任客户端字段。
+- 真实 HTTP 验证：用户附图 200、read_image 200、不存在 404。
+
+### 插话折叠修复（#79，P1）
+
+- 修复「思考/运行中插入消息后该轮永久无法折叠」：`forceExpanded` 仅保留「未结束 / aborted / interrupted / error」。
+- 轮内插话改为**默认展开但可手动折叠**：`afterAnswer` 档回答刚结束保持展开；`onNewMessage` 档仍按轮后新消息自动收起。
+- 运行中/异常轮仍硬强制展开；两档时机、手动覆盖、组折叠矩阵不变。
+
+### 文档
+
+- ADR 0027 §2 / ADR 0028 §4 同步插话折叠语义。
+
+### 验证
+
+- flutter test 1221 全绿；timeline-contract 179、account-usage 15/15、Kotlin 门禁通过；attachment-routes 11/11。
+- 真机验收：alpha.12 重点验证图片加载、插话后折叠、折叠视觉/滚动回归。
+
+
 ## v3.2.4-alpha.11（build 43，issues #73 / #74 / #75 / #76 / #77）— 真机验收修复
 
 > 插件 `3.2.4-alpha.11` / App `3.2.4+43` / 载体 `3.2.4-alpha.11-app`。
