@@ -19,7 +19,8 @@ issue #1 当年决定「assistant/tool 产出文件的元数据不再下发，�
 ### 2. 轮次过程折叠与展示模式
 
 - 三层折叠：整轮（turn）→ 过程组（按事件 `step` 派生；缺 step 时退化为整轮一组）→ 单卡。
-- 强制展开（不看策略）：轮次未结束、轮内有插话、`turn/end` 的 reason.kind ∈ `aborted`/`interrupted`/`error`；底部最新组延后收起。
+- **硬强制展开**（不可折叠）：轮次未结束、`turn/end` 的 reason.kind ∈ `aborted`/`interrupted`/`error`；底部最新组延后收起。
+- **轮内有插话**：默认展开，但**允许手动折叠**（不再永久强制）；`afterAnswer` 档回答刚结束时保持展开，`onNewMessage` 档仍按轮后新消息自动收起（issue #79）。
 - 四档展示模式：简洁、标准、详细、完全展开；两档收起时机：回答结束后、下次有新消息时。默认「标准」+「回答结束后」，偏好只存手机本地（不新增宿主设置端点）。
 
   四档策略表（与桌面 `presentation-policy.js` 同构，M1 已按此实现并验收）：
