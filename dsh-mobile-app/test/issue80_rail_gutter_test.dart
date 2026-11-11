@@ -1,7 +1,8 @@
 // issue #80：轮次导航 Gutter 36。
 //
 // 规格（note 2264）：
-// - 轨道宽 28dp + 右侧 8dp gutter；轨道可见时消息列表右 padding 36dp，隐藏时恢复 16dp；
+// - 轨道宽 28dp + 右侧 8dp gutter；轨道隐藏时 padding 恢复 16dp（#81 起圆钮可见时
+//   取 38dp：轨道可见必然伴随圆钮可见，见 issue81 的 action gutter 矩阵）；
 // - 390/320 都不自动缩轨；轨道仅真实轨框范围命中，gutter 右侧 8dp 留白不命中；
 // - 显隐与 padding 同帧；右下「回到底部」圆钮与轨道下界至少 12dp 避让；
 // - 保留点按/长按扫掠/高亮/未加载刻度/轨内自动滚动（导航行为不改）。
@@ -166,7 +167,7 @@ Finder get _jumpButton => find.byWidgetPredicate(
     );
 
 void main() {
-  testWidgets('390：轨道 28/右 8、正文右让 36、gutter 不命中', (tester) async {
+  testWidgets('390：轨道 28/右 8、正文右让 action gutter、gutter 不命中', (tester) async {
     tester.view.physicalSize = const Size(390, 844);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
@@ -177,12 +178,13 @@ void main() {
     final railRect = tester.getRect(_rail);
     expect(railRect.width, 28, reason: '轨道宽 28dp');
     expect(railRect.right, closeTo(390 - 8, 0.5), reason: '轨道右侧留 8dp gutter');
-    expect(_liveRightPadding(tester), 36, reason: '轨道可见时列表右 padding 36');
+    // issue #81：「回到底部」圆钮与轨道同 gate 可见，取两者最大值 38dp。
+    expect(_liveRightPadding(tester), 38, reason: '圆钮+轨道 → 列表右 padding 38');
 
     final textRight = _visibleUserTextRight(tester);
     expect(textRight, isNotNull, reason: '需要可见的长用户气泡');
-    // 气泡右缘 = 屏宽-36，文本再内缩 12（气泡内边距）。
-    expect(textRight!, closeTo(390 - 36 - 12, 2),
+    // 气泡右缘 = 屏宽-38，文本再内缩 12（气泡内边距）。
+    expect(textRight!, closeTo(390 - 38 - 12, 2),
         reason: '正文不进入 gutter（右缘 $textRight）');
 
     // gutter 右侧 8dp 留白不命中：点它不触发导航（滚动位置不变）。
@@ -202,7 +204,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 900));
   });
 
-  testWidgets('320：不自动缩轨；正文宽 268（屏宽-16-36）', (tester) async {
+  testWidgets('320：不自动缩轨；正文宽 266（屏宽-16-38）', (tester) async {
     tester.view.physicalSize = const Size(320, 700);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
@@ -213,12 +215,12 @@ void main() {
     final railRect = tester.getRect(_rail);
     expect(railRect.width, 28, reason: '320 也不自动缩轨');
     expect(railRect.right, closeTo(320 - 8, 0.5));
-    expect(_liveRightPadding(tester), 36);
+    expect(_liveRightPadding(tester), 38);
 
     final textRight = _visibleUserTextRight(tester);
     expect(textRight, isNotNull);
-    expect(textRight!, closeTo(320 - 36 - 12, 2),
-        reason: '320 正文右缘应为 272（屏宽-16-36-12）');
+    expect(textRight!, closeTo(320 - 38 - 12, 2),
+        reason: '320 正文右缘应为 270（屏宽-16-38-12）');
 
     final before = _pos(tester).pixels;
     await tester.tapAt(Offset(320 - 4, railRect.center.dy));
@@ -243,7 +245,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 900));
   });
 
-  testWidgets('显隐与 padding 同帧：离开底部出现轨道→36；回底后一帧内轨道消失→16', (tester) async {
+  testWidgets('显隐与 padding 同帧：离开底部出现轨道/圆钮→38；回底后一帧内恢复→16', (tester) async {
     tester.view.physicalSize = const Size(390, 844);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
@@ -254,7 +256,7 @@ void main() {
 
     await _scrollUp(tester);
     expect(_rail, findsOneWidget);
-    expect(_liveRightPadding(tester), 36, reason: '同一帧内轨道+padding 一起出现');
+    expect(_liveRightPadding(tester), 38, reason: '同一帧内轨道/圆钮+padding 一起出现');
 
     // 点「回到底部」圆钮：只 pump 一帧（不 settle），轨道与 padding 必须同帧恢复。
     expect(_jumpButton, findsOneWidget);
@@ -305,7 +307,7 @@ void main() {
     await _pumpChat(tester, _TurnBackend(turns: 6), keySuffix: 'multi');
     await _scrollUp(tester);
     expect(_rail, findsOneWidget);
-    expect(_liveRightPadding(tester), 36);
+    expect(_liveRightPadding(tester), 38);
 
     await _pumpChat(
       tester,
@@ -328,7 +330,7 @@ void main() {
     await _scrollUp(tester);
     expect(_rail, findsOneWidget);
     expect(tester.getRect(_rail).width, 28);
-    expect(_liveRightPadding(tester), 36);
+    expect(_liveRightPadding(tester), 38);
     expect(tester.takeException(), isNull, reason: '320+1.3 不应 overflow');
     await tester.pump(const Duration(milliseconds: 900));
   });
