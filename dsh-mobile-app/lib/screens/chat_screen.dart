@@ -60,6 +60,26 @@ const double chatMessageDefaultRightPadding = 16;
 /// 轨道区底部预留：圆钮高 38 + bottom 12 + 与圆钮至少 12dp 避让 = 62dp。
 const double turnRailBottomReserve = 62;
 
+// ── issue #81：320+大字下「回到底部」圆钮遮挡尾段 ─────────────────────
+// 圆钮也占用右侧 action gutter：可见时正文右 padding 取 38（≥轨道 36），并把圆钮
+// 移到 right 0（占用最后 38dp）；圆钮隐藏时回到轨道/默认口径。两者同帧计算。
+const double jumpToLatestSize = 38;
+const double jumpToLatestRightPadding = jumpToLatestSize;
+
+/// 消息列表右 padding 的唯一判定（issue #80/#81 共用，供 widget/单测断言四组合）。
+///
+/// - 圆钮可见（用户上翻出「回到底部」）：38（按钮占用最后 38dp）；
+/// - 否则轨道可见：36（轨道 28 + 右留白 8）；
+/// - 都隐藏：16（默认）。
+double listRightPaddingFor({
+  required bool jumpVisible,
+  required bool railVisible,
+}) {
+  if (jumpVisible) return jumpToLatestRightPadding;
+  if (railVisible) return turnRailRightPadding;
+  return chatMessageDefaultRightPadding;
+}
+
 /// v3.0.0(热修 07)：服务端"明确拒绝"的错误码白名单——这些代表消息**未被投递且服务端无回执**，
 /// 可直接判失败；其余（`bridge-unavailable`、`receipt-pending`、传输层 reset/超时等）一律走回执
 /// 对账——因为服务端可能已接收（响应在回程被切断时，桥把它翻译成 502 `bridge-unavailable` 返回，
@@ -441,6 +461,9 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _suppressOlderPaging = false; // 占位调整帧内：位置修正不得触发「上翻加载更早」
   // issue #80：本帧轨道是否可见——列表右 padding 与轨道定位共用同一个 gate（同帧生效）。
   bool _turnRailVisible = false;
+  // issue #81：本帧消息列右 padding；宽度变化必须让依赖宽度的尺寸/内容偏移缓存失效，
+  // 否则「回到底部」圆钮/轨道显隐导致正文重排后，轮次定位仍按旧宽度高度估算。
+  double _lastLiveRightPadding = -1;
 
   /// issue #77：分帧收敛到底部（懒构建 extent 修正后按新 max 再跳，最多 [remaining] 帧）。
   void _settleToBottom(int remaining) {
@@ -1173,7 +1196,14 @@ class _ChatScreenState extends State<ChatScreen> {
         targetIndex: childIndex < 0 ? childCount - 1 : childIndex,
         childCount: childCount,
       );
-      if (!current() || outcome.ok) return;
+      if (!current()) return;
+      if (outcome.ok) {
+        // issue #81：正文宽度受 action gutter 影响（16/36/38），定位器只保证目标
+        // 「与视口相交」；若目标边界落在阅读线下方，高亮会停留在上一轮。落到目标后
+        // 把边界对齐到阅读线附近，保证「点了第 N 轮 → 高亮第 N 轮」。
+        await _alignTargetToReadingLine(anchor.seq);
+        return;
+      }
       if (!mounted) return; // 让分析器认得 context 守卫（current() 已含 mounted）
       final message = switch (outcome.failure) {
         TurnLocateFailure.notInWindow => L10n.t(
@@ -1201,6 +1231,22 @@ class _ChatScreenState extends State<ChatScreen> {
       duration: const Duration(milliseconds: 180),
       curve: Curves.easeOutCubic,
     );
+  }
+
+  /// issue #81：定位成功后把目标轮起始边界对齐到阅读线附近（仅在落在阅读线下方时），
+  /// 让「当前轮高亮」与实际跳转目标一致（不受 action gutter 宽度变化影响）。
+  Future<void> _alignTargetToReadingLine(int seq) async {
+    final box = _turnKeysBySeq[seq]?.currentContext?.findRenderObject() as RenderBox?;
+    final viewport =
+        _liveViewportKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize || viewport == null || !viewport.hasSize) {
+      return;
+    }
+    final lineOffset = math.min(96.0, viewport.size.height * 0.2);
+    final top = box.localToGlobal(Offset.zero).dy;
+    final viewTop = viewport.localToGlobal(Offset.zero).dy;
+    if (top - viewTop <= lineOffset) return;
+    await _revealTurnKey(_turnKeysBySeq[seq]);
   }
 
   /// 提交问询答案（answers 顺序与提问一致），失败时弹窗保留可重试。
@@ -1964,10 +2010,16 @@ class _ChatScreenState extends State<ChatScreen> {
   /// 统一单一方向（不再按条数切换 reverse）：根治 50/51 条边界翻转导致滚动位置跳变
   /// （review P1-1）；无限模式上翻加载更早时新数据出现在视觉顶部，阅读位置不跳动。
   Widget _buildLiveView() {
-    // issue #80：轨道可见时消息列表右让 36dp（28 轨道 + 8 gutter），否则默认 16dp。
-    final rightPadding = _turnRailVisible
-        ? turnRailRightPadding
-        : chatMessageDefaultRightPadding;
+    // issue #80/#81：右侧 action gutter 占位者取最大——圆钮可见 38、仅轨道 36、都无 16。
+    final rightPadding = listRightPaddingFor(
+      jumpVisible: _showJumpToLatest,
+      railVisible: _turnRailVisible,
+    );
+    if (_lastLiveRightPadding != rightPadding) {
+      _lastLiveRightPadding = rightPadding;
+      // 正文可用宽度变化 → 已测高度失效（issue #81：38/36/16 切换）。
+      _itemHeights.clear();
+    }
     final hasDraft = _streaming || _draft.isNotEmpty;
     final topButton = !_infiniteMode && _earliestSeq > 0;
     final loadingTail = _infiniteMode && _loadingMore && _earliestSeq > 0;
@@ -4636,9 +4688,11 @@ class _ChatScreenState extends State<ChatScreen> {
                     ),
                   ),
                 if (!_inHistory)
+                  // issue #81：圆钮移入右侧 action gutter（right 0，38dp），正文右
+                  // padding 相应取 38，避免 320+大字时遮挡尾段；动画/点击/语义不变。
                   Positioned(
                     bottom: 12,
-                    right: 14,
+                    right: 0,
                     child: _JumpToLatestButton(
                       visible: _showJumpToLatest,
                       onTap: _jumpToLatest,
@@ -10448,8 +10502,8 @@ class _JumpToLatestButton extends StatelessWidget {
             customBorder: const CircleBorder(),
             onTap: onTap,
             child: SizedBox(
-              width: 38,
-              height: 38,
+              width: jumpToLatestSize,
+              height: jumpToLatestSize,
               child: Icon(
                 Icons.keyboard_arrow_down,
                 size: 24,
