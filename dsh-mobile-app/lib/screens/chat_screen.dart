@@ -48,6 +48,18 @@ import 'session_tools_sheet.dart';
 import 'turn_changes_diff_screen.dart';
 import 'turn_file_preview_screen.dart';
 
+// ── issue #80：轮次导航 Gutter 36 ────────────────────────────────────
+// 轨道视觉宽 28dp（刻度条 20dp 右对齐），右侧留 8dp 不命中的 gutter；消息列表
+// 右侧 padding 在轨道可见时为 28+8=36dp，轨道隐藏（<2 轮/接近底部/历史浏览）时
+// 恢复默认 16dp，两者在**同一帧**由 build 内同一个 gate 决定。
+const double turnRailWidth = 28;
+const double turnRailRightGutter = 8;
+const double turnRailRightPadding = turnRailWidth + turnRailRightGutter; // 36
+const double chatMessageDefaultRightPadding = 16;
+
+/// 轨道区底部预留：圆钮高 38 + bottom 12 + 与圆钮至少 12dp 避让 = 62dp。
+const double turnRailBottomReserve = 62;
+
 /// v3.0.0(热修 07)：服务端"明确拒绝"的错误码白名单——这些代表消息**未被投递且服务端无回执**，
 /// 可直接判失败；其余（`bridge-unavailable`、`receipt-pending`、传输层 reset/超时等）一律走回执
 /// 对账——因为服务端可能已接收（响应在回程被切断时，桥把它翻译成 502 `bridge-unavailable` 返回，
@@ -427,6 +439,8 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _userDragActive = false;
   bool _followBottomScheduled = false;
   bool _suppressOlderPaging = false; // 占位调整帧内：位置修正不得触发「上翻加载更早」
+  // issue #80：本帧轨道是否可见——列表右 padding 与轨道定位共用同一个 gate（同帧生效）。
+  bool _turnRailVisible = false;
 
   /// issue #77：分帧收敛到底部（懒构建 extent 修正后按新 max 再跳，最多 [remaining] 帧）。
   void _settleToBottom(int remaining) {
@@ -1950,6 +1964,10 @@ class _ChatScreenState extends State<ChatScreen> {
   /// 统一单一方向（不再按条数切换 reverse）：根治 50/51 条边界翻转导致滚动位置跳变
   /// （review P1-1）；无限模式上翻加载更早时新数据出现在视觉顶部，阅读位置不跳动。
   Widget _buildLiveView() {
+    // issue #80：轨道可见时消息列表右让 36dp（28 轨道 + 8 gutter），否则默认 16dp。
+    final rightPadding = _turnRailVisible
+        ? turnRailRightPadding
+        : chatMessageDefaultRightPadding;
     final hasDraft = _streaming || _draft.isNotEmpty;
     final topButton = !_infiniteMode && _earliestSeq > 0;
     final loadingTail = _infiniteMode && _loadingMore && _earliestSeq > 0;
@@ -1973,7 +1991,7 @@ class _ChatScreenState extends State<ChatScreen> {
           center: _liveCenterKey,
           slivers: [
             SliverPadding(
-              padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+              padding: EdgeInsets.fromLTRB(16, 10, rightPadding, 0),
               sliver: SliverList(
                 key: _olderSliverKey,
                 delegate: SliverChildBuilderDelegate(
@@ -1996,7 +2014,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 child: SizedBox(height: _liveBottomGap),
               ),
             SliverPadding(
-              padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
+              padding: EdgeInsets.fromLTRB(16, 0, rightPadding, 6),
               sliver: SliverList(
                 key: _liveSliverKey,
                 delegate: SliverChildBuilderDelegate((context, index) {
@@ -4472,6 +4490,8 @@ class _ChatScreenState extends State<ChatScreen> {
       nearBottom: _pinnedToBottom,
       turnCount: turnTicks.length,
     );
+    // issue #80：轨道可见性与列表右 padding 同帧（历史浏览视图不显示轨道，保持 16dp）。
+    _turnRailVisible = !_inHistory && showTurnRail;
     // 阶梯被截断 / 读取失败 / 能力缺失 / 该会话无大纲：在用户**能看到刻度轨**时
     // 各说明一次（四态文案互不相同，见 `turnOutlineNotice`），绝不静默。
     // 评审 P2 指出：三态"给出不同说明"是正文与 ADR 的验收项，不能因为"退回一期本身
@@ -4591,16 +4611,25 @@ class _ChatScreenState extends State<ChatScreen> {
                 // issue #24：轮次导航刻度轨。放在消息流之上、右下角圆钮之下；
                 // 只占右侧约 28px，空白区域不吸收命中，消息流照常滚动。
                 if (!_inHistory && showTurnRail)
-                  Positioned.fill(
+                  // issue #80：轨道宽 28 + 右侧 8dp gutter；gutter 不命中（Align 只
+                  // 命中真实子节点）。底部预留 62dp，保证轨道下界与「回到底部」圆钮
+                  // 至少 12dp 避让；轨道自身仍受 420dp 轨框 + 可用高度约束。
+                  Positioned(
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    bottom: turnRailBottomReserve,
                     child: Align(
                       alignment: Alignment.centerRight,
                       child: Padding(
-                        padding: const EdgeInsets.only(right: 12),
+                        padding: const EdgeInsets.only(right: turnRailRightGutter),
                         child: TurnNavigatorRail(
                           anchors: turnAnchors,
                           unloadedTurns: unloadedTurns,
                           activeTurn: _activeTurn,
                           busyTurn: _busyTurn,
+                          width: turnRailWidth,
+                          maxHeight: 420,
                           onNavigate: (anchor) => unawaited(_navigateToTurn(anchor)),
                         ),
                       ),
