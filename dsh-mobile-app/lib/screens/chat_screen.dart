@@ -6259,7 +6259,6 @@ class _ChatScreenState extends State<ChatScreen> {
       if (start == null) continue; // 历史截断：没有 turn/start，不构造过程块
       anchoredTurns.add(turn);
       final segments = segmentsOf(process);
-      if (segments.isEmpty) continue;
       final expandedByDefault = !turnAutoCollapsed(
         process,
         policy: policy,
@@ -6280,6 +6279,9 @@ class _ChatScreenState extends State<ChatScreen> {
         for (final item in turnItems) {
           final seq = item.seq;
           if (seq == null || seq < segment.startSeq) continue;
+          // issue #91：插话 user 消息只做段边界，绝不能成为过程块宿主（否则块会
+          // 被前移到该 user 之前）。host 必须是过程行附近的工具/助手/分隔条。
+          if (item.kind == _MsgKind.user) continue;
           if (host == null || seq < (host.seq ?? 1 << 62)) host = item;
         }
         if (host == null || host.seq == null) continue;
