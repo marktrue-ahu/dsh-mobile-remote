@@ -49,7 +49,7 @@
 | GET | `/m/api/changes/summary` | 本轮改动文件摘要（按轮查询，宿主内存态，v3.3） | 是 |
 | GET | `/m/api/changes/diff` | 本轮单文件对比（最小闭环 diff，v3.3） | 是 |
 | GET | `/m/api/turn-file` | 按轮末记录坐标读取文件（预览/下载，v3.3） | 是 |
-| — | `/m/api/git/*`（规划中） | 设计草案；v3.1.5 未注册这些路由 | 不适用 |
+| GET/POST | `/m/api/git/*` | Git 只读/写接口（v3.3 已实现，见「Git API」节） | 是 |
 | GET | `/m/api/balance` | DeepSeek 官方余额 | 是 |
 | GET | `/m/api/account-usage` | 用量与额度（DeepSeek / Codex / OpenCode Go） | 是 |
 | GET | `/m/api/qr-config` | 桌面二维码数据（loopback only） | 否（loopback） |
@@ -312,7 +312,7 @@
 | `mobile/frame` | 内核瞬态帧（问询/审批）。`frame` 字段为 `question/requested`（含 `rpcId`、`questions[]`）、`question/resolved`（`questionRpcId`）、`approval/requested`（`rpcId`、`approvalId`、`toolName`、`reason?`）、`approval/resolved`（`approvalId`）。**`approvalId` 标识一次实际审批请求**：同一 `callId` 的 pre-execute 与 sandbox escalation 是两个不同 `approvalId`，`callId` 仅作关联（issue #60 R16）；`$events` 路径的 `rpcId` 使用稳定的 `eventId`。**App 断线重连时服务端补发挂起的待答帧**（`pendingFrames` 回放） |
 | `mobile/queue` | `{ sessionId, rows: [{ id, text, placement }] }`——内核队列快照（`agent/inbox/spliced` 即时镜像，v3.0.2）：认领/删除/编辑实时反映，App 端 dock 以此为权威源（`placement`: `queued` / `steering` / `context`，与 GET /queue 同款形状）；断线重连时 mux 回放当前队列 |
 | `attention/snapshot` | `{ version: 1, pending: [{ kind, sessionId, identity }] }`——在断线重连的 `mobile/frame` 挂起帧回放**之后**、同一有序 SSE 流上追加的**完整待办快照边界**（v3.3）。App 只据此撤销该宿主已不在 pending 中的业务通知，不得凭超时猜测待办已结束；旧宿主无此帧时保留既有行为 |
-| `git/changed`（规划中） | 设计目标为 `{ repositoryId }`；当前版本未实现 Git provider，也不会推送此帧 |
+| `git/changed`（v3.3） | Git 改动通知帧：至少包含 `{ repositoryId }`，可带 `changeKinds`（`index`/`head`） |
 
 客户端应按 `type` 分派；未知 type 使用通用事件卡保留顺序（前向兼容）。当前服务端故意不给未知 type 详情指针，按需详情端点对其返回 `404 event-not-found`，避免未经审查地暴露事件载荷。
 ### 3.7 GET /m/qr.png
@@ -696,9 +696,9 @@
 - `commands.execute` 外层套 `AbortSignal.timeout(15000)`：15s 是**整个命令**的上限。`/compact` 之类会等一次完整的 LLM 摘要，长会话可能超时 → `504 commands-execute-failed`；客户端此时**不能断言失败**（结果未知）
 - `result` 为内核 settle 对象（`commandId` + `result.{kind,text}`），与 PC 端一致
 
-### Git API 设计草案（本版本未实现）
+### Git API（v3.3 已实现）
 
-> 以下 Git endpoints 是设计目标，不属于 v3.1.5 已实现 API；当前 `lib/index.js` 未注册 `/m/api/git/*` 路由，客户端不得依赖这些端点。设计背景见 `docs/design/mobile-git.md` 与 `docs/adr/` 中相关 ADR。
+> `/m/api/git/*` 已注册并可用；以下为当前契约。设计背景见 `docs/design/mobile-git.md` 与 `docs/adr/` 中相关 ADR。
 
 Git 接口计划由项目自有 provider 提供，执行通过 DSH `subprocess`，仓库必须位于
 `workspaceRegistry` 已注册工作区内。`repositoryId` 为 provider 分配的不透明仓库标识，客户端不得自行拼接
