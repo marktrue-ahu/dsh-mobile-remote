@@ -76,6 +76,8 @@ List<int> selectedTipColorSlots(
   GitCommitSummary commit,
   List<GitBranch> selected,
 ) => <int>[
+  // issue #86 P2-4：槽位按选择顺序 i % 16 循环；同一 tip 的多个已选分支各占一个
+  // 槽位（与既有渲染一致），但不产生超过 16 的额外槽位。
   for (var i = 0; i < selected.length; i++)
     if (selected[i].oid == commit.oid) i % maxNodeColorSegments,
 ];

@@ -99,6 +99,7 @@ abstract interface class GitReadApi {
     String? snapshotId,
     String? cursor,
     int limit,
+    Duration timeout,
   });
   Future<GitCommitDetails> commitDetails(
     String sessionId,
@@ -1789,6 +1790,7 @@ class Api implements GitReadApi {
     String? snapshotId,
     String? cursor,
     int limit = 100,
+    Duration timeout = const Duration(seconds: 15),
   }) async => GitGraphPage.fromJson(
     await getJson(
       _gitQuery('/api/git/graph', {
@@ -1799,6 +1801,7 @@ class Api implements GitReadApi {
         'cursor': ?cursor,
         'limit': '$limit',
       }),
+      timeout: timeout,
     ),
   );
 

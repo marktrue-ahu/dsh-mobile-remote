@@ -32,6 +32,8 @@ class _FakeGitApi implements GitReadApi {
   final int branchCount;
   final List<List<String>> graphTips = [];
   Completer<GitGraphPage>? graphGate;
+  bool queueGates = false;
+  final List<Completer<GitGraphPage>> pendingGates = [];
 
   @override
   Future<GitReadCapabilities> capabilities(String sessionId) async =>
@@ -58,8 +60,14 @@ class _FakeGitApi implements GitReadApi {
     String? snapshotId,
     String? cursor,
     int limit = 100,
+    Duration timeout = const Duration(seconds: 15),
   }) {
     graphTips.add(tips.map((tip) => tip.name).toList());
+    if (queueGates) {
+      final gate = Completer<GitGraphPage>();
+      pendingGates.add(gate);
+      return gate.future;
+    }
     if (graphGate != null) return graphGate!.future;
     return Future.value(
       GitGraphPage(snapshotId: 'snapshot', nextCursor: null, tips: tips),
@@ -155,7 +163,7 @@ void main() {
       expect(await controller.toggleGraphBranch(_branches(12)[5]), isFalse);
       expect(controller.state.selectedBranches, hasLength(5));
 
-      expect(await controller.setBranchLimit(GitGraphBranchLimit.ten), 0);
+      expect(controller.setBranchLimit(GitGraphBranchLimit.ten), 0);
       expect(await controller.toggleGraphBranch(_branches(12)[5]), isTrue);
       expect(controller.state.selectedBranches, hasLength(6));
       expect(api.graphTips.last, hasLength(6));
@@ -181,7 +189,7 @@ void main() {
       final controller = GitBrowserController(api);
       addTearDown(controller.dispose);
       await controller.open('s');
-      await controller.setBranchLimit(GitGraphBranchLimit.ten);
+      controller.setBranchLimit(GitGraphBranchLimit.ten);
       for (var i = 1; i < 8; i++) {
         await controller.toggleGraphBranch(_branches(12)[i]);
       }
@@ -190,7 +198,7 @@ void main() {
           .map((branch) => branch.name)
           .toList();
 
-      final removed = await controller.setBranchLimit(GitGraphBranchLimit.five);
+      final removed = controller.setBranchLimit(GitGraphBranchLimit.five);
       expect(removed, 3);
       expect(controller.state.selectedBranches, hasLength(5));
       expect(
@@ -201,7 +209,7 @@ void main() {
       expect(api.graphTips.last, hasLength(5), reason: '裁剪后按新选择集重载 graph');
 
       // 升档不再裁剪。
-      expect(await controller.setBranchLimit(GitGraphBranchLimit.ten), 0);
+      expect(controller.setBranchLimit(GitGraphBranchLimit.ten), 0);
       expect(controller.state.selectedBranches, hasLength(5));
     });
 
@@ -274,6 +282,121 @@ void main() {
         selected,
       );
       expect(layout.rows, hasLength(20));
+    });
+  });
+  group('P2-2 改档不等待网络 / 操作代际', () {
+    test('setBranchLimit 同步返回；旧请求迟到不回写，新请求按新选择集', () async {
+      final api = _FakeGitApi()..queueGates = true;
+      final controller = GitBrowserController(api);
+      addTearDown(controller.dispose);
+      await controller.open('s');
+
+      // 第一个 graph 请求挂起（模拟慢网络）。
+      unawaited(controller.openBranch(_branches(12)[0]));
+      await Future<void>.delayed(Duration.zero);
+      expect(api.pendingGates, hasLength(1));
+
+      // 改档同步返回：不等待 graph 网络、选择/上限立即生效。
+      final removed = controller.setBranchLimit(GitGraphBranchLimit.ten);
+      expect(removed, 0);
+      expect(controller.branchLimit, GitGraphBranchLimit.ten);
+      expect(controller.state.loadingGraph, isTrue);
+      await Future<void>.delayed(Duration.zero);
+      expect(api.pendingGates, hasLength(2), reason: '改档后应发起新请求而非等待旧请求');
+
+      // 旧请求迟到完成：generation 作废，不得回写 commits/选择。
+      api.pendingGates[0].complete(
+        const GitGraphPage(snapshotId: 'old', nextCursor: 'old', commits: []),
+      );
+      await Future<void>.delayed(Duration.zero);
+      expect(controller.state.snapshotId, isNot('old'));
+      expect(controller.state.graphNextCursor, isNot('old'));
+
+      // 新请求完成：正常落盘。
+      api.pendingGates[1].complete(
+        const GitGraphPage(snapshotId: 'new', nextCursor: null, commits: []),
+      );
+      await Future<void>.delayed(Duration.zero);
+      expect(controller.state.snapshotId, 'new');
+      expect(controller.state.loadingGraph, isFalse);
+    });
+  });
+
+  group('P2-3 不限档取消最后一项', () {
+    test('unlimited 取消最后一项 → 0 选择、取消请求、无新 graph 请求', () async {
+      final api = _FakeGitApi();
+      final controller = GitBrowserController(
+        api,
+        branchLimit: GitGraphBranchLimit.unlimited,
+      );
+      addTearDown(controller.dispose);
+      await controller.open('s');
+      expect(controller.state.selectedBranches, hasLength(1));
+      final requestsBefore = api.graphTips.length;
+
+      expect(await controller.toggleGraphBranch(_branches(12)[0]), isTrue);
+      expect(controller.state.selectedBranches, isEmpty);
+      expect(controller.state.commits, isEmpty);
+      expect(controller.state.loadingGraph, isFalse);
+      expect(api.graphTips.length, requestsBefore, reason: '0 选择不应发起 graph 请求');
+    });
+
+    test('5/10 取消最后一项仍被拒绝（至少保留 1 个）', () async {
+      final controller = GitBrowserController(_FakeGitApi());
+      addTearDown(controller.dispose);
+      await controller.open('s');
+      expect(await controller.toggleGraphBranch(_branches(12)[0]), isFalse);
+      expect(controller.state.selectedBranches, hasLength(1));
+    });
+  });
+
+  group('P2-4 16 色槽位', () {
+    test('恰好 16 槽、按顺序取值、17/20 循环；与已选分支名/顺序无关', () {
+      for (final brightness in Brightness.values) {
+        final colors = [
+          for (var slot = 0; slot < 16; slot++)
+            gitLaneColor(slot, const [], brightness),
+        ];
+        expect(colors.toSet(), hasLength(16), reason: '恰好 16 个不同槽（$brightness）');
+        expect(gitLaneColor(16, const [], brightness), colors[0]);
+        expect(gitLaneColor(17, const [], brightness), colors[1]);
+        expect(gitLaneColor(20, const [], brightness), colors[4]);
+
+        // 选择集合/顺序不影响 lane 槽位（老实现按名字 hash 会改变颜色）。
+        final selected = _branches(20).reversed.toList();
+        for (var slot = 0; slot < 20; slot++) {
+          expect(
+            gitLaneColor(slot, selected, brightness),
+            colors[slot % 16],
+            reason: 'slot $slot 循环复用（$brightness）',
+          );
+        }
+      }
+    });
+
+    test('同 tip 多分支：每支一槽且槽位循环在 0..15；20 选的锚点无额外槽', () {
+      final branches = _branches(20);
+      final sharedTipCommit = GitCommitSummary(
+        oid: branches[3].oid,
+        parents: const [],
+      );
+      // 第 4 个与第 17 个已选分支指向同一 tip → 槽位 3 与 0（16 % 16），无 >15 槽。
+      final selected = [
+        ...branches.take(3),
+        branches[3],
+        ...branches.skip(4).take(12),
+        branches[3],
+      ];
+      final slots = selectedTipColorSlots(sharedTipCommit, selected);
+      expect(slots, [3, 0]);
+      expect(slots.every((slot) => slot >= 0 && slot < 16), isTrue);
+
+      final layout = layoutGraph([sharedTipCommit], selected);
+      expect(layout.rows.single.tipColorSlots, [3, 0]);
+      expect(
+        layout.rows.single.tipColorSlots.every((slot) => slot < 16),
+        isTrue,
+      );
     });
   });
 }

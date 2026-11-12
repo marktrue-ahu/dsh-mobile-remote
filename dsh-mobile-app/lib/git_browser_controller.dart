@@ -243,8 +243,9 @@ class GitBrowserController extends ChangeNotifier {
 
   /// issue #86：切换三档上限——升档保留选择，降档保留前 N 个；返回被裁剪的数量。
   ///
-  /// 选择集变化时按新选择集重载 graph（超时/迟到响应用新 generation 丢弃）。
-  Future<int> setBranchLimit(GitGraphBranchLimit limit) async {
+  /// P2-2：选择集与上限**同步原子更新**，graph 加载异步发起（不等待网络）；
+  /// 旧请求由 `_graphGeneration` 作废，迟到响应不回写。
+  int setBranchLimit(GitGraphBranchLimit limit) {
     if (limit == _branchLimit) return 0;
     _branchLimit = limit;
     final max = limit.max;
@@ -263,7 +264,7 @@ class GitBrowserController extends ChangeNotifier {
         commits: const [],
         snapshotId: null,
         graphNextCursor: null,
-        loadingGraph: false,
+        loadingGraph: selected.isNotEmpty,
         loadingGraphPage: false,
         graphTimedOut: false,
         stale: false,
@@ -271,7 +272,7 @@ class GitBrowserController extends ChangeNotifier {
       ),
     );
     if (selected.isNotEmpty && _state.repository != null) {
-      await _reloadGraphAfterSelectionChange();
+      unawaited(_reloadGraphAfterSelectionChange());
     }
     return trimmed;
   }
@@ -579,7 +580,29 @@ class GitBrowserController extends ChangeNotifier {
     final selected = [..._state.selectedBranches];
     final index = selected.indexWhere((item) => item.name == branch.name);
     if (index >= 0) {
-      if (selected.length == 1) return false;
+      // issue #86 P2-3：5/10 至少保留 1 个；不限档允许取消最后一项 → 0 选择空态。
+      if (selected.length == 1) {
+        if (!_branchLimit.isUnlimited) return false;
+        _graphGeneration++;
+        _commitGeneration++;
+        _cancelGraphTimeout();
+        _graphPageRequest = null;
+        _emit(
+          _state.copyWith(
+            selectedBranches: const [],
+            commits: const [],
+            snapshotId: null,
+            graphNextCursor: null,
+            commit: null,
+            loadingGraph: false,
+            loadingGraphPage: false,
+            graphTimedOut: false,
+            stale: false,
+            error: null,
+          ),
+        );
+        return true;
+      }
       selected.removeAt(index);
     } else {
       final limit = _branchLimit.max;
@@ -637,6 +660,11 @@ class GitBrowserController extends ChangeNotifier {
         snapshotId: snapshotId,
         cursor: cursor,
         limit: graphPageSize,
+        // issue #86 P1-2：不限档的 HTTP 超时必须晚于 30s 面板（35s），否则网络层
+        // 15s 超时先触发、30s 超时面板永远看不到；5/10 保持原 15s。
+        timeout: _branchLimit.isUnlimited
+            ? const Duration(seconds: 35)
+            : const Duration(seconds: 15),
       );
       if (generation != _generation || graphGeneration != _graphGeneration) {
         return;

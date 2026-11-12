@@ -1016,7 +1016,7 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
     if (store == null) return;
     final limit = store.gitGraphBranchLimit;
     if (limit != widget.controller.branchLimit) {
-      unawaited(widget.controller.setBranchLimit(limit));
+      widget.controller.setBranchLimit(limit);
     }
   }
 
@@ -1060,8 +1060,9 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
           : null,
     );
     if (!mounted || choice == null || choice == current) return false;
-    final removed = await widget.controller.setBranchLimit(choice);
-    await _persistLimit(choice);
+    // P2-2：上限/选择先同步原子更新，偏好写入与 graph 加载异步进行（不阻塞 UI）。
+    final removed = widget.controller.setBranchLimit(choice);
+    unawaited(_persistLimit(choice));
     if (!mounted) return true;
     if (removed > 0) {
       _toast(
@@ -1109,6 +1110,9 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
             !branch.displayName.toLowerCase().contains(query)) {
           return;
         }
+        // 补选无需等待 graph 网络：controller 先同步更新选择再异步加载。
+        unawaited(controller.toggleGraphBranch(branch));
+        return;
       }
     }
     await controller.toggleGraphBranch(branch);
@@ -1116,8 +1120,8 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
 
   /// issue #86：超时面板「改回 10 档」——写偏好、裁剪并重载，toast 提示。
   Future<void> _applyLimitTenAndReload() async {
-    await _persistLimit(GitGraphBranchLimit.ten);
-    await widget.controller.setBranchLimit(GitGraphBranchLimit.ten);
+    unawaited(_persistLimit(GitGraphBranchLimit.ten));
+    widget.controller.setBranchLimit(GitGraphBranchLimit.ten);
     if (!mounted) return;
     _toast(
       L10n.t('已改回 10 档，正在重新加载', 'Switched to 10; reloading'),

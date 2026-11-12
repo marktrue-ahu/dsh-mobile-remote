@@ -81,40 +81,13 @@ int stableGitColorSlot(String ref) {
 Color gitBranchColor(String ref, Brightness brightness) =>
     _graphPalette(brightness)[stableGitColorSlot(ref)];
 
-Map<String, Color> _selectedBranchColors(
-  List<GitBranch> selected,
-  List<Color> palette,
-) {
-  final result = <String, Color>{};
-  final usedSlots = <int>{};
-  final ordered = [...selected]..sort((a, b) => a.name.compareTo(b.name));
-  for (final branch in ordered.take(palette.length)) {
-    if (result.containsKey(branch.name)) continue;
-    var slot = stableGitColorSlot(branch.name);
-    while (usedSlots.contains(slot)) {
-      slot = (slot + 1) % palette.length;
-    }
-    usedSlots.add(slot);
-    result[branch.name] = palette[slot];
-  }
-  return result;
-}
-
-List<Color> _laneColors(List<GitBranch> selected, Brightness brightness) {
-  final palette = _graphPalette(brightness);
-  final selectedColors = _selectedBranchColors(selected, palette);
-  final result = <Color>[
-    for (final branch in selected.take(palette.length))
-      selectedColors[branch.name] ?? gitBranchColor(branch.name, brightness),
-  ];
-  for (final color in palette) {
-    if (!result.contains(color)) result.add(color);
-  }
-  return result;
-}
+/// issue #86 P2-4：lane 颜色取「选择顺序槽位」——选择第 i 个分支用 palette[i]，
+/// 恰好 16 槽；第 17 个起按 i % 16 循环复用。不再按名字 hash 找槽（那会引入
+/// 依赖名字的额外槽位与不可预测颜色）。
+List<Color> _laneColors(Brightness brightness) => _graphPalette(brightness);
 
 Color gitLaneColor(int slot, List<GitBranch> selected, Brightness brightness) {
-  final colors = _laneColors(selected, brightness);
+  final colors = _laneColors(brightness);
   return colors[slot.abs() % colors.length];
 }
 

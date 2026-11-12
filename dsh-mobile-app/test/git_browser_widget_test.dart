@@ -110,6 +110,7 @@ class WidgetGitApi implements GitReadApi {
     String? snapshotId,
     String? cursor,
     int limit = 100,
+    Duration timeout = const Duration(seconds: 15),
   }) async {
     graphCalls++;
     graphRequests.add(tips.map((tip) => tip.name).toList());

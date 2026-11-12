@@ -61,6 +61,7 @@ class _FakeGitApi implements GitReadApi {
     String? snapshotId,
     String? cursor,
     int limit = 100,
+    Duration timeout = const Duration(seconds: 15),
   }) {
     graphCalls++;
     graphTips.add(tips.map((tip) => tip.name).toList());
@@ -439,5 +440,28 @@ void main() {
     await tester.pumpAndSettle();
     expect(controller.branchLimit, GitGraphBranchLimit.unlimited);
     expect(controller.state.graphTimedOut, isTrue);
+  });
+  testWidgets('不限档取消最后一项：允许 0 选择、显示空态、不发起新 graph 请求', (tester) async {
+    final api = _FakeGitApi();
+    final mounted = await _mountSheet(
+      tester,
+      limit: GitGraphBranchLimit.unlimited,
+      api: api,
+    );
+    addTearDown(mounted.controller.dispose);
+    final controller = mounted.controller;
+    unawaited(controller.openBranch(_branch(0)));
+    await tester.pump(const Duration(milliseconds: 300));
+    final callsBefore = api.graphCalls;
+    expect(controller.state.selectedBranches, hasLength(1));
+
+    await _openFilter(tester);
+    await tester.tap(find.byKey(const Key('git-filter-refs/heads/b0')));
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(controller.state.selectedBranches, isEmpty);
+    expect(find.byKey(const Key('git-graph-empty-selection')), findsOneWidget);
+    expect(find.text('Selected 0 / limit Unlimited'), findsOneWidget);
+    expect(api.graphCalls, callsBefore, reason: '0 选择不应发起 graph 请求');
   });
 }
