@@ -11,6 +11,7 @@ import 'package:dsh_mobile_app/l10n.dart';
 import 'package:dsh_mobile_app/models.dart';
 import 'package:dsh_mobile_app/screens/chat_screen.dart';
 import 'package:dsh_mobile_app/store.dart';
+import 'package:dsh_mobile_app/theme.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -231,6 +232,19 @@ void main() {
     await _pumpChat(tester, backend);
     expect(find.byKey(const Key('slash-chip-command-compact')), findsOneWidget);
     expect(find.byKey(const Key('slash-chip-skill-grill-me')), findsOneWidget);
+    final commandDecoration =
+        tester.widget<Container>(find.byKey(const Key('slash-chip-command-compact'))).decoration
+            as BoxDecoration;
+    expect(commandDecoration.border, isNotNull, reason: '命令 chip 必须有可见边框');
+    expect(
+      commandDecoration.color,
+      isNot(DshColors.line(tester.element(find.byType(ChatScreen)))),
+      reason: '命令 chip 不得再与用户气泡同底色（line）',
+    );
+    final skillDecoration =
+        tester.widget<Container>(find.byKey(const Key('slash-chip-skill-grill-me'))).decoration
+            as BoxDecoration;
+    expect(skillDecoration.color, isNotNull, reason: '技能 chip 保持品牌色底');
     expect(find.byKey(const Key('slash-chip-command-unknown')), findsNothing);
     expect(find.byKey(const Key('slash-chip-skill-unknown')), findsNothing);
     // chip 不可点：内部不得有 InkWell/GestureDetector。
@@ -346,6 +360,31 @@ void main() {
     await tester.pump(const Duration(milliseconds: 300));
     expect(backend.commandRuns, 0);
     expect(backend.sends.single['text'], 'hello /grill-me');
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('320 + 大字号 + 深色：slash chip 可见且不溢出', (tester) async {
+    tester.view.physicalSize = const Size(320, 640);
+    tester.view.devicePixelRatio = 1.0;
+    tester.platformDispatcher.textScaleFactorTestValue = 1.5;
+    addTearDown(tester.view.reset);
+    addTearDown(tester.platformDispatcher.clearTextScaleFactorTestValue);
+    final backend = _Backend(events: [
+      _event('turn/start', 1, {'turn': 1}),
+      _event('user/message', 2, {
+        'messageId': 'u1',
+        'text': '/compact /grill-me',
+        'sourceKind': 'user',
+      }),
+    ]);
+    await _pumpChat(tester, backend, dark: true);
+    expect(find.byKey(const Key('slash-chip-command-compact')), findsOneWidget);
+    expect(find.byKey(const Key('slash-chip-skill-grill-me')), findsOneWidget);
+    expect(tester.takeException(), isNull, reason: '320+1.5x+深色不得 overflow');
+    final decoration =
+        tester.widget<Container>(find.byKey(const Key('slash-chip-command-compact'))).decoration
+            as BoxDecoration;
+    expect(decoration.border, isNotNull);
     await tester.pumpWidget(const SizedBox());
   });
 

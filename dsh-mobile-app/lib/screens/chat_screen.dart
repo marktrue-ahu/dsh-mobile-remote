@@ -10789,13 +10789,19 @@ class _SlashInlineChip extends StatelessWidget {
     final brand = DshColors.brand(context);
     final ink = DshColors.ink2(context);
     final color = skill ? brand : ink;
+    // 命令 chip 不能再用 line（与用户气泡底色相同，视觉上无 chip 底）：
+    // 用 surface + ink3 35% 细边框，在浅/深色下都与气泡底可辨识；技能保持 brand 12%。
+    final commandBorder = DshColors.ink3(context).withValues(alpha: 0.35);
     return Container(
       key: Key('slash-chip-${skill ? 'skill' : 'command'}-$name'),
       padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
       decoration: BoxDecoration(
         color: skill
             ? brand.withValues(alpha: 0.12)
-            : DshColors.line(context),
+            : DshColors.surface(context),
+        border: skill
+            ? null
+            : Border.all(color: commandBorder, width: 0.8),
         borderRadius: BorderRadius.circular(5),
       ),
       child: Row(
@@ -10807,13 +10813,15 @@ class _SlashInlineChip extends StatelessWidget {
             color: color,
           ),
           const SizedBox(width: 3),
-          ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 170),
-            child: Text(
-              '/$name',
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(fontSize: 13.5, height: 1.3, color: color),
+          Flexible(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 170),
+              child: Text(
+                '/$name',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 13.5, height: 1.3, color: color),
+              ),
             ),
           ),
         ],
