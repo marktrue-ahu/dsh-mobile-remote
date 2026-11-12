@@ -1053,15 +1053,16 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
     if (store != null) await store.setGitGraphBranchLimit(limit);
   }
 
-  String _limitLabel(GitGraphBranchLimit limit) => limit.isUnlimited
-      ? L10n.t('不限', 'Unlimited')
-      : '${limit.max}';
-
   String get _limitStatusText {
     final limit = widget.controller.branchLimit;
+    // re-review P2：状态里的上限用实际值 min(档位, host max)，与 controller 一致。
+    final cap = widget.controller.effectiveSelectionCap;
+    final label = limit.isUnlimited
+        ? L10n.t('不限（电脑端 $cap）', 'Unlimited (desktop $cap)')
+        : '$cap';
     return L10n.t(
-      '已选 ${widget.controller.state.selectedBranches.length} / 上限 ${_limitLabel(limit)}',
-      'Selected ${widget.controller.state.selectedBranches.length} / limit ${_limitLabel(limit)}',
+      '已选 ${widget.controller.state.selectedBranches.length} / 上限 $label',
+      'Selected ${widget.controller.state.selectedBranches.length} / limit $label',
     );
   }
 
@@ -1078,8 +1079,8 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
           widget.controller.state.capabilities?.supportsGraphPost ?? true,
       title: capReached
           ? L10n.t(
-              '已达上限（${current.max} 个）',
-              'Limit reached (${current.max})',
+              '已达上限（${widget.controller.effectiveSelectionCap} 个）',
+              'Limit reached (${widget.controller.effectiveSelectionCap})',
             )
           : null,
       note: capReached
@@ -1126,34 +1127,35 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
       return;
     }
     if (value == true) {
-      if (unlimited) {
-        final serverMax =
-            widget.controller.state.capabilities?.effectiveGraphTipsMax ?? 5;
-        if (selected.length >= serverMax) {
+      final hostMax =
+          controller.state.capabilities?.effectiveGraphTipsMax ?? 5;
+      final cap = controller.effectiveSelectionCap;
+      if (selected.length >= cap) {
+        // 不限档或当前档位已等于/高于 host max：没有更高档可升 → 立即 toast 拦截，
+        // 不弹无意义的改档 sheet（re-review P2）。
+        final configured = controller.branchLimit.max;
+        final supportsPost =
+            controller.state.capabilities?.supportsGraphPost ?? true;
+        if (supportsPost &&
+            (unlimited || (configured != null && configured >= hostMax))) {
           _toast(
             L10n.t(
-              '已达电脑端上限（$serverMax 个分支）',
-              'Desktop limit reached ($serverMax branches)',
+              '已达电脑端上限（$cap 个分支）',
+              'Desktop limit reached ($cap branches)',
             ),
           );
           return;
         }
-      }
-      final max = controller.branchLimit.max;
-      if (max != null && selected.length >= max) {
         final changed = await _showGraphLimitSheet(capReached: true);
         if (!mounted || !changed) return;
-        // 升档（或改到不限）后，若触发项仍属于当前搜索结果则自动补选；
-        // 降档已被裁剪到新上限，不再补选。
-        final newMax = controller.branchLimit.max;
-        final count = controller.state.selectedBranches.length;
-        if (newMax != null && count >= newMax) return;
+        // 升档后按实际上限（可能仍受 host max 限制）补选触发项。
+        final newCap = controller.effectiveSelectionCap;
+        if (controller.state.selectedBranches.length >= newCap) return;
         final query = _graphQuery.trim().toLowerCase();
         if (query.isNotEmpty &&
             !branch.displayName.toLowerCase().contains(query)) {
           return;
         }
-        // 补选无需等待 graph 网络：controller 先同步更新选择再异步加载。
         unawaited(controller.toggleGraphBranch(branch));
         return;
       }
@@ -1303,10 +1305,9 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
     return matches.every((branch) => names.contains(branch.name));
   }
 
-  bool get _atSelectedBranchCap {
-    final max = widget.controller.branchLimit.max;
-    return max != null && widget.controller.state.selectedBranches.length >= max;
-  }
+  bool get _atSelectedBranchCap =>
+      widget.controller.state.selectedBranches.length >=
+      widget.controller.effectiveSelectionCap;
 
   /// issue #86：达上限 chip（warn@10% 底 + ink 文字；可点开三档快捷 sheet）。
   Widget _limitReachedChip() {

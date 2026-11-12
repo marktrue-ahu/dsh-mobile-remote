@@ -207,6 +207,9 @@ class GitBrowserController extends ChangeNotifier {
   int get _effectiveTierCap => _branchLimit.isUnlimited
       ? _graphMaxTips
       : math.min(_branchLimit.max ?? _graphMaxTips, _graphMaxTips);
+
+  /// 供 UI 使用的实际上限（状态文案/达上限 chip/点击拦截必须与 controller 一致）。
+  int get effectiveSelectionCap => _effectiveTierCap;
   bool get _supportsGraphPost =>
       _state.capabilities?.supportsGraphPost == true;
 

@@ -257,7 +257,7 @@ void main() {
     final controller = mounted.controller;
     expect(controller.state.selectedBranches, hasLength(1), reason: '不自动全选');
     await _openFilter(tester);
-    expect(find.text('Selected 1 / limit Unlimited'), findsOneWidget);
+    expect(find.text('Selected 1 / limit Unlimited (desktop 128)'), findsOneWidget);
     expect(find.byKey(const Key('git-graph-select-all')), findsOneWidget);
     expect(find.byKey(const Key('git-graph-clear')), findsOneWidget);
 
@@ -272,7 +272,7 @@ void main() {
       controller.state.selectedBranches.map((b) => b.displayName),
       containsAll(['b0', 'b1', 'b10', 'b11']),
     );
-    expect(find.text('Selected 4 / limit Unlimited'), findsOneWidget);
+    expect(find.text('Selected 4 / limit Unlimited (desktop 128)'), findsOneWidget);
 
     await tester.tap(find.byKey(const Key('git-graph-clear')));
     await tester.pump(const Duration(milliseconds: 300));
@@ -467,7 +467,7 @@ void main() {
 
     expect(controller.state.selectedBranches, isEmpty);
     expect(find.byKey(const Key('git-graph-empty-selection')), findsOneWidget);
-    expect(find.text('Selected 0 / limit Unlimited'), findsOneWidget);
+    expect(find.text('Selected 0 / limit Unlimited (desktop 128)'), findsOneWidget);
     expect(api.graphCalls, callsBefore, reason: '0 选择不应发起 graph 请求');
   });
   testWidgets('旧宿主：已持久化 10 档打开即 clamp 回 5 并说明；快捷 sheet 禁用 10/不限', (tester) async {
@@ -507,5 +507,39 @@ void main() {
     expect(find.textContaining('Unsupported by this desktop version'), findsWidgets);
     await tester.tap(find.byKey(const Key('git-graph-limit-cancel')));
     await tester.pumpAndSettle();
+  });
+  testWidgets('10 档 + host max=8：状态/达上限 chip/第 9 项拦截都用实际上限 8', (tester) async {
+    final api = _FakeGitApi(
+      capsOverride: const GitReadCapabilities(
+        available: true,
+        graphTipsMax: 8,
+        graphTipsGetMax: 8,
+      ),
+    );
+    final mounted = await _mountSheet(
+      tester,
+      limit: GitGraphBranchLimit.ten,
+      api: api,
+    );
+    addTearDown(mounted.controller.dispose);
+    final controller = mounted.controller;
+    for (var i = 1; i <= 7; i++) {
+      await controller.toggleGraphBranch(_branch(i));
+    }
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(controller.state.selectedBranches, hasLength(8));
+    await _openFilter(tester);
+    expect(find.text('Selected 8 / limit 8'), findsOneWidget);
+    expect(find.byKey(const Key('git-graph-limit-reached')), findsOneWidget);
+
+    // 第 9 项：立即 toast 拦截，且不弹无意义的改档 sheet。
+    await _tapBranchFilter(tester, 8);
+    expect(controller.state.selectedBranches, hasLength(8));
+    expect(
+      find.textContaining('Desktop limit reached (8 branches)'),
+      findsOneWidget,
+      reason: '10 档也必须在 host max=8 处立即拦截并说明',
+    );
+    expect(find.byKey(const Key('git-graph-limit-10')), findsNothing);
   });
 }

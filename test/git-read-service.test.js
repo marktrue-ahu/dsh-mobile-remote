@@ -468,6 +468,8 @@ function graphProvider({
 	graph = null,
 	refNames = [],
 	refsHangOnCall = 0,
+	refsOidOnCall = 0,
+	refsChangedOid = null,
 	resolveHang = false,
 	graphHangOnCall = 0,
 	graphByCall = null,
@@ -503,17 +505,20 @@ function graphProvider({
 			if (refsHangOnCall > 0 && state.refsCalls === refsHangOnCall) {
 				return new Promise(() => {});
 			}
+			const refOid = refsOidOnCall > 0 && state.refsCalls === refsOidOnCall
+				? (refsChangedOid ?? "b".repeat(40))
+				: oid;
 			return [
-				{ name: "HEAD", commitOid: oid },
-				{ name: "refs/heads/main", commitOid: oid },
-				...refNames.map((name) => ({ name, commitOid: oid })),
+				{ name: "HEAD", commitOid: refOid },
+				{ name: "refs/heads/main", commitOid: refOid },
+				...refNames.map((name) => ({ name, commitOid: refOid })),
 			];
 		};
 	}
 	return { provider, state, oid };
 }
 
-function serviceWithProvider(provider, { graphDeadlineMs } = {}) {
+function serviceWithProvider(provider, { graphDeadlineMs, onSnapshotDisposed } = {}) {
 	const root = mkdtempSync(`${tmpdir()}/git-graph-provider-`);
 	fixture(root);
 	const session = { id: "session-1", header: { cwd: root } };
@@ -523,7 +528,10 @@ function serviceWithProvider(provider, { graphDeadlineMs } = {}) {
 		if (name === "gitReadProvider") return provider;
 		throw new Error(`missing ${name}`);
 	} };
-	return { root, service: createGitReadService(ctx, { graphDeadlineMs }) };
+	return {
+		root,
+		service: createGitReadService(ctx, { graphDeadlineMs, onSnapshotDisposed }),
+	};
 }
 
 test("task-28: 128 POST tips resolve via one provider.refs batch (no per-tip resolveTip)", async () => {
@@ -607,8 +615,8 @@ test("re-review P1-2: 25s absolute deadline 覆盖 refs/resolveTip/readRefRecord
     );
   } finally { rmSync(b.root, { recursive: true, force: true }); }
 
-  // 最后 readRefRecords/装饰阶段挂起（第 3 次 refs 调用）。
-  const hangRecords = graphProvider({ refsHangOnCall: 3 });
+  // 装饰 readRefRecords 阶段挂起：refs 顺序 resolve#1 → pre#2 → post#3 → 装饰#4。
+  const hangRecords = graphProvider({ refsHangOnCall: 4 });
   const c = serviceWithProvider(hangRecords.provider, { graphDeadlineMs: 80 });
   try {
     const { repositoryId } = await c.service.repositoryForSession("session-1");
@@ -667,5 +675,108 @@ test("re-review P1-3: 新建 snapshot 的初始请求超时可重试（不残留
     assert.ok(retried.snapshotId);
     assert.equal(retried.commits.length, 1);
     void oid;
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("re-review P1 分页闭环：append pre-verify 超时 → 504；同 cursor 重试 200", async () => {
+  const { provider } = graphProvider({ refsHangOnCall: 5 });
+  const disposed = [];
+  const { root, service } = serviceWithProvider(provider, {
+    graphDeadlineMs: 80,
+    onSnapshotDisposed: (id) => disposed.push(id),
+  });
+  try {
+    const { repositoryId } = await service.repositoryForSession("session-1");
+    const first = await service.graph("session-1", repositoryId, { tips: [{ name: "refs/heads/main" }], limit: 1 });
+    assert.ok(first.nextCursor && first.snapshotId);
+    await assert.rejects(
+      () => service.graph("session-1", repositoryId, { snapshotId: first.snapshotId, cursor: first.nextCursor, limit: 1 }),
+      (e) => e.code === "graph-timeout" && e.status === 504,
+    );
+    assert.deepEqual(disposed, [], "已交付快照纯 timeout 不得清理");
+    const retried = await service.graph("session-1", repositoryId, { snapshotId: first.snapshotId, cursor: first.nextCursor, limit: 1 });
+    assert.equal(retried.snapshotId, first.snapshotId);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("re-review P1 分页闭环：append post-verify 超时 → 504；同 cursor 重试 200", async () => {
+  const { provider } = graphProvider({ refsHangOnCall: 6 });
+  const disposed = [];
+  const { root, service } = serviceWithProvider(provider, {
+    graphDeadlineMs: 80,
+    onSnapshotDisposed: (id) => disposed.push(id),
+  });
+  try {
+    const { repositoryId } = await service.repositoryForSession("session-1");
+    const first = await service.graph("session-1", repositoryId, { tips: [{ name: "refs/heads/main" }], limit: 1 });
+    await assert.rejects(
+      () => service.graph("session-1", repositoryId, { snapshotId: first.snapshotId, cursor: first.nextCursor, limit: 1 }),
+      (e) => e.code === "graph-timeout" && e.status === 504,
+    );
+    assert.deepEqual(disposed, [], "post-verify 纯 timeout 也不得清理已交付快照");
+    const retried = await service.graph("session-1", repositoryId, { snapshotId: first.snapshotId, cursor: first.nextCursor, limit: 1 });
+    assert.equal(retried.snapshotId, first.snapshotId);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("re-review P1 分页闭环：装饰 readRefRecords 超时 → 504；同 cursor 重试 200", async () => {
+  const { provider } = graphProvider({ refsHangOnCall: 7 });
+  const disposed = [];
+  const { root, service } = serviceWithProvider(provider, {
+    graphDeadlineMs: 80,
+    onSnapshotDisposed: (id) => disposed.push(id),
+  });
+  try {
+    const { repositoryId } = await service.repositoryForSession("session-1");
+    const first = await service.graph("session-1", repositoryId, { tips: [{ name: "refs/heads/main" }], limit: 1 });
+    await assert.rejects(
+      () => service.graph("session-1", repositoryId, { snapshotId: first.snapshotId, cursor: first.nextCursor, limit: 1 }),
+      (e) => e.code === "graph-timeout" && e.status === 504,
+    );
+    assert.deepEqual(disposed, []);
+    const retried = await service.graph("session-1", repositoryId, { snapshotId: first.snapshotId, cursor: first.nextCursor, limit: 1 });
+    assert.equal(retried.snapshotId, first.snapshotId);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("re-review P1 分页闭环：ref 变化 → 409 stale 并清理；同 cursor 重试仍 409", async () => {
+  const { provider } = graphProvider({ refsOidOnCall: 6 });
+  const disposed = [];
+  const { root, service } = serviceWithProvider(provider, {
+    graphDeadlineMs: 500,
+    onSnapshotDisposed: (id) => disposed.push(id),
+  });
+  try {
+    const { repositoryId } = await service.repositoryForSession("session-1");
+    const first = await service.graph("session-1", repositoryId, { tips: [{ name: "refs/heads/main" }], limit: 1 });
+    await assert.rejects(
+      () => service.graph("session-1", repositoryId, { snapshotId: first.snapshotId, cursor: first.nextCursor, limit: 1 }),
+      (e) => e.code === "graph-stale" && e.status === 409,
+    );
+    assert.deepEqual(disposed, [first.snapshotId], "ref 变化必须清理快照");
+    await assert.rejects(
+      () => service.graph("session-1", repositoryId, { snapshotId: first.snapshotId, cursor: first.nextCursor, limit: 1 }),
+      (e) => e.code === "graph-stale" && e.status === 409,
+    );
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("re-review P1 分页闭环：未交付 initial timeout 清理快照；已交付 append 保留", async () => {
+  const { provider } = graphProvider({ graphHangOnCall: 1 });
+  const disposed = [];
+  const { root, service } = serviceWithProvider(provider, {
+    graphDeadlineMs: 80,
+    onSnapshotDisposed: (id) => disposed.push(id),
+  });
+  try {
+    const { repositoryId } = await service.repositoryForSession("session-1");
+    await assert.rejects(
+      () => service.graph("session-1", repositoryId, { tips: [{ name: "refs/heads/main" }], limit: 1 }),
+      (e) => e.code === "graph-timeout" && e.status === 504,
+    );
+    assert.equal(disposed.length, 1, "未交付 initial 超时应清理新建快照");
+    // 新请求可正常重试（无残留半页）。
+    const retried = await service.graph("session-1", repositoryId, { tips: [{ name: "refs/heads/main" }], limit: 1 });
+    assert.ok(retried.snapshotId);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

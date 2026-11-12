@@ -59,14 +59,52 @@ class _Backend {
 }
 
 /// 运行中的一轮：turn/start + user + [completed] 个已完成工具 + 1 个运行中工具。
+
+/// 运行中工具在过程块**首 50 行**，其后还有 60 个并行运行中的工具调用：
+/// 长过程滚动到尾部时，首行工具已展开/承载但视口不可见 → 活动条必须恢复。
+List<Map<String, dynamic>> _runningToolAboveEvents() {
+  return <Map<String, dynamic>>[
+    {'seq': 1, 'type': 'turn/start', 'data': {'turn': 1}},
+    {
+      'seq': 2,
+      'type': 'user/message',
+      'data': {'messageId': 'u1', 'text': '长任务', 'sourceKind': 'user'},
+    },
+    {
+      'seq': 3,
+      'type': 'tool/call',
+      'data': {
+        'turn': 1,
+        'step': 1,
+        'callId': 'long-running',
+        'name': 'long-shell',
+        'arguments': 'sleep 60',
+      },
+    },
+    for (var i = 0; i < 60; i++)
+      {
+        'seq': 4 + i,
+        'type': 'tool/call',
+        'data': {
+          'turn': 1,
+          'step': i + 2,
+          'callId': 'later-$i',
+          'name': 'bash',
+          'arguments': 'echo $i',
+        },
+      },
+  ];
+}
+
 List<Map<String, dynamic>> _runningEvents({
   int completedTools = 0,
   String runningTool = 'shell',
   bool withTurnStart = true,
   String? longAssistant,
+  int startSeq = 1,
 }) {
   final events = <Map<String, dynamic>>[];
-  var seq = 1;
+  var seq = startSeq;
   if (withTurnStart) {
     events.add({'seq': seq++, 'type': 'turn/start', 'data': {'turn': 1}});
   }
@@ -135,6 +173,9 @@ Future<AppStore> _pumpChat(WidgetTester tester, _Backend backend) async {
     ),
   ));
   await tester.pump(const Duration(milliseconds: 350));
+  // 多泵两帧：首帧 layout 后过程工具行的 GlobalKey 才挂载，活动条需一次几何重建。
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 50));
   await tester.pump();
   return store;
 }
@@ -218,20 +259,43 @@ void main() {
     await _pumpChat(
       tester,
       _Backend(
-        events: _runningEvents(
-          completedTools: 3,
-          longAssistant: '长回复内容。' * 400,
-        ),
+        events: [
+          // 若干短历史消息制造可滚动高度；当前轮在底部且运行工具真实可见。
+          for (var i = 0; i < 10; i++) ...[
+            {
+              'seq': 1 + i * 2,
+              'type': 'user/message',
+              'data': {'messageId': 'old-u$i', 'text': '旧问题 $i', 'sourceKind': 'user'},
+            },
+            {
+              'seq': 2 + i * 2,
+              'type': 'assistant/message',
+              'data': {
+                'turn': 0,
+                'step': 1,
+                'messageId': 'old-a$i',
+                'text': '旧回复 $i',
+              },
+            },
+          ],
+          ..._runningEvents(completedTools: 3, startSeq: 100),
+        ],
       ),
     );
-    expect(find.byKey(_activityBarToolsKey), findsNothing,
-        reason: '仍在底部时工具可见 → 不重复');
     final pos = tester
         .state<ScrollableState>(find.descendant(
           of: find.byType(CustomScrollView),
           matching: find.byType(Scrollable),
         ))
         .position;
+    // 懒构建 extent 会随构建修正：先收敛到真实底部，确保运行工具行真的可见。
+    // 触发一次真实滚动事件，让首帧后挂载的过程行 key 参与几何判断。
+    pos.jumpTo(pos.maxScrollExtent - 1);
+    await tester.pump(const Duration(milliseconds: 120));
+    pos.jumpTo(pos.maxScrollExtent);
+    await tester.pump(const Duration(milliseconds: 120));
+    expect(find.byKey(_activityBarToolsKey), findsNothing,
+        reason: '仍在底部时工具可见 → 不重复');
     pos.jumpTo(pos.maxScrollExtent * 0.5);
     await tester.pump(const Duration(milliseconds: 300));
     expect(
@@ -241,4 +305,20 @@ void main() {
     );
     await tester.pump(const Duration(milliseconds: 900));
   });
+  testWidgets('已展开但滚出视口（长过程首50行工具离屏）：活动条恢复', (tester) async {
+    await _pumpChat(
+      tester,
+      _Backend(events: _runningToolAboveEvents()),
+    );
+    // 运行工具在过程块首行，但当前视口在 60 条后续工具之后：真实几何不相交。
+    expect(
+      find.byKey(_activityBarToolsKey),
+      findsOneWidget,
+      reason: 'visibleToolCallIds 只代表展开/分批，离屏时活动条必须恢复（P2 几何修复）',
+    );
+    await tester.pump(const Duration(milliseconds: 900));
+  });
+
+
+
 }
