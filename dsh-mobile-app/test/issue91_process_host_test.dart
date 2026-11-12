@@ -103,6 +103,34 @@ List<Map<String, dynamic>> _fixture() {
   return events;
 }
 
+
+/// issue #95：中间段只有思考（无工具/助手条目），下一项是插话 user B。
+/// 过程块必须锚在 B 之前，不能跨 B 前移/后移。
+List<Map<String, dynamic>> _reasoningOnlyFixture() {
+  final events = <Map<String, dynamic>>[];
+  var seq = 1;
+  void add(String type, Map<String, dynamic> data) =>
+      events.add({'seq': seq++, 'type': type, 'data': data});
+  add('turn/start', {'turn': 1});
+  add('user/message', {'messageId': 'prompt', 'text': 'Team message', 'sourceKind': 'agent-message'});
+  add('tool/call', {'turn': 1, 'step': 1, 'callId': 'c1', 'name': 'tool_before', 'arguments': 'ls'});
+  add('tool/result', {'turn': 1, 'step': 1, 'callId': 'c1', 'name': 'tool_before', 'text': 'ok'});
+  add('user/message', {'messageId': 'u-a', 'text': '插话 A', 'sourceKind': 'user'});
+  add('assistant/message', {
+    'turn': 1,
+    'step': 2,
+    'reasoning': '只思考了一段',
+    'reasoningChars': 7,
+    'text': '',
+  });
+  add('user/message', {'messageId': 'u-b', 'text': '插话 B', 'sourceKind': 'user'});
+  add('tool/call', {'turn': 1, 'step': 3, 'callId': 'c3', 'name': 'tool_after', 'arguments': '{}'});
+  add('tool/result', {'turn': 1, 'step': 3, 'callId': 'c3', 'name': 'tool_after', 'text': 'ok'});
+  add('assistant/message', {'turn': 1, 'step': 3, 'messageId': 'a-final', 'text': '最终回答'});
+  add('turn/end', {'turn': 1, 'reason': {'kind': 'completed'}});
+  return events;
+}
+
 Future<AppStore> _pumpChat(
   WidgetTester tester,
   _Backend backend, {
@@ -175,4 +203,21 @@ void main() {
     final middle2 = tester.getTopLeft(find.text('tool_middle')).dy;
     expect(middle2, greaterThan(userA2), reason: '折叠/展开不得改变 host 顺序');
   });
+  testWidgets('issue #95：纯思考中间段宿主落在段末之后的 user 之前（不跨消息）', (tester) async {
+    tester.view.physicalSize = const Size(800, 1400);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+    await _pumpChat(tester, _Backend(events: _reasoningOnlyFixture()), mode: WorkStepDisplayMode.expanded);
+    await tester.pump(const Duration(milliseconds: 200));
+    final userA = tester.getTopLeft(find.text('插话 A')).dy;
+    final userB = tester.getTopLeft(find.text('插话 B')).dy;
+    final thinking = find.textContaining('思考');
+    expect(thinking, findsOneWidget, reason: '纯思考段必须仍渲染过程块');
+    final thinkingY = tester.getTopLeft(thinking).dy;
+    expect(thinkingY, greaterThan(userA), reason: '思考段在插话 A 之后');
+    expect(thinkingY, lessThan(userB), reason: '思考段不得落到插话 B 之后（不跨用户消息）');
+    final afterTool = tester.getTopLeft(find.text('tool_after')).dy;
+    expect(afterTool, greaterThan(userB), reason: '后续工具段仍在 B 之后');
+  });
+
 }

@@ -49,6 +49,9 @@ class GitBrowserState {
   /// re-review P1-3：**分页** append 超时——保留已加载 commits，页级重试，不替换整图。
   final bool graphPageTimedOut;
 
+  /// issue #95：分页超时方向（true=更新页/顶部；false=更旧页/底部），供 UI 单侧重试。
+  final bool graphPageTimedOutNewer;
+
   const GitBrowserState({
     this.sessionId,
     this.capabilities,
@@ -80,6 +83,7 @@ class GitBrowserState {
     this.branchLimit = GitGraphBranchLimit.fallback,
     this.graphTimedOut = false,
     this.graphPageTimedOut = false,
+    this.graphPageTimedOutNewer = false,
   });
 
   List<GitBranch> get filteredBranches {
@@ -123,6 +127,7 @@ class GitBrowserState {
     GitGraphBranchLimit? branchLimit,
     bool? graphTimedOut,
     bool? graphPageTimedOut,
+    bool? graphPageTimedOutNewer,
   }) => GitBrowserState(
     sessionId: identical(sessionId, _keep)
         ? this.sessionId
@@ -182,6 +187,8 @@ class GitBrowserState {
     branchLimit: branchLimit ?? this.branchLimit,
     graphTimedOut: graphTimedOut ?? this.graphTimedOut,
     graphPageTimedOut: graphPageTimedOut ?? this.graphPageTimedOut,
+    graphPageTimedOutNewer:
+        graphPageTimedOutNewer ?? this.graphPageTimedOutNewer,
   );
 }
 
@@ -190,7 +197,7 @@ const _keep = Object();
 class GitBrowserController extends ChangeNotifier {
   GitBrowserController(
     this._api, {
-    this.graphPageSize = 100,
+    this.graphPageSize = 16,
     this.filesPageSize = 100,
     GitGraphBranchLimit branchLimit = GitGraphBranchLimit.fallback,
     this.graphLoadTimeout = const Duration(seconds: 30),
@@ -362,11 +369,13 @@ class GitBrowserController extends ChangeNotifier {
 
   /// issue #86：重试一次 graph（超时面板「重试」）。
   Future<void> retryGraphLoad() async {
-    if (_state.sessionId == null ||
-        _state.repository == null ||
-        _state.selectedBranches.isEmpty) {
+    if (_state.sessionId == null || _state.repository == null) return;
+    // issue #95：all 模式重试必须回到 all=true + focus 当前分支，绝不回退选择集。
+    if (graphAllMode) {
+      await openAllGraph(focus: _state.repository?.currentBranch);
       return;
     }
+    if (_state.selectedBranches.isEmpty) return;
     final graphGeneration = ++_graphGeneration;
     _cancelGraphTimeout();
     _emit(
@@ -862,6 +871,7 @@ class GitBrowserController extends ChangeNotifier {
           loadingGraphPage: false,
           graphTimedOut: false,
           graphPageTimedOut: false,
+          graphPageTimedOutNewer: false,
           stale: false,
           error: null,
         ),
@@ -883,6 +893,7 @@ class GitBrowserController extends ChangeNotifier {
             loadingGraph: false,
             loadingGraphPage: false,
             graphPageTimedOut: true,
+            graphPageTimedOutNewer: false,
             loading: false,
             stale: _state.stale,
             error: null,
@@ -907,6 +918,7 @@ class GitBrowserController extends ChangeNotifier {
           loadingGraph: false,
           loadingGraphPage: false,
           graphPageTimedOut: false,
+          graphPageTimedOutNewer: false,
           stale: graphStale ? true : _state.stale,
           error: graphStale ? 'graph-stale' : (code ?? error.toString()),
         ),
@@ -919,13 +931,21 @@ class GitBrowserController extends ChangeNotifier {
     if (graphAllMode) {
       if (_graphPageWantedNewer ? _state.graphPrevCursor == null : _state.graphNextCursor == null) return;
       _graphPageRequest = null;
-      _emit(_state.copyWith(graphPageTimedOut: false, error: null));
+      _emit(_state.copyWith(
+        graphPageTimedOut: false,
+        graphPageTimedOutNewer: false,
+        error: null,
+      ));
       await (_graphPageWantedNewer ? loadPrevGraphPage() : loadNextGraphPage());
       return;
     }
     if (_state.graphNextCursor == null) return;
     _graphPageRequest = null;
-    _emit(_state.copyWith(graphPageTimedOut: false, error: null));
+    _emit(_state.copyWith(
+      graphPageTimedOut: false,
+      graphPageTimedOutNewer: false,
+      error: null,
+    ));
     await loadNextGraphPage();
   }
 
@@ -1006,6 +1026,7 @@ class GitBrowserController extends ChangeNotifier {
       loadingGraphPage: false,
       graphTimedOut: false,
       graphPageTimedOut: false,
+      graphPageTimedOutNewer: false,
       stale: false,
       error: null,
     ));
@@ -1111,6 +1132,7 @@ class GitBrowserController extends ChangeNotifier {
         loadingGraphPage: false,
         graphTimedOut: false,
         graphPageTimedOut: false,
+        graphPageTimedOutNewer: false,
         stale: false,
         error: null,
       ));
@@ -1127,6 +1149,7 @@ class GitBrowserController extends ChangeNotifier {
           loadingGraph: false,
           loadingGraphPage: false,
           graphPageTimedOut: true,
+          graphPageTimedOutNewer: newer,
           error: null,
         ));
         return;
@@ -1136,6 +1159,7 @@ class GitBrowserController extends ChangeNotifier {
         loadingGraphPage: false,
         graphTimedOut: initial && timedOut,
         graphPageTimedOut: false,
+        graphPageTimedOutNewer: false,
         stale: code == 'graph-stale' ? true : _state.stale,
         error: code == 'graph-stale' ? 'graph-stale' : (code ?? error.toString()),
       ));

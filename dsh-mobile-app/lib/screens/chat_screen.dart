@@ -6690,13 +6690,19 @@ class _ChatScreenState extends State<ChatScreen> {
       for (var si = 0; si < segments.length; si++) {
         final segment = segments[si];
         // 宿主：该段第一条过程行所在的（或其后最近的）条目——过程块渲染在它之前。
+        // issue #91/#95：插话 user 只做段边界，不能把块前移到该 user 之前；但若该段
+        // 只有思考行、段末之后的下一条就是 user，则允许这个**段末行之后**的 user
+        // 作为宿主（块仍在它之前，不会跨用户消息前移），避免纯思考段丢失/落到下一条
+        // 插话之后。
+        var lastRowSeq = segment.startSeq - 1;
+        for (final row in segment.rows) {
+          if (row.seq > lastRowSeq) lastRowSeq = row.seq;
+        }
         _MsgItem? host;
         for (final item in turnItems) {
           final seq = item.seq;
           if (seq == null || seq < segment.startSeq) continue;
-          // issue #91：插话 user 消息只做段边界，绝不能成为过程块宿主（否则块会
-          // 被前移到该 user 之前）。host 必须是过程行附近的工具/助手/分隔条。
-          if (item.kind == _MsgKind.user) continue;
+          if (item.kind == _MsgKind.user && seq <= lastRowSeq) continue;
           if (host == null || seq < (host.seq ?? 1 << 62)) host = item;
         }
         if (host == null || host.seq == null) continue;

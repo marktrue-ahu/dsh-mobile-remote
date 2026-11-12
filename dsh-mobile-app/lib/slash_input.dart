@@ -55,9 +55,11 @@ class SlashTextToken {
   });
 }
 
-const _tokenChar = r'[A-Za-z0-9_-]';
-final RegExp _tokenCharRe = RegExp(_tokenChar);
-final RegExp _nameRe = RegExp('^$_tokenChar*\$');
+// issue #95：按 DSH 把 Unicode 字母/数字视为 word char（CJK/重音字母等）；
+// 否则 `你好/plan` 会被误判为行内技能。emoji 不是 word char，仍算边界。
+const _tokenChar = r'[\p{L}\p{N}_-]';
+final RegExp _tokenCharRe = RegExp(_tokenChar, unicode: true);
+final RegExp _nameRe = RegExp('^$_tokenChar*\$', unicode: true);
 
 bool _isWordChar(String ch) => ch.isNotEmpty && _tokenCharRe.hasMatch(ch);
 

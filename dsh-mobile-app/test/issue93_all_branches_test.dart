@@ -184,6 +184,34 @@ void main() {
       expect(controller.state.commits.map((commit) => commit.oid).toSet().length, 6, reason: '跨页无重复');
     });
 
+    test('issue #95：all 模式首屏超时重试 → 仍 all=true + focus 当前分支，不回选择集', () async {
+      var calls = 0;
+      final api = _FakeGitApi()
+        ..onAll = (focus, snapshotId, cursor) async {
+          calls += 1;
+          if (calls == 1) {
+            throw ApiException('timeout', code: 'graph-timeout', status: 504);
+          }
+          return _page(oids: ['c1', 'c2'], snapshotId: 's', focusOid: 'c1', prevCursor: 'p1', nextCursor: 'n1');
+        };
+      final controller = GitBrowserController(api, branchLimit: GitGraphBranchLimit.unlimited);
+      await controller.open('session-a');
+      await controller.openAllGraph();
+      expect(controller.state.graphTimedOut, isTrue);
+      expect(controller.state.graphAll, isTrue);
+
+      await controller.retryGraphLoad();
+      expect(api.requests.last, {
+        'all': true,
+        'focus': 'refs/heads/develop',
+        'snapshotId': null,
+        'cursor': null,
+        'limit': 16,
+      }, reason: '重试必须 openAllGraph(focus 当前分支)，不得回退选择集');
+      expect(controller.state.graphAll, isTrue);
+      expect(controller.state.commits.map((c) => c.oid), ['c1', 'c2']);
+    });
+
     test('双向分页 cursor：older 只更新 next、newer 只更新 prev；交替 old→new→old 不串', () async {
       final api = _FakeGitApi()
         ..onAll = (focus, snapshotId, cursor) async {
@@ -401,4 +429,145 @@ void main() {
     controller.dispose();
     scroll.dispose();
   });
+  testWidgets('issue #95：all 模式刷新后标题仍“全部分支”，数据 all=true', (tester) async {
+    final api = _FakeGitApi();
+    final controller = GitBrowserController(api, branchLimit: GitGraphBranchLimit.unlimited);
+    final store = AppStore()..gitGraphBranchLimit = GitGraphBranchLimit.unlimited;
+    final scroll = ScrollController();
+    tester.view.physicalSize = const Size(400, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: GitBrowserSheet(
+          controller: controller,
+          scrollController: scroll,
+          tabs: const ['graph'],
+          store: store,
+        ),
+      ),
+    ));
+    await controller.open('session-a');
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.byKey(const Key('git-graph-all-label')), findsOneWidget);
+
+    await tester.tap(find.byIcon(Icons.refresh));
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.byKey(const Key('git-graph-all-label')), findsOneWidget,
+        reason: '刷新不得回退选择集/丢 all 标题');
+    expect(controller.state.graphAll, isTrue);
+    expect(api.requests.last['all'], isTrue);
+    expect(api.requests.last['focus'], 'refs/heads/develop');
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('issue #95：newer 分页超时在顶部有重试，保留已加载页（最后一页 focus）', (tester) async {
+    final api = _FakeGitApi()
+      ..onAll = (focus, snapshotId, cursor) async {
+        if (snapshotId == null) {
+          // focus 页就是最后一页：没有 nextCursor，但仍有 prev（更新页）。
+          return _page(oids: ['c10', 'c11'], snapshotId: 's', focusOid: 'c10', prevCursor: 'p1');
+        }
+        throw ApiException('timeout', code: 'graph-timeout', status: 504);
+      };
+    final controller = GitBrowserController(api, branchLimit: GitGraphBranchLimit.unlimited);
+    final store = AppStore()..gitGraphBranchLimit = GitGraphBranchLimit.unlimited;
+    final scroll = ScrollController();
+    tester.view.physicalSize = const Size(400, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: GitBrowserSheet(
+          controller: controller,
+          scrollController: scroll,
+          tabs: const ['graph'],
+          store: store,
+        ),
+      ),
+    ));
+    await controller.open('session-a');
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.textContaining('subject c10'), findsOneWidget);
+
+    await controller.loadPrevGraphPage();
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.byKey(const Key('git-graph-page-timeout-top')), findsOneWidget);
+    expect(find.byKey(const Key('git-graph-page-retry-top')), findsOneWidget);
+    expect(find.textContaining('subject c10'), findsOneWidget, reason: '保留已加载页');
+    expect(find.byKey(const Key('git-graph-page-timeout')), findsNothing,
+        reason: 'newer 超时不得显示在底部');
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('issue #95：older 分页超时在底部有重试，保留已加载页', (tester) async {
+    final api = _FakeGitApi()
+      ..onAll = (focus, snapshotId, cursor) async {
+        if (snapshotId == null) {
+          return _page(oids: ['c1', 'c2'], snapshotId: 's', focusOid: 'c1', nextCursor: 'n1');
+        }
+        throw ApiException('timeout', code: 'graph-timeout', status: 504);
+      };
+    final controller = GitBrowserController(api, branchLimit: GitGraphBranchLimit.unlimited);
+    final store = AppStore()..gitGraphBranchLimit = GitGraphBranchLimit.unlimited;
+    final scroll = ScrollController();
+    tester.view.physicalSize = const Size(400, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: GitBrowserSheet(
+          controller: controller,
+          scrollController: scroll,
+          tabs: const ['graph'],
+          store: store,
+        ),
+      ),
+    ));
+    await controller.open('session-a');
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pump(const Duration(milliseconds: 300));
+    await controller.loadNextGraphPage();
+    await tester.pump(const Duration(milliseconds: 300));
+    scroll.jumpTo(scroll.position.maxScrollExtent);
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(find.byKey(const Key('git-graph-page-timeout')), findsOneWidget);
+    expect(find.byKey(const Key('git-graph-page-retry')), findsOneWidget);
+    expect(find.byKey(const Key('git-graph-page-timeout-top')), findsNothing);
+    expect(find.textContaining('subject c1'), findsOneWidget, reason: '保留已加载页');
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('issue #95：#93 all 模式 320/深色/1.5x 不溢出', (tester) async {
+    final api = _FakeGitApi();
+    final controller = GitBrowserController(api, branchLimit: GitGraphBranchLimit.unlimited);
+    final store = AppStore()..gitGraphBranchLimit = GitGraphBranchLimit.unlimited;
+    final scroll = ScrollController();
+    tester.view.physicalSize = const Size(320, 800);
+    tester.view.devicePixelRatio = 1;
+    tester.platformDispatcher.textScaleFactorTestValue = 1.5;
+    addTearDown(tester.view.reset);
+    addTearDown(tester.platformDispatcher.clearTextScaleFactorTestValue);
+    await tester.pumpWidget(MaterialApp(
+      theme: ThemeData.dark(),
+      home: Scaffold(
+        body: GitBrowserSheet(
+          controller: controller,
+          scrollController: scroll,
+          tabs: const ['graph'],
+          store: store,
+        ),
+      ),
+    ));
+    await controller.open('session-a');
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.byKey(const Key('git-graph-all-label')), findsOneWidget);
+    expect(tester.takeException(), isNull, reason: '320+深色+1.5x 不得 overflow');
+    await tester.pumpWidget(const SizedBox());
+  });
+
 }

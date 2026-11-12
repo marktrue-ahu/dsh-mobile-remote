@@ -20,6 +20,16 @@ void main() {
       expect(slashTokenAt('1/name'), isNull);
     });
 
+    test('issue #95：CJK/重音字母/全角数字算 word char；emoji 仍是边界', () {
+      expect(slashTokenAt('你好/plan'), isNull);
+      expect(slashTokenAt('你好，/plan')!.query, 'plan');
+      expect(slashTokenAt('é/plan'), isNull);
+      expect(slashTokenAt('１/plan'), isNull);
+      // emoji 不是 Unicode 字母/数字 → 作为边界，行内技能仍可触发。
+      expect(slashTokenAt('😀/plan')!.query, 'plan');
+      expect(slashTokenAt('😀/plan')!.scope, SlashMenuScope.inline);
+    });
+
     test('// 与 https:/ 豁免', () {
       expect(slashTokenAt('//'), isNull);
       expect(slashTokenAt('https:/'), isNull);
@@ -64,6 +74,13 @@ void main() {
     test('标点边界与中文标点', () {
       final tokens = slashTextTokens('（/compact），/grill-me\n/plan');
       expect(tokens.map((t) => t.name).toList(), ['compact', 'grill-me', 'plan']);
+    });
+
+    test('issue #95：CJK 词内 / 不高亮；URL/路径/emoji 边界', () {
+      final tokens = slashTextTokens(
+        '你好/plan 你好，/compact 😀/grill-me x/name https:/foo /tmp/foo',
+      );
+      expect(tokens.map((t) => t.name).toList(), ['compact', 'grill-me']);
     });
 
     test('空文本/无 token', () {
