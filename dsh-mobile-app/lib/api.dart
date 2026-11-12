@@ -1347,6 +1347,18 @@ class Api implements GitReadApi, GitGraphPostApi {
     );
   }
 
+  /// issue #90：技能目录（GET /api/skills）。
+  /// 返回 (技能列表, unavailable)——旧宿主/目录不可用时 unavailable=true，UI 静默只显示命令。
+  Future<(List<Map<String, dynamic>>, bool)> skills(String sessionId) async {
+    final data = await getJson(
+      '/api/skills?sessionId=${Uri.encodeQueryComponent(sessionId)}',
+    );
+    return (
+      (data['skills'] as List? ?? []).cast<Map<String, dynamic>>(),
+      data['unavailable'] == true,
+    );
+  }
+
   /// v2.8.0：执行斜杠命令（line 形如 "/plan 目标"）。
   /// issue #25：提交时（`_send` 判定为命令行且名字在命令目录里）与 ⊕ 菜单里的裸命令都走这里。
   /// 服务端把整条命令的上限放宽到 180s（`/compact` 要等内核跑完一次完整 LLM 摘要），客户端
