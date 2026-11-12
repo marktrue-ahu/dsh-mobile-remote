@@ -663,6 +663,10 @@ class _ChatScreenState extends State<ChatScreen> {
   /// v2.8.0：live 视图统一普通（非 reverse）列表，"最新"恒在 maxScrollExtent。
   void _onScrollTick() {
     if (!mounted || _inHistory) return;
+    // re-review P2：滚动后行几何/可见性变化，允许活动条重新做几何判定。
+    _activityGeometryResolved = false;
+    _activityGeometryRefreshScheduled = false;
+    _activityGeometryRefreshFrames = 0;
     final pos = _scrollCtrl.position;
     if (!pos.hasContentDimensions) return;
     // issue #77：内容高度增长（流式/工具插入）不是「用户上翻」——长度变化本身
@@ -4560,7 +4564,7 @@ class _ChatScreenState extends State<ChatScreen> {
         _activeTools.keys.any(plan.visibleToolCallIds.contains);
     if (!_activityGeometryResolved &&
         !_activityGeometryRefreshScheduled &&
-        _activityGeometryRefreshFrames < 2 &&
+        _activityGeometryRefreshFrames < 1 &&
         hasGeometryCandidate) {
       _activityGeometryRefreshFrames++;
       _activityGeometryRefreshScheduled = true;

@@ -60,9 +60,9 @@ class _Backend {
 
 /// 运行中的一轮：turn/start + user + [completed] 个已完成工具 + 1 个运行中工具。
 
-/// 运行中工具在过程块**首 50 行**，其后还有 60 个并行运行中的工具调用：
-/// 长过程滚动到尾部时，首行工具已展开/承载但视口不可见 → 活动条必须恢复。
-List<Map<String, dynamic>> _runningToolAboveEvents() {
+/// 少于 50 行：目标 long-shell 运行中、其余为已结束工具；总数 15 行即可把
+/// 目标行推出视口（不借 50 行分批制造“离屏”假证据）。
+List<Map<String, dynamic>> _runningToolAboveEvents({int ended = 7}) {
   return <Map<String, dynamic>>[
     {'seq': 1, 'type': 'turn/start', 'data': {'turn': 1}},
     {
@@ -76,23 +76,35 @@ List<Map<String, dynamic>> _runningToolAboveEvents() {
       'data': {
         'turn': 1,
         'step': 1,
-        'callId': 'long-running',
-        'name': 'long-shell',
+        'callId': 'long-shell',
+        'name': 'shell',
         'arguments': 'sleep 60',
       },
     },
-    for (var i = 0; i < 60; i++)
+    for (var i = 0; i < ended; i++) ...[
       {
-        'seq': 4 + i,
+        'seq': 4 + i * 2,
         'type': 'tool/call',
         'data': {
           'turn': 1,
           'step': i + 2,
-          'callId': 'later-$i',
+          'callId': 'done-$i',
           'name': 'bash',
           'arguments': 'echo $i',
         },
       },
+      {
+        'seq': 5 + i * 2,
+        'type': 'tool/result',
+        'data': {
+          'turn': 1,
+          'step': i + 2,
+          'callId': 'done-$i',
+          'name': 'bash',
+          'text': 'ok $i',
+        },
+      },
+    ],
   ];
 }
 
@@ -305,16 +317,78 @@ void main() {
     );
     await tester.pump(const Duration(milliseconds: 900));
   });
-  testWidgets('已展开但滚出视口（长过程首50行工具离屏）：活动条恢复', (tester) async {
-    await _pumpChat(
-      tester,
-      _Backend(events: _runningToolAboveEvents()),
-    );
-    // 运行工具在过程块首行，但当前视口在 60 条后续工具之后：真实几何不相交。
+  testWidgets('目标工具行真实离屏（<50 行、无分批）：活动条按名称保留且数量正确', (tester) async {
+    // 8 行过程内容 + 稍高视口：maxScrollExtent 与 5 行用例量级一致，目标行在底部
+    // 确实离屏，但滚回 150px（仍在 160px 贴底阈值内）即可进入视口。
+    tester.view.physicalSize = const Size(2400, 2781);
+    tester.view.devicePixelRatio = 3.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final events = _runningToolAboveEvents();
+    await _pumpChat(tester, _Backend(events: events));
+    final pos = tester
+        .state<ScrollableState>(find.descendant(
+          of: find.byType(CustomScrollView),
+          matching: find.byType(Scrollable),
+        ))
+        .position;
+    // 收敛到真实底部（保持贴底），并触发一次滚动重建。
+    pos.jumpTo(pos.maxScrollExtent - 1);
+    await tester.pump(const Duration(milliseconds: 120));
+    pos.jumpTo(pos.maxScrollExtent);
+    await tester.pump(const Duration(milliseconds: 120));
+
+    // 目标行（long-shell）在过程块内，但视口底部只看得到后续已结束工具。
+    final target = find.text('shell');
+    expect(target, findsOneWidget);
+    final targetBox = tester.renderObject<RenderBox>(target);
+    final viewportFinder = find.byType(CustomScrollView);
+    final viewportBox = tester.renderObject<RenderBox>(viewportFinder);
+    final targetRect = targetBox.localToGlobal(Offset.zero) & targetBox.size;
+    final viewportRect = viewportBox.localToGlobal(Offset.zero) & viewportBox.size;
+    expect(targetRect.overlaps(viewportRect), isFalse,
+        reason: '用例前提：目标工具行必须在视口外（$targetRect vs $viewportRect）');
+    // 且不是靠“>50 行分批隐藏”伪装：总 process 行数 < 50。
+    expect(events.where((e) => e['type'] == 'tool/call').length, lessThan(50));
+
+    // 活动条必须包含 shell，且只有这一个运行中工具（数量正确）。
+    final barTools = find.byKey(_activityBarToolsKey);
+    expect(barTools, findsOneWidget);
     expect(
-      find.byKey(_activityBarToolsKey),
+      find.descendant(of: barTools, matching: find.textContaining('shell')),
       findsOneWidget,
-      reason: 'visibleToolCallIds 只代表展开/分批，离屏时活动条必须恢复（P2 几何修复）',
+      reason: '离屏运行工具必须出现在活动条（按名称）',
+    );
+    expect(
+      find.descendant(of: barTools, matching: find.textContaining('bash')),
+      findsNothing,
+      reason: '已结束工具不得混入活动条',
+    );
+    expect(
+      find.descendant(of: barTools, matching: find.textContaining('Running 1 tools')),
+      findsNothing,
+    );
+
+    // 滚动目标进入视口（仍在贴底阈值内）：活动条不得再包含 shell。
+    pos.jumpTo(pos.maxScrollExtent - 150);
+    await tester.pump(const Duration(milliseconds: 200));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+    final visibleRect =
+        tester.renderObject<RenderBox>(target).localToGlobal(Offset.zero) &
+        tester.renderObject<RenderBox>(target).size;
+    final viewportRect2 =
+        tester.renderObject<RenderBox>(viewportFinder).localToGlobal(Offset.zero) &
+        tester.renderObject<RenderBox>(viewportFinder).size;
+    expect(visibleRect.overlaps(viewportRect2), isTrue,
+        reason: '滚动后目标行应与视口相交');
+    expect(
+      find.descendant(
+        of: find.byKey(_activityBarToolsKey),
+        matching: find.textContaining('shell'),
+      ),
+      findsNothing,
+      reason: '目标可见后活动条不得再重复 long-shell',
     );
     await tester.pump(const Duration(milliseconds: 900));
   });

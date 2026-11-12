@@ -473,6 +473,8 @@ function graphProvider({
 	resolveHang = false,
 	graphHangOnCall = 0,
 	graphByCall = null,
+	graphErrorOnCall = 0,
+	graphError = null,
 } = {}) {
 	const oid = "a".repeat(40);
 	const state = { refsCalls: 0, resolveCalls: 0, resolveGraphCalls: 0 };
@@ -490,6 +492,7 @@ function graphProvider({
 		graph: async (root, options) => {
 			void root;
 			state.resolveGraphCalls += 1;
+			if (graphError && state.resolveGraphCalls === graphErrorOnCall) throw graphError;
 			if (state.resolveGraphCalls === graphHangOnCall) return new Promise(() => {});
 			if (graphByCall && graphByCall[state.resolveGraphCalls - 1]) {
 				return graphByCall[state.resolveGraphCalls - 1](options);
@@ -778,5 +781,64 @@ test("re-review P1 分页闭环：未交付 initial timeout 清理快照；已�
     // 新请求可正常重试（无残留半页）。
     const retried = await service.graph("session-1", repositoryId, { tips: [{ name: "refs/heads/main" }], limit: 1 });
     assert.ok(retried.snapshotId);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("re-review P1 混合错误：provider.graph 503 → 二次 verify 挂起 → 504（不误判 stale），同 cursor 重试 200", async () => {
+  const transient = Object.assign(new Error("temporary unavailable"), {
+    code: "git-provider-unavailable",
+    status: 503,
+  });
+  const { provider } = graphProvider({
+    graphErrorOnCall: 2,
+    graphError: transient,
+    refsHangOnCall: 6,
+  });
+  const disposed = [];
+  const { root, service } = serviceWithProvider(provider, {
+    graphDeadlineMs: 60,
+    onSnapshotDisposed: (id) => disposed.push(id),
+  });
+  try {
+    const { repositoryId } = await service.repositoryForSession("session-1");
+    const first = await service.graph("session-1", repositoryId, { tips: [{ name: "refs/heads/main" }], limit: 1 });
+    assert.ok(first.snapshotId && first.nextCursor);
+    await assert.rejects(
+      () => service.graph("session-1", repositoryId, { snapshotId: first.snapshotId, cursor: first.nextCursor, limit: 1 }),
+      (e) => e.code === "graph-timeout" && e.status === 504,
+    );
+    assert.deepEqual(disposed, [], "混合错误下的二次 verify 超时也不得清理已交付快照");
+    const retried = await service.graph("session-1", repositoryId, { snapshotId: first.snapshotId, cursor: first.nextCursor, limit: 1 });
+    assert.equal(retried.snapshotId, first.snapshotId);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("re-review P1 混合错误：provider.graph 503 后 verify 发现 ref 真变化 → 409 + 清理", async () => {
+  const transient = Object.assign(new Error("temporary unavailable"), {
+    code: "git-provider-unavailable",
+    status: 503,
+  });
+  const { provider } = graphProvider({
+    graphErrorOnCall: 2,
+    graphError: transient,
+    refsOidOnCall: 6,
+  });
+  const disposed = [];
+  const { root, service } = serviceWithProvider(provider, {
+    graphDeadlineMs: 500,
+    onSnapshotDisposed: (id) => disposed.push(id),
+  });
+  try {
+    const { repositoryId } = await service.repositoryForSession("session-1");
+    const first = await service.graph("session-1", repositoryId, { tips: [{ name: "refs/heads/main" }], limit: 1 });
+    await assert.rejects(
+      () => service.graph("session-1", repositoryId, { snapshotId: first.snapshotId, cursor: first.nextCursor, limit: 1 }),
+      (e) => e.code === "graph-stale" && e.status === 409,
+    );
+    assert.deepEqual(disposed, [first.snapshotId], "ref 真变化仍必须清理快照");
+    await assert.rejects(
+      () => service.graph("session-1", repositoryId, { snapshotId: first.snapshotId, cursor: first.nextCursor, limit: 1 }),
+      (e) => e.code === "graph-stale" && e.status === 409,
+    );
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
