@@ -428,6 +428,17 @@ class _ChatScreenState extends State<ChatScreen> {
   int _loadGeneration = 0; // 丢弃跨越 reset/会话切换的旧 history 响应
   // v2.7.2 review(M1)：本页绑定的会话（initState 时捕获）——事件按它过滤，叠层页面互不污染
   String? _mySessionId;
+  // issue #94：Markdown 本地图片加载器（稳定实例 → md.dart 缓存按 loader+路径复用）。
+  late final MarkdownImageLoader _markdownImageLoader = _loadMarkdownImage;
+
+  Future<MarkdownImageData> _loadMarkdownImage(String source) async {
+    final id = _mySessionId;
+    if (id == null || id.isEmpty) {
+      throw ApiException('no-session', code: 'session-not-found');
+    }
+    final data = await _api.workspaceImage(id, source);
+    return MarkdownImageData(bytes: data.bytes, contentType: data.contentType);
+  }
   Api get _api => widget.apiClient ?? api;
   String get _pageAgentStatus =>
       widget.store.agentStatusForSession(_mySessionId);
@@ -2163,6 +2174,7 @@ class _ChatScreenState extends State<ChatScreen> {
                       text: _draft,
                       streaming: true,
                       api: _api,
+                      imageLoader: _markdownImageLoader,
                     );
                   }
                   return const SizedBox.shrink();
@@ -7446,6 +7458,7 @@ class _ChatScreenState extends State<ChatScreen> {
               codeTapKey: linkResolver == null
                   ? ''
                   : '$_turnTailVersion:$turn',
+              imageLoader: _markdownImageLoader,
             ),
             if (item.detailDegraded)
               Padding(
@@ -9548,6 +9561,7 @@ class _AssistantBubble extends StatefulWidget {
 
   /// 解析缓存附加键：记录集合变化（新交付声明/改动摘要到达）时强制重新解析。
   final String codeTapKey;
+  final MarkdownImageLoader? imageLoader;
   const _AssistantBubble({
     required this.text,
     required this.api,
@@ -9561,6 +9575,7 @@ class _AssistantBubble extends StatefulWidget {
     this.onOverride,
     this.codeTap,
     this.codeTapKey = '',
+    this.imageLoader,
   });
 
   @override
@@ -9584,6 +9599,7 @@ class _AssistantBubbleState extends State<_AssistantBubble> {
         widget.text.isEmpty ? '…' : widget.text,
         context,
         codeTap: widget.codeTap,
+        imageLoader: widget.imageLoader,
       );
       if (_parseLogs < 3) {
         _parseLogs++;
