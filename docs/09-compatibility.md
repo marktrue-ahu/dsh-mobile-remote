@@ -171,6 +171,10 @@
 
 ---
 
+### 2.x 本地 Markdown 图片（issue #95）
+
+`/m/api/workspace-image` 仅在宿主为 Linux、具备 `O_NOFOLLOW` 与 procfs 时可用；Windows/macOS 返回 `501 image-verification-unavailable`，App 不自动回退到路径读取，而是显示 alt/明确占位。HTTP(S) Markdown 图片本轮不自动加载。该限制是安全边界的一部分，不是可静默降级的体验差异。
+
 ## 3. Android 多品牌适配
 
 App 为 Flutter 原生 APK（`com.dsh.remote`），渲染后端为 **Impeller（Vulkan，自动回退 OpenGLES）**。

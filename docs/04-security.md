@@ -81,6 +81,12 @@
 
 同一认证身份还能通过 `POST /sessions {cwd}` 注册新的工作目录。因此仅按“已注册工作区”过滤文件接口无法限制持有口令的客户端：它可以先注册更大的目录。本轮保留任意新目录建会话的行为，不引入可被该入口绕过的访问控制承诺。若要增加受限身份，需要一并设计宿主批准的根目录、`realpath` / 符号链接检查和工作目录注册授权；不能只更改文件下载接口。当前权限上限由宿主操作系统身份、沙箱与可信传输控制。
 
+### 工作区图片端点（`/m/api/workspace-image`，issue #95）
+
+该端点比通用文件传输更窄：只允许当前会话 cwd 内、cwd 属于已登记工作区的普通图片，且使用 **fd 绑定**读取：`open(O_RDONLY|O_NOFOLLOW|O_NONBLOCK)` 后以 `fstat` 与 `/proc/self/fd/<fd>` 的实际路径做 cwd/工作区 containment，再 `readSync(fd)` 有界读取并 `finally close`；不再按路径二次 `stat`/`readFileSync`。末级 symlink 被 `O_NOFOLLOW` 拒绝，中间目录换链由 fd 实际路径校验拒绝。非 Linux/无 procfs/无 O_NOFOLLOW 一律 `501 image-verification-unavailable`，**fail-closed，不回退**。
+
+已知/接受边界：hardlink 与 bind-mount 的同用户场景不在本端点威胁模型内；8 MiB/8192px/40MP 上限；HEAD 仍完整读取以生成强 ETag。通用 `/files*` 的既有任意路径/符号链接边界见上节，二者不可混用。
+
 ### 持久化与投递
 
 - 插件**持久化仅限最小移动端状态**（`~/.dsh/mobile-remote/`：通知已读 id、会话最近活跃时间），不含会话内容；口令只存在于 profile 配置。

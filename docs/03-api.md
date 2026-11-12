@@ -1056,7 +1056,9 @@ graph 的每个提交与 commit 详情都**保留旧的** `refs: string[]`（dep
 
 POST 请求体：`{"sessionId","repositoryId","tips":[...],"limit"?,"snapshotId"?,"cursor"?}`；续页可省略 `tips`，`snapshotId/cursor` 与 GET 互通（传输方式不参与快照身份）。POST body ≤256 KiB、每个 `name` ≤1024 B，超限 `413 payload-too-large`。`HEAD /git/graph` 返回 200 无 body，不创建快照。
 
-响应：`{ ok, repositoryId, snapshotId, tips, commits, nextCursor }`，`commits[]` 含 `oid` / `parents` / `author` / `timestamp` / `subject` / `refs` / `refsDetail` / `tagsDetail`。引用在翻页期间移动、tip 失效、快照过期或游标非法返回 `409 graph-stale`；非法 tip 返回 `409 graph-tip-invalid`；GET 超过 32 / POST 超过 128 返回 `400 graph-too-many-tips`（detail 声明对应上限）；服务端 25s deadline 返回 `504 graph-timeout`。
+**all 模式（仅 POST）**：`{"sessionId","repositoryId","all":true,"focus"?:ref|oid,"limit":16,"snapshotId"?,"cursor"?}`。服务端解析 `refs/heads/* + refs/remotes/*`（排除 `/HEAD`）作为 tips；**tag 不作为 tip/分支线**，只作为分支历史内可达提交上的 label。固定每页 16 提交；`focus` 返回包含该提交的页并带 `focusOid/pageStart/prevCursor/nextCursor/hasNewer/hasOlder`，`prevCursor` 更新、`nextCursor` 更旧。all 快照绑定全部分支 refs 指纹；分支新增/移动/删除返回 `409 graph-stale`。保护超限返回 `400 graph-too-many-refs`、focus 非法/未找到返回 `400 graph-focus-invalid`/`409 graph-focus-not-found`，不静默截断。GET 不接受 `all=true`。
+
+响应：`{ ok, repositoryId, snapshotId, tips, commits, nextCursor }`（all 模式另含 `all/pageSize/pageStart/focusOid/prevCursor/hasNewer/hasOlder`），`commits[]` 含 `oid` / `parents` / `author` / `timestamp` / `subject` / `refs` / `refsDetail` / `tagsDetail`。引用在翻页期间移动、tip 失效、快照过期或游标非法返回 `409 graph-stale`；非法 tip 返回 `409 graph-tip-invalid`；GET 超过 32 / POST 超过 128 返回 `400 graph-too-many-tips`（detail 声明对应上限）；服务端 25s deadline 返回 `504 graph-timeout`。
 
 #### 6.19.5 GET /m/api/git/commit
 
@@ -1126,6 +1128,21 @@ POST 请求体：`{"sessionId","repositoryId","tips":[...],"limit"?,"snapshotId"
 - **有界**：单次最多扫描 5000 条提交或 20 秒软超时；达到上限时返回已取部分并 `truncated: true`（客户端可提示「仅显示最近 N 条提交」）。
 - 缺失 `path` → `400 bad-request`。
 
+#### 6.19.12 GET/HEAD /m/api/workspace-image
+
+只读返回当前会话工作区内的图片字节，供 App 渲染 Markdown 本地图片。**不是任意文件读取接口。**
+
+| 参数 | 说明 |
+|---|---|
+| `sessionId` | 必填；会话 cwd 必须位于已登记工作区内 |
+| `path` | 必填；会话 cwd 内的工作区路径（词法前缀 + realpath containment） |
+
+- 仅接受普通图片文件（png/jpeg/gif/webp；扩展名与 magic 必须一致）；目录/FIFO/device/空文件拒绝；**末级符号链接拒绝**。
+- 安全读取（Linux）：`open(O_RDONLY|O_NOFOLLOW|O_NONBLOCK)` → `fstat` → `/proc/self/fd/<fd>` 实际路径 containment（cwd + 登记工作区）→ 有界 `readSync` → `close`；不再按路径二次 `stat/readFileSync`。**非 Linux/无 O_NOFOLLOW/无 procfs 返回 `501 image-verification-unavailable`，不回退到不安全读取。**
+- 上限：8 MiB / 8192px 单边 / 40 MP；超限 `413 image-too-large`；类型不符/无法解析尺寸 `415 unsupported-image-type`；越界/工作区未授权 `403 path-outside-workspace`；不存在 `404 image-not-found`；错误不泄露主机路径。
+- 响应：`200` 图片字节 + `content-type` + 强 ETag；`HEAD` 同 headers 无 body；`If-None-Match` 命中 `304`；`cache-control: private, max-age=86400`；`x-content-type-options: nosniff`。POST/其它方法 `405`。
+- App：只对工作区本地路径调用此端点；`http(s)` 图片本轮不自动加载（显示 alt/占位），避免第三方请求；本地图片失败显示 alt + 可读原因。
+
 #### 6.19.9 Git 只读端点错误码
 
 | HTTP | error 值 | 场景 |
@@ -1134,12 +1151,14 @@ POST 请求体：`{"sessionId","repositoryId","tips":[...],"limit"?,"snapshotId"
 | 400 | `invalid-oid` / `invalid-files-cursor` / `invalid-history-cursor` | 非法 OID / 文件分页游标 / 历史分页游标 |
 | 400 | `path-invalid` | `/git/file-history` 传入目录路径 |
 | 400 | `preview-invalid` | 预览参数非法 |
-| 400 | `graph-tip-invalid` / `graph-too-many-tips` | 非法 tip / GET 超过 32、POST 超过 128 tips |
+| 400 | `graph-tip-invalid` / `graph-too-many-tips` / `graph-too-many-refs` / `graph-focus-invalid` | 非法 tip / 超选择集上限 / all refs 超保护 / all focus 非法 |
 | 401 | `auth-required` / `bad-token` | 未鉴权（同 §1） |
-| 403 | `repository-not-authorized` / `workspace-not-allowed` | 会话/仓库不匹配或路径不在已注册工作区 |
-| 404 | `session-not-found` / `not-git-repository` / `preview-file-not-found` | 会话不存在 / cwd 不是仓库 / 提交中无该文件 |
-| 409 | `graph-stale` / `graph-tip-invalid` | 快照或 tip 已变化 |
-| 413 | `git-output-too-large` / `payload-too-large` | Git 输出超过宿主上限；POST graph body 超过 256 KiB 或单个 ref name 超过 1024 B |
+| 403 | `repository-not-authorized` / `workspace-not-allowed` / `path-outside-workspace` | 会话/仓库不匹配、路径不在工作区、图片实际 fd 越界 |
+| 404 | `session-not-found` / `not-git-repository` / `preview-file-not-found` / `image-not-found` | 会话不存在 / cwd 不是仓库 / 提交中无该文件 / 图片不存在或非普通文件 |
+| 409 | `graph-stale` / `graph-tip-invalid` / `graph-focus-not-found` | 快照/tip 已变化 / all focus 扫描未命中 |
+| 413 | `git-output-too-large` / `payload-too-large` / `image-too-large` | Git 输出/请求体超限；图片超 8 MiB/8192px/40MP |
+| 415 | `unsupported-image-type` | 图片扩展名/magic 不符或尺寸不可解析 |
+| 501 | `image-verification-unavailable` | 当前平台无法提供 fd 级安全校验（Windows/macOS/无 procfs） |
 | 504 | `graph-timeout` | graph 25s deadline（任意阶段） |
 | 431 | —（HTTP） | GET URL 过长；新 App 在能力允许时自动改 POST 重试一次 |
 | 503 | `git-provider-unavailable` / `provider-incompatible` | provider 不可用 / 旧 provider 不支持所需方法 |
