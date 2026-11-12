@@ -759,4 +759,30 @@ void main() {
     });
   });
 
+  group('issue #92：压缩回放孤儿工具结果', () {
+    test('有已锚定轮次时，缺 turn/start 的旧 turn tool/result 生成 partial 过程组', () {
+      final turns = trackerOf([
+        ev(1, 'turn/start', {'turn': 220}),
+        ev(2, 'user/message', {'text': '开始', 'sourceKind': 'user'}),
+        ev(3, 'tool/call', {'turn': 220, 'step': 1, 'callId': 'c-now', 'name': 'bash'}),
+        ev(4, 'tool/result', {'turn': 220, 'step': 1, 'callId': 'c-now', 'name': 'bash', 'text': 'ok'}),
+        // 压缩回放：新 seq、旧 turn，窗口里没有 148 的 turn/start。
+        ev(5, 'tool/result', {'turn': 148, 'step': 1, 'callId': 'c-old', 'name': 'bash', 'text': 'note 2312'}),
+      ]).build();
+      expect(turns.map((t) => t.turn), containsAll([148, 220]));
+      final orphan = turns.singleWhere((t) => t.turn == 148);
+      expect(orphan.partial, isTrue);
+      expect(orphan.ended, isTrue);
+      expect(orphan.rows.single.callId, 'c-old');
+      expect(orphan.groups.single.toolCount, 1);
+    });
+
+    test('没有已锚定轮次时（典型 #61 旧卡片场景）不生成孤儿过程组', () {
+      final turns = trackerOf([
+        ev(1, 'tool/result', {'turn': 1, 'step': 1, 'callId': 'call-orphan', 'text': 'SUMMARY'}),
+      ]).build();
+      expect(turns, isEmpty, reason: '无 turn/start 的 fallback 仍走独立工具卡');
+    });
+  });
+
 }

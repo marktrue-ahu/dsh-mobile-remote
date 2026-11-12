@@ -786,6 +786,8 @@ class TurnProcessTracker {
   // issue #91：所有 user/message 的 seq（含 agent-message 等非真人提示词）——
   // 只用于识别「本轮第一条 user 事件（提示词）」，不能把首个真人间插话误当提示词。
   final List<int> _allUserSeqs = [];
+  // issue #92：只有 tool/result 回放、没有 turn/start 的孤儿 turn 的合成锚点。
+  final Map<int, int> _orphanAnchors = {};
   final Set<int> _allUserSeqSet = {};
   final Set<int> _humanUserSeqSet = {};
   int _order = 0;
@@ -802,6 +804,7 @@ class TurnProcessTracker {
     _humanUserSeqs.clear();
     _allUserSeqs.clear();
     _allUserSeqSet.clear();
+    _orphanAnchors.clear();
     _humanUserSeqSet.clear();
     _order = 0;
   }
@@ -1016,7 +1019,8 @@ class TurnProcessTracker {
   ///
   /// issue #60 R04：历史窗口缺 `turn/start` 的**部分轮次**没有真实起点；这里返回该轮
   /// 最早可观察事件的序号作为合成锚点，让过程块/页脚/M2 两卡仍能定位与渲染。
-  int? startSeqOfTurn(int turn) => _anchorOf(_turns[turn]);
+  int? startSeqOfTurn(int turn) =>
+      _anchorOf(_turns[turn]) ?? _orphanAnchors[turn];
 
   /// 该轮的渲染锚点：真实 startSeq 优先；否则取已知的最早事件序号。
   int? _anchorOf(_MutableTurn? turn) {
@@ -1154,6 +1158,53 @@ class TurnProcessTracker {
         endedAtMs: t.endedAtMs,
         groups: _groupRows(rows),
         humanUserSeqs: human,
+      ));
+    }
+    // issue #92：compaction 会重新落盘旧 turn 的 tool/result（seq 变新、turn/step 保留），
+    // 但加载窗口里没有该 turn 的 turn/start / turn/end。旧逻辑不生成 TurnProcess →
+    // 工具 item 无法进入过程块，只能回退成“旧版独立卡片”。这里为**只有工具行、
+    // 无轮次锚点**的孤儿 turn 生成 partial 过程组，让它们像过程行一样可折叠，
+    // 而不是伪装成独立工具卡（plan 仍按 host 位置渲染）。
+    final knownTurns = _turns.keys.toSet();
+    // 只有「时间线已有轮次锚点」时才把孤儿工具并入历史过程组；#61 旧卡片兜底
+    // （整段只有 result、没有任何 turn/start）必须保留独立卡与可读摘要。
+    final hasAnchoredTurns = knownTurns.isNotEmpty;
+    final orphanTurns = <int>{
+      if (hasAnchoredTurns)
+        for (final tool in _tools.values)
+          if (tool.turn != null &&
+              !knownTurns.contains(tool.turn) &&
+              tool.reportedSeq != null)
+            tool.turn!,
+    };
+    for (final turn in orphanTurns) {
+      final rows = <ProcessRow>[];
+      for (final tool in _tools.values) {
+        if (tool.turn != turn) continue;
+        final seq = tool.reportedSeq;
+        if (seq == null) continue;
+        rows.add(ProcessRow.tool(
+          seq: seq,
+          step: tool.step,
+          callId: tool.callId,
+          toolName: tool.name,
+          status: tool.settled
+              ? (tool.isError ? 'failed' : 'success')
+              : 'running',
+          isError: tool.isError,
+        ));
+      }
+      if (rows.isEmpty) continue;
+      rows.sort((a, b) => a.seq.compareTo(b.seq));
+      _orphanAnchors[turn] = rows.first.seq;
+      result.add(TurnProcess(
+        turn: turn,
+        startSeq: rows.first.seq,
+        partial: true,
+        ended: true,
+        endReasonKind: 'completed',
+        groups: _groupRows(rows),
+        humanUserSeqs: const [],
       ));
     }
     return result;
