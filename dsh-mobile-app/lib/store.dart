@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'api.dart';
 import 'attention.dart';
 import 'floating.dart';
+import 'git_models.dart';
 import 'l10n.dart';
 import 'logger.dart';
 import 'models.dart';
@@ -222,6 +223,9 @@ class AppStore extends ChangeNotifier {
   /// issue #52（ADR 0027 §2）：工作步骤展示模式（四档）与收起时机（两档）。
   /// 偏好只存手机本地（不新增宿主设置端点）；默认「标准」+「回答结束后」。
   WorkStepDisplayMode stepDisplayMode = WorkStepDisplayMode.standard;
+
+  /// issue #86：Git 分支图选中上限（全局偏好，5/10/不限；默认 5）。
+  GitGraphBranchLimit gitGraphBranchLimit = GitGraphBranchLimit.fallback;
   TurnFoldTiming turnFoldTiming = TurnFoldTiming.afterAnswer;
   /// 思维链折叠手动状态（会话 -> 消息key -> 手动展开值；滚动/重进/重启持久，null=跟随设置默认）
   Map<String, Map<String, bool>> reasoningOverrides = {};
@@ -1508,6 +1512,7 @@ class AppStore extends ChangeNotifier {
   static const _kReasoningDefaultExpanded = 'dsh_mr_reasoning_default_expanded';
   static const _kTimelineDebug = 'dsh_mr_timeline_debug';
   static const _kStepDisplayMode = 'dsh_mr_step_display_mode';
+  static const _kGitGraphBranchLimit = 'dsh_mr_git_graph_branch_limit';
   static const _kTurnFoldTiming = 'dsh_mr_turn_fold_timing';
   static const _kReasoningOverrides = 'dsh_mr_reasoning_overrides';
   static const _kWorkspace = 'dsh_mr_workspace';
@@ -1542,6 +1547,9 @@ class AppStore extends ChangeNotifier {
     stepDisplayMode = WorkStepDisplayMode.values.firstWhere(
       (mode) => mode.name == prefs.getString(_kStepDisplayMode),
       orElse: () => WorkStepDisplayMode.standard,
+    );
+    gitGraphBranchLimit = GitGraphBranchLimit.fromStorage(
+      prefs.getString(_kGitGraphBranchLimit),
     );
     final foldTiming = prefs.getString(_kTurnFoldTiming);
     turnFoldTiming = foldTiming == 'onNewMessage'
@@ -2111,6 +2119,14 @@ class AppStore extends ChangeNotifier {
     stepDisplayMode = mode;
     notifyListeners();
     await _persistPrefs(_kStepDisplayMode, mode.name);
+  }
+
+  /// issue #86：Git 分支图选中上限三档（5/10/不限）——下次打开分支图生效。
+  Future<void> setGitGraphBranchLimit(GitGraphBranchLimit limit) async {
+    if (gitGraphBranchLimit == limit) return;
+    gitGraphBranchLimit = limit;
+    notifyListeners();
+    await _persistPrefs(_kGitGraphBranchLimit, limit.storageValue);
   }
 
   /// issue #52：收起时机两档（回答结束后 / 下次有新消息时）——改动即时重算。

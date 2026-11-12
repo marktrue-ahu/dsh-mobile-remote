@@ -4345,7 +4345,10 @@ class _ChatScreenState extends State<ChatScreen> {
     final readApi = widget.gitReadApi ?? _api;
     final controller =
         widget.gitControllerFactory?.call(readApi) ??
-        GitBrowserController(readApi);
+        GitBrowserController(
+          readApi,
+          branchLimit: widget.store.gitGraphBranchLimit,
+        );
     _gitController = controller;
     unawaited(controller.open(sid));
     final graphScrollController = ScrollController();

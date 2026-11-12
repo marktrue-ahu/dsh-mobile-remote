@@ -1,5 +1,34 @@
 import 'dart:collection';
 
+/// issue #86：Git 分支图选中上限三档（全局本地偏好）。
+///
+/// 5 / 10 为有界选择；unlimited 取消硬上限（仍由用户手动选择，不自动全选）。
+enum GitGraphBranchLimit {
+  five(5, '5'),
+  ten(10, '10'),
+  unlimited(null, 'unlimited');
+
+  const GitGraphBranchLimit(this.max, this.storageValue);
+
+  /// 可选分支数上限；null = 不限。
+  final int? max;
+
+  /// SharedPreferences 存储值（稳定，不随枚举 name 变化）。
+  final String storageValue;
+
+  bool get isUnlimited => max == null;
+
+  static GitGraphBranchLimit fromStorage(Object? value) => switch (value) {
+    '10' => GitGraphBranchLimit.ten,
+    'unlimited' => GitGraphBranchLimit.unlimited,
+    _ => GitGraphBranchLimit.five,
+  };
+
+  /// 默认档位（兼容旧行为）。
+  static const GitGraphBranchLimit fallback = GitGraphBranchLimit.five;
+}
+
+/// 兼容旧引用：默认档位 5 的硬上限。
 const maxSelectedGraphBranches = 5;
 
 List<String> _strings(Object? value) => (value as List? ?? const [])

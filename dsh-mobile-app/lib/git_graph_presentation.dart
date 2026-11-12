@@ -36,6 +36,16 @@ const _lightBranchColors = <Color>[
   Color(0xff0096c7),
   Color(0xffe00000),
   Color(0xffc58a00),
+  // issue #86：扩到 16 色——10 档稳定不撞色；按色相拉开距离，
+  // 并保持与背景对比 ≥3:1、饱和度 ≥0.70（与既有 8 色同一可读性口径）。
+  Color(0xff972f0c),
+  Color(0xff97970c),
+  Color(0xff2f970c),
+  Color(0xff0c9752),
+  Color(0xff0c9797),
+  Color(0xff0c0c97),
+  Color(0xff970c97),
+  Color(0xff970c2f),
 ];
 const _darkBranchColors = <Color>[
   Color(0xff4f8cff),
@@ -46,6 +56,15 @@ const _darkBranchColors = <Color>[
   Color(0xff20c8f6),
   Color(0xffff4d4d),
   Color(0xffffd000),
+  // issue #86：16 色（深色同样拉开色相，保持对比与饱和度）。
+  Color(0xfff65723),
+  Color(0xfff6f623),
+  Color(0xff57f623),
+  Color(0xff23f68c),
+  Color(0xff23f6f6),
+  Color(0xff4848ff),
+  Color(0xfff623f6),
+  Color(0xfff62357),
 ];
 
 List<Color> _graphPalette(Brightness brightness) =>
