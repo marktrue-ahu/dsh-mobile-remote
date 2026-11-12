@@ -709,7 +709,7 @@ shell 命令。Slice A 是只读基础；B1/B2 提供受保护的 stage/commit �
 `GET /m/api/git/context?sessionId=…` 返回不透明的稳定 `repositoryId`、仓库名称和能力，不返回主机路径。
 其余接口均要求 `repositoryId`：`status` 返回分支与文件状态，`branches` 返回本地/远端分支。
 客户端不得将主机路径当作 B1 写操作的 `repositoryId`；服务端仅接受由 `context` 返回、并在授权工作区内解析的仓库标识。
-`graph` 支持 `limit/cursor` 和可选 JSON `refs`（最多 5 个 `{name,tipOid}` 引用对；本地与远程引用合计）；首次请求返回
+`graph` 支持 `limit/cursor` 和可选 JSON `refs`（GET 最多 32 个、POST 最多 128 个 `{name,tipOid}` 引用对；本地与远程引用合计）；首次请求返回
 `snapshotId`、绑定的 `tips`、提交页和 `nextCursor`，后续请求必须使用同一快照的不透明游标。
 引用移动、删除、tip 不匹配、仓库变化、游标上下文错误或快照过期返回 `409 graph-stale`，客户端不得
 静默回退到全量图。`commit` 要求 `oid`，`diff` 支持 `kind=working|staged|commit`、`oid/path`。
@@ -961,7 +961,8 @@ fetch/push 序列化 common domain，pull/sync/abort 同时序列化 common 与 
 | GET | `/m/api/git/capabilities` | Git 只读能力与契约版本 |
 | GET | `/m/api/git/repository` | 当前会话 cwd 解析出的仓库标识 |
 | GET | `/m/api/git/branches` | 本地/远程分支列表 |
-| GET | `/m/api/git/graph` | 一至五个 tip 之间的提交拓扑（分页） |
+| GET | `/m/api/git/graph` | 1–32 tip 的提交拓扑（分页） |
+| POST | `/m/api/git/graph` | 1–128 tip 的提交拓扑（JSON body，分页/续页） |
 | GET | `/m/api/git/commit` | 提交详情 + 变更文件（分页） |
 | GET | `/m/api/git/worktree` | 工作区快照（已暂存/未暂存/未跟踪） |
 | GET | `/m/api/git/preview` | 单文件文本差异预览（有界） |
@@ -980,6 +981,7 @@ fetch/push 序列化 common domain，pull/sync/abort 同时序列化 common 与 
     "readOnly": true,
     "provider": "bundled",
     "features": {
+      "graphTips": { "max": 128, "getMax": 32 },
       "repository": true, "branches": true, "graph": true, "commit": true,
       "worktree": true, "preview": true, "refsDetail": true, "fileHistory": true
     }
@@ -1044,15 +1046,17 @@ graph 的每个提交与 commit 详情都**保留旧的** `refs: string[]`（dep
 
 `branches` 响应：`{ ok, repositoryId, branches: [{ name, displayName, oid, kind, current, tracking, ahead, behind }] }`，`kind` 为 `local` / `remote`，`name` 为完整 ref 名。
 
-#### 6.19.4 GET /m/api/git/graph
+#### 6.19.4 GET/POST /m/api/git/graph
 
 | 参数 | 说明 |
 |---|---|
-| `tips` | JSON 数组字符串：`[{"name":"refs/heads/main"\|"HEAD"\|"refs/remotes/origin/main","tipOid":"<可选>"}]`，1–5 个且不重复 |
+| `tips` | GET：JSON 数组字符串 `1–32` 个；POST：body `tips` 数组 `1–128` 个。元素 `{"name":"refs/heads/main"\|"HEAD"\|"refs/remotes/origin/main","tipOid":"<可选>"}`，不重复 |
 | `snapshotId` / `cursor` | 翻页时成对提交：首次请求省略，响应返回 `snapshotId` 与 `nextCursor` |
 | `limit` | 每页条数，1–200，默认 100 |
 
-响应：`{ ok, repositoryId, snapshotId, tips, commits, nextCursor }`，`commits[]` 含 `oid` / `parents` / `author` / `timestamp` / `subject` / `refs` / `refsDetail` / `tagsDetail`。引用在翻页期间移动、tip 失效、快照过期或游标非法返回 `409 graph-stale`；非法 tip 返回 `409 graph-tip-invalid`，超过 5 个返回 `400 graph-too-many-tips`。
+POST 请求体：`{"sessionId","repositoryId","tips":[...],"limit"?,"snapshotId"?,"cursor"?}`；续页可省略 `tips`，`snapshotId/cursor` 与 GET 互通（传输方式不参与快照身份）。POST body ≤256 KiB、每个 `name` ≤1024 B，超限 `413 payload-too-large`。`HEAD /git/graph` 返回 200 无 body，不创建快照。
+
+响应：`{ ok, repositoryId, snapshotId, tips, commits, nextCursor }`，`commits[]` 含 `oid` / `parents` / `author` / `timestamp` / `subject` / `refs` / `refsDetail` / `tagsDetail`。引用在翻页期间移动、tip 失效、快照过期或游标非法返回 `409 graph-stale`；非法 tip 返回 `409 graph-tip-invalid`；GET 超过 32 / POST 超过 128 返回 `400 graph-too-many-tips`（detail 声明对应上限）；服务端 25s deadline 返回 `504 graph-timeout`。
 
 #### 6.19.5 GET /m/api/git/commit
 
@@ -1130,12 +1134,14 @@ graph 的每个提交与 commit 详情都**保留旧的** `refs: string[]`（dep
 | 400 | `invalid-oid` / `invalid-files-cursor` / `invalid-history-cursor` | 非法 OID / 文件分页游标 / 历史分页游标 |
 | 400 | `path-invalid` | `/git/file-history` 传入目录路径 |
 | 400 | `preview-invalid` | 预览参数非法 |
-| 400 | `graph-tip-invalid` / `graph-too-many-tips` | 非法 tip / 超过 5 个 tip |
+| 400 | `graph-tip-invalid` / `graph-too-many-tips` | 非法 tip / GET 超过 32、POST 超过 128 tips |
 | 401 | `auth-required` / `bad-token` | 未鉴权（同 §1） |
 | 403 | `repository-not-authorized` / `workspace-not-allowed` | 会话/仓库不匹配或路径不在已注册工作区 |
 | 404 | `session-not-found` / `not-git-repository` / `preview-file-not-found` | 会话不存在 / cwd 不是仓库 / 提交中无该文件 |
 | 409 | `graph-stale` / `graph-tip-invalid` | 快照或 tip 已变化 |
-| 413 | `git-output-too-large` | Git 输出超过宿主上限（graph/commit/preview 的输出、`/git/files` 的 HEAD 路径总表，均为 8 MiB 级） |
+| 413 | `git-output-too-large` / `payload-too-large` | Git 输出超过宿主上限；POST graph body 超过 256 KiB 或单个 ref name 超过 1024 B |
+| 504 | `graph-timeout` | graph 25s deadline（任意阶段） |
+| 431 | —（HTTP） | GET URL 过长；新 App 在能力允许时自动改 POST 重试一次 |
 | 503 | `git-provider-unavailable` / `provider-incompatible` | provider 不可用 / 旧 provider 不支持所需方法 |
 
 #### 6.19.10 兼容与降级
