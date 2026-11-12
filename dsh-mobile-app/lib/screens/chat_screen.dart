@@ -4502,7 +4502,9 @@ class _ChatScreenState extends State<ChatScreen> {
     // 活动条不再重复同一工具；只保留过程块尚未承载的工具（或滚动离开底部时）。
     final tools = [
       for (final entry in _activeTools.entries)
-        if (!(plan != null && _pinnedToBottom && plan.renderedCallIds.contains(entry.key)))
+        if (!(plan != null &&
+            _pinnedToBottom &&
+            plan.visibleToolCallIds.contains(entry.key)))
           entry.value,
     ];
     if (reasoning.isEmpty && tools.isEmpty) return const SizedBox.shrink();
@@ -6079,6 +6081,9 @@ class _ChatScreenState extends State<ChatScreen> {
 
     final hosts = <int, List<_ProcessBlockPlan>>{};
     final renderedCallIds = <String>{};
+    // issue #84：真正渲染可见的运行中工具（segment 展开 + 组展开 + 未被分批隐藏），
+    // 仅用于活动条去重；renderedCallIds 仍表示「过程块承载」用于平铺卡抑制。
+    final visibleToolCallIds = <String>{};
     final anchoredTurns = <int>{};
     // 页脚需要「该轮最后一条助手消息」：只存 seq（渲染时再从当前列表取对象，
     // 避免反馈/详情原地替换后仍拿着旧对象）。
@@ -6169,6 +6174,26 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
           ];
         }
+        // issue #84：活动条去重只认「真正可见」的工具行——segment 展开（occupied）、
+        // 组展开（分组模式）、且 seq 在分批后的 visibleRowSeqs 内。
+        if (occupied) {
+          if (grouping) {
+            for (var gi = 0; gi < segment.groups.length; gi++) {
+              if (!groupExpandedFlags![gi]) continue;
+              for (final row in segment.groups[gi].rows) {
+                final callId = row.callId;
+                if (!row.isTool || callId == null) continue;
+                if (visibleRows.contains(row.seq)) visibleToolCallIds.add(callId);
+              }
+            }
+          } else {
+            for (final row in segment.rows) {
+              final callId = row.callId;
+              if (!row.isTool || callId == null) continue;
+              if (visibleRows.contains(row.seq)) visibleToolCallIds.add(callId);
+            }
+          }
+        }
         // provisional 可见条件：该轮最后一段、块可见；若该 step 已有组则组也必须展开。
         _ProvisionalSlot? slot;
         if (live != null &&
@@ -6256,6 +6281,7 @@ class _ChatScreenState extends State<ChatScreen> {
       epoch: _processEpoch,
       hostsBySeq: hosts,
       renderedCallIds: renderedCallIds,
+      visibleToolCallIds: visibleToolCallIds,
       anchoredTurns: anchoredTurns,
       assistantSeqByTurn: assistantSeqByTurn,
       provisionalRendered: provisionalRendered,
@@ -11259,6 +11285,12 @@ class _ProcessPlan {
   final int epoch;
   final Map<int, List<_ProcessBlockPlan>> hostsBySeq;
   final Set<String> renderedCallIds;
+
+  /// issue #84：真正渲染进可见过程块（展开段 + 展开组 + 未被分批隐藏）的工具 callId。
+  ///
+  /// 活动条只用它去重——`renderedCallIds` 包含被折叠/分批隐藏的行，会造成
+  /// 「活动条消失但界面上看不到该运行工具」的回归。
+  final Set<String> visibleToolCallIds;
   final Set<int> anchoredTurns;
 
   /// 该轮最后一条助手消息的 seq（渲染时再从当前列表取对象，见 `_currentAssistantItem`）。
@@ -11276,6 +11308,7 @@ class _ProcessPlan {
     required this.epoch,
     required this.hostsBySeq,
     required this.renderedCallIds,
+    required this.visibleToolCallIds,
     required this.anchoredTurns,
     required this.assistantSeqByTurn,
     this.provisionalRendered = false,
