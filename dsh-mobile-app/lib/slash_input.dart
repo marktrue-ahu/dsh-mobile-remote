@@ -18,13 +18,19 @@ enum SlashMenuScope {
 /// 当前光标处 `/` token。（[start] 指向 `/`，[query] 为 `/` 后的已输入部分。）
 class SlashToken {
   final int start;
+
+  /// 光标位置（query 右端）。
   final int end;
+
+  /// 整个 token 的右端（含光标右侧同一 token 的剩余字符）；替换/高亮用。
+  final int rightEnd;
   final String query;
   final SlashMenuScope scope;
 
   const SlashToken({
     required this.start,
     required this.end,
+    required this.rightEnd,
     required this.query,
     required this.scope,
   });
@@ -93,9 +99,14 @@ SlashToken? slashTokenAt(String text, [int? cursor]) {
   if (!_isSlashBoundary(text, slash)) return null;
   final query = text.substring(slash + 1, at);
   if (!_nameRe.hasMatch(query)) return null;
+  var rightEnd = at;
+  while (rightEnd < text.length && _isWordChar(text[rightEnd])) {
+    rightEnd++;
+  }
   return SlashToken(
     start: slash,
     end: at,
+    rightEnd: rightEnd,
     query: query,
     scope: slash == 0 ? SlashMenuScope.leading : SlashMenuScope.inline,
   );

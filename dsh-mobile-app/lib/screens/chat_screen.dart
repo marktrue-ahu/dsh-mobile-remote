@@ -33,6 +33,7 @@ import '../turn_outline.dart';
 import '../turn_tail.dart';
 import '../turn_file_actions.dart';
 import '../md.dart';
+import '../workspace_image_cache.dart';
 import '../fmt.dart';
 import '../image_gallery.dart';
 import '../git_browser_controller.dart';
@@ -359,6 +360,10 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
+/// issue #95：200 `unavailable:true` 的短 TTL（默认 30s；测试可注入更短值验证重试）。
+/// 不用永久空缓存，避免旧宿主/临时故障导致技能菜单一直缺失。
+Duration slashSkillsUnavailableTtl = const Duration(seconds: 30);
+
 class _ChatScreenState extends State<ChatScreen> {
   final _inputCtrl = TextEditingController();
   final _scrollCtrl = ScrollController();
@@ -429,16 +434,32 @@ class _ChatScreenState extends State<ChatScreen> {
   int _loadGeneration = 0; // 丢弃跨越 reset/会话切换的旧 history 响应
   // v2.7.2 review(M1)：本页绑定的会话（initState 时捕获）——事件按它过滤，叠层页面互不污染
   String? _mySessionId;
-  // issue #94：Markdown 本地图片加载器（稳定实例 → md.dart 缓存按 loader+路径复用）。
+  // issue #94/#95：Markdown 本地图片 loader；缓存/并发/会话隔离由本页 LRU 负责。
   late final MarkdownImageLoader _markdownImageLoader = _loadMarkdownImage;
+  late final WorkspaceImageCache _workspaceImageCache = WorkspaceImageCache();
 
   Future<MarkdownImageData> _loadMarkdownImage(String source) async {
     final id = _mySessionId;
     if (id == null || id.isEmpty) {
       throw ApiException('no-session', code: 'session-not-found');
     }
-    final data = await _api.workspaceImage(id, source);
-    return MarkdownImageData(bytes: data.bytes, contentType: data.contentType);
+    final bytes = await _workspaceImageCache.load(
+      '$id|$source',
+      () async {
+        final data = await _api.workspaceImage(id, source);
+        // 服务端 8MiB + 客户端二次校验（防旧宿主/中间层异常大响应）。
+        if (data.bytes.length > 8 * 1024 * 1024) {
+          throw ApiException(
+            'image too large',
+            code: 'image-too-large',
+            status: 413,
+          );
+        }
+        return data.bytes;
+      },
+      stillWanted: () => mounted && _mySessionId == id,
+    );
+    return MarkdownImageData(bytes: bytes);
   }
   Api get _api => widget.apiClient ?? api;
   String get _pageAgentStatus =>
@@ -600,6 +621,11 @@ class _ChatScreenState extends State<ChatScreen> {
   String? _slashCatalogSessionId;
   bool _slashCatalogLoading = false;
   bool _slashSkillsUnavailable = false;
+  DateTime? _slashSkillsUnavailableUntil;
+  Future<void>? _slashCatalogInFlight;
+  String? _slashCatalogInFlightId;
+  int _slashCatalogGeneration = 0;
+
   bool _slashCommandsUnavailable = false;
   SlashToken? _slashToken;
   bool _pickingImages = false; // 选图在途锁（相册多选期间防重复触发）
@@ -693,6 +719,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
+    _workspaceImageCache.clear();
     _draftTimer?.cancel();
     _activityTimer?.cancel();
     _queueRefreshTimer?.cancel();
@@ -3695,19 +3722,42 @@ class _ChatScreenState extends State<ChatScreen> {
     return list;
   }
 
-  /// issue #90：按会话并行取命令+技能目录（菜单/高亮/提交共用）。
-  /// 失败保留 null 以便下次重试；技能 unavailable 单独标记（旧宿主静默只显示命令）。
+  /// issue #90/#95：按会话并行取命令+技能目录（菜单/高亮/提交共用）。
+  ///
+  /// - 同会话 in-flight 复用同一个 Future（命令先回、技能延迟时提交等待，不误报未知）；
+  /// - 会话代际/加载代际变化时旧响应丢弃，不串会话；
+  /// - 200 `unavailable:true` 只短 TTL 缓存空（30s），到期重试；网络失败不缓存；
+  /// - 失败/超限不缓存，输入下一次可重试；in-flight 去重防风暴。
   Future<void> _ensureSlashCatalog(String id) async {
     if (id.isEmpty) return;
+    final now = DateTime.now();
+    // 空列表也可能是 unavailable 的 TTL 缓存；可用仅当「有真实技能列表」或
+    // 「unavailable TTL 尚未到期」，到期后必须重试。
+    final skillsUsable = (_slashSkills != null && !_slashSkillsUnavailable) ||
+        (_slashSkillsUnavailable &&
+            _slashSkillsUnavailableUntil != null &&
+            now.isBefore(_slashSkillsUnavailableUntil!));
     final cached = _slashCatalogSessionId == id;
-    if (cached &&
-        _slashCommands != null &&
-        (_slashSkills != null || _slashSkillsUnavailable)) {
+    if (cached && _slashCommands != null && skillsUsable) return;
+    final inFlight = _slashCatalogInFlight;
+    if (_slashCatalogInFlightId == id && inFlight != null) {
+      await inFlight;
       return;
     }
-    if (_slashCatalogLoading && cached) return;
+    final generation = ++_slashCatalogGeneration;
     _slashCatalogLoading = true;
-    _slashCatalogSessionId = id;
+    final future = _loadSlashCatalog(id, generation);
+    _slashCatalogInFlightId = id;
+    _slashCatalogInFlight = future;
+    try {
+      await future;
+    } finally {
+      if (_slashCatalogInFlightId == id) _slashCatalogInFlight = null;
+      if (generation == _slashCatalogGeneration) _slashCatalogLoading = false;
+    }
+  }
+
+  Future<void> _loadSlashCatalog(String id, int generation) async {
     final commandFuture = _slashCatalogSessionId == id && _slashCommands != null
         ? Future.value((_slashCommands!, false))
         : _api.commands(id);
@@ -3720,8 +3770,6 @@ class _ChatScreenState extends State<ChatScreen> {
       final (list, unavailable) = await commandFuture;
       commands = unavailable ? <Map<String, dynamic>>[] : list;
     } catch (_) {
-      // 命令服务失败：本会话按空目录处理（仍可正常发消息），但保留"取不到"标记，
-      // 提交时按既有行为放行普通发送、不误报未知命令。技能失败保留 null 以便重试。
       commands = <Map<String, dynamic>>[];
       commandsUnavailable = true;
     }
@@ -3734,16 +3782,19 @@ class _ChatScreenState extends State<ChatScreen> {
         skills = list;
       }
     } catch (_) {
-      skills = null; // 网络失败可重试；只有显式 unavailable 才缓存空
+      skills = null; // 网络失败可重试
     }
-    if (!mounted) return;
+    if (!mounted || generation != _slashCatalogGeneration) return;
     final current = _mySessionId ?? widget.store.sessionId;
-    _slashCatalogLoading = false;
-    if (current != id) return; // 切会话不串目录
+    if (current != id) return;
+    _slashCatalogSessionId = id;
     setState(() {
       _slashCommands = commands;
       _slashSkills = skills;
       _slashSkillsUnavailable = skillsUnavailable;
+      _slashSkillsUnavailableUntil = skillsUnavailable
+          ? DateTime.now().add(slashSkillsUnavailableTtl)
+          : null;
       _slashCommandsUnavailable = commandsUnavailable;
       if (commands != null) {
         _commandCatalog = commands;
@@ -3802,8 +3853,12 @@ class _ChatScreenState extends State<ChatScreen> {
     final token = _slashToken;
     if (token == null) return;
     final text = _inputCtrl.text;
-    final replacement = '/$name ';
-    final updated = text.replaceRange(token.start, token.end, replacement);
+    // issue #95：替换到 token 右端（保留光标右侧同 token 文本之后的内容），
+    // 而不是只替换到光标，避免 `/gr|ill-me rest` 变成 `/grill-me ill-me rest`。
+    // 若 token 后已紧跟空白，不再额外补空格（避免出现双空格）。
+    final tail = token.rightEnd < text.length ? text[token.rightEnd] : '';
+    final replacement = tail.isNotEmpty && tail.trim().isEmpty ? '/$name' : '/$name ';
+    final updated = text.replaceRange(token.start, token.rightEnd, replacement);
     _inputCtrl.value = TextEditingValue(
       text: updated,
       selection: TextSelection.collapsed(offset: token.start + replacement.length),
@@ -4752,6 +4807,7 @@ class _ChatScreenState extends State<ChatScreen> {
         widget.gitControllerFactory?.call(readApi) ??
         GitBrowserController(
           readApi,
+          graphPageSize: 16,
           branchLimit: widget.store.gitGraphBranchLimit,
         );
     _gitController = controller;

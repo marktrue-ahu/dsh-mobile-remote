@@ -35,13 +35,17 @@ class _Backend {
   _Backend({
     this.events = const [],
     this.skillsUnavailable = false,
+    this.skillsUnavailableOnce = false,
     this.skillsFailFirst = false,
     this.catalogGate,
+    this.skillsGate,
   });
   final List<Map<String, dynamic>> events;
   final bool skillsUnavailable;
+  final bool skillsUnavailableOnce;
   final bool skillsFailFirst;
   final Completer<void>? catalogGate;
+  final Completer<void>? skillsGate;
   final List<Map<String, dynamic>> sends = [];
   int commandRuns = 0;
   int skillRequests = 0;
@@ -86,7 +90,9 @@ class _Backend {
         return http.Response('boom', 500);
       }
       await catalogGate?.future;
-      if (skillsUnavailable) {
+      await skillsGate?.future;
+      if (skillsUnavailable ||
+          (skillsUnavailableOnce && skillRequests == 1)) {
         return reply({'ok': true, 'skills': <Object>[], 'unavailable': true});
       }
       return reply({'ok': true, 'skills': _skills});
@@ -385,6 +391,72 @@ void main() {
         tester.widget<Container>(find.byKey(const Key('slash-chip-command-compact'))).decoration
             as BoxDecoration;
     expect(decoration.border, isNotNull);
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('issue #95：中间光标插入替换整个 token，保留右侧文本/选择', (tester) async {
+    await _pumpChat(tester, _Backend());
+    tester.widget<TextField>(_input).controller!.value =
+        const TextEditingValue(
+      text: '/grill-me rest',
+      selection: TextSelection.collapsed(offset: 3),
+    );
+    await tester.pump(const Duration(milliseconds: 150));
+    expect(find.byKey(const Key('slash-menu-skill-grill-me')), findsOneWidget);
+    await tester.tap(find.byKey(const Key('slash-menu-skill-grill-me')));
+    await tester.pump(const Duration(milliseconds: 100));
+    final controller = tester.widget<TextField>(_input).controller!;
+    expect(controller.text, '/grill-me rest', reason: '保留 token 右侧文本，不重复后缀/空格');
+    expect(controller.selection.baseOffset, '/grill-me'.length);
+
+    // 非空选择同样不丢前后文本（光标 base 决定 token，右侧 token 整段替换）。
+    tester.widget<TextField>(_input).controller!.value =
+        const TextEditingValue(
+      text: 'pre /gr rest',
+      selection: TextSelection(baseOffset: 7, extentOffset: 9),
+    );
+    await tester.pump(const Duration(milliseconds: 150));
+    final skill = find.byKey(const Key('slash-menu-skill-grill-me'));
+    if (skill.evaluate().isNotEmpty) {
+      await tester.tap(skill);
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(controller.text, startsWith('pre /grill-me'), reason: '保留前置文本');
+      expect(controller.text, endsWith(' rest'), reason: '保留后置文本');
+    }
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('issue #95：命令先回/技能延迟时提交等待同一 in-flight，不误报未知命令', (tester) async {
+    final gate = Completer<void>();
+    final backend = _Backend(skillsGate: gate);
+    await _pumpChat(tester, backend);
+    await _type(tester, '/grill-me');
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(backend.sends, isEmpty, reason: '技能目录未回前不发送/不误报');
+    expect(backend.commandRuns, 0);
+    gate.complete();
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(backend.commandRuns, 0);
+    expect(backend.sends.single['text'], '/grill-me');
+    expect(backend.skillRequests, 1, reason: '同会话 in-flight 复用，不重复请求');
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('issue #95：200 unavailable 只短 TTL 缓存空，到期重试并恢复技能菜单', (tester) async {
+    final oldTtl = slashSkillsUnavailableTtl;
+    slashSkillsUnavailableTtl = const Duration(milliseconds: 30);
+    addTearDown(() => slashSkillsUnavailableTtl = oldTtl);
+    final backend = _Backend(skillsUnavailableOnce: true);
+    await _pumpChat(tester, backend);
+    await _type(tester, '/');
+    expect(find.byKey(const Key('slash-menu-command-compact')), findsOneWidget);
+    expect(find.byKey(const Key('slash-menu-skill-grill-me')), findsNothing);
+    await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 60)));
+    await _type(tester, '/gr');
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(backend.skillRequests, greaterThanOrEqualTo(2), reason: 'TTL 到期重试');
+    expect(find.byKey(const Key('slash-menu-skill-grill-me')), findsOneWidget);
     await tester.pumpWidget(const SizedBox());
   });
 
