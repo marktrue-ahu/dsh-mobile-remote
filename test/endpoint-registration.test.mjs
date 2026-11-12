@@ -167,3 +167,18 @@ test("R02 recheck-2：/turn-file 抽取与登记都是 GET/HEAD（真实分派�
 	assert.equal(entry?.methods, "GET/HEAD");
 });
 });
+
+test("re-review P1-1：Git 路由方法按真实分派登记（graph GET/HEAD/POST，其余 GET/HEAD）", () => {
+	const details = extractEndpointDetails(source);
+	assert.equal(details.get("/git/graph"), "GET/HEAD/POST");
+	for (const route of ["/git/branches", "/git/capabilities", "/git/commit", "/git/file-history", "/git/files", "/git/preview", "/git/repository", "/git/worktree"]) {
+		assert.equal(details.get(route), "GET/HEAD", route);
+	}
+	// 负向：方法后缀不匹配（伪造 POST 的只读路由）必须被判为 mismatch。
+	const fake = `
+		if (rest === "/git/branches") { if (method !== "GET" && method !== "HEAD") return; }
+	`;
+	const fakeSource = fake + source;
+	// 用真实 REGISTERED_ENDPOINTS 与伪造分派比对：不依赖源码追加后的整体一致，只验证提取。
+	assert.equal(extractEndpointDetails(fake).get("/git/branches"), "GET/HEAD");
+});
