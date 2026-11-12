@@ -1651,8 +1651,12 @@ class _ChatScreenState extends State<ChatScreen> {
       widget.store.refreshSessionConfig();
       // issue #25 二期：会话打开后拉一次轮次大纲（能力缺失/读取失败都退回一期行为）。
       unawaited(_refreshTurnOutline());
-      // issue #90：会话打开后并行取命令/技能目录（失败静默，下次输入重试）。
-      unawaited(_ensureSlashCatalog(id));
+      // issue #90：只有当前时间线里出现 slash 消息时才需要目录（避免普通会话多两次请求）；
+      // 输入 `/` 时也会触发。失败静默，下次输入/加载重试。
+      if (_items.any((m) =>
+          m.kind == _MsgKind.user && slashTextTokens(m.text).isNotEmpty)) {
+        unawaited(_ensureSlashCatalog(id));
+      }
     } catch (e) {
       if (!mounted || generation != _loadGeneration || id != _mySessionId) {
         return;
@@ -4138,6 +4142,9 @@ class _ChatScreenState extends State<ChatScreen> {
       _sending = true;
       if (!queued) _items.insert(0, _MsgItem.user(text)); // 最新在前：插入头部（视觉底部）
     });
+    if (slashTextTokens(text).isNotEmpty) {
+      unawaited(_ensureSlashCatalog(id));
+    }
     _inputCtrl.clear();
     _scrollToBottom(force: true);
     try {
