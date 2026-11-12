@@ -19,6 +19,13 @@ import 'plugin_update_status.dart';
 import 'update_core.dart';
 import 'version_alignment.dart';
 
+/// issue #94：/workspace-image 返回的图片字节。
+class WorkspaceImageData {
+  final Uint8List bytes;
+  final String? contentType;
+  const WorkspaceImageData({required this.bytes, this.contentType});
+}
+
 class ApiException implements Exception {
   final String message;
 
@@ -155,7 +162,22 @@ abstract interface class GitGraphPostApi {
   });
 }
 
-class Api implements GitReadApi, GitGraphPostApi {
+/// issue #93（全部分支模式）：all=true 的图请求只走 POST，固定页大小由宿主声明。
+/// 旧宿主/测试 fake 不实现本接口 → controller 回退现有 5/10/不限选择档。
+abstract interface class GitGraphAllApi {
+  Future<GitGraphPage> graphAll(
+    String sessionId,
+    String repositoryId, {
+    required bool all,
+    String? focus,
+    String? snapshotId,
+    String? cursor,
+    int limit = 16,
+    Duration timeout = const Duration(seconds: 35),
+  });
+}
+
+class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
   final http.Client _client;
 
   Api({http.Client? client}) : _client = client ?? http.Client();
@@ -1334,6 +1356,46 @@ class Api implements GitReadApi, GitGraphPostApi {
     });
   }
 
+  /// issue #94：只读工作区图片字节（本地 Markdown `![alt](path)`）。
+  ///
+  /// 只由服务端 `/workspace-image` 端点读取会话 cwd 内图片；客户端不直接读文件系统。
+  /// 失败抛 [ApiException]（UI 显示 alt + 可读原因）。
+  Future<WorkspaceImageData> workspaceImage(
+    String sessionId,
+    String path, {
+    Duration timeout = const Duration(seconds: 20),
+  }) async {
+    final uri = _uri(
+      '/api/workspace-image?sessionId=${Uri.encodeQueryComponent(sessionId)}'
+      '&path=${Uri.encodeQueryComponent(path)}',
+    );
+    final res = await _client
+        .get(uri, headers: {
+          if (token.isNotEmpty) 'x-mobile-token': token,
+          if (appVersion.isNotEmpty) 'x-mobile-app-version': appVersion,
+          'accept': 'image/*',
+        })
+        .timeout(timeout);
+    if (res.statusCode == 200) {
+      return WorkspaceImageData(
+        bytes: res.bodyBytes,
+        contentType: res.headers['content-type'],
+      );
+    }
+    Map<String, dynamic>? body;
+    try {
+      body = jsonDecode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
+    } catch (_) {}
+    throw ApiException(
+      (body?['detail'] as String?) ??
+          (body?['error'] as String?) ??
+          'HTTP ${res.statusCode}',
+      code: body?['error'] is String ? body!['error'] as String : null,
+      status: res.statusCode,
+      body: body,
+    );
+  }
+
   /// v2.8.0：斜杠命令目录（对齐 PC 端 ctx.commands）。
   /// v2.9.0 review(LOW#13)：返回 (命令列表, unavailable)——服务端 commands 服务缺失时
   /// unavailable=true，UI 应提示"命令服务不可用"而非"无可用命令"。
@@ -1343,6 +1405,18 @@ class Api implements GitReadApi, GitGraphPostApi {
     );
     return (
       (data['commands'] as List? ?? []).cast<Map<String, dynamic>>(),
+      data['unavailable'] == true,
+    );
+  }
+
+  /// issue #90：技能目录（GET /api/skills）。
+  /// 返回 (技能列表, unavailable)——旧宿主/目录不可用时 unavailable=true，UI 静默只显示命令。
+  Future<(List<Map<String, dynamic>>, bool)> skills(String sessionId) async {
+    final data = await getJson(
+      '/api/skills?sessionId=${Uri.encodeQueryComponent(sessionId)}',
+    );
+    return (
+      (data['skills'] as List? ?? []).cast<Map<String, dynamic>>(),
       data['unavailable'] == true,
     );
   }
@@ -1839,6 +1913,33 @@ class Api implements GitReadApi, GitGraphPostApi {
         'sessionId': sessionId,
         'repositoryId': repositoryId,
         'tips': [for (final tip in tips) tip.toJson()],
+        'limit': limit,
+        'snapshotId': ?snapshotId,
+        'cursor': ?cursor,
+      },
+      timeout: timeout,
+    ),
+  );
+
+  /// issue #93：全部分支图（all=true，仅 POST；忽略 tips 选择集）。
+  @override
+  Future<GitGraphPage> graphAll(
+    String sessionId,
+    String repositoryId, {
+    required bool all,
+    String? focus,
+    String? snapshotId,
+    String? cursor,
+    int limit = 16,
+    Duration timeout = const Duration(seconds: 35),
+  }) async => GitGraphPage.fromJson(
+    await postJson(
+      '/api/git/graph',
+      {
+        'sessionId': sessionId,
+        'repositoryId': repositoryId,
+        'all': all,
+        'focus': ?focus,
         'limit': limit,
         'snapshotId': ?snapshotId,
         'cursor': ?cursor,

@@ -136,6 +136,7 @@ class _SessionFilesScreenState extends State<SessionFilesScreen> {
     }
     final controller = GitBrowserController(
       _gitApi,
+      graphPageSize: 16,
       branchLimit: widget.store.gitGraphBranchLimit,
     );
     unawaited(controller.open(widget.sessionId));

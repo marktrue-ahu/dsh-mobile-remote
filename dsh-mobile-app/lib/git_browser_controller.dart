@@ -18,6 +18,13 @@ class GitBrowserState {
   final List<GitCommitSummary> commits;
   final String? snapshotId;
   final String? graphNextCursor;
+
+  /// issue #93：全部分支模式状态。prevCursor 指向更**新**一页；focus/pageStart 用于
+  /// 首屏定位当前分支 HEAD 所在页；graphAll=true 表示当前图来自 all 快照。
+  final String? graphPrevCursor;
+  final String? graphFocusOid;
+  final int? graphPageStart;
+  final bool graphAll;
   final GitCommitDetails? commit;
   final GitWorktreeSnapshot? worktree;
   final bool loadingWorktree;
@@ -42,6 +49,9 @@ class GitBrowserState {
   /// re-review P1-3：**分页** append 超时——保留已加载 commits，页级重试，不替换整图。
   final bool graphPageTimedOut;
 
+  /// issue #95：分页超时方向（true=更新页/顶部；false=更旧页/底部），供 UI 单侧重试。
+  final bool graphPageTimedOutNewer;
+
   const GitBrowserState({
     this.sessionId,
     this.capabilities,
@@ -52,6 +62,10 @@ class GitBrowserState {
     this.commits = const [],
     this.snapshotId,
     this.graphNextCursor,
+    this.graphPrevCursor,
+    this.graphFocusOid,
+    this.graphPageStart,
+    this.graphAll = false,
     this.commit,
     this.worktree,
     this.loadingWorktree = false,
@@ -69,6 +83,7 @@ class GitBrowserState {
     this.branchLimit = GitGraphBranchLimit.fallback,
     this.graphTimedOut = false,
     this.graphPageTimedOut = false,
+    this.graphPageTimedOutNewer = false,
   });
 
   List<GitBranch> get filteredBranches {
@@ -91,6 +106,10 @@ class GitBrowserState {
     List<GitCommitSummary>? commits,
     Object? snapshotId = _keep,
     Object? graphNextCursor = _keep,
+    Object? graphPrevCursor = _keep,
+    Object? graphFocusOid = _keep,
+    Object? graphPageStart = _keep,
+    bool? graphAll,
     Object? commit = _keep,
     Object? worktree = _keep,
     bool? loadingWorktree,
@@ -108,6 +127,7 @@ class GitBrowserState {
     GitGraphBranchLimit? branchLimit,
     bool? graphTimedOut,
     bool? graphPageTimedOut,
+    bool? graphPageTimedOutNewer,
   }) => GitBrowserState(
     sessionId: identical(sessionId, _keep)
         ? this.sessionId
@@ -130,6 +150,16 @@ class GitBrowserState {
     graphNextCursor: identical(graphNextCursor, _keep)
         ? this.graphNextCursor
         : graphNextCursor as String?,
+    graphPrevCursor: identical(graphPrevCursor, _keep)
+        ? this.graphPrevCursor
+        : graphPrevCursor as String?,
+    graphFocusOid: identical(graphFocusOid, _keep)
+        ? this.graphFocusOid
+        : graphFocusOid as String?,
+    graphPageStart: identical(graphPageStart, _keep)
+        ? this.graphPageStart
+        : graphPageStart as int?,
+    graphAll: graphAll ?? this.graphAll,
     commit: identical(commit, _keep)
         ? this.commit
         : commit as GitCommitDetails?,
@@ -157,6 +187,8 @@ class GitBrowserState {
     branchLimit: branchLimit ?? this.branchLimit,
     graphTimedOut: graphTimedOut ?? this.graphTimedOut,
     graphPageTimedOut: graphPageTimedOut ?? this.graphPageTimedOut,
+    graphPageTimedOutNewer:
+        graphPageTimedOutNewer ?? this.graphPageTimedOutNewer,
   );
 }
 
@@ -165,7 +197,7 @@ const _keep = Object();
 class GitBrowserController extends ChangeNotifier {
   GitBrowserController(
     this._api, {
-    this.graphPageSize = 100,
+    this.graphPageSize = 16,
     this.filesPageSize = 100,
     GitGraphBranchLimit branchLimit = GitGraphBranchLimit.fallback,
     this.graphLoadTimeout = const Duration(seconds: 30),
@@ -188,6 +220,7 @@ class GitBrowserController extends ChangeNotifier {
   int _worktreeCheckGeneration = 0;
   int _previewGeneration = 0;
   Future<void>? _graphPageRequest;
+  bool _graphPageWantedNewer = false;
   Future<void>? _filesPageRequest;
   bool _disposed = false;
 
@@ -197,6 +230,18 @@ class GitBrowserController extends ChangeNotifier {
 
   /// task-28：可选 POST 能力（旧宿主/旧 fake 不实现 → GET）。
   GitGraphPostApi? get _postApi => _api is GitGraphPostApi ? _api as GitGraphPostApi : null;
+
+  /// issue #93：可选全部分支能力（旧宿主/旧 fake 不实现 → 回退选择档）。
+  GitGraphAllApi? get _allApi => _api is GitGraphAllApi ? _api as GitGraphAllApi : null;
+
+  /// issue #93：不限档 + 宿主声明 graphAll → 真正的全部分支模式。
+  bool get graphAllMode =>
+      _branchLimit.isUnlimited &&
+      (_state.capabilities?.graphAll ?? false) &&
+      _allApi != null;
+
+  int get graphAllPageSize =>
+      _state.capabilities?.graphAllPageSize ?? graphPageSize;
 
   /// 宿主声明的 GET/POST tips 上限；capability 缺失按旧宿主 5/5。
   int get _graphGetMax =>
@@ -305,6 +350,10 @@ class GitBrowserController extends ChangeNotifier {
         commits: const [],
         snapshotId: null,
         graphNextCursor: null,
+        graphPrevCursor: null,
+        graphFocusOid: null,
+        graphPageStart: null,
+        graphAll: false,
         loadingGraph: selected.isNotEmpty,
         loadingGraphPage: false,
         graphTimedOut: false,
@@ -320,11 +369,13 @@ class GitBrowserController extends ChangeNotifier {
 
   /// issue #86：重试一次 graph（超时面板「重试」）。
   Future<void> retryGraphLoad() async {
-    if (_state.sessionId == null ||
-        _state.repository == null ||
-        _state.selectedBranches.isEmpty) {
+    if (_state.sessionId == null || _state.repository == null) return;
+    // issue #95：all 模式重试必须回到 all=true + focus 当前分支，绝不回退选择集。
+    if (graphAllMode) {
+      await openAllGraph(focus: _state.repository?.currentBranch);
       return;
     }
+    if (_state.selectedBranches.isEmpty) return;
     final graphGeneration = ++_graphGeneration;
     _cancelGraphTimeout();
     _emit(
@@ -332,6 +383,10 @@ class GitBrowserController extends ChangeNotifier {
         commits: const [],
         snapshotId: null,
         graphNextCursor: null,
+        graphPrevCursor: null,
+        graphFocusOid: null,
+        graphPageStart: null,
+        graphAll: false,
         loadingGraph: true,
         graphTimedOut: false,
         graphPageTimedOut: false,
@@ -396,6 +451,10 @@ class GitBrowserController extends ChangeNotifier {
         commits: const [],
         snapshotId: null,
         graphNextCursor: null,
+        graphPrevCursor: null,
+        graphFocusOid: null,
+        graphPageStart: null,
+        graphAll: false,
         commit: null,
         loadingGraph: true,
         graphTimedOut: false,
@@ -425,6 +484,10 @@ class GitBrowserController extends ChangeNotifier {
         commits: const [],
         snapshotId: null,
         graphNextCursor: null,
+        graphPrevCursor: null,
+        graphFocusOid: null,
+        graphPageStart: null,
+        graphAll: false,
         commit: null,
         loadingGraph: false,
         loadingGraphPage: false,
@@ -625,6 +688,10 @@ class GitBrowserController extends ChangeNotifier {
         commits: const [],
         snapshotId: null,
         graphNextCursor: null,
+        graphPrevCursor: null,
+        graphFocusOid: null,
+        graphPageStart: null,
+        graphAll: false,
         commit: null,
         loadingGraph: true,
         graphTimedOut: false,
@@ -657,6 +724,10 @@ class GitBrowserController extends ChangeNotifier {
             commits: const [],
             snapshotId: null,
             graphNextCursor: null,
+            graphPrevCursor: null,
+            graphFocusOid: null,
+            graphPageStart: null,
+            graphAll: false,
             commit: null,
             loadingGraph: false,
             loadingGraphPage: false,
@@ -683,6 +754,10 @@ class GitBrowserController extends ChangeNotifier {
         commits: const [],
         snapshotId: null,
         graphNextCursor: null,
+        graphPrevCursor: null,
+        graphFocusOid: null,
+        graphPageStart: null,
+        graphAll: false,
         commit: null,
         loadingGraph: true,
         graphTimedOut: false,
@@ -796,6 +871,7 @@ class GitBrowserController extends ChangeNotifier {
           loadingGraphPage: false,
           graphTimedOut: false,
           graphPageTimedOut: false,
+          graphPageTimedOutNewer: false,
           stale: false,
           error: null,
         ),
@@ -817,6 +893,7 @@ class GitBrowserController extends ChangeNotifier {
             loadingGraph: false,
             loadingGraphPage: false,
             graphPageTimedOut: true,
+            graphPageTimedOutNewer: false,
             loading: false,
             stale: _state.stale,
             error: null,
@@ -841,6 +918,7 @@ class GitBrowserController extends ChangeNotifier {
           loadingGraph: false,
           loadingGraphPage: false,
           graphPageTimedOut: false,
+          graphPageTimedOutNewer: false,
           stale: graphStale ? true : _state.stale,
           error: graphStale ? 'graph-stale' : (code ?? error.toString()),
         ),
@@ -850,14 +928,51 @@ class GitBrowserController extends ChangeNotifier {
 
   /// re-review P1-3：分页超时后的页级重试（不重载整图）。
   Future<void> retryGraphPage() async {
+    if (graphAllMode) {
+      if (_graphPageWantedNewer ? _state.graphPrevCursor == null : _state.graphNextCursor == null) return;
+      _graphPageRequest = null;
+      _emit(_state.copyWith(
+        graphPageTimedOut: false,
+        graphPageTimedOutNewer: false,
+        error: null,
+      ));
+      await (_graphPageWantedNewer ? loadPrevGraphPage() : loadNextGraphPage());
+      return;
+    }
     if (_state.graphNextCursor == null) return;
     _graphPageRequest = null;
-    _emit(_state.copyWith(graphPageTimedOut: false, error: null));
+    _emit(_state.copyWith(
+      graphPageTimedOut: false,
+      graphPageTimedOutNewer: false,
+      error: null,
+    ));
     await loadNextGraphPage();
+  }
+
+  /// issue #93：加载更**新**一页（全部分支模式向左/上拖）。
+  Future<void> loadPrevGraphPage() {
+    if (_graphPageRequest != null) return _graphPageRequest!;
+    if (!graphAllMode ||
+        _state.stale ||
+        _state.graphPrevCursor == null ||
+        _state.loadingGraphPage ||
+        _state.graphPageTimedOut) {
+      return Future.value();
+    }
+    return _requestAllGraphPage(newer: true);
   }
 
   Future<void> loadNextGraphPage() {
     if (_graphPageRequest != null) return _graphPageRequest!;
+    if (graphAllMode) {
+      if (_state.stale ||
+          _state.graphNextCursor == null ||
+          _state.loadingGraphPage ||
+          _state.graphPageTimedOut) {
+        return Future.value();
+      }
+      return _requestAllGraphPage(newer: false);
+    }
     if (_state.stale ||
         _state.graphNextCursor == null ||
         _state.loadingGraphPage ||
@@ -888,6 +1003,167 @@ class GitBrowserController extends ChangeNotifier {
         });
     _graphPageRequest = request;
     return request;
+  }
+
+  /// issue #93：打开全部分支图（首页或 focus 页）。
+  Future<void> openAllGraph({String? focus}) async {
+    if (!graphAllMode) return;
+    final generation = _generation;
+    final graphGeneration = ++_graphGeneration;
+    _graphPageRequest = null;
+    _commitGeneration++;
+    _filesPageRequest = null;
+    _emit(_state.copyWith(
+      commits: const [],
+      snapshotId: null,
+      graphNextCursor: null,
+      graphPrevCursor: null,
+      graphFocusOid: null,
+      graphPageStart: null,
+      graphAll: true,
+      commit: null,
+      loadingGraph: true,
+      loadingGraphPage: false,
+      graphTimedOut: false,
+      graphPageTimedOut: false,
+      graphPageTimedOutNewer: false,
+      stale: false,
+      error: null,
+    ));
+    _armGraphTimeout(generation, graphGeneration);
+    await _loadAllGraphPage(
+      generation: generation,
+      graphGeneration: graphGeneration,
+      initial: true,
+      newer: false,
+      focus: focus ?? _state.repository?.currentBranch,
+    );
+  }
+
+  Future<void> _requestAllGraphPage({required bool newer}) {
+    final generation = _generation;
+    final graphGeneration = _graphGeneration;
+    _graphPageWantedNewer = newer;
+    _emit(_state.copyWith(
+      loadingGraphPage: true,
+      graphPageTimedOut: false,
+      error: null,
+    ));
+    late final Future<void> request;
+    request = _loadAllGraphPage(
+      generation: generation,
+      graphGeneration: graphGeneration,
+      initial: false,
+      newer: newer,
+    ).whenComplete(() {
+      if (identical(_graphPageRequest, request)) _graphPageRequest = null;
+      if (generation == _generation &&
+          graphGeneration == _graphGeneration &&
+          _state.loadingGraphPage) {
+        _emit(_state.copyWith(loadingGraphPage: false));
+      }
+    });
+    _graphPageRequest = request;
+    return request;
+  }
+
+  Future<void> _loadAllGraphPage({
+    required int generation,
+    required int graphGeneration,
+    required bool initial,
+    required bool newer,
+    String? focus,
+  }) async {
+    final sessionId = _state.sessionId;
+    final repository = _state.repository;
+    final api = _allApi;
+    if (sessionId == null || repository == null || api == null) return;
+    final cursor = initial
+        ? null
+        : (newer ? _state.graphPrevCursor : _state.graphNextCursor);
+    final snapshotId = initial ? null : _state.snapshotId;
+    try {
+      final page = await api.graphAll(
+        sessionId,
+        repository.repositoryId,
+        all: true,
+        focus: initial ? focus : null,
+        snapshotId: snapshotId,
+        cursor: cursor,
+        limit: graphAllPageSize,
+        timeout: const Duration(seconds: 35),
+      );
+      if (generation != _generation || graphGeneration != _graphGeneration) {
+        return;
+      }
+      _cancelGraphTimeout();
+      final existing = _state.commits;
+      final List<GitCommitSummary> commits;
+      if (initial) {
+        commits = page.commits;
+      } else if (newer) {
+        final seen = {for (final commit in existing) commit.oid};
+        commits = [
+          ...page.commits.where((commit) => seen.add(commit.oid)),
+          ...existing,
+        ];
+      } else {
+        final seen = {for (final commit in existing) commit.oid};
+        commits = [
+          ...existing,
+          ...page.commits.where((commit) => seen.add(commit.oid)),
+        ];
+      }
+      _emit(_state.copyWith(
+        commits: commits,
+        snapshotId: page.snapshotId,
+        // issue #95（#93 review）：older 页只更新 next、newer 页只更新 prev；
+        // 不能用响应里的另一侧 cursor 覆盖当前浏览方向已加载页的锚点。
+        graphNextCursor: initial
+            ? page.nextCursor
+            : (newer ? _state.graphNextCursor : page.nextCursor),
+        graphPrevCursor: initial
+            ? page.prevCursor
+            : (newer ? page.prevCursor : _state.graphPrevCursor),
+        graphFocusOid: initial ? page.focusOid : _state.graphFocusOid,
+        graphPageStart: initial ? page.pageStart : _state.graphPageStart,
+        graphAll: true,
+        loadingGraph: false,
+        loadingGraphPage: false,
+        graphTimedOut: false,
+        graphPageTimedOut: false,
+        graphPageTimedOutNewer: false,
+        stale: false,
+        error: null,
+      ));
+    } catch (error) {
+      if (generation != _generation || graphGeneration != _graphGeneration) {
+        return;
+      }
+      _cancelGraphTimeout();
+      final apiError = error is ApiException ? error : null;
+      final code = apiError?.code;
+      final timedOut = apiError?.status == 504 || code == 'graph-timeout';
+      if (!initial && timedOut) {
+        _emit(_state.copyWith(
+          loadingGraph: false,
+          loadingGraphPage: false,
+          graphPageTimedOut: true,
+          graphPageTimedOutNewer: newer,
+          error: null,
+        ));
+        return;
+      }
+      _emit(_state.copyWith(
+        loadingGraph: false,
+        loadingGraphPage: false,
+        graphTimedOut: initial && timedOut,
+        graphPageTimedOut: false,
+        graphPageTimedOutNewer: false,
+        stale: code == 'graph-stale' ? true : _state.stale,
+        error: code == 'graph-stale' ? 'graph-stale' : (code ?? error.toString()),
+      ));
+    }
   }
 
   Future<void> openCommit(String oid) async {

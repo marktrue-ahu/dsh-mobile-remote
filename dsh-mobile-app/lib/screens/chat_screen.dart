@@ -21,6 +21,7 @@ import '../resumable_download.dart';
 import '../logger.dart';
 import '../l10n.dart';
 import '../models.dart';
+import '../slash_input.dart';
 import '../store.dart';
 import '../timeline.dart';
 import '../theme.dart';
@@ -32,6 +33,7 @@ import '../turn_outline.dart';
 import '../turn_tail.dart';
 import '../turn_file_actions.dart';
 import '../md.dart';
+import '../workspace_image_cache.dart';
 import '../fmt.dart';
 import '../image_gallery.dart';
 import '../git_browser_controller.dart';
@@ -358,6 +360,10 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
+/// issue #95：200 `unavailable:true` 的短 TTL（默认 30s；测试可注入更短值验证重试）。
+/// 不用永久空缓存，避免旧宿主/临时故障导致技能菜单一直缺失。
+Duration slashSkillsUnavailableTtl = const Duration(seconds: 30);
+
 class _ChatScreenState extends State<ChatScreen> {
   final _inputCtrl = TextEditingController();
   final _scrollCtrl = ScrollController();
@@ -428,6 +434,33 @@ class _ChatScreenState extends State<ChatScreen> {
   int _loadGeneration = 0; // 丢弃跨越 reset/会话切换的旧 history 响应
   // v2.7.2 review(M1)：本页绑定的会话（initState 时捕获）——事件按它过滤，叠层页面互不污染
   String? _mySessionId;
+  // issue #94/#95：Markdown 本地图片 loader；缓存/并发/会话隔离由本页 LRU 负责。
+  late final MarkdownImageLoader _markdownImageLoader = _loadMarkdownImage;
+  late final WorkspaceImageCache _workspaceImageCache = WorkspaceImageCache();
+
+  Future<MarkdownImageData> _loadMarkdownImage(String source) async {
+    final id = _mySessionId;
+    if (id == null || id.isEmpty) {
+      throw ApiException('no-session', code: 'session-not-found');
+    }
+    final bytes = await _workspaceImageCache.load(
+      '$id|$source',
+      () async {
+        final data = await _api.workspaceImage(id, source);
+        // 服务端 8MiB + 客户端二次校验（防旧宿主/中间层异常大响应）。
+        if (data.bytes.length > 8 * 1024 * 1024) {
+          throw ApiException(
+            'image too large',
+            code: 'image-too-large',
+            status: 413,
+          );
+        }
+        return data.bytes;
+      },
+      stillWanted: () => mounted && _mySessionId == id,
+    );
+    return MarkdownImageData(bytes: bytes);
+  }
   Api get _api => widget.apiClient ?? api;
   String get _pageAgentStatus =>
       widget.store.agentStatusForSession(_mySessionId);
@@ -581,6 +614,20 @@ class _ChatScreenState extends State<ChatScreen> {
   // ⊕ 菜单取回目录时同步刷新；`command-not-found`（目录过期）时丢弃、下次提交重新拉取。
   List<Map<String, dynamic>>? _commandCatalog;
   String? _commandCatalogSessionId;
+  // issue #90：斜杠菜单/高亮共用目录（命令沿用 /commands，技能新增 /api/skills）。
+  // 按 session 缓存；失败保持 null 以便下次重试；技能 unavailable 用标志区分。
+  List<Map<String, dynamic>>? _slashCommands;
+  List<Map<String, dynamic>>? _slashSkills;
+  String? _slashCatalogSessionId;
+  bool _slashCatalogLoading = false;
+  bool _slashSkillsUnavailable = false;
+  DateTime? _slashSkillsUnavailableUntil;
+  Future<void>? _slashCatalogInFlight;
+  String? _slashCatalogInFlightId;
+  int _slashCatalogGeneration = 0;
+
+  bool _slashCommandsUnavailable = false;
+  SlashToken? _slashToken;
   bool _pickingImages = false; // 选图在途锁（相册多选期间防重复触发）
   GitBrowserController? _gitController;
 
@@ -661,11 +708,18 @@ class _ChatScreenState extends State<ChatScreen> {
   void _onDraftChanged() {
     final sid = _mySessionId;
     if (sid != null) widget.store.saveDraft(sid, _inputCtrl.text);
-    if (mounted) setState(() {});
+    final token = slashTokenAt(
+      _inputCtrl.text,
+      _inputCtrl.selection.baseOffset,
+    );
+    if (mounted) setState(() => _slashToken = token);
+    // 输入 / 时并行取命令+技能目录（失败不阻塞输入；下次输入可重试）。
+    if (token != null && sid != null) unawaited(_ensureSlashCatalog(sid));
   }
 
   @override
   void dispose() {
+    _workspaceImageCache.clear();
     _draftTimer?.cancel();
     _activityTimer?.cancel();
     _queueRefreshTimer?.cancel();
@@ -1635,6 +1689,12 @@ class _ChatScreenState extends State<ChatScreen> {
       widget.store.refreshSessionConfig();
       // issue #25 二期：会话打开后拉一次轮次大纲（能力缺失/读取失败都退回一期行为）。
       unawaited(_refreshTurnOutline());
+      // issue #90：只有当前时间线里出现 slash 消息时才需要目录（避免普通会话多两次请求）；
+      // 输入 `/` 时也会触发。失败静默，下次输入/加载重试。
+      if (_items.any((m) =>
+          m.kind == _MsgKind.user && slashTextTokens(m.text).isNotEmpty)) {
+        unawaited(_ensureSlashCatalog(id));
+      }
     } catch (e) {
       if (!mounted || generation != _loadGeneration || id != _mySessionId) {
         return;
@@ -2163,6 +2223,7 @@ class _ChatScreenState extends State<ChatScreen> {
                       text: _draft,
                       streaming: true,
                       api: _api,
+                      imageLoader: _markdownImageLoader,
                     );
                   }
                   return const SizedBox.shrink();
@@ -3641,13 +3702,343 @@ class _ChatScreenState extends State<ChatScreen> {
   /// （`GET /api/commands`）并缓存——目录在会话生命周期内基本不变，没必要每条命令消息都多一次往返。
   /// 服务未提供时得到空目录（等同于"所有名字都未注册"，照常按普通消息发送，不阻塞）。
   Future<List<Map<String, dynamic>>> _commandCatalogFor(String id) async {
+    // issue #90：与斜杠菜单共用目录缓存，避免同一会话重复 GET /commands。
+    if (_slashCatalogSessionId == id && _slashCommands != null) {
+      if (_slashCommandsUnavailable) {
+        throw ApiException('commands catalog unavailable', code: 'session-not-found');
+      }
+      _commandCatalog = _slashCommands;
+      _commandCatalogSessionId = id;
+      return _slashCommands!;
+    }
     final cached = _commandCatalog;
     if (cached != null && _commandCatalogSessionId == id) return cached;
     final (cmds, unavailable) = await _api.commands(id);
     final list = unavailable ? <Map<String, dynamic>>[] : cmds;
     _commandCatalog = list;
     _commandCatalogSessionId = id;
+    _slashCommands = list;
+    _slashCatalogSessionId = id;
     return list;
+  }
+
+  /// issue #90/#95：按会话并行取命令+技能目录（菜单/高亮/提交共用）。
+  ///
+  /// - 同会话 in-flight 复用同一个 Future（命令先回、技能延迟时提交等待，不误报未知）；
+  /// - 会话代际/加载代际变化时旧响应丢弃，不串会话；
+  /// - 200 `unavailable:true` 只短 TTL 缓存空（30s），到期重试；网络失败不缓存；
+  /// - 失败/超限不缓存，输入下一次可重试；in-flight 去重防风暴。
+  Future<void> _ensureSlashCatalog(String id) async {
+    if (id.isEmpty) return;
+    final now = DateTime.now();
+    // 空列表也可能是 unavailable 的 TTL 缓存；可用仅当「有真实技能列表」或
+    // 「unavailable TTL 尚未到期」，到期后必须重试。
+    final skillsUsable = (_slashSkills != null && !_slashSkillsUnavailable) ||
+        (_slashSkillsUnavailable &&
+            _slashSkillsUnavailableUntil != null &&
+            now.isBefore(_slashSkillsUnavailableUntil!));
+    final cached = _slashCatalogSessionId == id;
+    if (cached && _slashCommands != null && skillsUsable) return;
+    final inFlight = _slashCatalogInFlight;
+    if (_slashCatalogInFlightId == id && inFlight != null) {
+      await inFlight;
+      return;
+    }
+    final generation = ++_slashCatalogGeneration;
+    _slashCatalogLoading = true;
+    final future = _loadSlashCatalog(id, generation);
+    _slashCatalogInFlightId = id;
+    _slashCatalogInFlight = future;
+    try {
+      await future;
+    } finally {
+      if (_slashCatalogInFlightId == id) _slashCatalogInFlight = null;
+      if (generation == _slashCatalogGeneration) _slashCatalogLoading = false;
+    }
+  }
+
+  Future<void> _loadSlashCatalog(String id, int generation) async {
+    final commandFuture = _slashCatalogSessionId == id && _slashCommands != null
+        ? Future.value((_slashCommands!, false))
+        : _api.commands(id);
+    final skillsFuture = _api.skills(id);
+    List<Map<String, dynamic>>? commands;
+    List<Map<String, dynamic>>? skills;
+    var skillsUnavailable = false;
+    var commandsUnavailable = false;
+    try {
+      final (list, unavailable) = await commandFuture;
+      commands = unavailable ? <Map<String, dynamic>>[] : list;
+    } catch (_) {
+      commands = <Map<String, dynamic>>[];
+      commandsUnavailable = true;
+    }
+    try {
+      final (list, unavailable) = await skillsFuture;
+      if (unavailable) {
+        skills = <Map<String, dynamic>>[];
+        skillsUnavailable = true;
+      } else {
+        skills = list;
+      }
+    } catch (_) {
+      skills = null; // 网络失败可重试
+    }
+    if (!mounted || generation != _slashCatalogGeneration) return;
+    final current = _mySessionId ?? widget.store.sessionId;
+    if (current != id) return;
+    _slashCatalogSessionId = id;
+    setState(() {
+      _slashCommands = commands;
+      _slashSkills = skills;
+      _slashSkillsUnavailable = skillsUnavailable;
+      _slashSkillsUnavailableUntil = skillsUnavailable
+          ? DateTime.now().add(slashSkillsUnavailableTtl)
+          : null;
+      _slashCommandsUnavailable = commandsUnavailable;
+      if (commands != null) {
+        _commandCatalog = commands;
+        _commandCatalogSessionId = id;
+      }
+    });
+  }
+
+  /// 当前会话技能名（不可用/未加载时返回 null）。
+  Future<List<Map<String, dynamic>>?> _skillCatalogFor(String id) async {
+    await _ensureSlashCatalog(id);
+    return _slashSkills;
+  }
+
+  /// issue #90：菜单条目（命令组前、技能组后；命令同名优先）。
+  List<({String name, String? description, String? hint, bool skill, bool userOnly})>
+      _slashMenuEntries() {
+    final token = _slashToken;
+    if (token == null) return const [];
+    final commands = token.scope == SlashMenuScope.leading
+        ? (_slashCommands ?? const <Map<String, dynamic>>[])
+        : const <Map<String, dynamic>>[];
+    final commandNames = {
+      for (final c in commands)
+        if (c['name'] is String) c['name'] as String,
+    };
+    final entries = <({String name, String? description, String? hint, bool skill, bool userOnly})>[];
+    for (final c in commands) {
+      final name = c['name'];
+      if (name is! String || !slashItemMatches(token.query, name, c['description']?.toString())) continue;
+      entries.add((
+        name: name,
+        description: c['description']?.toString(),
+        hint: commandMenuSubtitle(c),
+        skill: false,
+        userOnly: false,
+      ));
+    }
+    for (final skill in _slashSkills ?? const <Map<String, dynamic>>[]) {
+      final name = skill['name'];
+      if (name is! String || commandNames.contains(name)) continue;
+      if (!slashItemMatches(token.query, name, skill['description']?.toString())) continue;
+      entries.add((
+        name: name,
+        description: skill['description']?.toString(),
+        hint: skill['whenToUse']?.toString(),
+        skill: true,
+        userOnly: skill['modelInvocable'] == false,
+      ));
+    }
+    return entries;
+  }
+
+  /// issue #90：点选只插入 `/name `（不自动发送/执行）。
+  void _insertSlash(String name) {
+    final token = _slashToken;
+    if (token == null) return;
+    final text = _inputCtrl.text;
+    // issue #95：替换到 token 右端（保留光标右侧同 token 文本之后的内容），
+    // 而不是只替换到光标，避免 `/gr|ill-me rest` 变成 `/grill-me ill-me rest`。
+    // 若 token 后已紧跟空白，不再额外补空格（避免出现双空格）。
+    final tail = token.rightEnd < text.length ? text[token.rightEnd] : '';
+    final replacement = tail.isNotEmpty && tail.trim().isEmpty ? '/$name' : '/$name ';
+    final updated = text.replaceRange(token.start, token.rightEnd, replacement);
+    _inputCtrl.value = TextEditingValue(
+      text: updated,
+      selection: TextSelection.collapsed(offset: token.start + replacement.length),
+    );
+    setState(() => _slashToken = null);
+  }
+
+  void _refreshSlashToken() {
+    final token = slashTokenAt(
+      _inputCtrl.text,
+      _inputCtrl.selection.baseOffset,
+    );
+    if (mounted) setState(() => _slashToken = token);
+  }
+
+  /// issue #90：输入框上方内联菜单（命令组前、技能组后；空 query 分组）。
+  Widget _buildSlashMenu() {
+    final entries = _slashMenuEntries();
+    final context = this.context;
+    final ink3 = DshColors.ink3(context);
+    final brand = DshColors.brand(context);
+    final surface = DshColors.surface(context);
+    final line = DshColors.line(context);
+    final commands = entries.where((e) => !e.skill).toList(growable: false);
+    final skills = entries.where((e) => e.skill).toList(growable: false);
+    Widget header(String label) => Padding(
+          padding: const EdgeInsets.fromLTRB(10, 6, 10, 2),
+          child: Text(
+            label,
+            style: TextStyle(
+              fontSize: 10.5,
+              fontWeight: FontWeight.w600,
+              color: ink3,
+            ),
+          ),
+        );
+    Widget item(({String name, String? description, String? hint, bool skill, bool userOnly}) entry) {
+      final color = entry.skill ? brand : ink3;
+      return Semantics(
+        button: true,
+        label: '/${entry.name}',
+        hint: entry.hint ?? entry.description,
+        child: InkWell(
+          key: Key('slash-menu-${entry.skill ? 'skill' : 'command'}-${entry.name}'),
+          onTap: () => _insertSlash(entry.name),
+          child: ConstrainedBox(
+          constraints: const BoxConstraints(minHeight: 44),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            child: Row(
+              children: [
+                Icon(
+                  entry.skill ? Icons.auto_awesome : Icons.terminal,
+                  size: 16,
+                  color: color,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Flexible(
+                            child: Text(
+                              '/${entry.name}',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 13.5,
+                                fontWeight: FontWeight.w600,
+                                color: entry.skill ? brand : ink3,
+                              ),
+                            ),
+                          ),
+                          if (entry.userOnly)
+                            Padding(
+                              padding: const EdgeInsets.only(left: 6),
+                              child: Text(
+                                L10n.t('仅手动', 'manual only'),
+                                style: TextStyle(fontSize: 10, color: ink3),
+                              ),
+                            ),
+                        ],
+                      ),
+                      if ((entry.hint ?? entry.description ?? '').isNotEmpty)
+                        Text(
+                          entry.hint ?? entry.description!,
+                          maxLines: entry.skill ? 2 : 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(fontSize: 11, color: ink3),
+                        ),
+                    ],
+                  ),
+                ),
+              ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Container(
+      key: const Key('slash-menu'),
+      margin: const EdgeInsets.only(bottom: 6),
+      constraints: const BoxConstraints(maxHeight: 232),
+      decoration: BoxDecoration(
+        color: surface,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: line),
+      ),
+      child: entries.isEmpty
+          ? Padding(
+              key: const Key('slash-menu-empty'),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
+              child: Text(
+                L10n.t('无匹配命令或技能', 'No matching commands or skills'),
+                style: TextStyle(fontSize: 12.5, color: ink3),
+              ),
+            )
+          : ListView(
+              shrinkWrap: true,
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              children: [
+                if (commands.isNotEmpty) header(L10n.t('命令', 'Commands')),
+                for (final entry in commands) item(entry),
+                if (skills.isNotEmpty) header(L10n.t('技能', 'Skills')),
+                for (final entry in skills) item(entry),
+                if (_slashCatalogLoading && _slashSkills == null)
+                  const Padding(
+                    padding: EdgeInsets.all(8),
+                    child: Center(
+                      child: SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+    );
+  }
+
+  /// issue #90：用户消息气泡内联斜杠高亮（命令/技能不同图标+颜色；不可点）。
+  Widget _buildUserMessageText(String text) {
+    const base = TextStyle(fontSize: 15, height: 1.5);
+    final tokens = slashTextTokens(text);
+    if (tokens.isEmpty) return Text(text, style: base);
+    final commandNames = {
+      for (final c in _slashCommands ?? const <Map<String, dynamic>>[])
+        if (c['name'] is String) c['name'] as String,
+    };
+    final skillNames = {
+      for (final s in _slashSkills ?? const <Map<String, dynamic>>[])
+        if (s['name'] is String) s['name'] as String,
+    };
+    if (commandNames.isEmpty && skillNames.isEmpty) return Text(text, style: base);
+    final spans = <InlineSpan>[];
+    var cursor = 0;
+    var changed = false;
+    for (final token in tokens) {
+      final isCommand = commandNames.contains(token.name);
+      final isSkill = !isCommand && skillNames.contains(token.name);
+      if (!isCommand && !isSkill) continue;
+      if (token.start > cursor) {
+        spans.add(TextSpan(text: text.substring(cursor, token.start)));
+      }
+      spans.add(WidgetSpan(
+        alignment: PlaceholderAlignment.middle,
+        child: _SlashInlineChip(name: token.name, skill: isSkill),
+      ));
+      cursor = token.end;
+      changed = true;
+    }
+    if (!changed) return Text(text, style: base);
+    if (cursor < text.length) spans.add(TextSpan(text: text.substring(cursor)));
+    return Text.rich(TextSpan(style: base, children: spans));
   }
 
   /// issue #25：提交时把"形如命令行"的一行交给内核。
@@ -3669,6 +4060,12 @@ class _ChatScreenState extends State<ChatScreen> {
       await _executeCommandLine(id, line, draft: line);
       return true;
     }
+    // issue #90：同名命令优先；未命中命令但命中技能 → 按普通消息发送（宿主注入），
+    // 不误报「未知命令」。技能目录不可用/加载失败则维持原未知命令兜底。
+    try {
+      final skills = await _skillCatalogFor(id);
+      if (skills != null && skills.any((s) => s['name'] == name)) return false;
+    } catch (_) {}
     if (!mounted) return true; // 页面已销毁：不提示，也不能落回普通发送路径去碰 context
     // 名字未注册 → **不阻塞**（刻意与 issue #25 原文的"提示 + 保留草稿"不同）：拦截会让 `/tmp`
     // 这类合法普通消息永远发不出去（单段文本在语法上与命令名无法区分，见 [isCommandLine]），
@@ -3812,6 +4209,9 @@ class _ChatScreenState extends State<ChatScreen> {
       _sending = true;
       if (!queued) _items.insert(0, _MsgItem.user(text)); // 最新在前：插入头部（视觉底部）
     });
+    if (slashTextTokens(text).isNotEmpty) {
+      unawaited(_ensureSlashCatalog(id));
+    }
     _inputCtrl.clear();
     _scrollToBottom(force: true);
     try {
@@ -4407,6 +4807,7 @@ class _ChatScreenState extends State<ChatScreen> {
         widget.gitControllerFactory?.call(readApi) ??
         GitBrowserController(
           readApi,
+          graphPageSize: 16,
           branchLimit: widget.store.gitGraphBranchLimit,
         );
     _gitController = controller;
@@ -4923,6 +5324,8 @@ class _ChatScreenState extends State<ChatScreen> {
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
+                    // issue #90：输入框上方的内联斜杠菜单（只做输入辅助，不自动提交）。
+                    if (!_inHistory && _slashToken != null) _buildSlashMenu(),
                     // 第一层：输入框（独占最宽）
                     Row(
                       children: [
@@ -4944,6 +5347,18 @@ class _ChatScreenState extends State<ChatScreen> {
                               ),
                             ),
                             onSubmitted: (_) => _send(),
+                            onTap: _refreshSlashToken,
+                            onTapOutside: (_) {
+                              WidgetsBinding.instance.addPostFrameCallback((_) {
+                                if (!mounted) return;
+                                final focused = FocusManager
+                                    .instance.primaryFocus?.context?.widget;
+                                if (focused is EditableText) return;
+                                if (_slashToken != null) {
+                                  setState(() => _slashToken = null);
+                                }
+                              });
+                            },
                           ),
                         ),
                       ],
@@ -6259,7 +6674,6 @@ class _ChatScreenState extends State<ChatScreen> {
       if (start == null) continue; // 历史截断：没有 turn/start，不构造过程块
       anchoredTurns.add(turn);
       final segments = segmentsOf(process);
-      if (segments.isEmpty) continue;
       final expandedByDefault = !turnAutoCollapsed(
         process,
         policy: policy,
@@ -6276,10 +6690,19 @@ class _ChatScreenState extends State<ChatScreen> {
       for (var si = 0; si < segments.length; si++) {
         final segment = segments[si];
         // 宿主：该段第一条过程行所在的（或其后最近的）条目——过程块渲染在它之前。
+        // issue #91/#95：插话 user 只做段边界，不能把块前移到该 user 之前；但若该段
+        // 只有思考行、段末之后的下一条就是 user，则允许这个**段末行之后**的 user
+        // 作为宿主（块仍在它之前，不会跨用户消息前移），避免纯思考段丢失/落到下一条
+        // 插话之后。
+        var lastRowSeq = segment.startSeq - 1;
+        for (final row in segment.rows) {
+          if (row.seq > lastRowSeq) lastRowSeq = row.seq;
+        }
         _MsgItem? host;
         for (final item in turnItems) {
           final seq = item.seq;
           if (seq == null || seq < segment.startSeq) continue;
+          if (item.kind == _MsgKind.user && seq <= lastRowSeq) continue;
           if (host == null || seq < (host.seq ?? 1 << 62)) host = item;
         }
         if (host == null || host.seq == null) continue;
@@ -6430,10 +6853,29 @@ class _ChatScreenState extends State<ChatScreen> {
     final policy = _foldPolicy;
     final process = plan.process;
     if (plan.segment.isEmpty) return const SizedBox.shrink();
+    // issue #92：compaction 回放的旧 turn 只有工具行、没有轮次锚点/用户上下文；
+    // 明确标注为历史工具结果 fallback（仍可随该过程块折叠），不伪装成当前过程行。
+    final toolOnlyReplay = process.partial &&
+        process.humanUserSeqs.isEmpty &&
+        process.groups.isNotEmpty &&
+        process.groups.every((g) => g.rows.every((row) => row.isTool));
     // 强制展开（未结束 / 有插话 / 异常结束）时摘要不可点——点了也收不起来，
     // 与其给一个无效点按，不如禁用并保留箭头缺失的静态态。
     final forced = process.forceExpanded;
     final children = <Widget>[];
+    if (toolOnlyReplay) {
+      children.add(Padding(
+        key: Key('historical-tool-results-${process.turn}'),
+        padding: const EdgeInsets.only(bottom: 4, left: 2),
+        child: Text(
+          L10n.t(
+            '历史工具结果（无过程上下文）',
+            'Historical tool results (no process context)',
+          ),
+          style: TextStyle(fontSize: 10.5, color: DshColors.ink3(context)),
+        ),
+      ));
+    }
     // issue #61：摘要行只作折叠态的「展开入口」；展开后组抬头/过程行已经表达了同一信息，
     // 再挂整轮摘要会造成层级重复（alpha.7 真机截图问题 1）。
     if (!plan.expanded) {
@@ -7341,10 +7783,7 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
             if (item.files.isNotEmpty)
               userBubble(_FileResults(files: item.files)),
-            if (text.isNotEmpty)
-              userBubble(
-                Text(text, style: const TextStyle(fontSize: 15, height: 1.5)),
-              ),
+            if (text.isNotEmpty) userBubble(_buildUserMessageText(text)),
             // v3.1.5（issue #15）：用户消息此前没有任何复制入口（只有助手消息有操作栏）——
             // 这里右对齐补一个「复制」，复用 _runMessageAction('copy')：复制正文 + 「已复制」提示，
             // 与助手消息行为一致。整段选择另由 SelectionArea 承担（长按选词）。
@@ -7425,6 +7864,7 @@ class _ChatScreenState extends State<ChatScreen> {
               codeTapKey: linkResolver == null
                   ? ''
                   : '$_turnTailVersion:$turn',
+              imageLoader: _markdownImageLoader,
             ),
             if (item.detailDegraded)
               Padding(
@@ -9527,6 +9967,7 @@ class _AssistantBubble extends StatefulWidget {
 
   /// 解析缓存附加键：记录集合变化（新交付声明/改动摘要到达）时强制重新解析。
   final String codeTapKey;
+  final MarkdownImageLoader? imageLoader;
   const _AssistantBubble({
     required this.text,
     required this.api,
@@ -9540,6 +9981,7 @@ class _AssistantBubble extends StatefulWidget {
     this.onOverride,
     this.codeTap,
     this.codeTapKey = '',
+    this.imageLoader,
   });
 
   @override
@@ -9563,6 +10005,7 @@ class _AssistantBubbleState extends State<_AssistantBubble> {
         widget.text.isEmpty ? '…' : widget.text,
         context,
         codeTap: widget.codeTap,
+        imageLoader: widget.imageLoader,
       );
       if (_parseLogs < 3) {
         _parseLogs++;
@@ -10441,6 +10884,58 @@ class _ReasoningProcessRow extends StatelessWidget {
 
 /// 活动条：agent 当前在干什么（思考中 / 工具执行中）。
 /// 思考面板可展开看实时思考内容（仅 showContent 时）；工具执行结束即消失；正文流式开始后由文字本身反馈。
+/// issue #90：用户气泡内联斜杠 chip（不可点、不额外语义；命令/技能不同配色）。
+class _SlashInlineChip extends StatelessWidget {
+  final String name;
+  final bool skill;
+  const _SlashInlineChip({required this.name, required this.skill});
+
+  @override
+  Widget build(BuildContext context) {
+    final brand = DshColors.brand(context);
+    final ink = DshColors.ink2(context);
+    final color = skill ? brand : ink;
+    // 命令 chip 不能再用 line（与用户气泡底色相同，视觉上无 chip 底）：
+    // 用 surface + ink3 35% 细边框，在浅/深色下都与气泡底可辨识；技能保持 brand 12%。
+    final commandBorder = DshColors.ink3(context).withValues(alpha: 0.35);
+    return Container(
+      key: Key('slash-chip-${skill ? 'skill' : 'command'}-$name'),
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+      decoration: BoxDecoration(
+        color: skill
+            ? brand.withValues(alpha: 0.12)
+            : DshColors.surface(context),
+        border: skill
+            ? null
+            : Border.all(color: commandBorder, width: 0.8),
+        borderRadius: BorderRadius.circular(5),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            skill ? Icons.auto_awesome : Icons.terminal,
+            size: 12,
+            color: color,
+          ),
+          const SizedBox(width: 3),
+          Flexible(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 170),
+              child: Text(
+                '/$name',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 13.5, height: 1.3, color: color),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _ActivityBar extends StatelessWidget {
   final String reasoning;
   final bool expanded;

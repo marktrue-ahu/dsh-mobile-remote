@@ -783,6 +783,12 @@ class TurnProcessTracker {
   // 只读查询 [hasSettledReasoning]；用于挡住 reset/reload 后已落定 step 的迟到 chunk。
   final Set<String> _settledAssistantKeys = {};
   final List<int> _humanUserSeqs = [];
+  // issue #91：所有 user/message 的 seq（含 agent-message 等非真人提示词）——
+  // 只用于识别「本轮第一条 user 事件（提示词）」，不能把首个真人间插话误当提示词。
+  final List<int> _allUserSeqs = [];
+  // issue #92：只有 tool/result 回放、没有 turn/start 的孤儿 turn 的合成锚点。
+  final Map<int, int> _orphanAnchors = {};
+  final Set<int> _allUserSeqSet = {};
   final Set<int> _humanUserSeqSet = {};
   int _order = 0;
 
@@ -796,6 +802,9 @@ class TurnProcessTracker {
     _reasoningStarts.clear();
     _settledAssistantKeys.clear();
     _humanUserSeqs.clear();
+    _allUserSeqs.clear();
+    _allUserSeqSet.clear();
+    _orphanAnchors.clear();
     _humanUserSeqSet.clear();
     _order = 0;
   }
@@ -876,6 +885,7 @@ class TurnProcessTracker {
         return;
       case 'user/message':
         if (seq == null) return;
+        if (_allUserSeqSet.add(seq)) _allUserSeqs.add(seq);
         final sourceKind = data['sourceKind'];
         final human = sourceKind == null || sourceKind == 'user';
         final text = data['text'] is String ? data['text'] as String : '';
@@ -1009,7 +1019,8 @@ class TurnProcessTracker {
   ///
   /// issue #60 R04：历史窗口缺 `turn/start` 的**部分轮次**没有真实起点；这里返回该轮
   /// 最早可观察事件的序号作为合成锚点，让过程块/页脚/M2 两卡仍能定位与渲染。
-  int? startSeqOfTurn(int turn) => _anchorOf(_turns[turn]);
+  int? startSeqOfTurn(int turn) =>
+      _anchorOf(_turns[turn]) ?? _orphanAnchors[turn];
 
   /// 该轮的渲染锚点：真实 startSeq 优先；否则取已知的最早事件序号。
   int? _anchorOf(_MutableTurn? turn) {
@@ -1120,17 +1131,22 @@ class TurnProcessTracker {
         if (bySeq != 0) return bySeq;
         return 0;
       });
-      // 「轮内有插话」只算**额外的**真人发言：事件序是 turn/start → 提示词 user/message
-      // → 过程 → 回答，所以该轮**第一条**真人 user 消息是提示词（不算插话），其余才是插话。
-      // 历史分页缺提示词时也按同一规则（不拿「首个过程行之前的 user」去猜——那会把
-      // 早到的 steer 误判成提示词，导致本应强制展开的轮被收起）。
-      final inRange = <int>[
-        for (final seq in _humanUserSeqs)
+      // issue #91：提示词 = 本轮第一条 user/message（**任意 sourceKind**，含
+      // agent-message）；然后才是真人插话。旧实现默认「首条真人 user 就是提示词」，
+      // 当 prompt 是 agent-message/非真人时会错误吞掉第一个真人间插话，导致过程段
+      // 少切一段、host 前移。历史倒序时也能靠 allInRange 的最小 seq 正确识别。
+      final allInRange = <int>[
+        for (final seq in _allUserSeqs)
           if (seq > anchor && (t.endSeq == null || seq < t.endSeq!)) seq,
       ]..sort();
-      final human = inRange.isEmpty
-          ? const <int>[]
-          : inRange.sublist(1);
+      final promptSeq = allInRange.isEmpty ? null : allInRange.first;
+      final human = <int>[
+        for (final seq in _humanUserSeqs)
+          if (seq > anchor &&
+              seq != promptSeq &&
+              (t.endSeq == null || seq < t.endSeq!))
+            seq,
+      ]..sort();
       result.add(TurnProcess(
         turn: t.turn,
         startSeq: anchor,
@@ -1142,6 +1158,53 @@ class TurnProcessTracker {
         endedAtMs: t.endedAtMs,
         groups: _groupRows(rows),
         humanUserSeqs: human,
+      ));
+    }
+    // issue #92：compaction 会重新落盘旧 turn 的 tool/result（seq 变新、turn/step 保留），
+    // 但加载窗口里没有该 turn 的 turn/start / turn/end。旧逻辑不生成 TurnProcess →
+    // 工具 item 无法进入过程块，只能回退成“旧版独立卡片”。这里为**只有工具行、
+    // 无轮次锚点**的孤儿 turn 生成 partial 过程组，让它们像过程行一样可折叠，
+    // 而不是伪装成独立工具卡（plan 仍按 host 位置渲染）。
+    final knownTurns = _turns.keys.toSet();
+    // 只有「时间线已有轮次锚点」时才把孤儿工具并入历史过程组；#61 旧卡片兜底
+    // （整段只有 result、没有任何 turn/start）必须保留独立卡与可读摘要。
+    final hasAnchoredTurns = knownTurns.isNotEmpty;
+    final orphanTurns = <int>{
+      if (hasAnchoredTurns)
+        for (final tool in _tools.values)
+          if (tool.turn != null &&
+              !knownTurns.contains(tool.turn) &&
+              tool.reportedSeq != null)
+            tool.turn!,
+    };
+    for (final turn in orphanTurns) {
+      final rows = <ProcessRow>[];
+      for (final tool in _tools.values) {
+        if (tool.turn != turn) continue;
+        final seq = tool.reportedSeq;
+        if (seq == null) continue;
+        rows.add(ProcessRow.tool(
+          seq: seq,
+          step: tool.step,
+          callId: tool.callId,
+          toolName: tool.name,
+          status: tool.settled
+              ? (tool.isError ? 'failed' : 'success')
+              : 'running',
+          isError: tool.isError,
+        ));
+      }
+      if (rows.isEmpty) continue;
+      rows.sort((a, b) => a.seq.compareTo(b.seq));
+      _orphanAnchors[turn] = rows.first.seq;
+      result.add(TurnProcess(
+        turn: turn,
+        startSeq: rows.first.seq,
+        partial: true,
+        ended: true,
+        endReasonKind: 'completed',
+        groups: _groupRows(rows),
+        humanUserSeqs: const [],
       ));
     }
     return result;
