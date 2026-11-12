@@ -29,7 +29,8 @@ GitBranch _branch(int i) => GitBranch(
 );
 
 class _FakeGitApi implements GitReadApi {
-  _FakeGitApi();
+  _FakeGitApi({this.capsOverride});
+  final GitReadCapabilities? capsOverride;
   final List<List<String>> graphTips = [];
   Completer<GitGraphPage>? graphGate;
   Completer<GitGraphPage>? pageGate;
@@ -38,7 +39,12 @@ class _FakeGitApi implements GitReadApi {
 
   @override
   Future<GitReadCapabilities> capabilities(String sessionId) async =>
-      const GitReadCapabilities(available: true);
+      capsOverride ??
+      const GitReadCapabilities(
+        available: true,
+        graphTipsMax: 128,
+        graphTipsGetMax: 32,
+      );
 
   @override
   Future<GitRepository> repository(String sessionId) async =>
@@ -463,5 +469,43 @@ void main() {
     expect(find.byKey(const Key('git-graph-empty-selection')), findsOneWidget);
     expect(find.text('Selected 0 / limit Unlimited'), findsOneWidget);
     expect(api.graphCalls, callsBefore, reason: '0 选择不应发起 graph 请求');
+  });
+  testWidgets('旧宿主：已持久化 10 档打开即 clamp 回 5 并说明；快捷 sheet 禁用 10/不限', (tester) async {
+    final api = _FakeGitApi(
+      capsOverride: const GitReadCapabilities(available: true),
+    );
+    final mounted = await _mountSheet(
+      tester,
+      limit: GitGraphBranchLimit.ten,
+      api: api,
+    );
+    addTearDown(mounted.controller.dispose);
+    expect(mounted.controller.branchLimit, GitGraphBranchLimit.five);
+    expect(mounted.store.gitGraphBranchLimit, GitGraphBranchLimit.five);
+    expect(
+      find.textContaining('Desktop version too old'),
+      findsOneWidget,
+      reason: '一次性说明电脑端版本过低',
+    );
+
+    // 5 档触顶 → 快捷 sheet；旧宿主 10/不限不可点。
+    for (var i = 1; i < 5; i++) {
+      await mounted.controller.toggleGraphBranch(_branch(i));
+    }
+    await tester.pump(const Duration(milliseconds: 100));
+    await _openFilter(tester);
+    await _tapBranchFilter(tester, 5);
+    expect(find.byKey(const Key('git-graph-limit-10')), findsOneWidget);
+    final ten = tester.widget<InkWell>(
+      find.byKey(const Key('git-graph-limit-10')),
+    );
+    expect(ten.onTap, isNull, reason: '旧宿主不得升到 10 档');
+    final unlimited = tester.widget<InkWell>(
+      find.byKey(const Key('git-graph-limit-unlimited')),
+    );
+    expect(unlimited.onTap, isNull);
+    expect(find.textContaining('Unsupported by this desktop version'), findsWidgets);
+    await tester.tap(find.byKey(const Key('git-graph-limit-cancel')));
+    await tester.pumpAndSettle();
   });
 }

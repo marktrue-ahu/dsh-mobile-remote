@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 
@@ -187,6 +188,22 @@ class GitBrowserController extends ChangeNotifier {
 
   GitGraphBranchLimit get branchLimit => _branchLimit;
 
+  /// task-28：可选 POST 能力（旧宿主/旧 fake 不实现 → GET）。
+  GitGraphPostApi? get _postApi => _api is GitGraphPostApi ? _api as GitGraphPostApi : null;
+
+  /// 宿主声明的 GET/POST tips 上限；capability 缺失按旧宿主 5/5。
+  int get _graphGetMax =>
+      _state.capabilities?.effectiveGraphTipsGetMax ?? 5;
+  int get _graphMaxTips => _state.capabilities?.effectiveGraphTipsMax ?? 5;
+  bool get _supportsGraphPost =>
+      _state.capabilities?.supportsGraphPost == true;
+
+  /// GET URL 预算：编码后的 tips JSON 超过 ~8KB 直接走 POST（避免 431/16KB URL 上限）。
+  int _encodedTipsBytes(List<GitGraphTip> tips) =>
+      Uri.encodeQueryComponent(
+        jsonEncode([for (final tip in tips) tip.toJson()]),
+      ).length;
+
   int get selectedGraphBranchCount => _state.selectedBranches.length;
 
   /// 只读 Git API：sheet 里的文件历史等附加视图复用同一注入实现（测试可替换）。
@@ -246,6 +263,13 @@ class GitBrowserController extends ChangeNotifier {
   /// P2-2：选择集与上限**同步原子更新**，graph 加载异步发起（不等待网络）；
   /// 旧请求由 `_graphGeneration` 作废，迟到响应不回写。
   int setBranchLimit(GitGraphBranchLimit limit) {
+    // task-28：旧宿主（capability 已解析且无 POST graphTips）不允许升到 10/不限。
+    // capability 还没加载时不做判断——由 `_loadSession` 在解析后 clamp。
+    final caps = _state.capabilities;
+    if (caps != null && !caps.supportsGraphPost &&
+        limit != GitGraphBranchLimit.five) {
+      limit = GitGraphBranchLimit.five;
+    }
     if (limit == _branchLimit) return 0;
     _branchLimit = limit;
     final max = limit.max;
@@ -327,10 +351,13 @@ class GitBrowserController extends ChangeNotifier {
   Future<int> selectGraphBranches(List<GitBranch> branches) async {
     if (!_branchLimit.isUnlimited || _state.repository == null) return 0;
     final known = {for (final branch in _state.selectedBranches) branch.name};
+    final cap = _state.capabilities?.effectiveGraphTipsMax ?? 5;
+    final room = cap - _state.selectedBranches.length;
+    if (room <= 0) return 0;
     final added = <GitBranch>[
       for (final branch in branches)
         if (known.add(branch.name)) branch,
-    ];
+    ].take(room).toList(growable: false);
     if (added.isEmpty) return 0;
     final selected = [..._state.selectedBranches, ...added];
     _graphGeneration++;
@@ -476,8 +503,15 @@ class GitBrowserController extends ChangeNotifier {
         final fallback = _defaultBranch(repository, sorted);
         selected = fallback == null ? const [] : [fallback];
       }
-      // issue #86：降档后重进/刷新时按当前上限裁剪（保留前 N 个）。
-      final limit = _branchLimit.max;
+      // task-28：旧宿主无 graphTips（不支持 POST）→ 10/不限回退 5（一次性 clamp）。
+      if (!capabilities.supportsGraphPost &&
+          _branchLimit != GitGraphBranchLimit.five) {
+        _branchLimit = GitGraphBranchLimit.five;
+      }
+      // issue #86：按当前上限（含服务端 max）裁剪，保留前 N 个。
+      final limit = _branchLimit.isUnlimited
+          ? capabilities.effectiveGraphTipsMax
+          : _branchLimit.max;
       if (limit != null && selected.length > limit) {
         selected = selected.sublist(0, limit);
       }
@@ -605,7 +639,9 @@ class GitBrowserController extends ChangeNotifier {
       }
       selected.removeAt(index);
     } else {
-      final limit = _branchLimit.max;
+      final limit = _branchLimit.isUnlimited
+          ? (_state.capabilities?.effectiveGraphTipsMax ?? 5)
+          : _branchLimit.max;
       if (limit != null && selected.length >= limit) return false;
       selected.add(branch);
     }
@@ -644,28 +680,77 @@ class GitBrowserController extends ChangeNotifier {
     final selected = _state.selectedBranches;
     final snapshotId = append ? _state.snapshotId : null;
     final cursor = append ? _state.graphNextCursor : null;
-    if (sessionId == null || repository == null || selected.isEmpty) return;
+    if (sessionId == null || repository == null) return;
+    if (selected.isEmpty && !append) return;
     _cancelGraphTimeout();
+    final tips = selected
+        .map((branch) => GitGraphTip(name: branch.name, tipOid: branch.oid))
+        .toList(growable: false);
+    // task-28：>服务端 max 的事前阻止（UI 已阻止；controller 兜底不发请求）。
+    if (!append && tips.length > _graphMaxTips) {
+      _emit(
+        _state.copyWith(
+          loadingGraph: false,
+          loadingGraphPage: false,
+          error: 'graph-too-many-tips',
+        ),
+      );
+      return;
+    }
     if (!append) {
       // issue #86：仅「不限」档启用 30s 超时；5/10 沿用普通加载/失败处理。
       _armGraphTimeout(generation, graphGeneration);
     }
-    try {
-      final page = await _api.graph(
+    final timeout = _branchLimit.isUnlimited
+        ? const Duration(seconds: 35)
+        : const Duration(seconds: 15);
+    final postApi = _postApi;
+    final supportsPost = _supportsGraphPost && postApi != null;
+    // 续页只带 snapshotId/cursor（服务端忽略 tips）；初始按 GET/POST 阈值与 URL 预算选择。
+    final requestTips = append ? const <GitGraphTip>[] : tips;
+    final usePost = supportsPost &&
+        (append
+            ? selected.length > _graphGetMax
+            : tips.length > _graphGetMax || _encodedTipsBytes(tips) > 8192);
+    Future<GitGraphPage> fetch({required bool post}) {
+      if (post) {
+        return postApi!.graphPost(
+          sessionId,
+          repository.repositoryId,
+          requestTips,
+          snapshotId: snapshotId,
+          cursor: cursor,
+          limit: graphPageSize,
+          timeout: timeout,
+        );
+      }
+      return _api.graph(
         sessionId,
         repository.repositoryId,
-        selected
-            .map((branch) => GitGraphTip(name: branch.name, tipOid: branch.oid))
-            .toList(growable: false),
+        requestTips,
         snapshotId: snapshotId,
         cursor: cursor,
         limit: graphPageSize,
-        // issue #86 P1-2：不限档的 HTTP 超时必须晚于 30s 面板（35s），否则网络层
-        // 15s 超时先触发、30s 超时面板永远看不到；5/10 保持原 15s。
-        timeout: _branchLimit.isUnlimited
-            ? const Duration(seconds: 35)
-            : const Duration(seconds: 15),
+        timeout: timeout,
       );
+    }
+
+    try {
+      GitGraphPage page;
+      try {
+        page = await fetch(post: usePost);
+      } catch (error) {
+        // GET URL 超长（Node 431）/ 网关 414：一次性回退 POST（task-28）。
+        final urlTooLarge = error is ApiException &&
+            (error.status == 431 ||
+                error.status == 414 ||
+                error.code == 'payload-too-large');
+        if (!usePost && supportsPost && urlTooLarge) {
+          page = await fetch(post: true);
+        } else {
+          rethrow;
+        }
+      }
       if (generation != _generation || graphGeneration != _graphGeneration) {
         return;
       }
@@ -680,6 +765,7 @@ class GitBrowserController extends ChangeNotifier {
           graphNextCursor: page.nextCursor,
           loadingGraph: false,
           loadingGraphPage: false,
+          graphTimedOut: false,
           stale: false,
           error: null,
         ),
@@ -689,13 +775,28 @@ class GitBrowserController extends ChangeNotifier {
         return;
       }
       _cancelGraphTimeout();
-      final graphStale = error is ApiException && error.code == 'graph-stale';
+      final apiError = error is ApiException ? error : null;
+      final code = apiError?.code;
+      final graphStale = code == 'graph-stale';
+      final timedOut = apiError?.status == 504 || code == 'graph-timeout';
+      if (timedOut && _branchLimit.isUnlimited) {
+        // 服务端 25s deadline（504）与客户端 30s 兜底同一超时三动作面板。
+        _emit(
+          _state.copyWith(
+            loadingGraph: false,
+            loadingGraphPage: false,
+            graphTimedOut: true,
+            error: null,
+          ),
+        );
+        return;
+      }
       _emit(
         _state.copyWith(
           loadingGraph: false,
           loadingGraphPage: false,
           stale: graphStale ? true : _state.stale,
-          error: graphStale ? 'graph-stale' : error.toString(),
+          error: graphStale ? 'graph-stale' : (code ?? error.toString()),
         ),
       );
     }

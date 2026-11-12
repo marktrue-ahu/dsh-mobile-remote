@@ -68,6 +68,7 @@ Future<GitGraphBranchLimit?> showGitGraphLimitSheet(
   required int currentSelectedCount,
   String? title,
   String? note,
+  bool supportsGraphPost = true,
 }) {
   return showModalBottomSheet<GitGraphBranchLimit>(
     context: context,
@@ -140,9 +141,13 @@ Future<GitGraphBranchLimit?> showGitGraphLimitSheet(
                           limit,
                           current: current,
                           currentSelectedCount: currentSelectedCount,
+                          supportsGraphPost: supportsGraphPost,
                         ),
                         active: limit == current,
-                        onTap: () => Navigator.of(sheetContext).pop(limit),
+                        // 旧宿主（无 graphTips/POST）不得升到 10/不限。
+                        onTap: !supportsGraphPost && limit != GitGraphBranchLimit.five
+                            ? null
+                            : () => Navigator.of(sheetContext).pop(limit),
                       ),
                     const SizedBox(height: 4),
                     InkWell(
@@ -181,6 +186,7 @@ String _graphLimitOptionSub(
   GitGraphBranchLimit limit, {
   required GitGraphBranchLimit current,
   required int currentSelectedCount,
+  bool supportsGraphPost = true,
 }) {
   final base = switch (limit) {
     GitGraphBranchLimit.five => L10n.t('最多 5 个；加载更快', 'Up to 5; faster to load'),
@@ -193,6 +199,12 @@ String _graphLimitOptionSub(
       'No cap; large repos may time out after 30s',
     ),
   };
+  if (!supportsGraphPost && limit != GitGraphBranchLimit.five) {
+    return L10n.t(
+      '$base · 电脑端版本过低，不支持',
+      '$base · Unsupported by this desktop version',
+    );
+  }
   if (limit == current) {
     return L10n.t('$base · 当前上限', '$base · Current limit');
   }
@@ -232,7 +244,7 @@ void showChoiceSheet(
   ]);
 }
 
-Widget _sheetItem(BuildContext context, {Key? key, required String name, String? sub, bool active = false, required VoidCallback onTap}) {
+Widget _sheetItem(BuildContext context, {Key? key, required String name, String? sub, bool active = false, VoidCallback? onTap}) {
   final ink3 = DshColors.ink3(context);
   final brand = DshColors.brand(context);
   return InkWell(

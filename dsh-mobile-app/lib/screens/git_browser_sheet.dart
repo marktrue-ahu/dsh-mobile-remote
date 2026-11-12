@@ -70,6 +70,7 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
   String? _previewOid;
   bool _choosingBranches = false;
   String _graphQuery = '';
+  bool _legacyLimitNoticeDone = false;
   String? _openingOid;
 
   /// 文件提交历史：tab 与独立历史视图共用同一个 controller/body。
@@ -271,6 +272,7 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
       widget.controller.loadWorktree();
     }
     setState(() {});
+    _maybeHandleLegacyLimit();
     _maybeHandleHistoryDeepLink();
     _maybeOpenDefaultGraph();
     // A short first page may not generate a scroll event at all.
@@ -672,7 +674,7 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
                 state.branches.isNotEmpty &&
                 _view == _View.tab)
               MaterialBanner(
-                content: Text(state.error!),
+                content: Text(_graphErrorText(state.error!)),
                 actions: [
                   TextButton(
                     onPressed: _refresh,
@@ -744,7 +746,7 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
     }
     if (id == 'worktree') return _worktree(state);
     if (state.error != null && state.branches.isEmpty && !state.stale) {
-      return _MessageState(message: state.error!, onRetry: _refresh);
+      return _MessageState(message: _graphErrorText(state.error!), onRetry: _refresh);
     }
     if (state.repository?.empty == true || state.branches.isEmpty) {
       return _MessageState(
@@ -1020,6 +1022,31 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
     }
   }
 
+  /// task-28：旧宿主（无 graphTips/POST）打开面板时把已持久化的 10/不限回退 5，
+  /// 一次性 toast 并写回偏好（之后不再反复提示）。
+  void _maybeHandleLegacyLimit() {
+    if (_legacyLimitNoticeDone || !mounted) return;
+    final caps = widget.controller.state.capabilities;
+    if (caps == null || caps.supportsGraphPost) return;
+    _legacyLimitNoticeDone = true;
+    final store = widget.store;
+    final needsPersist =
+        store != null && store.gitGraphBranchLimit != GitGraphBranchLimit.five;
+    if (needsPersist) {
+      unawaited(store.setGitGraphBranchLimit(GitGraphBranchLimit.five));
+    }
+    if (widget.controller.branchLimit != GitGraphBranchLimit.five) {
+      widget.controller.setBranchLimit(GitGraphBranchLimit.five);
+    }
+    if (!needsPersist) return;
+    _toast(
+      L10n.t(
+        '电脑端版本过低：分支图上限已回退为 5',
+        'Desktop version too old: branch graph limit reverted to 5',
+      ),
+    );
+  }
+
   Future<void> _persistLimit(GitGraphBranchLimit limit) async {
     final store = widget.store;
     if (store != null) await store.setGitGraphBranchLimit(limit);
@@ -1046,6 +1073,8 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
       context,
       current: current,
       currentSelectedCount: selectedCount,
+      supportsGraphPost:
+          widget.controller.state.capabilities?.supportsGraphPost ?? true,
       title: capReached
           ? L10n.t(
               '已达上限（${current.max} 个）',
@@ -1096,6 +1125,19 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
       return;
     }
     if (value == true) {
+      if (unlimited) {
+        final serverMax =
+            widget.controller.state.capabilities?.effectiveGraphTipsMax ?? 5;
+        if (selected.length >= serverMax) {
+          _toast(
+            L10n.t(
+              '已达电脑端上限（$serverMax 个分支）',
+              'Desktop limit reached ($serverMax branches)',
+            ),
+          );
+          return;
+        }
+      }
       final max = controller.branchLimit.max;
       if (max != null && selected.length >= max) {
         final changed = await _showGraphLimitSheet(capReached: true);
@@ -1233,6 +1275,20 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
       ),
     );
   }
+
+  /// task-28：POST 新错误码 → 可读文案（旧错误原样显示）。
+  String _graphErrorText(String error) => switch (error) {
+    'graph-too-many-tips' => L10n.t(
+      '分支数超过电脑端上限',
+      'Too many branches for this desktop',
+    ),
+    'payload-too-large' || 'git-output-too-large' => L10n.t(
+      '请求或输出过大',
+      'Request or output too large',
+    ),
+    'graph-timeout' => L10n.t('分支图加载超时', 'Branch graph timed out'),
+    _ => error,
+  };
 
   bool get _allMatchesSelected {
     final query = _graphQuery.trim().toLowerCase();
@@ -1382,14 +1438,25 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
                     onPressed: matches.isEmpty || _allMatchesSelected
                         ? null
                         : () async {
+                            final candidates = matches
+                                .where((branch) => !widget.controller.state
+                                    .selectedBranches
+                                    .any((item) => item.name == branch.name))
+                                .length;
                             final added = await widget.controller
                                 .selectGraphBranches(matches.toList(growable: false));
                             if (!mounted || added <= 0) return;
+                            final skipped = candidates - added;
                             _toast(
-                              L10n.t(
-                                '已加入当前搜索结果中的 $added 个分支',
-                                'Added $added branches from the current search',
-                              ),
+                              skipped > 0
+                                  ? L10n.t(
+                                      '已加入 $added 个（达到电脑端上限，$skipped 个未加入）',
+                                      'Added $added (desktop limit reached; $skipped skipped)',
+                                    )
+                                  : L10n.t(
+                                      '已加入当前搜索结果中的 $added 个分支',
+                                      'Added $added branches from the current search',
+                                    ),
                             );
                           },
                     child: Text(

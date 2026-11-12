@@ -36,6 +36,7 @@ class _DelayedGitServer {
   Duration graphDelay;
   int graphAttempts = 0;
   final List<Duration> delays = [];
+  final List<(String method, Map<String, dynamic> body)> graphRequests = [];
 
   late final Api api = Api(client: MockClient(_handle))
     ..baseUrl = 'http://issue86-timeout.test'
@@ -45,7 +46,12 @@ class _DelayedGitServer {
   Future<http.Response> _handle(http.Request request) async {
     final path = request.url.path;
     if (path.endsWith('/api/git/capabilities')) {
-      return _json({'git': {'available': true}});
+      return _json({
+        'git': {
+          'available': true,
+          'graphTips': {'max': 128, 'getMax': 32},
+        },
+      });
     }
     if (path.endsWith('/api/git/repository')) {
       return _json({
@@ -78,6 +84,16 @@ class _DelayedGitServer {
     }
     if (path.endsWith('/api/git/graph')) {
       graphAttempts += 1;
+      if (request.method == 'POST') {
+        try {
+          graphRequests.add((
+            request.method,
+            jsonDecode(request.body) as Map<String, dynamic>,
+          ));
+        } catch (_) {}
+      } else {
+        graphRequests.add((request.method, const {}));
+      }
       final delay = graphAttempts <= delays.length
           ? delays[graphAttempts - 1]
           : graphDelay;
@@ -185,5 +201,54 @@ void main() {
     await tester.pump(const Duration(seconds: 10));
     expect(controller.state.snapshotId, 'snap-2');
     expect(controller.state.error, isNull);
+  });
+  testWidgets('真实 Api.graphPost：POST JSON body（不传路径）、GET 仍走 query', (tester) async {
+    final server = _DelayedGitServer();
+    final page = await server.api.graphPost(
+      'session-a',
+      'repo',
+      const [
+        GitGraphTip(
+          name: 'refs/heads/main',
+          tipOid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        ),
+        GitGraphTip(
+          name: 'refs/heads/topic',
+          tipOid: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        ),
+      ],
+      limit: 64,
+    );
+    expect(page.snapshotId, startsWith('snap-'));
+    final recorded = server.graphRequests.last;
+    expect(recorded.$1, 'POST');
+    expect(recorded.$2['sessionId'], 'session-a');
+    expect(recorded.$2['repositoryId'], 'repo');
+    expect(recorded.$2['limit'], 64);
+    expect(recorded.$2['tips'], [
+      {
+        'name': 'refs/heads/main',
+        'tipOid': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      },
+      {
+        'name': 'refs/heads/topic',
+        'tipOid': 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      },
+    ]);
+    expect(recorded.$2.containsKey('path'), isFalse, reason: 'POST 不传路径');
+
+    await server.api.graph(
+      'session-a',
+      'repo',
+      const [
+        GitGraphTip(
+          name: 'refs/heads/main',
+          tipOid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        ),
+      ],
+      limit: 1,
+    );
+    expect(server.graphRequests.last.$1, 'GET');
+    await tester.pump();
   });
 }

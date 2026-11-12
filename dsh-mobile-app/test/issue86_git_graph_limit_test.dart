@@ -37,7 +37,11 @@ class _FakeGitApi implements GitReadApi {
 
   @override
   Future<GitReadCapabilities> capabilities(String sessionId) async =>
-      const GitReadCapabilities(available: true);
+      const GitReadCapabilities(
+        available: true,
+        graphTipsMax: 128,
+        graphTipsGetMax: 32,
+      );
 
   @override
   Future<GitRepository> repository(String sessionId) async =>
@@ -114,6 +118,75 @@ class _FakeGitApi implements GitReadApi {
     int limit = 20,
   }) async => const GitFileHistoryPage();
 }
+
+/// task-28：GET/POST 双传输 fake（实现可选 GitGraphPostApi）。
+class _TransportApi extends _FakeGitApi implements GitGraphPostApi {
+  _TransportApi({super.branchCount = 160, this.capsOverride});
+  final GitReadCapabilities? capsOverride;
+  int getCalls = 0;
+  int postCalls = 0;
+  bool failGet431Once = false;
+  Object? postError;
+
+  @override
+  Future<GitReadCapabilities> capabilities(String sessionId) async =>
+      capsOverride ??
+      const GitReadCapabilities(
+        available: true,
+        graphTipsMax: 128,
+        graphTipsGetMax: 32,
+      );
+
+  @override
+  Future<GitGraphPage> graph(
+    String sessionId,
+    String repositoryId,
+    List<GitGraphTip> tips, {
+    String? snapshotId,
+    String? cursor,
+    int limit = 100,
+    Duration timeout = const Duration(seconds: 15),
+  }) {
+    getCalls += 1;
+    if (failGet431Once) {
+      failGet431Once = false;
+      throw ApiException('request header fields too large', status: 431);
+    }
+    graphTips.add(tips.map((tip) => tip.name).toList());
+    return Future.value(
+      GitGraphPage(snapshotId: 'get', nextCursor: null, tips: tips),
+    );
+  }
+
+  @override
+  Future<GitGraphPage> graphPost(
+    String sessionId,
+    String repositoryId,
+    List<GitGraphTip> tips, {
+    String? snapshotId,
+    String? cursor,
+    int limit = 100,
+    Duration timeout = const Duration(seconds: 15),
+  }) {
+    postCalls += 1;
+    graphTips.add(tips.map((tip) => tip.name).toList());
+    final error = postError;
+    if (error != null) return Future.error(error);
+    return Future.value(
+      GitGraphPage(snapshotId: 'post', nextCursor: null, tips: tips),
+    );
+  }
+}
+
+List<GitBranch> _namedBranches(int count, int nameLength) => [
+  for (var i = 0; i < count; i++)
+    GitBranch(
+      name: 'refs/heads/${'b' * nameLength}${i.toString().padLeft(3, '0')}',
+      displayName: '${'b' * nameLength}${i.toString().padLeft(3, '0')}',
+      oid: 'oid-$i',
+      kind: 'local',
+    ),
+];
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -396,6 +469,120 @@ void main() {
       expect(
         layout.rows.single.tipColorSlots.every((slot) => slot < 16),
         isTrue,
+      );
+    });
+  });
+  group('task-28 GET/POST 传输', () {
+    test('n≤getMax GET；getMax<n≤max POST（不限档 64 tips）', () async {
+      final api = _TransportApi();
+      final controller = GitBrowserController(
+        api,
+        branchLimit: GitGraphBranchLimit.unlimited,
+      );
+      addTearDown(controller.dispose);
+      await controller.open('s');
+      // 打开默认分支图：1 个已选 → GET。
+      await controller.openBranch(_branches(160)[0]);
+      expect(api.getCalls, greaterThan(0));
+      expect(api.postCalls, 0, reason: '≤32 GET');
+
+      for (var i = 1; i < 64; i++) {
+        await controller.toggleGraphBranch(_branches(160)[i]);
+      }
+      expect(api.postCalls, greaterThan(0), reason: '64 tips → POST');
+      expect(api.graphTips.last, hasLength(64));
+    });
+
+    test('URL 预算：编码 tips >8KB 时优先 POST', () async {
+      final api = _TransportApi();
+      final controller = GitBrowserController(
+        api,
+        branchLimit: GitGraphBranchLimit.unlimited,
+      );
+      addTearDown(controller.dispose);
+      await controller.open('s');
+      final longBranches = _namedBranches(32, 300);
+      await controller.selectGraphBranches(longBranches);
+      expect(api.postCalls, greaterThan(0), reason: 'URL 预算超限 → POST');
+    });
+
+    test('GET 431 → 自动回退 POST 一次', () async {
+      final api = _TransportApi()..failGet431Once = true;
+      final controller = GitBrowserController(api);
+      addTearDown(controller.dispose);
+      await controller.open('s');
+      await controller.toggleGraphBranch(_branches(160)[1]);
+      expect(api.postCalls, 1);
+      expect(controller.state.snapshotId, 'post');
+    });
+
+    test('POST 504（不限档）→ 同一超时面板；400/413 → 错误码', () async {
+      final api = _TransportApi(branchCount: 160);
+      final controller = GitBrowserController(
+        api,
+        branchLimit: GitGraphBranchLimit.unlimited,
+      );
+      addTearDown(controller.dispose);
+      await controller.open('s');
+      await controller.selectGraphBranches(_branches(160).take(64).toList());
+      expect(api.postCalls, greaterThan(0));
+
+      api.postError = ApiException(
+        'graph deadline',
+        code: 'graph-timeout',
+        status: 504,
+      );
+      await controller.toggleGraphBranch(_branches(160)[70]);
+      expect(controller.state.graphTimedOut, isTrue);
+      expect(controller.state.error, isNull);
+
+      api.postError = ApiException(
+        'too many',
+        code: 'graph-too-many-tips',
+        status: 400,
+      );
+      await controller.toggleGraphBranch(_branches(160)[71]);
+      expect(controller.state.error, 'graph-too-many-tips');
+    });
+
+    test('旧宿主（无 graphTips）：10/不限 clamp 回 5、上限 5', () async {
+      final api = _TransportApi(
+        capsOverride: const GitReadCapabilities(available: true),
+      );
+      final controller = GitBrowserController(
+        api,
+        branchLimit: GitGraphBranchLimit.unlimited,
+      );
+      addTearDown(controller.dispose);
+      await controller.open('s');
+      expect(controller.state.branchLimit, GitGraphBranchLimit.five);
+      controller.setBranchLimit(GitGraphBranchLimit.ten);
+      for (var i = 1; i < 6; i++) {
+        await controller.toggleGraphBranch(_branches(160)[i]);
+      }
+      expect(controller.state.selectedBranches, hasLength(5));
+      expect(controller.state.capabilities?.supportsGraphPost, isFalse);
+    });
+
+    test('>max 事前阻止：服务端上限 128，129 不加；union 截断到 128', () async {
+      final api = _TransportApi();
+      final controller = GitBrowserController(
+        api,
+        branchLimit: GitGraphBranchLimit.unlimited,
+      );
+      addTearDown(controller.dispose);
+      await controller.open('s');
+      await controller.selectGraphBranches(_branches(160).take(120).toList());
+      expect(controller.state.selectedBranches, hasLength(120));
+      final added = await controller.selectGraphBranches(
+        _branches(160).skip(120).take(10).toList(),
+      );
+      expect(added, 8);
+      expect(controller.state.selectedBranches, hasLength(128));
+      expect(
+        await controller.toggleGraphBranch(_branches(160)[130]),
+        isFalse,
+        reason: '超过服务端 max 时不加',
       );
     });
   });
