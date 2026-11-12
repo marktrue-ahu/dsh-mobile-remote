@@ -1,5 +1,43 @@
 # Changelog
 
+## v3.2.4-alpha.15（build 47，issues #90 / #91 / #92 / #93 / #94 / #95）— 斜杠菜单、全部分支图与本地图片
+
+> 插件 `3.2.4-alpha.15` / App `3.2.4+47` / 载体 `3.2.4-alpha.15-app`。
+
+### 斜杠命令与技能菜单（#90 / #95）
+
+- 输入 `/` 自动列出命令与技能（内联菜单）：按前缀筛选、命令/技能分组、键盘与点按选择；选中即插入输入框，不打断已输入文本；
+- 命令/技能目录按需加载并缓存（同一会话/同一时间线复用）：只有输入框或时间线出现 slash 时才拉取，普通会话不再多两次请求；
+- 用户消息中的 slash 命令双高亮；命令 chip 改为 surface + 细边框，在用户气泡底色上可辨识；长按复制等原有交互不变。
+
+### 插话与压缩回放（#91 / #92）
+
+- 同 turn 插话时按提示词识别过程块宿主，禁止把 user 消息当宿主，思考/工具过程块归属正确轮次，不再错位到插话消息；
+- compaction 回放：孤儿工具 partial 结果并入历史过程组，不再回退为旧版独立工具卡；折叠/展开与正常轮次一致。
+
+### 全部分支图（#93）
+
+- 新增全部分支模式（`POST /git/graph` `all:true`）与 focus 定位：解析 `refs/heads/* + refs/remotes/*`（排除 `/HEAD`）为 tips，tag 仅作为可达提交上的 label，不画分支线；
+- 固定每页 16 提交、双向分页（`prevCursor` 更新 / `nextCursor` 更旧）、prev 锚定、隐藏分支筛选与横向滚动；focus 返回包含该提交的页并带 `focusOid/pageStart/prevCursor/hasNewer/hasOlder`；
+- 快照绑定全部分支 refs 指纹：refs 新增/移动/删除返回 `409 graph-stale`；保护超限 `400 graph-too-many-refs`、focus 非法/未找到 `400 graph-focus-invalid` / `409 graph-focus-not-found`，不静默截断；GET 不接受 all。
+
+### 本地 Markdown 图片（#94 / #95）
+
+- 新增 `GET/HEAD /m/api/workspace-image` 只读端点：仅会话 cwd（且属于已登记工作区）内的普通图片，fd 绑定读取（`O_NOFOLLOW`/`O_NONBLOCK` → `fstat` → `/proc/self/fd` 实际路径 containment → 有界 `readSync` → `close`），末级符号链接与中间目录换链均拒绝；非 Linux/无 procfs 返回 `501 image-verification-unavailable`，fail-closed 不回退；
+- 上限 8 MiB / 8192px 单边 / 40 MP（`413 image-too-large`）；扩展名与 magic 一致校验（`415 unsupported-image-type`）；强 ETag、HEAD 同 headers 无 body、`If-None-Match` 命中 304；
+- App 渲染 `![alt](url)` 本地图片；http(s) 远程图片本轮不自动加载，显示 alt/占位以避免第三方请求；`WorkspaceImageCache` 增加会话 LRU 上限、clear 与并发槽位，避免长会话内存膨胀。
+
+### 文档
+
+- docs/03-api §6.19.12 新增 workspace-image 契约与错误码；docs/04-security 新增工作区图片端点安全边界；docs/09-compatibility 记录 2.x 本地 Markdown 图片兼容说明（Linux/fd 校验限制）。
+
+### 验证
+
+- 本机发布门禁：node 测试 **1139**（1126 通过 / 13 跳过 / 0 失败）、flutter test **1373** 全绿、flutter analyze 0 error/warning（20 条既有 info）；
+- 独立 review 无 P0/P1/P2，verify 5/5；
+- 真机/320 宽/深色主题、分支图 5/10/all、本地 Markdown 图片渲染列为本版验收项（发布后按验收清单执行）。
+
+
 ## v3.2.4-alpha.14（build 46，issues #83 / #84 / #85 / #86 / #88）— 交互修复与分支图上限
 
 > 插件 `3.2.4-alpha.14` / App `3.2.4+46` / 载体 `3.2.4-alpha.14-app`。
