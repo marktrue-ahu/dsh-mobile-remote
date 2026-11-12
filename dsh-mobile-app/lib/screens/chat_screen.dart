@@ -27,6 +27,7 @@ import '../theme.dart';
 import '../turn_navigation.dart';
 import '../turn_process.dart';
 import '../inline_path.dart';
+import '../pending_image_preview.dart';
 import '../turn_outline.dart';
 import '../turn_tail.dart';
 import '../turn_file_actions.dart';
@@ -5422,6 +5423,19 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   /// v3.0.0 图像链路：待发送图片缩略图 rail（composer 上方，可移除；PC 端 AttachmentRail 同理念）。
+  /// issue #85：点击待上传图片打开全屏预览（本地文件，不经过服务端）。
+  void _openPendingImagePreview(int index) {
+    if (_pendingImages.isEmpty) return;
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => PendingImagePreviewScreen(
+          paths: _pendingImages.map((file) => file.path).toList(),
+          initialIndex: index,
+        ),
+      ),
+    );
+  }
+
   Widget _buildImageRail() {
     if (_pendingImages.isEmpty) return const SizedBox.shrink();
     final line = DshColors.line(context);
@@ -5438,24 +5452,27 @@ class _ChatScreenState extends State<ChatScreen> {
                 padding: const EdgeInsets.only(right: 8),
                 child: Stack(
                   children: [
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(10),
-                      child: Image.file(
-                        File(_pendingImages[i].path),
-                        width: 76,
-                        height: 76,
-                        fit: BoxFit.cover,
-                        // v3.1.6（app-audit ①4）：按显示尺寸解码（2x 供 HiDPI）——
-                        // 不给 cacheWidth 时 Flutter 按**原始分辨率**解码，一次选 10-20 张
-                        // 12MP 原图（≈48MB/张）直接顶爆内存（低端机闪退）。
-                        cacheWidth: 160,
-                        errorBuilder: (_, _, _) => Container(
+                    GestureDetector(
+                      onTap: () => _openPendingImagePreview(i),
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(10),
+                        child: Image.file(
+                          File(_pendingImages[i].path),
                           width: 76,
                           height: 76,
-                          color: line,
-                          child: const Icon(
-                            Icons.image_outlined,
-                            color: Colors.white54,
+                          fit: BoxFit.cover,
+                          // v3.1.6（app-audit ①4）：按显示尺寸解码（2x 供 HiDPI）——
+                          // 不给 cacheWidth 时 Flutter 按**原始分辨率**解码，一次选 10-20 张
+                          // 12MP 原图（≈48MB/张）直接顶爆内存（低端机闪退）。
+                          cacheWidth: 160,
+                          errorBuilder: (_, _, _) => Container(
+                            width: 76,
+                            height: 76,
+                            color: line,
+                            child: const Icon(
+                              Icons.image_outlined,
+                              color: Colors.white54,
+                            ),
                           ),
                         ),
                       ),
