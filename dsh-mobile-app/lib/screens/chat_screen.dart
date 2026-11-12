@@ -4497,7 +4497,13 @@ class _ChatScreenState extends State<ChatScreen> {
     final inBlock =
         plan != null && (plan.provisionalRendered || plan.reasoningRowVisible);
     final reasoning = inBlock ? '' : (live?.text ?? '');
-    final tools = _activeTools.values.toList();
+    // issue #83 后续：过程块已展开且钉在底部时，运行中工具行已在对话里可见，
+    // 活动条不再重复同一工具；只保留过程块尚未承载的工具（或滚动离开底部时）。
+    final tools = [
+      for (final entry in _activeTools.entries)
+        if (!(plan != null && _pinnedToBottom && plan.renderedCallIds.contains(entry.key)))
+          entry.value,
+    ];
     if (reasoning.isEmpty && tools.isEmpty) return const SizedBox.shrink();
     return _ActivityBar(
       reasoning: reasoning,
