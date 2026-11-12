@@ -84,6 +84,9 @@ class WidgetGitApi implements GitReadApi {
     return GitReadCapabilities(
       available: available,
       reason: available ? null : 'Git is unavailable here',
+      // task-28：此 fake 模拟新宿主（10/不限可用；GET≤32/POST≤128）。
+      graphTipsMax: 128,
+      graphTipsGetMax: 32,
     );
   }
 
@@ -110,6 +113,7 @@ class WidgetGitApi implements GitReadApi {
     String? snapshotId,
     String? cursor,
     int limit = 100,
+    Duration timeout = const Duration(seconds: 15),
   }) async {
     graphCalls++;
     graphRequests.add(tips.map((tip) => tip.name).toList());
@@ -618,9 +622,18 @@ void main() {
     await tester.scrollUntilVisible(sixth, 80, scrollable: pickerScroll);
     await tester.tap(sixth);
     await tester.pumpAndSettle();
+    // issue #86：5/10 触顶不再只 toast——弹出三档快捷 sheet。
     expect(controller.state.selectedBranches.length, 5);
     expect(api.graphRequests.last.length, 5);
-    expect(find.text('Select up to 5 branches'), findsOneWidget);
+    expect(find.byKey(const Key('git-graph-limit-10')), findsOneWidget);
+    expect(find.text('Select up to 5 branches'), findsNothing);
+
+    await tester.tap(find.byKey(const Key('git-graph-limit-10')));
+    await tester.pumpAndSettle();
+    expect(controller.branchLimit, GitGraphBranchLimit.ten);
+    // 升档保留选择 + 自动补选触发项（issue #86 产品定稿）。
+    expect(controller.state.selectedBranches.length, 6);
+    expect(api.graphRequests.last.length, 6);
   });
 
   testWidgets(

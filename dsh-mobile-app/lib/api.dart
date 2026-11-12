@@ -99,6 +99,7 @@ abstract interface class GitReadApi {
     String? snapshotId,
     String? cursor,
     int limit,
+    Duration timeout,
   });
   Future<GitCommitDetails> commitDetails(
     String sessionId,
@@ -135,9 +136,26 @@ abstract interface class GitReadApi {
     String? cursor,
     int limit,
   });
+
 }
 
-class Api implements GitReadApi {
+/// task-28（#86 方案 B）：支持 POST graph（1–128 tips）的宿主能力（可选接口）。
+///
+/// 旧宿主/测试 fake 不实现本接口 → controller 自动回退 GET；不给 `GitReadApi.graph`
+/// 加参数，避免破坏既有 fake 与 GET 兼容路径。
+abstract interface class GitGraphPostApi {
+  Future<GitGraphPage> graphPost(
+    String sessionId,
+    String repositoryId,
+    List<GitGraphTip> tips, {
+    String? snapshotId,
+    String? cursor,
+    int limit,
+    Duration timeout,
+  });
+}
+
+class Api implements GitReadApi, GitGraphPostApi {
   final http.Client _client;
 
   Api({http.Client? client}) : _client = client ?? http.Client();
@@ -1789,6 +1807,7 @@ class Api implements GitReadApi {
     String? snapshotId,
     String? cursor,
     int limit = 100,
+    Duration timeout = const Duration(seconds: 15),
   }) async => GitGraphPage.fromJson(
     await getJson(
       _gitQuery('/api/git/graph', {
@@ -1799,6 +1818,32 @@ class Api implements GitReadApi {
         'cursor': ?cursor,
         'limit': '$limit',
       }),
+      timeout: timeout,
+    ),
+  );
+
+  /// task-28：POST graph（1–128 tips）。与 GET 共用 snapshotId/cursor 快照。
+  @override
+  Future<GitGraphPage> graphPost(
+    String sessionId,
+    String repositoryId,
+    List<GitGraphTip> tips, {
+    String? snapshotId,
+    String? cursor,
+    int limit = 100,
+    Duration timeout = const Duration(seconds: 15),
+  }) async => GitGraphPage.fromJson(
+    await postJson(
+      '/api/git/graph',
+      {
+        'sessionId': sessionId,
+        'repositoryId': repositoryId,
+        'tips': [for (final tip in tips) tip.toJson()],
+        'limit': limit,
+        'snapshotId': ?snapshotId,
+        'cursor': ?cursor,
+      },
+      timeout: timeout,
     ),
   );
 

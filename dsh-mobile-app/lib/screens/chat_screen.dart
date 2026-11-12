@@ -516,6 +516,14 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _turnOutlineNoticeShown = false;
   bool _activeTurnCalibrationScheduled = false; // 滚动期间合并调度几何校准
   final GlobalKey _liveViewportKey = GlobalKey(); // 阅读线基准：消息流视口
+  // re-review P2：过程工具行的真实几何 key（callId → GlobalKey），活动条据此判断
+  // 该行是否真的与视口相交，而不是只看「计划里可见 / 已展开」。
+  final Map<String, GlobalKey> _processToolRowKeys = {};
+  // 首帧几何尚未 layout 完成：安排一次 post-frame 重建，让“行可见→隐藏活动条”生效。
+  bool _activityGeometryResolved = false;
+  bool _activityGeometryRefreshScheduled = false;
+  int _activityGeometryRefreshFrames = 0;
+  String _activityGeometryCandidateKey = '';
   // 两条消息流列表（center 前后）的渲染对象：定位时用来遍历**已构建子项**的
   // 真实索引与几何（长回复会挤掉落点附近的轮次边界，只有子项索引是连续可靠的）。
   final GlobalKey _olderSliverKey = GlobalKey(); // center 之前：_olderItems
@@ -655,6 +663,10 @@ class _ChatScreenState extends State<ChatScreen> {
   /// v2.8.0：live 视图统一普通（非 reverse）列表，"最新"恒在 maxScrollExtent。
   void _onScrollTick() {
     if (!mounted || _inHistory) return;
+    // re-review P2：滚动后行几何/可见性变化，允许活动条重新做几何判定。
+    _activityGeometryResolved = false;
+    _activityGeometryRefreshScheduled = false;
+    _activityGeometryRefreshFrames = 0;
     final pos = _scrollCtrl.position;
     if (!pos.hasContentDimensions) return;
     // issue #77：内容高度增长（流式/工具插入）不是「用户上翻」——长度变化本身
@@ -4345,7 +4357,10 @@ class _ChatScreenState extends State<ChatScreen> {
     final readApi = widget.gitReadApi ?? _api;
     final controller =
         widget.gitControllerFactory?.call(readApi) ??
-        GitBrowserController(readApi);
+        GitBrowserController(
+          readApi,
+          branchLimit: widget.store.gitGraphBranchLimit,
+        );
     _gitController = controller;
     unawaited(controller.open(sid));
     final graphScrollController = ScrollController();
@@ -4492,19 +4507,80 @@ class _ChatScreenState extends State<ChatScreen> {
   // - 无过程块锚点 → 保留现状思考（`思考中…（N 字）`，正文流式后 `已思考 N 字`）；
   // - 历史视图不渲染活动条；`showReasoning` 仍只控制内容能否展开。
   // 思考文本走 `_liveReasoningRevision` 行级通知（与 provisional 行同源、同一快照）。
+  /// re-review P2：运行工具行是否仍在真正视口内。
+  ///
+  /// 保守策略：key 尚未挂载/视口缺失/尺寸未定 → 视为不可见（活动条显示），
+  /// 避免“活动条被过滤但屏幕上看不到”的回归。
+  bool _isProcessToolRowInViewport(String callId) {
+    final rowContext = _processToolRowKeys[callId]?.currentContext;
+    final viewportContext = _liveViewportKey.currentContext;
+    if (rowContext == null ||
+        viewportContext == null ||
+        !rowContext.mounted ||
+        !viewportContext.mounted) {
+      return false;
+    }
+    try {
+      final rowBox = rowContext.findRenderObject();
+      final viewportBox = viewportContext.findRenderObject();
+      if (rowBox is! RenderBox || viewportBox is! RenderBox) return false;
+      if (!rowBox.attached || !viewportBox.attached) return false;
+      if (!rowBox.hasSize || !viewportBox.hasSize) return false;
+      final rowRect = rowBox.localToGlobal(Offset.zero) & rowBox.size;
+      final viewportRect =
+          viewportBox.localToGlobal(Offset.zero) & viewportBox.size;
+      _activityGeometryResolved = true;
+      return rowRect.overlaps(viewportRect);
+    } catch (_) {
+      // 布局/语义帧交界上的极端时序：保守视为不可见（活动条显示）。
+      return false;
+    }
+  }
+
   Widget _buildActivityBar() {
     final live = _liveReasoning.current;
     final plan = _livePlanCache;
     final inBlock =
         plan != null && (plan.provisionalRendered || plan.reasoningRowVisible);
     final reasoning = inBlock ? '' : (live?.text ?? '');
+    // re-review P2：过程行 key 在首帧 layout 后才挂载。用「已解析」状态驱动少量
+    // post-frame 重建（而不是固定多帧），避免空转重建影响性能用例。
+    // 用「当前可能重复的活动工具集合」判断是否需要重新尝试几何；流式 delta 只改文本，
+    // 集合不变 → 不重置，避免每帧都 post-frame 重建（性能用例敏感）。
+    final candidateKey = [
+      for (final callId in _activeTools.keys)
+        if (plan != null && plan.visibleToolCallIds.contains(callId)) callId,
+    ]..sort();
+    final signature = candidateKey.join('|');
+    if (signature != _activityGeometryCandidateKey) {
+      _activityGeometryCandidateKey = signature;
+      _activityGeometryResolved = false;
+      _activityGeometryRefreshScheduled = false;
+      _activityGeometryRefreshFrames = 0;
+    }
+    // 只有「活动条当前可能有重复候选」时才需要几何重建；没有运行中工具不影响活动条。
+    final hasGeometryCandidate = plan != null &&
+        _pinnedToBottom &&
+        _activeTools.keys.any(plan.visibleToolCallIds.contains);
+    if (!_activityGeometryResolved &&
+        !_activityGeometryRefreshScheduled &&
+        _activityGeometryRefreshFrames < 1 &&
+        hasGeometryCandidate) {
+      _activityGeometryRefreshFrames++;
+      _activityGeometryRefreshScheduled = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _activityGeometryRefreshScheduled = false;
+        if (mounted) setState(() {});
+      });
+    }
     // issue #83 后续：过程块已展开且钉在底部时，运行中工具行已在对话里可见，
     // 活动条不再重复同一工具；只保留过程块尚未承载的工具（或滚动离开底部时）。
     final tools = [
       for (final entry in _activeTools.entries)
         if (!(plan != null &&
             _pinnedToBottom &&
-            plan.visibleToolCallIds.contains(entry.key)))
+            plan.visibleToolCallIds.contains(entry.key) &&
+            _isProcessToolRowInViewport(entry.key)))
           entry.value,
     ];
     if (reasoning.isEmpty && tools.isEmpty) return const SizedBox.shrink();
@@ -4713,9 +4789,10 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
           // 活动条：工具状态 / 无过程块时的思考（issue #70：与 provisional 同源、三处不重复）
           if (!_inHistory)
-            ValueListenableBuilder<int>(
-              valueListenable: _liveReasoningRevision,
-              builder: (context, _, _) => _buildActivityBar(),
+            // re-review P2：随滚动重建，工具行滚出视口时活动条立刻恢复。
+            ListenableBuilder(
+              listenable: Listenable.merge([_liveReasoningRevision, _scrollCtrl]),
+              builder: (context, _) => _buildActivityBar(),
             ),
           // 内核问询/审批弹窗（思考中途需要你拍板，与 PC 端同一 pending 通道）
           if (_question != null)
@@ -6561,9 +6638,11 @@ class _ChatScreenState extends State<ChatScreen> {
       );
     }
     final item = _currentToolItem(row.callId, historyView: historyView);
+    final callId = row.callId;
+    Widget child;
     if (item == null) {
       // 该工具卡不在当前列表（分页边界）：给一行只读摘要，不假装能展开详情。
-      return Padding(
+      child = Padding(
         padding: const EdgeInsets.only(left: 24, bottom: 6),
         child: Text(
           '${_isPlaceholderToolName(row.toolName) ? L10n.t('工具调用', 'Tool call') : row.toolName} · '
@@ -6575,10 +6654,17 @@ class _ChatScreenState extends State<ChatScreen> {
           style: TextStyle(fontSize: 12, color: DshColors.ink3(context)),
         ),
       );
+    } else {
+      // 单张工具卡在所有档位默认收起（note 1700 / 桌面 useDisclosure 默认关闭）。
+      // issue #76：过程区内用平铺变体（无逐卡边框）。
+      child = _buildToolCard(item, flat: true);
     }
-    // 单张工具卡在所有档位默认收起（note 1700 / 桌面 useDisclosure 默认关闭）。
-    // issue #76：过程区内用平铺变体（无逐卡边框）。
-    return _buildToolCard(item, flat: true);
+    if (callId == null) return child;
+    final rowKey = _processToolRowKeys.putIfAbsent(
+      callId,
+      () => GlobalKey(debugLabel: 'process-tool-row:$callId'),
+    );
+    return KeyedSubtree(key: rowKey, child: child);
   }
 
   /// issue #70：过程块里的运行中思考行（provisional）。

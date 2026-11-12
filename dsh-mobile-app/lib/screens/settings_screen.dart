@@ -11,6 +11,7 @@ import '../api.dart';
 import '../app_icon.dart';
 import '../app_icon_switcher.dart';
 import '../floating.dart';
+import '../git_models.dart';
 import '../keep_alive.dart';
 import '../l10n.dart';
 import '../local_notifications.dart';
@@ -973,6 +974,42 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String get _gitTabsSummary =>
       widget.store.gitTabs.map(_gitTabName).join(' · ');
 
+  /// issue #86：分支图选中上限（5/10/不限）的当前值文案（设置行 trailing）。
+  String get _gitGraphLimitSummary => switch (widget.store.gitGraphBranchLimit) {
+    GitGraphBranchLimit.five => '5',
+    GitGraphBranchLimit.ten => '10',
+    GitGraphBranchLimit.unlimited => L10n.t('不限', 'Unlimited'),
+  };
+
+  /// issue #86：设置行说明（§2.1 文案表；下次打开分支图时生效，不暗示持久化已选）。
+  String get _gitGraphLimitSub => switch (widget.store.gitGraphBranchLimit) {
+    GitGraphBranchLimit.five => L10n.t(
+      '最多同时选中 5 个分支（默认）；下次打开分支图时生效',
+      'Up to 5 selected branches (default); applies the next time you open the branch graph',
+    ),
+    GitGraphBranchLimit.ten => L10n.t(
+      '最多同时选中 10 个分支；下次打开分支图时生效',
+      'Up to 10 selected branches; applies the next time you open the branch graph',
+    ),
+    GitGraphBranchLimit.unlimited => L10n.t(
+      '不限制已选分支数；大仓库可能较慢，30 秒超时会提示改回 10 档',
+      'No cap on selected branches; large repos may be slow, and a 30s timeout suggests switching to 10',
+    ),
+  };
+
+  Future<void> _pickGitGraphLimit() async {
+    final current = widget.store.gitGraphBranchLimit;
+    final choice = await showGitGraphLimitSheet(
+      context,
+      current: current,
+      // 设置页不显示/不读取当前会话已选分支（未持久化，显示会误导）。
+      currentSelectedCount: 0,
+    );
+    if (choice != null && choice != current) {
+      await widget.store.setGitGraphBranchLimit(choice);
+    }
+  }
+
   Future<void> _pickGitTabs() async {
     var selected = List<String>.of(widget.store.gitTabs);
     final result = await showDialog<List<String>>(
@@ -1782,6 +1819,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Widget _row({
+    Key? key,
     required Widget leading,
     required String title,
     String? sub,
@@ -1791,6 +1829,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final ink3 = DshColors.ink3(context);
     final line = DshColors.line(context);
     return InkWell(
+      key: key,
       onTap: onTap,
       child: Container(
         padding: const EdgeInsets.symmetric(vertical: 12),
@@ -2031,6 +2070,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
             title: L10n.t('Git 标签页', 'Git tabs'),
             sub: _gitTabsSummary,
             onTap: _pickGitTabs,
+          ),
+          // issue #86：分支图选中上限（全局偏好，下次打开分支图生效）。
+          _row(
+            key: const Key('settings-git-graph-limit'),
+            leading: const Icon(Icons.account_tree_outlined),
+            title: L10n.t('Git 分支图上限', 'Git branch graph limit'),
+            sub: _gitGraphLimitSub,
+            trailing: Text(
+              _gitGraphLimitSummary,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: brand,
+              ),
+            ),
+            onTap: _pickGitGraphLimit,
           ),
           _row(
             leading: const Icon(Icons.psychology_outlined),
