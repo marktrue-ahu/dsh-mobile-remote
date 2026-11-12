@@ -1,5 +1,34 @@
 # Changelog
 
+## v3.2.4-alpha.14（build 46，issues #83 / #84 / #85 / #86 / #88）— 交互修复与分支图上限
+
+> 插件 `3.2.4-alpha.14` / App `3.2.4+46` / 载体 `3.2.4-alpha.14-app`。
+
+### Git 分支图上限（#86）
+
+- 新增 **5 / 10 / 不限** 三档（默认 5，设置页全局偏好）；筛选面板显示已选/上限，达上限一键改档；降档保留前 N + 提示；
+- 服务端 `GET /git/graph` 保留 1–32 tips，新增 **POST `/git/graph` 1–128 tips**；capability `graphTips:{max:128,getMax:32}`，旧宿主回退 5/5；
+- HEAD 200 不建快照；批量 tips 解析；25s absolute deadline + 504；snapshot 生命周期（已交付 timeout 保留 TTL、同 cursor 可重试、真 stale 才 409）；POST body 256KiB/name 1024B → 413；
+- App GET/POST 阈值、URL 预算、431→POST 回退、分页 504 保留整图 + 页级重试；各档 `min(档位, host max)`；>128 事前阻止；全选 union 仅当前搜索 + 即时反馈；
+- 16 色 palette；不持久化已选分支（退出重置，已确认）。
+
+### 交互修复
+
+- **行内绝对路径预览（#83/PR #50）**：未命中本轮记录时，绝对路径可点；确认后按 `/api/files` 打开，取消/复制不读取；
+- **待上传图片预览（#85/PR #52）**：点击缩略图全屏预览，多图页码/缩放/关闭；
+- **活动条真实可见性（#84/PR #55）**：只有过程工具行与视口相交才去重；分批/手收组/离屏时保留运行提醒；
+- **绝对路径精确匹配（#88/PR #54）**：不再用唯一 basename 误打开另一条记录；相对路径兜底保持。
+
+### 文档
+
+- ADR 0009/0005、docs/03-api §6.19、mobile-git 同步 POST graph/capability/413/504/431 与选择集语义。
+
+### 验证
+
+- flutter test **1295 全绿**；analyze 0 error/warning；timeline-contract 179；account-usage 15/15；Kotlin PASS；
+- reviewer 独立真实 service 场景与 #84 负向变异通过；真机 5/10/不限、大仓库、320/深色待本版验收。
+
+
 ## v3.2.4-alpha.13（build 45，issues #80 / #81）— 轮次导航手势与窄屏可读性
 
 > 插件 `3.2.4-alpha.13` / App `3.2.4+45` / 载体 `3.2.4-alpha.13-app`。
