@@ -1,5 +1,63 @@
 # Changelog
 
+## v3.2.4-alpha.16（build 48，issues #87 / #90 / #92 / #94 / #96 / #97 / #98 / #99 / #100 / #101 / #102）— 宿主兼容、触发卡与图片授权
+
+> 插件 `3.2.4-alpha.16` / App `3.2.4+48` / 载体 `3.2.4-alpha.16-app`。
+
+### 子代理/团队消息触发轮次卡（#101）
+
+- 普通模式新增两类触发卡：`agent-message`「收到任务消息」、`team-message`「收到团队消息」；`subagent-settled` 与 agent-instructions/runtime-context/skill-catalog/tool/plugin 等系统注入仍隐藏；
+- 紧凑卡片（图标 + 通用标签 + 首行预览），点按展开正文并沿用 `inj:` 每消息展开状态；空文本只显示标签、无预览，不铺普通气泡；
+- 触发卡是 user item，天然位于该轮过程块之前；history 与 SSE 共用同一构建路径，重复 messageId 去重；debug 模式仍显示全部注入；320/深色/1.5x 适配。
+
+### DSH 0.2.2-rc.2 宿主兼容（#87）
+
+- **subagents 中断**：按能力探测 `interruptByUser` 分流——rc.2 调用 `subagents/interruptByUser` 且 payload 仅 `{childSessionId}`，rc.1 保持 `interruptByParent` + `{childSessionId,parentSessionId,mode}`；透传 rc.2 `SubagentInterruptReceipt.accepted`（受理 ≠ 已静默），旧宿主无 receipt 仍返回 `{ok:true}`；
+- **子代理目录**：优先 `listDescendants(parent,signal)` 并只取 `depth===1`，失败/缺失回退 rc.1 `listChildren`，再回退既有持久化枚举；diagnostic 改按 `kind==="diagnostic"` 识别，reason 映射 `unsupported`/`corrupt`/`unavailable` 三枚举；目录缺 `createdAt` 时回落 `session.header.createdAt`，仍缺则沉底、组内 id 升序；App 面板显示对应「不受支持 / 目录数据损坏 / 目录不可用」；
+- hostCapabilities 新增 `subagents.catalog`、`subagents.interrupt` 三态（ok/drift/missing），hostGeneration 记录实际代际（descendants/children/none、user/parent/none）；host-canary 与 docs/09-compatibility §2.5/§2.6 同步为 10 项能力全绿口径。
+
+### 分支图动态左边距与 focus 预取（#102 / #100）
+
+- 按 scroll offset、rowHeight、viewport（+1 行 overscan）计算可见行区间与最大 lane；图宽 `max(80, 可见 lane 数*30+32)`，所有行标签共用同一列并随宽度移动；
+- 100ms debounce + 150ms Tween 平滑，快照切换立即重置目标、首帧按真实视口重算；横向 offset 变化后仅 clamp 到新 max，不自动跳左/不重置 0；320/深色/1.5x 不溢出；
+- #100：focus/prev 预取改为用户手势驱动——程序性 `jumpTo/animateTo` 不再触发 prev，focus 动画未稳定前禁止预取；prev 先缓存 pending，真实到顶才前插，并按可见首行 oid + 像素偏移锚定，不把当前视口推走；next 与 5/10 选择模式行为不变。
+
+### 工作区外图片会话授权（#94 → #98）
+
+- **#94 原始问题**：工作区外本地图片在 App 中无法显示；本版在不放宽读取边界的前提下，改为按会话显式授权后显示（修复 #98）。
+
+- 工作区外图片改为按会话授权显示：授权卡片支持「仅本次 / 本目录」，取消后记录 declined 状态——组件重建、滚动回滚、重新加载只显示「授权读取」，不再自动弹窗；用户点按才重新弹；
+- 切会话/dispose 清空授权、declined、pending prompt 与图片缓存；`consent-invalid` 清旧授权但保留 declined，避免自动弹窗循环；
+- 服务端 consent 端点 `lstat` 提前拒绝末级 symlink（`415 unsupported-image-symlink`），授权后 GET 仍走 `O_NOFOLLOW` + fd 实际路径校验，不因授权放宽读取边界。
+
+### 插件更新检查与 slash 菜单修复（#90 → #97 / #96）
+
+- **#90 原始问题**：斜杠命令/技能菜单的滚动、高亮与配色体验问题；本版由 #97 收口（修复 #97）。
+
+- 更新检查新增成功快照（5min）与失败/unavailable 独立短缓存（30s），`POST /plugin-update/check` 返回 checkId 异步轮询（GET 未知 404、过期 410、同 key in-flight 去重），整次检查 12s deadline → 稳定 `check-timeout`，不返回半结果；
+- 代际（generation）防止旧在途检查写回污染缓存；异常统一脱敏为 `check-failed`；submit 遇 `check-unavailable` 直接 503 不进版本比对，仅成功检查且 targetVersion 真实不同才重查一次，仍不同才 409 `candidate-changed`；
+- App 保留 35s 同步回退，超时后设置页显示「继续检查」并复用原 checkId（410 自动重启），旧宿主自动回退 GET；不抛裸 TimeoutException；
+- #97 后续：slash 菜单滚动、输入框高亮、命令绿 / 技能蓝配色，修复 320+键盘菜单溢出、过滤残留与文件名误高亮。
+
+### 压缩回放 surface 去重（#92 → #99）
+
+- **#92 原始问题**：部分工具调用在压缩回放后仍显示为旧版独立工具卡且无法随过程折叠；本版由 #99 的 surface replay 去重与严格解析收口（修复 #99）。
+
+- 服务端 `/history` 与 SSE 共用摘要，只读透传 `surfaceOp`（字符串 append / 对象 append/replace）与 `sourceEventSeqs`（去重正序 ≤64），非法 envelope 整组丢弃，不 bump 契约版本；
+- App `SurfaceOp` 按真实 union 严格解析（缺失 vs 显式 null、append 可省 start/end、replace 必带且 start<=end、source 必须早于当前 seq），坏 envelope 不解释为 replace；
+- 登记被 replace 遮蔽的 source seq：旧 source 后到不再生成工具卡、不清 surface 状态；replay 工具行锚回 source seq、按 source 排序且不新增历史工具卡；SSE 桥接保留 surface 字段，history/SSE 同语义。
+
+### 文档
+
+- docs/03-api §6.11b 同步 hostCapabilities/hostGeneration 的 subagents 三态与代际，§6.14 同步 `listDescendants` depth1、diagnostic 三枚举、createdAt 回落、interruptByUser 单字段与 accepted receipt 语义；
+- docs/09-compatibility §2.5/§2.6 更新 rc.2 subagents 两处契约漂移与能力口径；CONTEXT 增补更新检查快照/检查任务与触发卡术语。
+
+### 验证
+
+- 本机发布门禁：node 测试 **1172**（1159 通过 / 13 跳过 / 0 失败）、flutter test **1442** 全绿、flutter analyze 0 error/warning（24 条既有 info）；首轮 node 全量 1 例 host-canary 已知时序 flake（#40），单文件 46/46 与全量重跑均全绿；
+- 真机/320 宽/深色、分支图 5/10/all、图片授权、trigger 卡、动态 margin 列为本版验收项（发布后按验收清单执行）。
+
+
 ## v3.2.4-alpha.15（build 47，issues #90 / #91 / #92 / #93 / #94 / #95）— 斜杠菜单、全部分支图与本地图片
 
 > 插件 `3.2.4-alpha.15` / App `3.2.4+47` / 载体 `3.2.4-alpha.15-app`。
