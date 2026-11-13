@@ -139,10 +139,24 @@ List<SlashTextToken> slashTextTokens(String text) {
       continue;
     }
     // token 之后必须是空白/结束（DSH 词边界）；`/tmp/foo`、`x/name` 不成立。
-    if (j < text.length &&
-        (text[j] == '/' || !_isWhitespaceOrPunctuation(text[j]))) {
-      i = j;
-      continue;
+    if (j < text.length) {
+      final next = text[j];
+      // issue #97 P2：`/compact.md`、`/compact.txt` 是绝对文件名/路径前缀，不是命令；
+      // 点后接扩展名字符（或路径分隔符）一律按路径处理，不生成 token。
+      if (next == '\\' ||
+          next == '/' ||
+          (next == '.' &&
+              j + 1 < text.length &&
+              _isWordChar(text[j + 1]))) {
+        i = j + 1;
+        continue;
+      }
+      // `.` 后无扩展名（句号收尾）仍算标点边界；其余标点也允许命令收尾，
+      // 只有字母/数字等词内字符才不是 token 边界。
+      if (next != '.' && !_isWhitespaceOrPunctuation(next)) {
+        i = j;
+        continue;
+      }
     }
     tokens.add(SlashTextToken(
       start: i,

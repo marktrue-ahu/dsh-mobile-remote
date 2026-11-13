@@ -71,6 +71,16 @@ void main() {
       expect(slashTextTokens('/tmp/foo').where((t) => t.name == 'tmp'), isEmpty);
     });
 
+    test('issue #97 P2：绝对文件名/扩展名前缀不当作命令 token', () {
+      for (final text in ['/compact.md', '/compact.txt', '/plan.json', '/tmp/foo', 'x/name', 'https:/foo']) {
+        expect(slashTextTokens(text), isEmpty, reason: text);
+      }
+      // 点号只是句末标点（后面空白/结束）时仍算命令收尾。
+      expect(slashTextTokens('/compact.').map((t) => t.name), ['compact']);
+      expect(slashTextTokens('/compact. 你好').map((t) => t.name), ['compact']);
+      expect(slashTextTokens('/compact, /plan').map((t) => t.name), ['compact', 'plan']);
+    });
+
     test('标点边界与中文标点', () {
       final tokens = slashTextTokens('（/compact），/grill-me\n/plan');
       expect(tokens.map((t) => t.name).toList(), ['compact', 'grill-me', 'plan']);

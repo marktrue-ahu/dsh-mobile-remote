@@ -389,10 +389,13 @@ class _ChatScreenState extends State<ChatScreen> {
   final _inputCtrl = _SlashHighlightController();
   // issue #97：菜单在输入框上方/composer 外；用 composer 位置计算可用最大高度。
   final _composerKey = GlobalKey();
+  double? _bodyMaxHeight;
+  final _bottomControlsKey = GlobalKey();
   final _slashScroll = ScrollController();
   int _slashRemaining = 0;
   bool _slashOverflow = false;
   bool _slashAtBottom = true;
+  String _slashMenuSignature = '';
   int _slashScrollCheckTries = 0;
   final _scrollCtrl = ScrollController();
   static const _liveCenterKey = ValueKey<String>('chat-live-center');
@@ -3493,6 +3496,11 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     }
     final old = index >= 0 ? owner[index] : null;
+    // issue #99（reviewer P1）：surface replace replay 不能新建独立工具卡。
+    // reducer 已把替代内容合并进同一 callId 生命周期；这里若列表里找不到原卡，
+    // 说明这是“旧事件被替换”而非新的工具调用（原始事件不在当前窗口），不渲染。
+    // 原始 tool/call 随后到达时会走非 replay 分支，从生命周期带出合并后的结果并生成一张卡。
+    if (ev.isSurfaceReplace && old == null) return;
     // apply() 已在 _buildInto 入口执行，故 tools[callId] 已是合并后的权威生命周期。
     final lifecycle =
         _timelineReducer.tools[callId] ??
@@ -3643,15 +3651,31 @@ class _ChatScreenState extends State<ChatScreen> {
         _advanceLiveReasoningStep(ev);
       }
     }
+    // issue #99（reviewer P1）：surface replace 的 shadow 判定必须先于所有投影生效。
+    // reducer 先登记 source seq；tracker/UI 不得再消费后到的旧 source 事件，
+    // 否则会清掉 surfaceReplay 标记并生成 turn148 partial 历史组。
+    final accepted = _timelineReducer.apply(ev);
+    if (_timelineReducer.isShadowedSeq(ev.seq)) {
+      // 替换事件可能先于旧 source 到达（历史倒序/翻旧页）。旧 source 本身不再进
+      // tracker/过程组，但若 reducer 已有同 callId 的替代生命周期，则把工具卡
+      // **物化在原 source 位置**（有原事件 → 一张卡；replay-only 永远不会走到这里）。
+      if (ev.type == 'tool/call' ||
+          ev.type == 'tool/result' ||
+          (ev.type == 'assistant/chunk' || ev.type == 'assistant/live-chunk') &&
+              (ev.data?['toolCall'] != null || ev.data?['argumentsDelta'] != null)) {
+        _upsertToolItem(out, ev, history: history);
+      }
+      return;
+    }
+    // Historical reconstruction must still render a record even when the same seq
+    // arrived via SSE while the REST request was in flight. Live ingestion can
+    // discard the duplicate because _handleEvent already owns the visible stream.
+    if (!accepted && !history) return;
     // issue #61：先记 tool 名再合并，保证没有 name 的后续事件（result/增量）能补名。
     _recordToolName(ev);
     // issue #52：轮次过程投影与时间线条目同步观察（历史/实时/分页重叠都收敛到同一结构）。
     _turnProcess.observe(ev);
     _processVersion++;
-    // Historical reconstruction must still render a record even when the same seq
-    // arrived via SSE while the REST request was in flight. Live ingestion can
-    // discard the duplicate because _handleEvent already owns the visible stream.
-    if (!_timelineReducer.apply(ev) && !history) return;
     switch (ev.type) {
       case 'deliverables/presented':
         // issue #53（§6.20）：交付文件声明收进轮末交付卡，不生成通用事件卡；
@@ -3790,13 +3814,13 @@ class _ChatScreenState extends State<ChatScreen> {
       case 'tool/call':
         final callId = _toolActivityKey(d ?? const <String, dynamic>{}, ev.seq, out.length);
         final name = timelineToolNameOf(d, callId: callId, fallback: L10n.t('工具', 'Tool'));
-        if (!history) {
+        if (!history && !ev.isSurfaceReplace) {
           _activeTools[callId] = name;
           _scheduleActivityFlush();
         }
         _upsertToolItem(out, ev, history: history);
       case 'tool/result':
-        if (!history) {
+        if (!history && !ev.isSurfaceReplace) {
           _activeTools.remove(
             _toolActivityKey(
               d ?? const <String, dynamic>{},
@@ -4104,13 +4128,27 @@ class _ChatScreenState extends State<ChatScreen> {
   /// composer 尚未布局时保守回退 240，避免首帧菜单溢出。
   double _slashMenuMaxHeight(BuildContext context) {
     final media = MediaQuery.of(context);
-    final keyboardTop = media.size.height - media.viewInsets.bottom;
-    final box = _composerKey.currentContext?.findRenderObject() as RenderBox?;
-    final composerTop = box != null && box.hasSize
-        ? box.localToGlobal(Offset.zero).dy
-        : keyboardTop - 160;
-    final available = composerTop - media.padding.top - 16;
-    return math.min(360.0, math.max(120.0, available));
+    // Scaffold 内容区高度（已扣除 AppBar/键盘/安全区）；不能用全屏高度−inset，
+    // 否则 320×640 会多算 56px AppBar，菜单把底部 Column 撑溢出。
+    final bodyHeight = _bodyMaxHeight ??
+        (media.size.height - media.viewInsets.bottom - media.padding.top - 56);
+    // 只测量独立 composer 卡片（不能量包含菜单的外层 Padding，否则菜单一出现
+    // composer 高度就把它算进去，形成循环并算出负可用空间）。
+    final composerBox =
+        _composerKey.currentContext?.findRenderObject() as RenderBox?;
+    final composerHeight = (composerBox != null && composerBox.hasSize
+            ? composerBox.size.height
+            : 102.0) +
+        14.0 +
+        media.padding.bottom;
+    final controlsBox =
+        _bottomControlsKey.currentContext?.findRenderObject() as RenderBox?;
+    final controlsHeight = controlsBox != null && controlsBox.hasSize
+        ? controlsBox.size.height
+        : 0.0;
+    // 菜单在 composer 上方，与输入区间隔 8；再留 8 安全余量。
+    final available = bodyHeight - controlsHeight - composerHeight - 16;
+    return math.min(360.0, math.max(0.0, available));
   }
 
   /// issue #97：菜单独立滚动到底时收起“上滑查看更多”，最多展示剩余项数。
@@ -4150,6 +4188,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final commandColor = _SlashPalette.commandText(pageContext);
     final skillColor = _SlashPalette.skillText(pageContext);
     final maxHeight = _slashMenuMaxHeight(pageContext);
+    if (maxHeight < 48) return const SizedBox.shrink();
     Widget header(String label, int count, Color dot) => Padding(
           padding: const EdgeInsets.fromLTRB(10, 8, 10, 4),
           child: Row(
@@ -4257,6 +4296,22 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         ),
     ];
+    // 条目/过滤变化后必须重算 overflow：先复位旧提示与滚动位置，避免只剩 1 项时
+    // 仍显示“Scroll for more · 23 left”；过滤后仍溢出则从顶部重新计算。
+    final signature = entries
+        .map((entry) => '${entry.skill ? 1 : 0}:${entry.name}')
+        .join('\u0001');
+    if (signature != _slashMenuSignature) {
+      _slashMenuSignature = signature;
+      _slashRemaining = 0;
+      _slashOverflow = false;
+      _slashAtBottom = true;
+      if (_slashScroll.hasClients) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted && _slashScroll.hasClients) _slashScroll.jumpTo(0);
+        });
+      }
+    }
     _slashScrollCheckTries = 0;
     void scheduleScrollCheck() {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -4264,6 +4319,19 @@ class _ChatScreenState extends State<ChatScreen> {
         if (_slashScroll.hasClients && _slashScroll.position.maxScrollExtent > 0) {
           _slashScrollCheckTries = 0;
           _updateSlashMenuScroll(entries.length);
+          return;
+        }
+        // 列表可完整放下（maxScrollExtent==0）：必须显式清掉旧 overflow/remaining，
+        // 否则过滤到 1 项后仍残留 “Scroll for more”。
+        if (_slashScroll.hasClients) {
+          _slashScrollCheckTries = 0;
+          if (_slashOverflow || _slashRemaining != 0 || !_slashAtBottom) {
+            setState(() {
+              _slashOverflow = false;
+              _slashRemaining = 0;
+              _slashAtBottom = true;
+            });
+          }
           return;
         }
         if (_slashScrollCheckTries < 3) {
@@ -5510,7 +5578,9 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         ],
       ),
-      body: Column(
+      body: LayoutBuilder(builder: (context, constraints) {
+        _bodyMaxHeight = constraints.maxHeight;
+        return Column(
         children: [
           // 用量条
           if (_usageLoaded && _usage.isNotEmpty)
@@ -5611,6 +5681,12 @@ class _ChatScreenState extends State<ChatScreen> {
               ],
             ),
           ),
+          // issue #97 P2：composer 上方的底部控件统一成可测量的一组，
+          // 菜单可用高度需扣除它们，避免 320×640 + 键盘时 Column 溢出。
+          Column(
+            key: _bottomControlsKey,
+            mainAxisSize: MainAxisSize.min,
+            children: [
           // 活动条：工具状态 / 无过程块时的思考（issue #70：与 provisional 同源、三处不重复）
           if (!_inHistory)
             // re-review P2：随滚动重建，工具行滚出视口时活动条立刻恢复。
@@ -5670,6 +5746,8 @@ class _ChatScreenState extends State<ChatScreen> {
           if (!_inHistory) _buildTodoPanel(),
           // v2.7.2：队列停靠区（独立于输入框的轻量条，空队列不渲染）
           _buildQueueDock(),
+            ],
+          ),
           // composer（v2.8.0 重构为两层，对齐 PC 端 InputBar）：
           // 第一层 = [/命令] + 输入框（独占最宽）；第二层 = 模型/权限/排队胶囊 + 上下文圆环 + 发送
           SafeArea(
@@ -5854,7 +5932,8 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           ),
         ],
-      ),
+      );
+      }),
     );
   }
 

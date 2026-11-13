@@ -42,6 +42,22 @@ class ApiException implements Exception {
   String toString() => message;
 }
 
+/// issue #96：恢复的 checkId 已过期/不存在（404/410），需重新发起检查。
+class PluginUpdateCheckExpired implements Exception {
+  final String checkId;
+  const PluginUpdateCheckExpired(this.checkId);
+  @override
+  String toString() => 'update-check-expired';
+}
+
+/// issue #96：异步检查轮询超时（checkId 保留，供 UI 提示“仍在电脑端进行”）。
+class PluginUpdateCheckTimeout implements Exception {
+  final String checkId;
+  const PluginUpdateCheckTimeout(this.checkId);
+  @override
+  String toString() => 'update-check-timeout';
+}
+
 /// 电脑端**口令生成/落盘失败**（罕见：状态目录不可写等；契约 §5.7 / F21）。
 /// 与普通 `auth-required`（口令缺失/错误，重扫一次即可）分开处理。
 bool isAuthNotConfigured(ApiException error) {
@@ -1161,9 +1177,173 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
     throw ApiException('清单重定向次数过多');
   }
 
-  /// Read the host-selected plugin/carrier candidate. The phone never contacts npm.
-  Future<Map<String, dynamic>> checkPluginUpdate() =>
-      getJson('/api/plugin-update/check');
+  /// 旧宿主/fallback：同步只读检查（35s 兼容旧 App 15s 检查窗口）。
+  Future<Map<String, dynamic>> checkPluginUpdate({
+    Duration timeout = const Duration(seconds: 35),
+  }) => getJson('/api/plugin-update/check', timeout: timeout);
+
+  /// issue #96：新宿主异步检查入口（200 checking + checkId）。
+  Future<Map<String, dynamic>> startPluginUpdateCheck({
+    bool force = false,
+    Duration timeout = const Duration(seconds: 15),
+  }) => postJson('/api/plugin-update/check', {
+    if (force) 'force': true,
+  }, timeout: timeout);
+
+  /// issue #96：轮询异步检查结果（timeout 取总预算剩余时间）。
+  Future<Map<String, dynamic>> pluginUpdateCheckStatus(
+    String checkId, {
+    Duration timeout = const Duration(seconds: 15),
+  }) => getJson(
+    '/api/plugin-update/check?checkId=${Uri.encodeQueryComponent(checkId)}',
+    timeout: timeout,
+  );
+
+  Future<Map<String, dynamic>> _legacyPluginUpdateCheck(
+    Duration totalTimeout,
+    Stopwatch watch,
+  ) async {
+    final remaining = totalTimeout - watch.elapsed;
+    try {
+      return await checkPluginUpdate(
+        timeout: remaining > Duration.zero ? remaining : totalTimeout,
+      );
+    } on TimeoutException {
+      throw ApiException(
+        'update-check-timeout',
+        code: 'check-timeout',
+      );
+    }
+  }
+
+  /// issue #96：优先异步检查；旧宿主 POST 404/405 自动回退同步 GET。
+  ///
+  /// 轮询 1s/2s/3s 退避，总 35s；超时抛 [PluginUpdateCheckTimeout] 并保留 checkId，
+  /// 不抛裸 TimeoutException。只在 done 时返回结果，绝不返回半状态。
+  Future<Map<String, dynamic>> checkPluginUpdateAsync({
+    bool force = false,
+    Duration totalTimeout = const Duration(seconds: 35),
+    void Function(String state)? onProgress,
+    List<Duration>? pollDelays,
+  }) async {
+    final watch = Stopwatch()..start();
+    Map<String, dynamic> started;
+    try {
+      final startBudget = totalTimeout - watch.elapsed;
+      started = await startPluginUpdateCheck(
+        force: force,
+        timeout: startBudget < const Duration(seconds: 15)
+            ? startBudget
+            : const Duration(seconds: 15),
+      );
+    } on TimeoutException {
+      // 单请求超时也映射成友好检查超时，不冒泡裸 TimeoutException。
+      throw ApiException(
+        'update-check-timeout',
+        code: 'check-timeout',
+      );
+    } on ApiException catch (error) {
+      if (error.status == 404 || error.status == 405) {
+        // 旧宿主无异步能力：照旧走同步 GET，不把探测失败暴露给用户。
+        return _legacyPluginUpdateCheck(totalTimeout, watch);
+      }
+      rethrow;
+    }
+    final checkId = (started['checkId'] ?? '').toString();
+    if (checkId.isEmpty) {
+      // 旧宿主/代理可能对未知 POST 返回 200 {}；按无异步能力回退同步 GET。
+      return _legacyPluginUpdateCheck(totalTimeout, watch);
+    }
+    return _pollPluginUpdateCheck(
+      checkId,
+      totalTimeout: totalTimeout,
+      onProgress: onProgress,
+      pollDelays: pollDelays,
+      watch: watch,
+    );
+  }
+
+  /// issue #96 review P2：用已保留的 checkId 续查（不重新 POST），用于超时后
+  /// 更新行「继续检查」；404/410 抛 [PluginUpdateCheckExpired] 由 UI 清状态重启。
+  Future<Map<String, dynamic>> resumePluginUpdateCheck(
+    String checkId, {
+    Duration totalTimeout = const Duration(seconds: 35),
+    void Function(String state)? onProgress,
+    List<Duration>? pollDelays,
+  }) {
+    return _pollPluginUpdateCheck(
+      checkId,
+      totalTimeout: totalTimeout,
+      onProgress: onProgress,
+      pollDelays: pollDelays,
+      watch: Stopwatch()..start(),
+    );
+  }
+
+  Future<Map<String, dynamic>> _pollPluginUpdateCheck(
+    String checkId, {
+    required Duration totalTimeout,
+    void Function(String state)? onProgress,
+    List<Duration>? pollDelays,
+    required Stopwatch watch,
+  }) async {
+    var pollIndex = 0;
+    while (true) {
+      final remaining = totalTimeout - watch.elapsed;
+      if (remaining <= Duration.zero) {
+        throw PluginUpdateCheckTimeout(checkId);
+      }
+      final wait = pollDelays == null || pollDelays.isEmpty
+          ? Duration(seconds: pollIndex < 2 ? pollIndex + 1 : 3)
+          : pollDelays[pollIndex < pollDelays.length
+              ? pollIndex
+              : pollDelays.length - 1];
+      await Future<void>.delayed(wait < remaining ? wait : remaining);
+      Map<String, dynamic> status;
+      try {
+        final requestBudget = totalTimeout - watch.elapsed;
+        status = await pluginUpdateCheckStatus(
+          checkId,
+          timeout: requestBudget < const Duration(seconds: 15)
+              ? (requestBudget > Duration.zero
+                  ? requestBudget
+                  : const Duration(milliseconds: 1))
+              : const Duration(seconds: 15),
+        );
+      } on TimeoutException {
+        throw PluginUpdateCheckTimeout(checkId);
+      } on ApiException catch (error) {
+        if (error.status == 404 || error.status == 410) {
+          throw PluginUpdateCheckExpired(checkId);
+        }
+        rethrow;
+      }
+      final state = (status['state'] ?? '').toString();
+      onProgress?.call(state);
+      if (state == 'done') {
+        final pluginUpdate = status['pluginUpdate'];
+        if (pluginUpdate is! Map) {
+          throw ApiException(
+            'update-check-incomplete',
+            code: 'update-check-incomplete',
+            body: status,
+          );
+        }
+        return <String, dynamic>{
+          ...status,
+          'pluginUpdate': Map<String, dynamic>.from(pluginUpdate),
+        };
+      }
+      if (state == 'error') {
+        throw ApiException(
+          (status['error'] ?? 'update-check-failed').toString(),
+          code: 'update-check-failed',
+          body: status,
+        );
+      }
+      pollIndex += 1;
+    }
+  }
 
   /// Resolve legacy candidate metadata before asking for final update confirmation.
   Future<Map<String, dynamic>> preparePluginUpdate({required String opId}) =>
