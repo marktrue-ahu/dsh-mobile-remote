@@ -192,10 +192,12 @@ class _PluginUpdateDetailsPanelState extends State<_PluginUpdateDetailsPanel> {
 class SettingsScreen extends StatefulWidget {
   final AppStore store;
   final Future<void> Function() onReconfigure;
+  final Duration pluginCheckTotalTimeout;
   const SettingsScreen({
     super.key,
     required this.store,
     required this.onReconfigure,
+    this.pluginCheckTotalTimeout = const Duration(seconds: 35),
   });
 
   @override
@@ -213,6 +215,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String _appVersion = ''; // App 自身版本（package_info_plus，构建时打包）
   bool _bubbleOn = false; // 悬浮球开关状态（与服务实际运行状态同步）
   bool _updateFlowBusy = false;
+  bool _pluginCheckRunning = false;
+  String? _pendingPluginCheckId; // 超时保留的 checkId，供“继续检查”
+  String? _settingsSessionId;
   bool _keepAliveOn = false; // 后台保活（常驻通知）开关，默认关
   Timer? _diagTimer; // 设置页打开时每 5s 刷新原生轮询状态
 
@@ -2356,7 +2361,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _row(
             leading: const Icon(Icons.desktop_windows_outlined),
             title: L10n.t('更新电脑端插件', 'Update desktop plugin'),
-            sub: store.pluginUpdateJournal != null
+            sub: _pluginCheckRunning
+                ? L10n.t('正在检查…', 'Checking…')
+                : _pendingPluginCheckId != null
+                ? L10n.t(
+                    '上次检查仍在电脑端进行，点击继续检查',
+                    'The previous check is still running; tap to continue',
+                  )
+                : store.pluginUpdateJournal != null
                 ? _journalSub(store)
                 : !store.api.pluginUpdate.contentUpdateAvailable
                 ? L10n.t(
@@ -2372,13 +2384,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     '电脑端插件有新版本：本机形态需按指引更新',
                     'A newer desktop plugin is available — follow the guide for your install',
                   ),
-            onTap: store.pluginUpdateJournal != null
+            onTap: _pluginCheckRunning
+                ? null
+                : store.pluginUpdateJournal != null
                 ? () => unawaited(_updateJournalActions(store))
                 : (!store.api.pluginUpdate.contentUpdateAvailable ||
                           store.api.pluginUpdate.canSelfUpdate
                       ? _triggerPluginUpdate
                       : _showPluginUpdateGuidance),
-            trailing: store.pluginUpdateJournal == null
+            trailing: _pluginCheckRunning
+                ? Text(
+                    L10n.t('检查中…', 'Checking…'),
+                    style: TextStyle(fontSize: 12, color: brand),
+                  )
+                : _pendingPluginCheckId != null
+                ? Text(
+                    L10n.t('继续检查 ▸', 'Continue ▸'),
+                    style: TextStyle(fontSize: 12, color: brand),
+                  )
+                : store.pluginUpdateJournal == null
                 ? Text(
                     !store.api.pluginUpdate.contentUpdateAvailable
                         ? L10n.t('检查 ▸', 'Check ▸')
@@ -2581,6 +2605,76 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  /// issue #96：异步更新检查（force 手动刷新）；超时保留 checkId 并提示，不弹裸超时。
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final session = widget.store.sessionId;
+    if (_settingsSessionId != null && session != _settingsSessionId) {
+      _pendingPluginCheckId = null;
+    }
+    _settingsSessionId = session;
+  }
+
+  Future<Map<String, dynamic>?> _runPluginUpdateCheck({String? resumeCheckId}) async {
+    if (_pluginCheckRunning) return null;
+    setState(() => _pluginCheckRunning = true);
+    try {
+      var resume = resumeCheckId;
+      while (true) {
+        try {
+          final response = resume != null
+              ? await widget.store.api.resumePluginUpdateCheck(
+                  resume,
+                  totalTimeout: widget.pluginCheckTotalTimeout,
+                )
+              : await widget.store.api.checkPluginUpdateAsync(
+                  force: true,
+                  totalTimeout: widget.pluginCheckTotalTimeout,
+                );
+          _pendingPluginCheckId = null;
+          return response;
+        } on PluginUpdateCheckExpired {
+          _pendingPluginCheckId = null;
+          if (mounted) {
+            showToast(
+              context,
+              L10n.t(
+                '上次检查已过期，正在重新检查',
+                'The previous check expired; starting a new check',
+              ),
+            );
+          }
+          if (resume == null) return null;
+          resume = null; // 404/410：清掉旧 checkId 后自动重启检查。
+          continue;
+        } on PluginUpdateCheckTimeout catch (error) {
+          _pendingPluginCheckId = error.checkId;
+          if (mounted) {
+            showToast(
+              context,
+              L10n.t(
+                '检查仍在电脑端进行，可再次点击“继续检查”或查看更新日志',
+                'The check is still running on the desktop; tap “Continue check” again or view the update log',
+              ),
+            );
+          }
+          return null;
+        }
+      }
+    } on ApiException catch (error) {
+      if (mounted) {
+        showToast(
+          context,
+          '${L10n.t('检查暂不可用：', 'Check unavailable: ')}${error.code ?? error.message}',
+        );
+      }
+      return null;
+    } finally {
+      if (mounted) setState(() => _pluginCheckRunning = false);
+    }
+  }
+
   /// 在手机上触发电脑端插件更新。
   ///
   /// Legacy prepare 可在确认前查询候选，但不启动最终插件更新 POST。prepare 失败后
@@ -2633,8 +2727,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
         targetContentSha256 = current.targetContentSha256;
         prepareId = current.prepareId;
       } else {
-        final response = await store.api.checkPluginUpdate();
-        if (!mounted) return;
+        final response = await _runPluginUpdateCheck(
+          resumeCheckId: _pendingPluginCheckId,
+        );
+        if (!mounted || response == null) return;
         final rawStatus = response['pluginUpdate'];
         if (rawStatus is Map) {
           // 检查结果也是最新状态：刷新后行文案/是否可自更新都跟着变。

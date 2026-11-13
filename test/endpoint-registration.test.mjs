@@ -143,7 +143,7 @@ test("本次新增的自更新端点已登记并保护 NPM check/prepare/log API
 	for (const p of ["/plugin-update", "/update/manifest", "/update/apk", "/update/plugin"]) {
 		assert.ok(byPath.has(p), `${p} 未登记`);
 	}
-	for (const [path, methods] of [["/plugin-update/check", "GET"], ["/plugin-update/prepare", "POST"], ["/plugin-update/log", "GET"]]) {
+	for (const [path, methods] of [["/plugin-update/check", "GET/POST"], ["/plugin-update/prepare", "POST"], ["/plugin-update/log", "GET"]]) {
 		assert.equal(byPath.get(path)?.methods, methods, `${path} method mismatch`);
 		assert.equal(byPath.get(path)?.auth, "required", `${path} must require mobile auth`);
 	}
