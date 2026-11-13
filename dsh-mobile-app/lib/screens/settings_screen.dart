@@ -213,6 +213,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String _appVersion = ''; // App 自身版本（package_info_plus，构建时打包）
   bool _bubbleOn = false; // 悬浮球开关状态（与服务实际运行状态同步）
   bool _updateFlowBusy = false;
+  bool _pluginCheckRunning = false;
   bool _keepAliveOn = false; // 后台保活（常驻通知）开关，默认关
   Timer? _diagTimer; // 设置页打开时每 5s 刷新原生轮询状态
 
@@ -2356,7 +2357,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _row(
             leading: const Icon(Icons.desktop_windows_outlined),
             title: L10n.t('更新电脑端插件', 'Update desktop plugin'),
-            sub: store.pluginUpdateJournal != null
+            sub: _pluginCheckRunning
+                ? L10n.t('正在检查…', 'Checking…')
+                : store.pluginUpdateJournal != null
                 ? _journalSub(store)
                 : !store.api.pluginUpdate.contentUpdateAvailable
                 ? L10n.t(
@@ -2372,13 +2375,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     '电脑端插件有新版本：本机形态需按指引更新',
                     'A newer desktop plugin is available — follow the guide for your install',
                   ),
-            onTap: store.pluginUpdateJournal != null
+            onTap: _pluginCheckRunning
+                ? null
+                : store.pluginUpdateJournal != null
                 ? () => unawaited(_updateJournalActions(store))
                 : (!store.api.pluginUpdate.contentUpdateAvailable ||
                           store.api.pluginUpdate.canSelfUpdate
                       ? _triggerPluginUpdate
                       : _showPluginUpdateGuidance),
-            trailing: store.pluginUpdateJournal == null
+            trailing: _pluginCheckRunning
+                ? Text(
+                    L10n.t('检查中…', 'Checking…'),
+                    style: TextStyle(fontSize: 12, color: brand),
+                  )
+                : store.pluginUpdateJournal == null
                 ? Text(
                     !store.api.pluginUpdate.contentUpdateAvailable
                         ? L10n.t('检查 ▸', 'Check ▸')
@@ -2581,6 +2591,36 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  /// issue #96：异步更新检查（force 手动刷新）；超时保留 checkId 并提示，不弹裸超时。
+  Future<Map<String, dynamic>?> _runPluginUpdateCheck() async {
+    if (_pluginCheckRunning) return null;
+    setState(() => _pluginCheckRunning = true);
+    try {
+      return await widget.store.api.checkPluginUpdateAsync(force: true);
+    } on PluginUpdateCheckTimeout catch (error) {
+      if (mounted) {
+        showToast(
+          context,
+          L10n.t(
+            '检查仍在电脑端进行，可重试或查看更新日志（check ${error.checkId}）',
+            'The check is still running on the desktop; retry or view the update log (check ${error.checkId})',
+          ),
+        );
+      }
+      return null;
+    } on ApiException catch (error) {
+      if (mounted) {
+        showToast(
+          context,
+          '${L10n.t('检查暂不可用：', 'Check unavailable: ')}${error.code ?? error.message}',
+        );
+      }
+      return null;
+    } finally {
+      if (mounted) setState(() => _pluginCheckRunning = false);
+    }
+  }
+
   /// 在手机上触发电脑端插件更新。
   ///
   /// Legacy prepare 可在确认前查询候选，但不启动最终插件更新 POST。prepare 失败后
@@ -2633,8 +2673,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
         targetContentSha256 = current.targetContentSha256;
         prepareId = current.prepareId;
       } else {
-        final response = await store.api.checkPluginUpdate();
-        if (!mounted) return;
+        final response = await _runPluginUpdateCheck();
+        if (!mounted || response == null) return;
         final rawStatus = response['pluginUpdate'];
         if (rawStatus is Map) {
           // 检查结果也是最新状态：刷新后行文案/是否可自更新都跟着变。

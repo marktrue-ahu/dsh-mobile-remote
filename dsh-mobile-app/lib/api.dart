@@ -42,6 +42,14 @@ class ApiException implements Exception {
   String toString() => message;
 }
 
+/// issue #96：异步检查轮询超时（checkId 保留，供 UI 提示“仍在电脑端进行”）。
+class PluginUpdateCheckTimeout implements Exception {
+  final String checkId;
+  const PluginUpdateCheckTimeout(this.checkId);
+  @override
+  String toString() => 'update-check-timeout';
+}
+
 /// 电脑端**口令生成/落盘失败**（罕见：状态目录不可写等；契约 §5.7 / F21）。
 /// 与普通 `auth-required`（口令缺失/错误，重扫一次即可）分开处理。
 bool isAuthNotConfigured(ApiException error) {
@@ -1161,9 +1169,95 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
     throw ApiException('清单重定向次数过多');
   }
 
-  /// Read the host-selected plugin/carrier candidate. The phone never contacts npm.
+  /// 旧宿主/fallback：同步只读检查（35s 兼容旧 App 15s 检查窗口）。
   Future<Map<String, dynamic>> checkPluginUpdate() =>
-      getJson('/api/plugin-update/check');
+      getJson('/api/plugin-update/check', timeout: const Duration(seconds: 35));
+
+  /// issue #96：新宿主异步检查入口（200 checking + checkId）。
+  Future<Map<String, dynamic>> startPluginUpdateCheck({bool force = false}) =>
+      postJson('/api/plugin-update/check', {
+        if (force) 'force': true,
+      }, timeout: const Duration(seconds: 15));
+
+  /// issue #96：轮询异步检查结果。
+  Future<Map<String, dynamic>> pluginUpdateCheckStatus(String checkId) => getJson(
+    '/api/plugin-update/check?checkId=${Uri.encodeQueryComponent(checkId)}',
+    timeout: const Duration(seconds: 15),
+  );
+
+  /// issue #96：优先异步检查；旧宿主 POST 404/405 自动回退同步 GET。
+  ///
+  /// 轮询 1s/2s/3s 退避，总 35s；超时抛 [PluginUpdateCheckTimeout] 并保留 checkId，
+  /// 不抛裸 TimeoutException。只在 done 时返回结果，绝不返回半状态。
+  Future<Map<String, dynamic>> checkPluginUpdateAsync({
+    bool force = false,
+    Duration totalTimeout = const Duration(seconds: 35),
+    void Function(String state)? onProgress,
+    List<Duration>? pollDelays,
+  }) async {
+    Map<String, dynamic> started;
+    try {
+      started = await startPluginUpdateCheck(force: force);
+    } on ApiException catch (error) {
+      if (error.status == 404 || error.status == 405) {
+        // 旧宿主无异步能力：照旧走同步 GET，不把探测失败暴露给用户。
+        return checkPluginUpdate();
+      }
+      rethrow;
+    }
+    final checkId = (started['checkId'] ?? '').toString();
+    if (checkId.isEmpty) {
+      // 旧宿主/代理可能对未知 POST 返回 200 {}；按无异步能力回退同步 GET。
+      return checkPluginUpdate();
+    }
+    final watch = Stopwatch()..start();
+    var pollIndex = 0;
+    while (true) {
+      final remaining = totalTimeout - watch.elapsed;
+      if (remaining <= Duration.zero) {
+        throw PluginUpdateCheckTimeout(checkId);
+      }
+      final wait = pollDelays == null || pollDelays.isEmpty
+          ? Duration(seconds: pollIndex < 2 ? pollIndex + 1 : 3)
+          : pollDelays[pollIndex < pollDelays.length
+              ? pollIndex
+              : pollDelays.length - 1];
+      await Future<void>.delayed(wait < remaining ? wait : remaining);
+      Map<String, dynamic> status;
+      try {
+        status = await pluginUpdateCheckStatus(checkId);
+      } on ApiException catch (error) {
+        if (error.status == 404 || error.status == 410) {
+          throw PluginUpdateCheckTimeout(checkId);
+        }
+        rethrow;
+      }
+      final state = (status['state'] ?? '').toString();
+      onProgress?.call(state);
+      if (state == 'done') {
+        final pluginUpdate = status['pluginUpdate'];
+        if (pluginUpdate is! Map) {
+          throw ApiException(
+            'update-check-incomplete',
+            code: 'update-check-incomplete',
+            body: status,
+          );
+        }
+        return <String, dynamic>{
+          ...status,
+          'pluginUpdate': Map<String, dynamic>.from(pluginUpdate),
+        };
+      }
+      if (state == 'error') {
+        throw ApiException(
+          (status['error'] ?? 'update-check-failed').toString(),
+          code: 'update-check-failed',
+          body: status,
+        );
+      }
+      pollIndex += 1;
+    }
+  }
 
   /// Resolve legacy candidate metadata before asking for final update confirmation.
   Future<Map<String, dynamic>> preparePluginUpdate({required String opId}) =>
