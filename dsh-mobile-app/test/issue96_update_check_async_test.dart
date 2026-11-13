@@ -163,4 +163,69 @@ void main() {
           .having((e) => e.code, 'code', 'update-check-failed')),
     );
   });
+  test('status 单请求超时用剩余预算，并映射友好 PluginUpdateCheckTimeout（不裸冒泡）', () async {
+    final api = Api(client: MockClient((request) async {
+      if (request.method == 'POST') {
+        return http.Response(
+          jsonEncode({'ok': true, 'state': 'checking', 'checkId': 'chk-slow'}),
+          200,
+        );
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      return http.Response(
+        jsonEncode({'ok': true, 'state': 'checking', 'checkId': 'chk-slow'}),
+        200,
+      );
+    }))
+      ..baseUrl = 'http://host:3080'
+      ..path = '/m'
+      ..token = 'tok';
+    final watch = Stopwatch()..start();
+    await expectLater(
+      api.checkPluginUpdateAsync(
+        totalTimeout: const Duration(milliseconds: 120),
+        pollDelays: const [Duration(milliseconds: 10)],
+      ),
+      throwsA(isA<PluginUpdateCheckTimeout>()
+          .having((e) => e.checkId, 'checkId', 'chk-slow')),
+    );
+    expect(watch.elapsed, lessThan(const Duration(seconds: 2)),
+        reason: 'status 请求应使用剩余预算，而不是固定 15s');
+  });
+
+  test('POST 启动超时映射为 ApiException check-timeout，不抛裸 TimeoutException', () async {
+    final api = Api(client: MockClient((request) async {
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      return http.Response('{}', 200);
+    }))
+      ..baseUrl = 'http://host:3080'
+      ..path = '/m'
+      ..token = 'tok';
+    await expectLater(
+      api.checkPluginUpdateAsync(
+        totalTimeout: const Duration(milliseconds: 80),
+        pollDelays: const [Duration(milliseconds: 10)],
+      ),
+      throwsA(isA<ApiException>()
+          .having((e) => e.code, 'code', 'check-timeout')),
+    );
+  });
+
+  test('旧宿主回退 GET 超时也映射友好 check-timeout', () async {
+    final api = Api(client: MockClient((request) async {
+      if (request.method == 'POST') {
+        return http.Response(jsonEncode({'error': 'not-found'}), 404);
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      return http.Response('{}', 200);
+    }))
+      ..baseUrl = 'http://host:3080'
+      ..path = '/m'
+      ..token = 'tok';
+    await expectLater(
+      api.checkPluginUpdateAsync(totalTimeout: const Duration(milliseconds: 80)),
+      throwsA(isA<ApiException>().having((e) => e.code, 'code', 'check-timeout')),
+    );
+  });
+
 }

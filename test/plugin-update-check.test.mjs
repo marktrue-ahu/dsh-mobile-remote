@@ -118,7 +118,7 @@ test("#96 异步：检查抛错 → error 状态；过期未知/检查超时明�
 	await new Promise((r) => setImmediate(r));
 	const result = service.getAsync(started.checkId);
 	assert.equal(result.body.state, "error");
-	assert.equal(result.body.error, "boom");
+	assert.equal(result.body.error, "check-failed", "不得原样返回 error.message");
 
 	const timed = createUpdateCheckService({
 		checkFn: () => new Promise(() => {}),
@@ -203,4 +203,36 @@ test("#96 controller submit：复用 5min 快照；targetVersion 不匹配 -> �
 	} finally {
 		rmSync(home, { recursive: true, force: true });
 	}
+});
+
+test("#96 review：bootstrap checkSync 与立即 force 共享同一 in-flight（npm view 只跑一次）", async () => {
+	let calls = 0;
+	const service = createUpdateCheckService({
+		checkFn: async () => { calls += 1; await new Promise((r) => setTimeout(r, 50)); return { ...UP_TO_DATE }; },
+	});
+	const bootstrap = service.checkSync();
+	const forced = service.check({ force: true });
+	const [a, b] = await Promise.all([bootstrap, forced]);
+	assert.deepEqual(a, b);
+	assert.equal(calls, 1, "bootstrap 与立即 force 不得各跑一遍 npm");
+});
+
+test("#96 review：invalidate 清 tasks/in-flight，旧 checkId 不再 done", async () => {
+	const service = createUpdateCheckService({
+		checkFn: async () => ({ ...UP_TO_DATE }),
+	});
+	const started = service.startAsync();
+	await new Promise((r) => setImmediate(r));
+	assert.equal(service.getAsync(started.checkId).body.state, "done");
+	service.invalidate();
+	assert.equal(service.getAsync(started.checkId).status, 404, "旧 checkId 必须失效");
+
+	const slow = createUpdateCheckService({
+		checkFn: () => new Promise(() => {}),
+		checkTimeoutMs: 5000,
+	});
+	const pending = slow.startAsync();
+	slow.invalidate();
+	const fresh = slow.startAsync();
+	assert.notEqual(fresh.checkId, pending.checkId, "invalidate 后不得复用旧 in-flight");
 });

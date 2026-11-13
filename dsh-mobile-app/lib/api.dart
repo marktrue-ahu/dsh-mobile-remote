@@ -1170,20 +1170,43 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
   }
 
   /// 旧宿主/fallback：同步只读检查（35s 兼容旧 App 15s 检查窗口）。
-  Future<Map<String, dynamic>> checkPluginUpdate() =>
-      getJson('/api/plugin-update/check', timeout: const Duration(seconds: 35));
+  Future<Map<String, dynamic>> checkPluginUpdate({
+    Duration timeout = const Duration(seconds: 35),
+  }) => getJson('/api/plugin-update/check', timeout: timeout);
 
   /// issue #96：新宿主异步检查入口（200 checking + checkId）。
-  Future<Map<String, dynamic>> startPluginUpdateCheck({bool force = false}) =>
-      postJson('/api/plugin-update/check', {
-        if (force) 'force': true,
-      }, timeout: const Duration(seconds: 15));
+  Future<Map<String, dynamic>> startPluginUpdateCheck({
+    bool force = false,
+    Duration timeout = const Duration(seconds: 15),
+  }) => postJson('/api/plugin-update/check', {
+    if (force) 'force': true,
+  }, timeout: timeout);
 
-  /// issue #96：轮询异步检查结果。
-  Future<Map<String, dynamic>> pluginUpdateCheckStatus(String checkId) => getJson(
+  /// issue #96：轮询异步检查结果（timeout 取总预算剩余时间）。
+  Future<Map<String, dynamic>> pluginUpdateCheckStatus(
+    String checkId, {
+    Duration timeout = const Duration(seconds: 15),
+  }) => getJson(
     '/api/plugin-update/check?checkId=${Uri.encodeQueryComponent(checkId)}',
-    timeout: const Duration(seconds: 15),
+    timeout: timeout,
   );
+
+  Future<Map<String, dynamic>> _legacyPluginUpdateCheck(
+    Duration totalTimeout,
+    Stopwatch watch,
+  ) async {
+    final remaining = totalTimeout - watch.elapsed;
+    try {
+      return await checkPluginUpdate(
+        timeout: remaining > Duration.zero ? remaining : totalTimeout,
+      );
+    } on TimeoutException {
+      throw ApiException(
+        'update-check-timeout',
+        code: 'check-timeout',
+      );
+    }
+  }
 
   /// issue #96：优先异步检查；旧宿主 POST 404/405 自动回退同步 GET。
   ///
@@ -1195,22 +1218,34 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
     void Function(String state)? onProgress,
     List<Duration>? pollDelays,
   }) async {
+    final watch = Stopwatch()..start();
     Map<String, dynamic> started;
     try {
-      started = await startPluginUpdateCheck(force: force);
+      final startBudget = totalTimeout - watch.elapsed;
+      started = await startPluginUpdateCheck(
+        force: force,
+        timeout: startBudget < const Duration(seconds: 15)
+            ? startBudget
+            : const Duration(seconds: 15),
+      );
+    } on TimeoutException {
+      // 单请求超时也映射成友好检查超时，不冒泡裸 TimeoutException。
+      throw ApiException(
+        'update-check-timeout',
+        code: 'check-timeout',
+      );
     } on ApiException catch (error) {
       if (error.status == 404 || error.status == 405) {
         // 旧宿主无异步能力：照旧走同步 GET，不把探测失败暴露给用户。
-        return checkPluginUpdate();
+        return _legacyPluginUpdateCheck(totalTimeout, watch);
       }
       rethrow;
     }
     final checkId = (started['checkId'] ?? '').toString();
     if (checkId.isEmpty) {
       // 旧宿主/代理可能对未知 POST 返回 200 {}；按无异步能力回退同步 GET。
-      return checkPluginUpdate();
+      return _legacyPluginUpdateCheck(totalTimeout, watch);
     }
-    final watch = Stopwatch()..start();
     var pollIndex = 0;
     while (true) {
       final remaining = totalTimeout - watch.elapsed;
@@ -1225,7 +1260,17 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
       await Future<void>.delayed(wait < remaining ? wait : remaining);
       Map<String, dynamic> status;
       try {
-        status = await pluginUpdateCheckStatus(checkId);
+        final requestBudget = totalTimeout - watch.elapsed;
+        status = await pluginUpdateCheckStatus(
+          checkId,
+          timeout: requestBudget < const Duration(seconds: 15)
+              ? (requestBudget > Duration.zero
+                  ? requestBudget
+                  : const Duration(milliseconds: 1))
+              : const Duration(seconds: 15),
+        );
+      } on TimeoutException {
+        throw PluginUpdateCheckTimeout(checkId);
       } on ApiException catch (error) {
         if (error.status == 404 || error.status == 410) {
           throw PluginUpdateCheckTimeout(checkId);
