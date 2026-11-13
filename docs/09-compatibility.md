@@ -45,7 +45,7 @@
 
 - `checks.hostCapabilities`：逐项给出三态——`ok` / `drift` / `missing`。`drift` 是**能力语义漂移**（服务在、调用不报错，但成员形状不是插件认识的样子），这正是 0.2.0 四处变更与 0.2.1 peer 收紧的形态，旧的两分法看不见它们。**`gateway.eventsPeer`（issue #34）** 专门覆盖"网关入口都在、但进程内 Peer 来源缺失"这一种漂移，原因码为 `gateway-peer-source-missing`。
 - `checks.hostCapabilityReasons`（issue #30 审查修复）：**只对 `drift` 项**给出 allow-list 原因码，避免"只报状态值查不出哪一步坏了"。`settings.read` 的取值：`settings-get-threw` / `settings-describe-threw` / `settings-describe-shape-invalid` / `settings-descriptor-without-value` / `settings-has-no-read-method`。该探针与真实读取**共享严格读取器**——对插件真正读取的命名空间逐个探测，"命名空间不存在"仍算 ok，读不到才报 `drift`。
-- `checks.hostGeneration`：插件**实际走了哪条代际路径**（`jobsCaller` / `settingsRead` / `wireStreamArgs` / `eventsPeer`），排查"为什么同一功能在两台机器上表现不同"时先看这里。`eventsPeer` 取值：`createPeer`（0.2.1+）/ `operatorPeer`（0.2.0 网关兜底）/ `legacy`（旧代 3 参开流不需要 peer）/ `none`（必失败）/ `unknown`（网关服务缺失，无法判定）。
+- `checks.hostGeneration`：插件**实际走了哪条代际路径**（`jobsCaller` / `settingsRead` / `wireStreamArgs` / `eventsPeer` / `subagents`），排查"为什么同一功能在两台机器上表现不同"时先看这里。`subagents` 为对象：`catalog`（`descendants` / `children` / `none`）与 `interrupt`（`user` / `parent` / `none`），对应 issue #87 的 rc.1/rc.2 目录与中断代际。`eventsPeer` 取值：`createPeer`（0.2.1+）/ `operatorPeer`（0.2.0 网关兜底）/ `legacy`（旧代 3 参开流不需要 peer）/ `none`（必失败）/ `unknown`（网关服务缺失，无法判定）。
 
 `services.apiProxy` / `checks.respondBridge` / `checks.frameBridge` **已随 v3.1.6 删除**：该服务自 `0.1.2-rc.1` 起就不存在，保留它们只会让人以为有一条可用的旧代降级通道。同样地，`/m/api/respond` 在待办不在本地清单时返回 `404 respond-not-pending`（此前返回 `503` 并归咎于"内核过旧"，属误导——真实原因通常是"另一端已先答"或"已超时"）。
 
@@ -131,6 +131,8 @@
 
 **另有一类风险单独处理**：插件依赖的若干宿主成员是 **TS-private**（无契约保证）——权限预设的 `names`/`presets`/`apply`，以及工作区注册表的 `enqueueOperation`/`requireState`/`setState`（后者此前**完全无守卫**）。v3.1.6 起这些成员缺失时**显式报错**（503）或显式降级，不再让 `TypeError` 在深处被吞成"按了没反应"。**不迁移**到公开 API——那是行为改变，与本次兼容修复分开评估。
 
+**subagents 三态的口径**：`subagents.catalog` / `subagents.interrupt` 分别探测"任一目录方法（rc.2 `listDescendants` 或 rc.1 `listChildren`）"与"任一中断方法（rc.2 `interruptByUser` 或 rc.1 `interruptByParent`）"是否存在。宿主**完全无 `subagents` 服务**时两项为 `missing`（服务不存在，预期降级，不是可修复的 drift）；服务在但两代成员都没有才报 `drift`；任一成员存在即 `ok`。金丝雀对 `missing`/`drift` 的判定与此一致，无需区分"完全没有服务"与"服务在但形状不对"的行为差异——两者都会被如实上报。
+
 **`$events` 流断开改为退避重连**：原实现"就绪后一旦断开即永久放弃"，使 `approvalMode: both` 在首次断流后永久退化为手机独占，直到重启宿主——而桌面 GUI 每次开关浏览器都会断流。现语义：**就绪前**失败 = 事件源尚未注册（有界重试 ≈15s）；**就绪后**断开 = 瞬时断开（3s 起退避、上限 60s、无限重连，仅插件卸载才停止）。重新就绪后退避复位。
 
 **`0.2.0` 另外两处破坏（issue #21，与上述四处同类，但位于 #19 未覆盖的位置）**：
@@ -171,7 +173,7 @@
 - `0.2.0`/`0.1.x` 不改变行为：没有 `createPeer` 时继续传 `undefined`，由网关兜底 / 旧代 3 参开流不需要 peer。
 - 诊断显式化：`checks.hostCapabilities["gateway.eventsPeer"]`（`ok`/`drift`，按**真实创建结果**判定而非只看工厂存在）+ `checks.hostGeneration.eventsPeer`（`createPeer`/`operatorPeer`/`legacy`/`none`/`unknown`），`drift` 时附原因码 `gateway-peer-source-missing`；创建失败写一次性告警日志；`approvalMode: both` 的降级文案不再归咎"宿主版本过低"。
 
-**验证范围（如实标注）**：`0.2.1-rc.2` 路径已在**隔离宿主**（`HOME`/`DSH_HOME` 独立、独立 profile、3099 端口）完成端到端验证：`hostCapabilities` 8/8 `ok`（含 `gateway.eventsPeer: ok`）、`hostGeneration.eventsPeer: createPeer`、`checks.remoteEvents: true`、`POST /m/api/defaults {"permissionPreset":"workspace-write"}` 返回 `200 {"ok":true}`。三代实参位次、peer 同源（含 `$events/result` 结算）、单例复用与释放、drift 上报由 `test/host-compat-021.test.mjs` 夹具钉住（变异验证：去掉结算 peer 或改为每次新建都会红）；`0.2.0`/`0.1.x` 回归由 `test/host-compat-020.test.mjs` 保护。**生产宿主部署与真机验收不在本分支自动化范围内**，需按发布流程人工执行。
+**验证范围（如实标注）**：`0.2.1-rc.2` 路径已在**隔离宿主**（`HOME`/`DSH_HOME` 独立、独立 profile、3099 端口）完成端到端验证：`hostCapabilities` 全绿（当前 10 项全部 `ok`，含 `gateway.eventsPeer: ok` 与 issue #87 的 `subagents.catalog` / `subagents.interrupt`）、`hostGeneration.eventsPeer: createPeer`、`hostGeneration.subagents: { catalog: "descendants", interrupt: "user" }`、`checks.remoteEvents: true`、`POST /m/api/defaults {"permissionPreset":"workspace-write"}` 返回 `200 {"ok":true}`。三代实参位次、peer 同源（含 `$events/result` 结算）、单例复用与释放、drift 上报由 `test/host-compat-021.test.mjs` 夹具钉住（变异验证：去掉结算 peer 或改为每次新建都会红）；`0.2.0`/`0.1.x` 回归由 `test/host-compat-020.test.mjs` 保护。**生产宿主部署与真机验收不在本分支自动化范围内**，需按发布流程人工执行。
 
 ---
 
