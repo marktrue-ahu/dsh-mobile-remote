@@ -543,9 +543,12 @@ class SurfaceOp {
   static SurfaceOp? fromJson(Object? value) {
     if (value is! Map) return null;
     final op = value['op'];
-    final start = (value['startSeq'] as num?)?.toInt();
-    final end = (value['endSeq'] as num?)?.toInt();
-    if (op is! String || op.isEmpty || start == null || end == null) return null;
+    final start = value['startSeq'];
+    final end = value['endSeq'];
+    // 与服务端同口径：只接受非负整数，不接受 null/false/''/true/字符串/小数。
+    if (op is! String || op.trim().isEmpty) return null;
+    if (start is! int || end is! int || start < 0 || end < 0) return null;
+    if (start > end) return null;
     return SurfaceOp(op: op, startSeq: start, endSeq: end);
   }
 }
@@ -629,16 +632,26 @@ class ChatEvent {
           ? ToolResultSummary.fromJson((j['data'] as Map)['summary'])
           : null,
       surfaceOp: SurfaceOp.fromJson(j['surfaceOp']),
-      sourceEventSeqs: _surfaceSourceSeqs(j['sourceEventSeqs']),
+      sourceEventSeqs: _surfaceSourceSeqs(j['sourceEventSeqs'], j['seq']),
     );
   }
 }
 
-List<int> _surfaceSourceSeqs(Object? value) => value is List
-    ? List.unmodifiable(
-        value.whereType<num>().map((seq) => seq.toInt()).where((seq) => seq >= 0),
-      )
-    : const [];
+/// issue #99 复审 P2：source seq 只接受非负整数且严格小于当前事件 seq；
+/// 任一非法/空/超长 → 整组视为缺失（不把坏数据解释成 replace）。
+List<int> _surfaceSourceSeqs(Object? value, Object? currentSeq) {
+  if (value is! List || value.isEmpty || value.length > 64) return const [];
+  if (currentSeq is! int || currentSeq < 0) return const [];
+  final unique = <int>[];
+  final seen = <int>{};
+  for (final item in value) {
+    if (item is! int || item < 0 || item >= currentSeq) return const [];
+    if (seen.add(item)) unique.add(item);
+  }
+  if (unique.isEmpty) return const [];
+  unique.sort();
+  return List.unmodifiable(unique);
+}
 
 /// 历史页结果：事件列表 + 服务端降级读取标记（v3.1.5，休眠会话 current-surface）
 /// + durable cursor 分页标记（PR #24）。

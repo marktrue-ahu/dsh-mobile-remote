@@ -38,6 +38,12 @@ Map<String, dynamic> _replayJson() => {
   'surfaceOp': {'op': 'replace', 'startSeq': 9142, 'endSeq': 9142},
 };
 
+Finder _toolCard(String callId) => find.byWidgetPredicate(
+      (w) =>
+          w.key is ValueKey<String> &&
+          (w.key as ValueKey<String>).value.startsWith('tool:$callId:'),
+    );
+
 void main() {
   test('issue #99：ChatEvent 解析 surfaceOp/sourceEventSeqs（history/SSE 同一摘要）', () {
     final event = ChatEvent.fromJson(_replayJson());
@@ -52,6 +58,41 @@ void main() {
     expect(plain.isSurfaceReplace, isFalse);
     expect(plain.sourceEventSeqs, isEmpty);
     expect(plain.surfaceAnchorSeq, 1);
+  });
+
+  test('issue #99 P2：App 严格解析——坏 envelope 不解释为 replace（与 server 同口径）', () {
+    for (final bad in <Map<String, dynamic>>[
+      {'surfaceOp': {'op': 'replace', 'startSeq': null, 'endSeq': 1}},
+      {'surfaceOp': {'op': 'replace', 'startSeq': false, 'endSeq': 1}},
+      {'surfaceOp': {'op': 'replace', 'startSeq': '', 'endSeq': 1}},
+      {'surfaceOp': {'op': 'replace', 'startSeq': true, 'endSeq': 1}},
+      {'surfaceOp': {'op': 'replace', 'startSeq': '9142', 'endSeq': 9142}},
+      {'surfaceOp': {'op': 'replace', 'startSeq': -1, 'endSeq': 1}},
+      {'surfaceOp': {'op': 'replace', 'startSeq': 5, 'endSeq': 1}},
+      {'sourceEventSeqs': [null]},
+      {'sourceEventSeqs': [false]},
+      {'sourceEventSeqs': ['9142']},
+      {'sourceEventSeqs': [-1]},
+      {'sourceEventSeqs': [9142]}, // >= 当前 seq
+    ]) {
+      final event = ChatEvent.fromJson({
+        'seq': 13283,
+        'type': 'tool/result',
+        'data': {'turn': 148},
+        ...bad,
+      });
+      expect(event.isSurfaceReplace, isFalse, reason: '$bad');
+      expect(event.surfaceOp, isNull, reason: '$bad');
+    }
+    // 合法 source 去重/正序；严格小于当前 seq。
+    final ok = ChatEvent.fromJson({
+      'seq': 13283,
+      'type': 'tool/result',
+      'data': {},
+      'sourceEventSeqs': [9142, 2, 9142, 3],
+      'surfaceOp': {'op': 'replace', 'startSeq': 2, 'endSeq': 9142},
+    });
+    expect(ok.sourceEventSeqs, [2, 3, 9142]);
   });
 
   test('issue #99：原 9142 + replace 13283 合并为同一工具行，不追加 replay 行', () {
@@ -95,15 +136,52 @@ void main() {
     expect(processes.any((process) => process.turn == 220), isTrue);
   });
 
+  test('issue #99 P1：tracker 先看 replay、后到旧 source 也不得生成 turn148 partial', () {
+    final tracker = TurnProcessTracker();
+    tracker.observe(_event(1, 'turn/start', {'turn': 220}));
+    tracker.observe(_event(2, 'tool/call', {'turn': 220, 'step': 1, 'callId': 'c-now', 'name': 'bash', 'arguments': 'ls'}));
+    tracker.observe(_event(3, 'tool/result', {'turn': 220, 'step': 1, 'callId': 'c-now', 'name': 'bash', 'text': 'ok'}));
+    // replay 先到，随后旧 source 9142 从另一历史页/倒序到达。
+    tracker.observe(ChatEvent.fromJson(_replayJson()));
+    tracker.observe(_event(9142, 'tool/result', {'turn': 148, 'step': 1, 'callId': _callId, 'name': 'bash', 'text': 'old'}));
+    final processes = tracker.build();
+    expect(processes.any((process) => process.turn == 148), isFalse,
+        reason: 'shadowed 旧 source 不得创建 partial 组');
+    expect(processes.any((process) => process.turn == 220), isTrue);
+  });
+
+  test('issue #99 P1：source 存在时 tracker 锚点仍指原 source seq', () {
+    final tracker = TurnProcessTracker();
+    tracker.observe(_event(1, 'turn/start', {'turn': 148}));
+    tracker.observe(_event(9142, 'tool/result', {'turn': 148, 'step': 1, 'callId': _callId, 'name': 'bash', 'text': 'old'}));
+    tracker.observe(ChatEvent.fromJson(_replayJson()));
+    final process = tracker.build().firstWhere((item) => item.turn == 148);
+    final rows = process.groups.expand((group) => group.rows).toList();
+    expect(rows, hasLength(1), reason: 'replay 不得新增第二行');
+    expect(rows.single.seq, 9142, reason: '工具行锚点保持原 source seq');
+  });
+
+  test('issue #99 P1：replay-only tracker 不生成 partial 组/工具行', () {
+    final tracker = TurnProcessTracker();
+    tracker.observe(_event(1, 'turn/start', {'turn': 220}));
+    tracker.observe(ChatEvent.fromJson(_replayJson()));
+    expect(tracker.build().any((process) => process.turn == 148), isFalse);
+  });
+
   group('issue #99 widget：当前轮 + replay-only 旧工具', () {
-    List<Map<String, dynamic>> fixture() => [
+    List<Map<String, dynamic>> fixture({bool withReplay = true}) => [
       {'seq': 1, 'type': 'turn/start', 'data': {'turn': 220}},
       {'seq': 2, 'type': 'user/message', 'data': {'messageId': 'u1', 'text': '开始', 'sourceKind': 'user'}},
       {'seq': 3, 'type': 'tool/call', 'data': {'turn': 220, 'step': 1, 'callId': 'c-now', 'name': 'bash', 'arguments': 'ls'}},
       {'seq': 4, 'type': 'tool/result', 'data': {'turn': 220, 'step': 1, 'callId': 'c-now', 'name': 'bash', 'text': 'ok'}},
-      _replayJson(),
-      {'seq': 13284, 'type': 'assistant/message', 'data': {'turn': 220, 'step': 1, 'messageId': 'a1', 'text': '最终回答'}},
-      {'seq': 13285, 'type': 'turn/end', 'data': {'turn': 220, 'reason': {'kind': 'completed'}}},
+      if (withReplay) _replayJson(),
+      if (withReplay) ...[
+        {'seq': 13284, 'type': 'assistant/message', 'data': {'turn': 220, 'step': 1, 'messageId': 'a1', 'text': '最终回答'}},
+        {'seq': 13285, 'type': 'turn/end', 'data': {'turn': 220, 'reason': {'kind': 'completed'}}},
+      ] else ...[
+        {'seq': 5, 'type': 'assistant/message', 'data': {'turn': 220, 'step': 1, 'messageId': 'a1', 'text': '最终回答'}},
+        {'seq': 6, 'type': 'turn/end', 'data': {'turn': 220, 'reason': {'kind': 'completed'}}},
+      ],
     ];
 
     Future<AppStore> pump(WidgetTester tester) async {
@@ -132,17 +210,58 @@ void main() {
       ));
       await tester.pump(const Duration(milliseconds: 350));
       await tester.pump(const Duration(milliseconds: 150));
-      expect(find.byKey(const Key('historical-tool-results-148')), findsOneWidget,
-          reason: '原 9142 与 replay 13283 必须合并为一份历史工具组，不能各生成一份');
-      expect(find.text('1 组 · 1 次工具调用'), findsNWidgets(2), reason: '当前轮 1 组 + 历史 1 组');
+      expect(_toolCard(_callId), findsOneWidget,
+          reason: '原 9142 与 replay 13283 必须合并为一张卡，不能各生成一张');
+      expect(find.text('历史工具结果（无过程上下文）'), findsNothing,
+          reason: 'surface replay 不能生成历史工具结果卡');
     });
 
-    testWidgets('SSE 路径：live frame 携带 surfaceOp 也不生成历史工具卡', (tester) async {
-      final store = await pump(tester);
+    testWidgets('原工具事件后到：replay 先到也不重复，仍只一张历史卡', (tester) async {
+      final backend = _Backend(events: fixture(withReplay: false));
+      final store = AppStore()
+        ..sessionId = 'session-99'
+        ..sessions = [Session(id: 'session-99', title: 'S', cwd: null, createdAt: 1)];
+      await tester.pumpWidget(MaterialApp(
+        home: ChatScreen(store: store, apiClient: backend.api, onTitleChanged: () {}),
+      ));
+      await tester.pump(const Duration(milliseconds: 350));
+      await tester.pump(const Duration(milliseconds: 150));
+      store.injectFrame({'type': 'session/event', 'sessionId': 'session-99', 'event': _replayJson()});
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(_toolCard(_callId), findsNothing);
+      // 原始工具调用随后到达（非 replay）：与已记录的 replay 内容合并成一张卡。
+      store.injectFrame({
+        'type': 'session/event',
+        'sessionId': 'session-99',
+        'event': {
+          'seq': 13284,
+          'type': 'tool/call',
+          'data': {'turn': 148, 'step': 1, 'callId': _callId, 'name': 'bash', 'arguments': 'ls'},
+        },
+      });
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(find.byKey(const Key('historical-tool-results-148')), findsOneWidget,
+          reason: '原事件后到仍归入同一历史组，不能多卡');
+      expect(_toolCard(_callId), findsNothing, reason: '卡片由过程组承载，不额外独立');
+      store.dispose();
+      await tester.pumpWidget(const SizedBox());
+    });
+
+    testWidgets('SSE 路径：新 seq replay frame 携带 surfaceOp 也不生成历史工具卡', (tester) async {
+      final backend = _Backend(events: fixture(withReplay: false));
+      final store = AppStore()
+        ..sessionId = 'session-99'
+        ..sessions = [Session(id: 'session-99', title: 'S', cwd: null, createdAt: 1)];
+      await tester.pumpWidget(MaterialApp(
+        home: ChatScreen(store: store, apiClient: backend.api, onTitleChanged: () {}),
+      ));
+      await tester.pump(const Duration(milliseconds: 350));
+      await tester.pump(const Duration(milliseconds: 150));
       store.injectFrame({'type': 'session/event', 'sessionId': 'session-99', 'event': _replayJson()});
       await tester.pump(const Duration(milliseconds: 300));
       expect(find.text('历史工具结果（无过程上下文）'), findsNothing);
       expect(find.byKey(const Key('historical-tool-results-148')), findsNothing);
+      expect(_toolCard(_callId), findsNothing, reason: 'replay-only 不得生成旧独立工具卡');
       expect(find.textContaining('note 2312'), findsNothing);
       store.dispose();
       await tester.pumpWidget(const SizedBox());
@@ -152,6 +271,7 @@ void main() {
       await pump(tester);
       expect(find.text('历史工具结果（无过程上下文）'), findsNothing);
       expect(find.byKey(const Key('historical-tool-results-148')), findsNothing);
+      expect(_toolCard(_callId), findsNothing, reason: 'replay-only 不得生成旧独立工具卡');
       expect(find.textContaining('note 2312'), findsNothing);
       // 当前轮工具只出现一次。
       expect(find.text('1 组 · 1 次工具调用'), findsOneWidget);

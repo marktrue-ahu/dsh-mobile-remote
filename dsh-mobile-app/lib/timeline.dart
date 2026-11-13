@@ -417,6 +417,9 @@ class TimelineReducer {
   /// 本次 apply 影响到的根工具 callId（只读快照，供 ChatScreen 原地刷新）。
   Set<String> get lastTouchedToolRoots => Set.unmodifiable(_ptcRootsTouched);
 
+  /// issue #99：该 seq 是否已被 surface replace shadow（各投影必须一致跳过）。
+  bool isShadowedSeq(int? seq) => seq != null && _shadowedSeq.contains(seq);
+
   void reset() {
     items.clear();
     tools.clear();

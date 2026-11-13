@@ -776,6 +776,9 @@ class TurnProcessTracker {
   final Map<int, int> _turnOfStartSeq = {};
   final Map<int, int> _turnOfEndSeq = {};
   final Map<String, _MutableToolRow> _tools = {};
+
+  /// issue #99：被 surface replace 遮蔽的旧 seq；后到的 source 事件不得再被 tracker 消费。
+  final Set<int> _shadowedSeqs = {};
   final Set<int> _reasoningSeqs = {};
   // issue #70：各 (turn, step) 首个 reasoning delta 的 seq（落定后持久行继承排序键）。
   final Map<String, int> _reasoningStarts = {};
@@ -797,6 +800,7 @@ class TurnProcessTracker {
     _turnOfStartSeq.clear();
     _turnOfEndSeq.clear();
     _tools.clear();
+    _shadowedSeqs.clear();
     _itemTurn.clear();
     _reasoningSeqs.clear();
     _reasoningStarts.clear();
@@ -845,6 +849,11 @@ class TurnProcessTracker {
 
   /// 记录一条事件。可重复调用（历史/实时重叠、分页重叠都是常态）。
   void observe(ChatEvent event) {
+    // surface replace 先登记 shadow，再跳过已被替换的旧 source（即使乱序/翻旧页后到）。
+    if (event.isSurfaceReplace && event.sourceEventSeqs.isNotEmpty) {
+      _shadowedSeqs.addAll(event.sourceEventSeqs);
+    }
+    if (event.seq != null && _shadowedSeqs.contains(event.seq)) return;
     final type = event.type;
     final data = event.data ?? const <String, dynamic>{};
     final seq = event.seq;

@@ -38,16 +38,116 @@ test("issue #99: append/无 envelope 事件不凭空产生 surface 字段", () =
   assert.equal("sourceEventSeqs" in plain, false);
 });
 
-test("issue #99: surface 字段做只读校验（非法 op/seq 丢弃，source 去重截断）", () => {
+test("issue #99: surface 字段严格校验——仅非负 safe integer，禁止 Number 强转", () => {
+  // 合法：去重 + 正序；startSeq<=endSeq；source < 当前 seq。
   assert.deepEqual(
-    surfaceWireFields({ surfaceOp: { op: "", startSeq: 1, endSeq: 1 }, sourceEventSeqs: [-1, 0, 2, 2, "x", 3.5] }),
-    { sourceEventSeqs: [0, 2] },
+    surfaceWireFields({
+      seq: 100,
+      surfaceOp: { op: "replace", startSeq: 1, endSeq: 1 },
+      sourceEventSeqs: [20, 2, 20, 3],
+    }),
+    {
+      surfaceOp: { op: "replace", startSeq: 1, endSeq: 1 },
+      sourceEventSeqs: [2, 3, 20],
+    },
   );
+  // append 无 source 也允许。
   assert.deepEqual(
-    surfaceWireFields({ surfaceOp: { op: "replace", startSeq: "9142", endSeq: 9142 } }),
-    { surfaceOp: { op: "replace", startSeq: 9142, endSeq: 9142 } },
+    surfaceWireFields({ seq: 10, surfaceOp: { op: "append", startSeq: 10, endSeq: 10 } }),
+    { surfaceOp: { op: "append", startSeq: 10, endSeq: 10 } },
   );
-  const many = surfaceWireFields({ sourceEventSeqs: Array.from({ length: 100 }, (_, i) => i) });
-  assert.equal(many.sourceEventSeqs.length, 64);
-  assert.deepEqual(many.sourceEventSeqs.slice(0, 3), [0, 1, 2]);
+  // 无 envelope 字段 → 空对象（不凭空产生 surface）。
+  assert.deepEqual(surfaceWireFields({ seq: 1 }), {});
+  assert.deepEqual(surfaceWireFields(null), {});
+});
+
+test("issue #99: surfaceOp 非法时整个字段省略（null/false/''/true/字符串/负数/倒序）", () => {
+  const invalidOps = [
+    null,
+    false,
+    "",
+    "replace",
+    [],
+    { op: "", startSeq: 1, endSeq: 1 },
+    { op: "   ", startSeq: 1, endSeq: 1 },
+    { op: "replace", startSeq: null, endSeq: 1 },
+    { op: "replace", startSeq: false, endSeq: 1 },
+    { op: "replace", startSeq: "", endSeq: 1 },
+    { op: "replace", startSeq: true, endSeq: 1 },
+    { op: "replace", startSeq: "9142", endSeq: 9142 },
+    { op: "replace", startSeq: -1, endSeq: 1 },
+    { op: "replace", startSeq: 1, endSeq: 1.5 },
+    { op: "replace", startSeq: 5, endSeq: 1 },
+  ];
+  for (const surfaceOp of invalidOps) {
+    assert.deepEqual(surfaceWireFields({ seq: 10, surfaceOp }), {}, JSON.stringify(surfaceOp));
+    assert.deepEqual(
+      Object.keys(summarizeEvent({ seq: 10, type: "tool/result", data: {}, surfaceOp })).includes("surfaceOp"),
+      false,
+    );
+  }
+});
+
+test("issue #99: sourceEventSeqs 非法/混入/超长/不早于当前 seq 时整体省略", () => {
+  const invalidSources = [
+    null,
+    false,
+    "",
+    true,
+    [],
+    [-1],
+    [10],
+    [11],
+    [1, "2"],
+    [1, true],
+    [1, null],
+    [1, 2, 2.5],
+    [1, -2],
+    [3, 8, 10],
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    [1, 2, "3", 4],
+  ];
+  for (const sourceEventSeqs of invalidSources) {
+    assert.deepEqual(
+      surfaceWireFields({ seq: 10, sourceEventSeqs }),
+      {},
+      JSON.stringify(sourceEventSeqs),
+    );
+  }
+  // 超长（65）即使都合法也拒绝。
+  assert.deepEqual(
+    surfaceWireFields({ seq: 1000, sourceEventSeqs: Array.from({ length: 65 }, (_, i) => i) }),
+    {},
+  );
+  // 64 项合法可通过。
+  assert.deepEqual(
+    surfaceWireFields({ seq: 1000, sourceEventSeqs: Array.from({ length: 64 }, (_, i) => i) }).sourceEventSeqs.length,
+    64,
+  );
+  // source 缺当前 seq（无法证明严格早于）→ 省略。
+  assert.deepEqual(surfaceWireFields({ sourceEventSeqs: [1] }), {});
+});
+
+test("issue #99: summarizeEvent 对坏 envelope 不解释为 replace（history/SSE 同函数）", () => {
+  const bad = summarizeEvent({
+    seq: 13283,
+    type: "tool/result",
+    data: { turn: 148, step: 1 },
+    sourceEventSeqs: [9142],
+    surfaceOp: { op: "replace", startSeq: "9142", endSeq: 9142 },
+  });
+  assert.equal("surfaceOp" in bad, false);
+  assert.equal("sourceEventSeqs" in bad, false);
+
+  const mixed = summarizeEvent({
+    seq: 13283,
+    type: "tool/result",
+    data: {},
+    sourceEventSeqs: [9142, null],
+    surfaceOp: { op: "replace", startSeq: 9142, endSeq: 9142 },
+  });
+  assert.equal(mixed.seq, 13283);
+  assert.equal(mixed.type, "tool/result");
+  assert.equal("surfaceOp" in mixed, false);
+  assert.equal("sourceEventSeqs" in mixed, false);
 });
