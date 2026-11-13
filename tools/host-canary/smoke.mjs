@@ -636,7 +636,7 @@ export function createCliAdapter({env = process.env, signal} = {}) {
 // compatibility of those paths needs a human on a real device, which is exactly
 // the manual confirmation step the canary asks for.
 const sessionGatedCapabilityNames = Object.freeze(['workspaceRegistry.stateWrite','gateway.eventsPeer']);
-const capabilityNames = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer'];
+const capabilityNames = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer','subagents.catalog','subagents.interrupt'];
 export function evaluateResponses(unauth, bootstrap, diagnostics, version, pid, repeats = {}) {
   const checks = [];
   const mismatch = (stage, value) => {

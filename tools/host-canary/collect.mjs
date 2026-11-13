@@ -9,7 +9,7 @@ import { RUNTIME_ERROR_CODES, INSTALL_ERROR_CODES } from './diagnostics.mjs';
 
 const STATUSES = new Set(['passed', 'compatibility-failure', 'infrastructure-failure']);
 const SOURCES = new Set(['fixed', 'latest', 'next', 'alpha']);
-const CAPABILITIES = Object.freeze(['jobs.callerShape', 'jobs.eventsApi', 'settings.read', 'gateway.wireStream', 'permissionPresets.apply', 'permissionPresets.catalog', 'workspaceRegistry.stateWrite', 'gateway.eventsPeer']);
+const CAPABILITIES = Object.freeze(['jobs.callerShape', 'jobs.eventsApi', 'settings.read', 'gateway.wireStream', 'permissionPresets.apply', 'permissionPresets.catalog', 'workspaceRegistry.stateWrite', 'gateway.eventsPeer', 'subagents.catalog', 'subagents.interrupt']);
 const PASS_CHECKS = Object.freeze(['auth', 'bootstrap', 'diagnostics', ...CAPABILITIES.map(name => `host-capability:${name}:ok`)]);
 // Capabilities that only become 'ok' after a real browser GUI session connects.
 // A passing canary still reports them, and may report them as missing/drift,
@@ -57,7 +57,7 @@ function parseArtifact(root, hostVersion, name, pluginSha) {
     const stat = lstatSync(file);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 16384) return null;
     const data = JSON.parse(readFileSync(file, 'utf8'));
-    if (!data || typeof data !== 'object' || Array.isArray(data) || data.schema !== 1 || data.hostVersion !== hostVersion || data.pluginSha !== pluginSha || !STATUSES.has(data.status) || !Array.isArray(data.checks) || data.checks.length > 11 || new Set(data.checks).size !== data.checks.length || data.checks.some(value => !CHECKS.has(value)) || !validCheckPrefix(data.checks)) return null;
+    if (!data || typeof data !== 'object' || Array.isArray(data) || data.schema !== 1 || data.hostVersion !== hostVersion || data.pluginSha !== pluginSha || !STATUSES.has(data.status) || !Array.isArray(data.checks) || data.checks.length > PASS_CHECKS.length || new Set(data.checks).size !== data.checks.length || data.checks.some(value => !CHECKS.has(value)) || !validCheckPrefix(data.checks)) return null;
     if (data.status === 'passed' && (data.stage !== 'complete' || data.errorCode !== null || !isPassingChecks(data.checks))) return null;
     if (data.status === 'compatibility-failure' && (data.stage !== 'runtime' || data.errorCode !== 'compatibility-check-failed' || data.checks.length < 1 || data.checks.length >= PASS_CHECKS.length)) return null;
     return { status: data.status, stage: STAGES.has(data.stage) ? data.stage : 'unknown', errorCode: ERROR_CODES.has(data.errorCode) ? data.errorCode : null, checks: data.checks };

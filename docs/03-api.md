@@ -565,9 +565,9 @@
 
 环境诊断在 `checks` 下提供宿主兼容自检（ADR 0017，**纯增量字段，旧 App 忽略即可**）：
 
-- `checks.hostCapabilities`：逐项三态 `ok` / `drift` / `missing`。`drift` = 能力语义漂移（服务在、调用不报错、成员形状或实参语义已变）。包含 `jobs.callerShape`、`jobs.eventsApi`、`settings.read`、`gateway.wireStream`、`gateway.eventsPeer`（issue #34，0.2.1 的进程内 Peer 来源）、`permissionPresets.apply`、`permissionPresets.catalog`、`workspaceRegistry.stateWrite`。
+- `checks.hostCapabilities`：逐项三态 `ok` / `drift` / `missing`。`drift` = 能力语义漂移（服务在、调用不报错、成员形状或实参语义已变）。包含 `jobs.callerShape`、`jobs.eventsApi`、`settings.read`、`gateway.wireStream`、`gateway.eventsPeer`（issue #34，0.2.1 的进程内 Peer 来源）、`permissionPresets.apply`、`permissionPresets.catalog`、`workspaceRegistry.stateWrite`，以及 issue #87 的 `subagents.catalog`（`listDescendants` 或 `listChildren` 至少一个可用）与 `subagents.interrupt`（`interruptByUser` 或 `interruptByParent` 至少一个可用）。
 - `checks.hostCapabilityReasons`：仅对 `drift` 项给出的允许清单原因码（如 `settings.read` 的 `settings-get-threw`；`gateway.eventsPeer` 的 `gateway-peer-source-missing`）。
-- `checks.hostGeneration`：插件实际走到的代际路径——`jobsCaller`（`sessionId` / `agent`）、`settingsRead`（`describe` / `get`）、`wireStreamArgs`（`controlArg` / `legacyArg`）、`eventsPeer`（`createPeer` / `operatorPeer` / `legacy` / `none` / `unknown`）。
+- `checks.hostGeneration`：插件实际走到的代际路径——`jobsCaller`（`sessionId` / `agent`）、`settingsRead`（`describe` / `get`）、`wireStreamArgs`（`controlArg` / `legacyArg`）、`eventsPeer`（`createPeer` / `operatorPeer` / `legacy` / `none` / `unknown`），以及 issue #87 的 `subagents.catalog`（`descendants` / `children` / `none`）与 `subagents.interrupt`（`user` / `parent` / `none`）。
 - `checks.remoteEvents` / `checks.approvalMode`：`$events` 双端审批通道是否就绪与实际生效的审批呈现策略。
 
 详见 `docs/09-compatibility.md` §2.5/§2.6。
@@ -639,19 +639,27 @@
   { "id": "…", "kind": "child", "status": "running", "title": "…", "createdAt": 1730000000000 }
 ]}
 ```
-- 目录来源按优先级取：① 宿主持久目录 `ctx.subagents.listChildren(parentSessionId)` → ② 持久化枚举（父会话休眠/归档时入口不消失）→ ③ 会话注册表派生。
+- 目录来源按优先级取（能力探测，不看宿主版本号）：
+  ① rc.2+ `ctx.subagents.listDescendants(parentSessionId, signal)`（递归，**只取 `depth===1`**）→
+  ①' rc.1 `ctx.subagents.listChildren(parentSessionId, signal)` → ② 持久化枚举（父会话休眠/归档时入口不消失）→ ③ 会话注册表派生。
   **不调用 `subagents/list` Remote 端点**——该端点在宿主 0.2.0 已被删除
-- `kind`：`child`（普通子代理）或 `diagnostic`（目录 `mode: "unknown"` 的不受支持条目，此时 `status` 为原因 `unsupported`）
-- `status`：活 agent 的 AgentStatus 映射（`running`/`inactive`）或 diagnostic reason
-- `createdAt` 可选，用于排序；`catalogDegraded: true` 表示来源 ②/③ 不完整，客户端据此区分"确实没有子代理"与"目录读不到"
+- `kind`：`child`（普通子代理）或 `diagnostic`（rc.2 的 `kind:"diagnostic"` / rc.1 的 `mode:"unknown"`）。
+  diagnostic 行**没有 `mode`**，客户端不得用 `row.mode` 判分支。
+- `status`：普通行为活 agent 的 AgentStatus 映射（`running`/`inactive`）；diagnostic 行为三枚举原因：
+  `unsupported`（该条目自身可继续遍历）/ `corrupt`（目录数据损坏、分支中止）/ `unavailable`（子目录读不到、分支中止）。
+- `createdAt`：rc.2 目录无该字段，回落 `session.header.createdAt`；两者都缺失时排到列表末尾（组内 `id` 升序），
+  排序仍为 createdAt 降序；`catalogDegraded: true` 表示来源 ②/③ 不完整，客户端据此区分"确实没有子代理"与"目录读不到"
 - 缺参数 `400 parentSessionId-required`；三条路径都取不到会话 `404 session-not-found`
 
 **POST `/m/api/subagents/interrupt`** — 中断子代理
 ```json
 请求: { "parentSessionId": "…", "childSessionId": "…" }
-响应: { "ok": true }
+响应: { "ok": true, "accepted": true }
 ```
-- 映射内核 `subagent.interrupt`（payload `{ parentSessionId, childSessionId, mode: "continuable" }`）
+- rc.2+（宿主暴露 `subagents.interruptByUser`）：映射 `subagents/interruptByUser`，payload **仅** `{ childSessionId }`；
+  响应透传 `SubagentInterruptReceipt.accepted`。语义是**中断信号已受理**，不等于目标已静默/已退出。
+- rc.1（仅 `subagents.interruptByParent`）：映射旧端点，payload `{ childSessionId, parentSessionId, mode: "continuable" }`；
+  旧宿主无 receipt，响应省略 `accepted`。
 
 **GET `/m/api/goal?sessionId=…`** — 当前目标（无目标返回 `{ "goal": null }`）
 ```json

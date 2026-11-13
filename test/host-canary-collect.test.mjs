@@ -10,7 +10,7 @@ import { classify } from '../tools/host-canary/report.mjs';
 const sha = 'a'.repeat(40), version = '0.2.2-alpha.2';
 const ctx = { runId: '123', runAttempt: '1', pluginSha: sha };
 const matrix = { include: [{ hostVersion: version, sources: ['latest', 'alpha'], isCandidate: true }] };
-const capabilities = ['jobs.callerShape', 'jobs.eventsApi', 'settings.read', 'gateway.wireStream', 'permissionPresets.apply', 'permissionPresets.catalog', 'workspaceRegistry.stateWrite', 'gateway.eventsPeer'];
+const capabilities = ['jobs.callerShape', 'jobs.eventsApi', 'settings.read', 'gateway.wireStream', 'permissionPresets.apply', 'permissionPresets.catalog', 'workspaceRegistry.stateWrite', 'gateway.eventsPeer', 'subagents.catalog', 'subagents.interrupt'];
 const result = (status, overrides = {}) => ({ schema: 1, hostVersion: version, pluginSha: sha, status, stage: status === 'passed' ? 'complete' : 'runtime', checks: status === 'passed' ? ['auth', 'bootstrap', 'diagnostics', ...capabilities.map(name => `host-capability:${name}:ok`)] : status === 'compatibility-failure' ? ['auth'] : [], errorCode: status === 'passed' ? null : status === 'compatibility-failure' ? 'compatibility-check-failed' : 'runtime-timeout', ...overrides });
 async function fixture(fn) {
   const root = mkdtempSync(join(tmpdir(), 'dsh-canary-collect-test-'));

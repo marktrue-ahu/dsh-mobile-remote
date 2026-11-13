@@ -104,6 +104,17 @@ int? subagentCreatedAt(Map<String, dynamic> entry) {
   return null;
 }
 
+/// issue #87：rc.2 diagnostic 的三种原因（unsupported / corrupt / unavailable）。
+/// 返回 null 表示非 diagnostic 或未知原因，调用方按普通子代理展示。
+String? subagentDiagnosticReason(Map<String, dynamic> entry) {
+  if (entry['kind'] != 'diagnostic') return null;
+  final status = entry['status'];
+  return switch (status) {
+    'unsupported' || 'corrupt' || 'unavailable' => status as String,
+    _ => null,
+  };
+}
+
 /// 子代理排序：`createdAt` **降序**（最新派生在最上），等值按 id 升序保证稳定。
 ///
 /// 时间缺失的条目排在最后（而不是最前）：缺字段是插件/旧数据的降级情况，
