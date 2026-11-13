@@ -97,6 +97,8 @@ test("issue #99: surfaceOp union 非法值整组丢弃（字符串/对象 append
     { op: "append", startSeq: 9, endSeq: 3 }, // 倒序
     { op: "append", startSeq: null, endSeq: 3 },
     { op: "append", startSeq: "3", endSeq: "4" },
+    { op: "append", startSeq: null, endSeq: null },
+    { op: "append", startSeq: null },
     { op: "other", startSeq: 3, endSeq: 3 },
   ]) {
     assert.deepEqual(surfaceWireFields({ seq: 10, surfaceOp }), {}, JSON.stringify(surfaceOp));
@@ -106,6 +108,21 @@ test("issue #99: surfaceOp union 非法值整组丢弃（字符串/对象 append
     surfaceWireFields({ seq: 10, surfaceOp: "append", sourceEventSeqs: [3, 10] }),
     {},
   );
+  // replace + 混合坏 source 也整组丢弃，不能留下 replace。
+  assert.deepEqual(
+    surfaceWireFields({
+      seq: 10,
+      surfaceOp: { op: "replace", startSeq: 3, endSeq: 3 },
+      sourceEventSeqs: [3, 10],
+    }),
+    {},
+  );
+  // 显式 null 与缺失不同：显式 null 一律非法。
+  assert.deepEqual(surfaceWireFields({ seq: 10, surfaceOp: null }), {});
+  assert.deepEqual(surfaceWireFields({ seq: 10, sourceEventSeqs: null }), {});
+  assert.deepEqual(surfaceWireFields({ seq: 10, surfaceOp: "append", sourceEventSeqs: null }), {});
+  // 仅 source（无 surfaceOp 键）合法；缺失 surfaceOp ≠ 非法。
+  assert.deepEqual(surfaceWireFields({ seq: 10, sourceEventSeqs: [3] }), { sourceEventSeqs: [3] });
 });
 
 test("issue #99: surfaceOp 非法时整个字段省略（null/false/''/true/字符串/负数/倒序）", () => {

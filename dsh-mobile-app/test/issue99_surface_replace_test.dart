@@ -126,6 +126,67 @@ void main() {
     expect(objectAppend.sourceEventSeqs, [3]);
   });
 
+  test('issue #99 P2：envelope 原子解析——缺失≠显式 null，任一非法整组丢弃', () {
+    ChatEvent parse(Map<String, dynamic> extra) => ChatEvent.fromJson({
+      'seq': 10,
+      'type': 'tool/result',
+      'data': {},
+      ...extra,
+    });
+
+    // 真实 append + 非法 source（>=seq）→ 整个 envelope 丢弃。
+    var event = parse({'surfaceOp': 'append', 'sourceEventSeqs': [3, 10]});
+    expect(event.surfaceOp, isNull);
+    expect(event.sourceEventSeqs, isEmpty);
+    expect(event.isSurfaceReplace, isFalse);
+
+    // 显式 null 与缺失不同：显式 null 一律非法。
+    for (final extra in <Map<String, dynamic>>[
+      {'surfaceOp': null},
+      {'sourceEventSeqs': null},
+      {'surfaceOp': 'append', 'sourceEventSeqs': null},
+      {'surfaceOp': {'op': 'append', 'startSeq': null, 'endSeq': null}},
+      {'surfaceOp': {'op': 'append', 'startSeq': null}},
+    ]) {
+      event = parse(extra);
+      expect(event.surfaceOp, isNull, reason: '$extra');
+      expect(event.sourceEventSeqs, isEmpty, reason: '$extra');
+    }
+
+    // 两字段都缺失 → 正常非 surface 事件。
+    event = parse({});
+    expect(event.surfaceOp, isNull);
+    expect(event.sourceEventSeqs, isEmpty);
+
+    // 仅 source（无 surfaceOp 键）合法；缺失 surfaceOp 不等于非法。
+    event = parse({'sourceEventSeqs': [3]});
+    expect(event.surfaceOp, isNull);
+    expect(event.sourceEventSeqs, [3]);
+
+    // 合法 append 无 source / 合法对象 append / replace + 合法 source。
+    event = parse({'surfaceOp': 'append'});
+    expect(event.surfaceOp?.op, 'append');
+    expect(event.sourceEventSeqs, isEmpty);
+    event = parse({'surfaceOp': {'op': 'append'}, 'sourceEventSeqs': [3]});
+    expect(event.surfaceOp?.op, 'append');
+    expect(event.sourceEventSeqs, [3]);
+    event = parse({
+      'surfaceOp': {'op': 'replace', 'startSeq': 3, 'endSeq': 3},
+      'sourceEventSeqs': [3],
+    });
+    expect(event.isSurfaceReplace, isTrue);
+    expect(event.sourceEventSeqs, [3]);
+
+    // replace + 坏 source（混合）→ 整个 envelope 丢弃，不能留下 replace。
+    event = parse({
+      'surfaceOp': {'op': 'replace', 'startSeq': 3, 'endSeq': 3},
+      'sourceEventSeqs': [3, 10],
+    });
+    expect(event.surfaceOp, isNull);
+    expect(event.sourceEventSeqs, isEmpty);
+    expect(event.isSurfaceReplace, isFalse);
+  });
+
   test('issue #99 P2：surfaceOp union 非法值矩阵（字符串/对象 append/对象 replace）', () {
     for (final surfaceOp in <Object?>[
       'replace', 'APPEND', '', 'append ', true, false, null, 1, [], ['append'],

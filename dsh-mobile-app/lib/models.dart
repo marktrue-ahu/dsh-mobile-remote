@@ -557,10 +557,13 @@ class SurfaceOp {
       if (rawStart < 0 || rawEnd < 0 || rawStart > rawEnd) return null;
       return SurfaceOp(op: op, startSeq: rawStart, endSeq: rawEnd);
     }
-    // append：start/end 可整体省略；若出现则必须同时存在、非负且有序。
-    if (rawStart == null && rawEnd == null) {
+    // append：start/end 可整体省略；显式 null 不等于省略（与服务端同输入拒绝）。
+    final hasStart = value.containsKey('startSeq');
+    final hasEnd = value.containsKey('endSeq');
+    if (!hasStart && !hasEnd) {
       return const SurfaceOp(op: 'append');
     }
+    if (!hasStart || !hasEnd) return null;
     if (rawStart is! int || rawEnd is! int) return null;
     if (rawStart < 0 || rawEnd < 0 || rawStart > rawEnd) return null;
     return SurfaceOp(op: op, startSeq: rawStart, endSeq: rawEnd);
@@ -627,7 +630,29 @@ class ChatEvent {
   factory ChatEvent.fromJson(Map<String, dynamic> j) {
     final detail = j['detail'];
     final d = detail is Map ? detail : const <String, dynamic>{};
-    final surfaceOp = SurfaceOp.fromJson(j['surfaceOp']);
+    // issue #99 复审 P2：surfaceOp/sourceEventSeqs 必须**原子解析**——以原始键是否
+    // 存在区分缺失/显式 null；任一字段非法则整个 envelope 丢弃，不能保留一半。
+    final hasSurfaceOp = j.containsKey('surfaceOp');
+    final hasSources = j.containsKey('sourceEventSeqs');
+    SurfaceOp? surfaceOp;
+    var sourceEventSeqs = const <int>[];
+    var envelopeValid = true;
+    if (hasSurfaceOp) {
+      surfaceOp = SurfaceOp.fromJson(j['surfaceOp']);
+      if (surfaceOp == null) envelopeValid = false;
+    }
+    if (envelopeValid && hasSources) {
+      final parsed = _surfaceSourceSeqsStrict(j['sourceEventSeqs'], j['seq']);
+      if (parsed == null) {
+        envelopeValid = false;
+      } else {
+        sourceEventSeqs = parsed;
+      }
+    }
+    if (!envelopeValid) {
+      surfaceOp = null;
+      sourceEventSeqs = const <int>[];
+    }
     return ChatEvent(
       seq: (j['seq'] as num?)?.toInt(),
       type: j['type'] as String? ?? 'unknown',
@@ -647,27 +672,23 @@ class ChatEvent {
           ? ToolResultSummary.fromJson((j['data'] as Map)['summary'])
           : null,
       surfaceOp: surfaceOp,
-      // surfaceOp 存在但非法 → 整组 envelope 视为非法，source 也不解释（与 server 同口径）；
-      // 纯 source（无 surfaceOp 键）仍保留，供旧/未来 envelope。
-      sourceEventSeqs: j.containsKey('surfaceOp') && surfaceOp == null
-          ? const []
-          : _surfaceSourceSeqs(j['sourceEventSeqs'], j['seq']),
+      sourceEventSeqs: sourceEventSeqs,
     );
   }
 }
 
 /// issue #99 复审 P2：source seq 只接受非负整数且严格小于当前事件 seq；
-/// 任一非法/空/超长 → 整组视为缺失（不把坏数据解释成 replace）。
-List<int> _surfaceSourceSeqs(Object? value, Object? currentSeq) {
-  if (value is! List || value.isEmpty || value.length > 64) return const [];
-  if (currentSeq is! int || currentSeq < 0) return const [];
+/// 返回 null 表示**非法**（调用方据此丢弃整个 envelope）；合法返回去重正序列表。
+List<int>? _surfaceSourceSeqsStrict(Object? value, Object? currentSeq) {
+  if (value is! List || value.isEmpty || value.length > 64) return null;
+  if (currentSeq is! int || currentSeq < 0) return null;
   final unique = <int>[];
   final seen = <int>{};
   for (final item in value) {
-    if (item is! int || item < 0 || item >= currentSeq) return const [];
+    if (item is! int || item < 0 || item >= currentSeq) return null;
     if (seen.add(item)) unique.add(item);
   }
-  if (unique.isEmpty) return const [];
+  if (unique.isEmpty) return null;
   unique.sort();
   return List.unmodifiable(unique);
 }
