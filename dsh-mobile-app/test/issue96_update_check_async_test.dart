@@ -228,4 +228,45 @@ void main() {
     );
   });
 
+  test('resumePluginUpdateCheck：只 GET 原 checkId；404/410 → PluginUpdateCheckExpired', () async {
+    final requests = <http.Request>[];
+    final api = Api(client: MockClient((request) async {
+      requests.add(request);
+      return http.Response(
+        jsonEncode({
+          'ok': true,
+          'state': 'done',
+          'checkId': 'chk-r',
+          'pluginUpdate': {'state': 'up-to-date'},
+        }),
+        200,
+      );
+    }))
+      ..baseUrl = 'http://host:3080'
+      ..path = '/m'
+      ..token = 'tok';
+    final result = await api.resumePluginUpdateCheck(
+      'chk-r',
+      pollDelays: const [Duration(milliseconds: 5)],
+    );
+    expect(requests.single.method, 'GET');
+    expect(requests.single.url.queryParameters['checkId'], 'chk-r');
+    expect((result['pluginUpdate'] as Map)['state'], 'up-to-date');
+
+    final expired = Api(client: MockClient((request) async {
+      return http.Response(jsonEncode({'error': 'check-expired'}), 410);
+    }))
+      ..baseUrl = 'http://host:3080'
+      ..path = '/m'
+      ..token = 'tok';
+    await expectLater(
+      expired.resumePluginUpdateCheck(
+        'chk-expired',
+        pollDelays: const [Duration(milliseconds: 5)],
+      ),
+      throwsA(isA<PluginUpdateCheckExpired>()
+          .having((e) => e.checkId, 'checkId', 'chk-expired')),
+    );
+  });
+
 }

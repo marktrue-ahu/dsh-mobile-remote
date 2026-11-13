@@ -13,6 +13,13 @@ const UPDATE_AVAILABLE = { state: "update-available", reason: "version-newer", c
 const UP_TO_DATE = { state: "up-to-date", reason: "same-version", checkedAt: "t" };
 const UNAVAILABLE = { state: "unavailable", reason: "npm-registry-unavailable", checkedAt: "t" };
 
+function createCheckServiceTimeout() {
+	return createUpdateCheckService({
+		checkFn: () => new Promise(() => {}),
+		checkTimeoutMs: 30,
+	});
+}
+
 function deferred() {
 	let resolve;
 	const promise = new Promise((r) => { resolve = r; });
@@ -110,20 +117,26 @@ test("#96 异步：POST 形状 checking；checkId 轮询 done；未知 404；同
 	assert.equal(done.body.result.state, "update-available");
 });
 
-test("#96 异步：检查抛错 → error 状态；过期未知/检查超时明确", async () => {
+test("#96 review P2：checkFn 任意异常脱敏为失败缓存，async done 返回完整结果", async () => {
+	let calls = 0;
 	const service = createUpdateCheckService({
-		checkFn: async () => { throw new Error("boom"); },
+		checkFn: async () => { calls += 1; throw new Error("/secret/path boom"); },
 	});
+	const first = await service.checkSync();
+	assert.equal(first.state, "unavailable");
+	assert.equal(first.reason, "check-failed");
+	assert.ok(!JSON.stringify(first).includes("/secret/path"), "不得泄露 error.message");
+	const second = await service.checkSync();
+	assert.deepEqual(second, first, "失败缓存命中必须返回完整结果，不能 null");
+	assert.equal(calls, 1, "失败缓存命中不得重复 checkFn");
+
 	const started = service.startAsync();
 	await new Promise((r) => setImmediate(r));
-	const result = service.getAsync(started.checkId);
-	assert.equal(result.body.state, "error");
-	assert.equal(result.body.error, "check-failed", "不得原样返回 error.message");
+	const done = service.getAsync(started.checkId);
+	assert.equal(done.body.state, "done");
+	assert.equal(done.body.result.reason, "check-failed", "async done 不得为 null");
 
-	const timed = createUpdateCheckService({
-		checkFn: () => new Promise(() => {}),
-		checkTimeoutMs: 30,
-	});
+	const timed = createCheckServiceTimeout();
 	const t = timed.startAsync();
 	await new Promise((r) => setTimeout(r, 60));
 	assert.equal(timed.getAsync(t.checkId).body.result.reason, "check-timeout");
@@ -235,4 +248,154 @@ test("#96 review：invalidate 清 tasks/in-flight，旧 checkId 不再 done", as
 	slow.invalidate();
 	const fresh = slow.startAsync();
 	assert.notEqual(fresh.checkId, pending.checkId, "invalidate 后不得复用旧 in-flight");
+});
+
+test("#96 review P1：failureCache 命中返回完整结果（不 null）；成功->失败->过期恢复", async () => {
+	let now = 0;
+	let calls = 0;
+	let mode = "success";
+	const service = createUpdateCheckService({
+		checkFn: async () => {
+			calls += 1;
+			if (mode === "throw") throw new Error("boom");
+			return { ...UPDATE_AVAILABLE };
+		},
+		now: () => now,
+		successTtlMs: 1000,
+		failureTtlMs: 100,
+	});
+	assert.equal((await service.checkSync()).state, "update-available");
+	mode = "throw";
+	const failed = await service.check({ force: true });
+	assert.equal(failed.reason, "check-failed");
+	const cachedFailure = await service.checkSync();
+	assert.deepEqual(cachedFailure, failed, "失败缓存命中必须返回同一完整结果");
+	assert.equal(calls, 2);
+	now = 101; // 失败 TTL 过期
+	mode = "success";
+	const recovered = await service.checkSync();
+	assert.equal(recovered.state, "update-available");
+	assert.equal(calls, 3);
+});
+
+test("#96 review P1：invalidate 后旧在途完成（晚于新）不得污染，旧调用方拿到非 null stale", async () => {
+	let calls = 0;
+	const gates = [];
+	const service = createUpdateCheckService({
+		checkFn: () => {
+			const gate = deferred();
+			gates.push(gate);
+			calls += 1;
+			return gate.promise;
+		},
+	});
+	const oldPromise = service.checkSync();
+	await new Promise((r) => setImmediate(r));
+	assert.equal(calls, 1);
+	service.invalidate();
+	const newPromise = service.checkSync();
+	await new Promise((r) => setImmediate(r));
+	assert.equal(calls, 2);
+	// 旧完成晚于新：旧结果必须被丢弃。
+	gates[1].resolve({ ...UP_TO_DATE });
+	assert.equal((await newPromise).state, "up-to-date");
+	gates[0].resolve({ ...UPDATE_AVAILABLE });
+	const oldResult = await oldPromise;
+	assert.equal(oldResult.state, "unavailable");
+	assert.equal(oldResult.reason, "check-stale");
+	const cached = await service.checkSync();
+	assert.equal(cached.state, "up-to-date", "旧完成不得回填快照");
+});
+
+test("#96 review P1：invalidate 后旧在途完成（早于新）同样不回填", async () => {
+	const gates = [];
+	const service = createUpdateCheckService({
+		checkFn: () => {
+			const gate = deferred();
+			gates.push(gate);
+			return gate.promise;
+		},
+	});
+	const oldPromise = service.checkSync();
+	await new Promise((r) => setImmediate(r));
+	service.invalidate();
+	const newPromise = service.checkSync();
+	await new Promise((r) => setImmediate(r));
+	gates[0].resolve({ ...UPDATE_AVAILABLE }); // 旧先完成
+	const oldResult = await oldPromise;
+	assert.equal(oldResult.reason, "check-stale");
+	gates[1].resolve({ ...UP_TO_DATE });
+	assert.equal((await newPromise).state, "up-to-date");
+	assert.equal((await service.checkSync()).state, "up-to-date", "旧成功不得覆盖新快照");
+});
+
+test("#96 review P2：连续 checkFn throw 只跑一次；TTL 后恢复成功", async () => {
+	let now = 0;
+	let calls = 0;
+	let mode = "throw";
+	const service = createUpdateCheckService({
+		checkFn: async () => {
+			calls += 1;
+			if (mode === "throw") throw new Error("secret path /x");
+			return { ...UP_TO_DATE };
+		},
+		now: () => now,
+		failureTtlMs: 100,
+	});
+	const first = await service.checkSync();
+	assert.equal(first.reason, "check-failed");
+	assert.equal(JSON.stringify(first).includes("/x"), false);
+	const second = await service.checkSync();
+	assert.deepEqual(second, first);
+	assert.equal(calls, 1, "失败缓存内不得再次出网");
+	now = 101;
+	mode = "success";
+	assert.equal((await service.checkSync()).state, "up-to-date");
+	assert.equal(calls, 2);
+});
+
+test("#96 review P2：submit 在检查 outage/timeout 时返回 503 check-unavailable，不误判 candidate-changed", async () => {
+	const home = mkdtempSync(join(tmpdir(), "update-check-outage-"));
+	try {
+		let views = 0;
+		const outage = createPluginUpdateController({
+			home,
+			configValue: "npm",
+			profileDir: home,
+			packageName: "pkg",
+			npmPackageView: async () => { views += 1; throw new Error("registry down"); },
+			capabilities: () => ({ canSelfUpdate: true, updateChannel: "restart" }),
+			localVersion: "3.2.4",
+			localContentSha256: "",
+			status: {},
+			log: () => {},
+			checkFailureTtlMs: 0,
+		});
+		const r = await outage.submit({ targetVersion: "3.2.5" });
+		assert.equal(r.status, 503);
+		assert.equal(r.body.error, "check-unavailable");
+		assert.equal(r.body.check.state, "unavailable");
+		assert.equal(views, 1, "检查失败后不得因 targetVersion 再强制重查");
+	} finally { rmSync(home, { recursive: true, force: true }); }
+
+	const home2 = mkdtempSync(join(tmpdir(), "update-check-timeout-"));
+	try {
+		const timeout = createPluginUpdateController({
+			home: home2,
+			configValue: "npm",
+			profileDir: home2,
+			packageName: "pkg",
+			npmPackageView: () => new Promise(() => {}),
+			capabilities: () => ({ canSelfUpdate: true, updateChannel: "restart" }),
+			localVersion: "3.2.4",
+			localContentSha256: "",
+			status: {},
+			log: () => {},
+			checkTimeoutMs: 30,
+		});
+		const r = await timeout.submit({ targetVersion: "3.2.5" });
+		assert.equal(r.status, 503);
+		assert.equal(r.body.error, "check-unavailable");
+		assert.equal(r.body.reason, "check-timeout");
+	} finally { rmSync(home2, { recursive: true, force: true }); }
 });

@@ -42,6 +42,14 @@ class ApiException implements Exception {
   String toString() => message;
 }
 
+/// issue #96：恢复的 checkId 已过期/不存在（404/410），需重新发起检查。
+class PluginUpdateCheckExpired implements Exception {
+  final String checkId;
+  const PluginUpdateCheckExpired(this.checkId);
+  @override
+  String toString() => 'update-check-expired';
+}
+
 /// issue #96：异步检查轮询超时（checkId 保留，供 UI 提示“仍在电脑端进行”）。
 class PluginUpdateCheckTimeout implements Exception {
   final String checkId;
@@ -1246,6 +1254,39 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
       // 旧宿主/代理可能对未知 POST 返回 200 {}；按无异步能力回退同步 GET。
       return _legacyPluginUpdateCheck(totalTimeout, watch);
     }
+    return _pollPluginUpdateCheck(
+      checkId,
+      totalTimeout: totalTimeout,
+      onProgress: onProgress,
+      pollDelays: pollDelays,
+      watch: watch,
+    );
+  }
+
+  /// issue #96 review P2：用已保留的 checkId 续查（不重新 POST），用于超时后
+  /// 更新行「继续检查」；404/410 抛 [PluginUpdateCheckExpired] 由 UI 清状态重启。
+  Future<Map<String, dynamic>> resumePluginUpdateCheck(
+    String checkId, {
+    Duration totalTimeout = const Duration(seconds: 35),
+    void Function(String state)? onProgress,
+    List<Duration>? pollDelays,
+  }) {
+    return _pollPluginUpdateCheck(
+      checkId,
+      totalTimeout: totalTimeout,
+      onProgress: onProgress,
+      pollDelays: pollDelays,
+      watch: Stopwatch()..start(),
+    );
+  }
+
+  Future<Map<String, dynamic>> _pollPluginUpdateCheck(
+    String checkId, {
+    required Duration totalTimeout,
+    void Function(String state)? onProgress,
+    List<Duration>? pollDelays,
+    required Stopwatch watch,
+  }) async {
     var pollIndex = 0;
     while (true) {
       final remaining = totalTimeout - watch.elapsed;
@@ -1273,7 +1314,7 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
         throw PluginUpdateCheckTimeout(checkId);
       } on ApiException catch (error) {
         if (error.status == 404 || error.status == 410) {
-          throw PluginUpdateCheckTimeout(checkId);
+          throw PluginUpdateCheckExpired(checkId);
         }
         rethrow;
       }
