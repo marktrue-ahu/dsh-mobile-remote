@@ -528,6 +528,28 @@ class AppNotification {
 }
 
 // 消息流事件（服务端摘要格式）。新增 detail 元数据后，旧插件/旧 App 仍可互相忽略未知字段。
+/// issue #99：compaction surface 投影操作（仅 envelope 元数据，不改变事件内容）。
+class SurfaceOp {
+  final String op;
+  final int startSeq;
+  final int endSeq;
+
+  const SurfaceOp({
+    required this.op,
+    required this.startSeq,
+    required this.endSeq,
+  });
+
+  static SurfaceOp? fromJson(Object? value) {
+    if (value is! Map) return null;
+    final op = value['op'];
+    final start = (value['startSeq'] as num?)?.toInt();
+    final end = (value['endSeq'] as num?)?.toInt();
+    if (op is! String || op.isEmpty || start == null || end == null) return null;
+    return SurfaceOp(op: op, startSeq: start, endSeq: end);
+  }
+}
+
 class ChatEvent {
   final int? seq;
   final String type;
@@ -553,6 +575,24 @@ class ChatEvent {
 
   /// issue #54：`tool/result` 的结构化摘要（退出码/信号/匹配数）；解析不到为 null。
   final ToolResultSummary? resultSummary;
+
+  /// issue #99：compaction surface 投影元数据。旧插件/普通事件为 null/空。
+  ///
+  /// `surfaceOp.op == 'replace'` 表示本事件替换 [sourceEventSeqs] 对应的旧事件，
+  /// 不是新的工具调用；App 必须按替换/遮蔽处理，避免多出历史工具卡。
+  final SurfaceOp? surfaceOp;
+  final List<int> sourceEventSeqs;
+
+  bool get isSurfaceReplace =>
+      surfaceOp?.op == 'replace' && sourceEventSeqs.isNotEmpty;
+
+  /// 替换事件的原始锚点 seq（用于把工具卡留在旧位置）；无 source 时退回自身 seq。
+  int? get surfaceAnchorSeq {
+    if (!isSurfaceReplace) return seq;
+    final anchor = sourceEventSeqs.reduce((a, b) => a < b ? a : b);
+    return anchor;
+  }
+
   ChatEvent({
     this.seq,
     required this.type,
@@ -564,6 +604,8 @@ class ChatEvent {
     this.tail,
     this.callSummary,
     this.resultSummary,
+    this.surfaceOp,
+    this.sourceEventSeqs = const [],
   });
   factory ChatEvent.fromJson(Map<String, dynamic> j) {
     final detail = j['detail'];
@@ -586,9 +628,17 @@ class ChatEvent {
       resultSummary: j['type'] == 'tool/result' && j['data'] is Map
           ? ToolResultSummary.fromJson((j['data'] as Map)['summary'])
           : null,
+      surfaceOp: SurfaceOp.fromJson(j['surfaceOp']),
+      sourceEventSeqs: _surfaceSourceSeqs(j['sourceEventSeqs']),
     );
   }
 }
+
+List<int> _surfaceSourceSeqs(Object? value) => value is List
+    ? List.unmodifiable(
+        value.whereType<num>().map((seq) => seq.toInt()).where((seq) => seq >= 0),
+      )
+    : const [];
 
 /// 历史页结果：事件列表 + 服务端降级读取标记（v3.1.5，休眠会话 current-surface）
 /// + durable cursor 分页标记（PR #24）。

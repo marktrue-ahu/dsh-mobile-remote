@@ -851,8 +851,14 @@ class TurnProcessTracker {
     final time = event.time;
     final turn = _intOf(data['turn']);
     final step = _intOf(data['step']);
+    final replace = event.isSurfaceReplace;
+    final replaceAnchor = replace ? event.surfaceAnchorSeq : null;
+    // issue #99：replace replay 的工具行按 source seq 排序/挂轮次，不按新 replay seq，
+    // 从而不会落在当前轮内容附近。
+    final layoutSeq = replaceAnchor ?? seq;
     // 事件自带 turn 字段时记下 seq → turn，供界面把普通条目（assistant/tool）挂回轮次。
     if (turn != null && seq != null) _itemTurn[seq] = turn;
+    if (turn != null && replaceAnchor != null) _itemTurn[replaceAnchor] = turn;
 
     switch (type) {
       case 'turn/start':
@@ -928,26 +934,32 @@ class TurnProcessTracker {
       case 'tool/call':
         final callId = _callIdOf(data);
         if (callId == null) return;
+        final existed = _tools.containsKey(callId);
         final tool = _tool(callId);
         tool.name = _toolNameOf(data, callId, tool.name);
         if (turn != null) tool.turn = turn;
         if (step != null) tool.step = step;
-        if (seq != null) {
-          tool.reportedSeq = seq;
+        if (replace && !existed) tool.surfaceReplay = true;
+        if (!replace) tool.surfaceReplay = false;
+        if (layoutSeq != null) {
+          tool.reportedSeq = layoutSeq;
           _toolOrder(tool);
         }
         return;
       case 'tool/result':
         final callId = _callIdOf(data);
         if (callId == null) return;
+        final existed = _tools.containsKey(callId);
         final tool = _tool(callId);
         tool.name = _toolNameOf(data, callId, tool.name);
         if (turn != null) tool.turn = turn;
         if (step != null) tool.step = step;
         tool.settled = true;
         tool.isError = data['isError'] == true;
-        if (seq != null && tool.reportedSeq == null) {
-          tool.reportedSeq = seq;
+        if (replace && !existed) tool.surfaceReplay = true;
+        if (!replace) tool.surfaceReplay = false;
+        if (layoutSeq != null && tool.reportedSeq == null) {
+          tool.reportedSeq = layoutSeq;
           _toolOrder(tool);
         }
         return;
@@ -1030,7 +1042,7 @@ class TurnProcessTracker {
     for (final row in turn.rows) {
       if (anchor == null || row.seq < anchor) anchor = row.seq;
     }
-    for (final tool in _tools.values) {
+    for (final tool in _tools.values.where((t) => !t.surfaceReplay)) {
       if (tool.turn != turn.turn) continue;
       final seq = tool.reportedSeq;
       if (seq == null) continue;
@@ -1111,7 +1123,7 @@ class TurnProcessTracker {
             reasoningChars: row.reasoningChars,
           ),
       ];
-      for (final tool in _tools.values) {
+      for (final tool in _tools.values.where((t) => !t.surfaceReplay)) {
         if (tool.turn != t.turn) continue;
         final seq = tool.reportedSeq;
         if (seq == null) continue;
@@ -1179,7 +1191,7 @@ class TurnProcessTracker {
     };
     for (final turn in orphanTurns) {
       final rows = <ProcessRow>[];
-      for (final tool in _tools.values) {
+      for (final tool in _tools.values.where((t) => !t.surfaceReplay)) {
         if (tool.turn != turn) continue;
         final seq = tool.reportedSeq;
         if (seq == null) continue;
@@ -1307,4 +1319,8 @@ class _MutableToolRow {
   int order = 0;
   bool settled = false;
   bool isError = false;
+
+  /// issue #99：本行**仅由 surface replace replay 创建**（原始工具事件不在窗口内）。
+  /// 这种行不生成历史工具结果/过程组；原始事件随后到达会清除标记。
+  bool surfaceReplay = false;
 }
