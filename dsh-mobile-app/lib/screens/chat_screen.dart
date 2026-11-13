@@ -336,6 +336,26 @@ class _ConversationActionRailState extends State<_ConversationActionRail> {
   }
 }
 
+/// issue #98：本会话内的工作区外图片授权记录（不持久化）。
+class _WorkspaceImageConsent {
+  const _WorkspaceImageConsent({
+    required this.consentId,
+    required this.scope,
+    required this.requestPath,
+    required this.requestDir,
+    required this.expiresAt,
+  });
+
+  final String consentId;
+  final String scope;
+  final String requestPath;
+  final String requestDir;
+  final DateTime? expiresAt;
+
+  bool get expired =>
+      expiresAt != null && !DateTime.now().isBefore(expiresAt!);
+}
+
 class ChatScreen extends StatefulWidget {
   final AppStore store;
   final String? initialSend; // 首页直达发送
@@ -446,31 +466,206 @@ class _ChatScreenState extends State<ChatScreen> {
   // v2.7.2 review(M1)：本页绑定的会话（initState 时捕获）——事件按它过滤，叠层页面互不污染
   String? _mySessionId;
   // issue #94/#95：Markdown 本地图片 loader；缓存/并发/会话隔离由本页 LRU 负责。
-  late final MarkdownImageLoader _markdownImageLoader = _loadMarkdownImage;
+  late final MarkdownImageLoader _markdownImageLoader =
+      (source) => _loadMarkdownImage(source);
+  late final MarkdownImageUserAction _markdownImageUserAction =
+      (source) => _loadMarkdownImage(source, userInitiated: true);
   late final WorkspaceImageCache _workspaceImageCache = WorkspaceImageCache();
+  final List<_WorkspaceImageConsent> _imageConsents = [];
+  final Map<String, Future<String?>> _imageConsentPrompts = {};
+  // issue #98 review P2：取消/失效过的 source 不再自动弹窗，只显示卡片入口；
+  // 用户主动点「授权读取」才清标记并重新弹。
+  final Set<String> _imageConsentDeclined = {};
+  bool _imageConsentDialogOpen = false;
 
-  Future<MarkdownImageData> _loadMarkdownImage(String source) async {
+  Future<MarkdownImageData> _loadMarkdownImage(
+    String source, {
+    bool userInitiated = false,
+  }) async {
     final id = _mySessionId;
     if (id == null || id.isEmpty) {
       throw ApiException('no-session', code: 'session-not-found');
     }
-    final bytes = await _workspaceImageCache.load(
-      '$id|$source',
-      () async {
-        final data = await _api.workspaceImage(id, source);
-        // 服务端 8MiB + 客户端二次校验（防旧宿主/中间层异常大响应）。
-        if (data.bytes.length > 8 * 1024 * 1024) {
-          throw ApiException(
-            'image too large',
-            code: 'image-too-large',
-            status: 413,
+    var consentId = _imageConsentIdFor(source);
+    Future<Uint8List> fetch() async {
+      final data = await _api.workspaceImage(
+        id,
+        source,
+        consentId: consentId,
+      );
+      // 服务端 8MiB + 客户端二次校验（防旧宿主/中间层异常大响应）。
+      if (data.bytes.length > 8 * 1024 * 1024) {
+        throw ApiException(
+          'image too large',
+          code: 'image-too-large',
+          status: 413,
+        );
+      }
+      return data.bytes;
+    }
+
+    final key = _imageConsentKey(id, source);
+    if (userInitiated) _imageConsentDeclined.remove(key);
+    try {
+      final bytes = await _workspaceImageCache.load(
+        key,
+        fetch,
+        stillWanted: () => mounted && _mySessionId == id,
+      );
+      _imageConsentDeclined.remove(key);
+      return MarkdownImageData(bytes: bytes);
+    } on ApiException catch (error) {
+      if (error.code != 'consent-required' && error.code != 'consent-invalid') {
+        rethrow;
+      }
+      if (consentId.isNotEmpty) _removeImageConsent(consentId);
+      // 服务端持续 invalid：自动路径必须先标记 declined，再抛给卡片；
+      // 否则重建会再次自动弹，形成循环。只有手动 action 才清 declined。
+      if (!userInitiated && error.code == 'consent-invalid') {
+        _imageConsentDeclined.add(key);
+      }
+      // 取消/失效后组件重建：不再自动弹，只让卡片显示「授权读取」。
+      if (!userInitiated && _imageConsentDeclined.contains(key)) rethrow;
+      final issued = await _ensureImageConsent(id, source);
+      if (issued == null) {
+        _imageConsentDeclined.add(key);
+        rethrow;
+      }
+      consentId = issued;
+      final bytes = await _workspaceImageCache.load(
+        key,
+        fetch,
+        stillWanted: () => mounted && _mySessionId == id,
+      );
+      _imageConsentDeclined.remove(key);
+      return MarkdownImageData(bytes: bytes);
+    }
+  }
+
+  String _imageConsentKey(String sessionId, String source) =>
+      '$sessionId|$source';
+
+  String _requestDir(String source) {
+    final normalized = source.replaceAll('\\', '/');
+    final index = normalized.lastIndexOf('/');
+    return index <= 0 ? '' : normalized.substring(0, index);
+  }
+
+  String _imageConsentIdFor(String source) {
+    final dir = _requestDir(source);
+    for (final consent in _imageConsents.reversed) {
+      if (consent.expired) continue;
+      if (consent.scope == 'once' && consent.requestPath == source) {
+        return consent.consentId;
+      }
+      if (consent.scope == 'session-directory' &&
+          consent.requestDir.isNotEmpty &&
+          consent.requestDir == dir) {
+        return consent.consentId;
+      }
+    }
+    return '';
+  }
+
+  void _removeImageConsent(String consentId) {
+    _imageConsents.removeWhere((consent) => consent.consentId == consentId);
+  }
+
+  Future<String?> _ensureImageConsent(String id, String source) {
+    final key = '$id|$source';
+    return _imageConsentPrompts.putIfAbsent(key, () async {
+      try {
+        return await _promptImageConsent(id, source);
+      } finally {
+        _imageConsentPrompts.remove(key);
+      }
+    });
+  }
+
+  String _imageDisplayPath(String source) {
+    final normalized = source.replaceAll('\\', '/');
+    final segments = normalized.split('/').where((part) => part.isNotEmpty).toList();
+    if (segments.isEmpty) return source;
+    if (segments.length == 1) return segments.single;
+    return '…/${segments[segments.length - 2]}/${segments.last}';
+  }
+
+  Future<String?> _promptImageConsent(String id, String source) async {
+    if (!mounted || _imageConsentDialogOpen) return null;
+    _imageConsentDialogOpen = true;
+    try {
+      final file = _imageDisplayPath(source);
+      final choice = await showDialog<String>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          key: const Key('image-consent-dialog'),
+          title: Text(L10n.t('授权读取图片', 'Authorize image access')),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(file),
+              const SizedBox(height: 6),
+              Text(
+                L10n.t(
+                  '该图片在工作区外。授权后本次读取仍受类型/大小/路径校验限制。',
+                  'This image is outside the workspace. Authorization still keeps type/size/path checks.',
+                ),
+                style: const TextStyle(fontSize: 12.5),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              key: const Key('image-consent-cancel'),
+              onPressed: () => Navigator.of(dialogContext).pop('cancel'),
+              child: Text(L10n.t('取消', 'Cancel')),
+            ),
+            TextButton(
+              key: const Key('image-consent-once'),
+              onPressed: () => Navigator.of(dialogContext).pop('once'),
+              child: Text(L10n.t('仅此次', 'This time')),
+            ),
+            FilledButton(
+              key: const Key('image-consent-directory'),
+              onPressed: () => Navigator.of(dialogContext).pop('session-directory'),
+              child: Text(L10n.t('本会话允许此目录', 'Allow this directory')),
+            ),
+          ],
+        ),
+      );
+      if (!mounted || choice == null || choice == 'cancel') return null;
+      try {
+        final issued = await _api.createWorkspaceImageConsent(
+          sessionId: id,
+          path: source,
+          scope: choice,
+        );
+        final consentId = (issued['consentId'] ?? '').toString();
+        if (consentId.isEmpty) return null;
+        final expiresAt = DateTime.tryParse((issued['expiresAt'] ?? '').toString());
+        _imageConsentDeclined.remove(_imageConsentKey(id, source));
+        _imageConsents.add(_WorkspaceImageConsent(
+          consentId: consentId,
+          scope: (issued['scope'] ?? choice).toString(),
+          requestPath: source,
+          requestDir: _requestDir(source),
+          expiresAt: expiresAt,
+        ));
+        if (mounted) setState(() {});
+        return consentId;
+      } on ApiException catch (error) {
+        if (mounted) {
+          showToast(
+            context,
+            '${L10n.t('无法授权读取图片：', 'Could not authorize image: ')}${error.code ?? error.message}',
           );
         }
-        return data.bytes;
-      },
-      stillWanted: () => mounted && _mySessionId == id,
-    );
-    return MarkdownImageData(bytes: bytes);
+        return null;
+      }
+    } finally {
+      _imageConsentDialogOpen = false;
+    }
   }
   Api get _api => widget.apiClient ?? api;
   String get _pageAgentStatus =>
@@ -705,6 +900,14 @@ class _ChatScreenState extends State<ChatScreen> {
   /// issue #52：设置变化（展示模式/收起时机）即时重算时间线。
   void _onStoreChanged() {
     final store = widget.store;
+    // issue #98：会话切换时清空本页图片授权与缓存（页面通常会被替换，这里兜底
+    // 同一实例被复用时也不串会话）。
+    final currentSession = store.sessionId;
+    if (currentSession != null &&
+        _mySessionId != null &&
+        currentSession != _mySessionId) {
+      _clearImageConsentState();
+    }
     if (_lastStepDisplayMode == store.stepDisplayMode &&
         _lastTurnFoldTiming == store.turnFoldTiming) {
       return;
@@ -733,9 +936,26 @@ class _ChatScreenState extends State<ChatScreen> {
     if (hasSlashText && sid != null) unawaited(_ensureSlashCatalog(sid));
   }
 
+  void _clearImageConsentState() {
+    _imageConsents.clear();
+    _imageConsentPrompts.clear();
+    _imageConsentDeclined.clear();
+    _workspaceImageCache.clear();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final current = widget.store.sessionId;
+    if (current != null && _mySessionId != null && current != _mySessionId) {
+      _mySessionId = current;
+      _clearImageConsentState();
+    }
+  }
+
   @override
   void dispose() {
-    _workspaceImageCache.clear();
+    _clearImageConsentState();
     _draftTimer?.cancel();
     _activityTimer?.cancel();
     _queueRefreshTimer?.cancel();
@@ -2241,6 +2461,7 @@ class _ChatScreenState extends State<ChatScreen> {
                       streaming: true,
                       api: _api,
                       imageLoader: _markdownImageLoader,
+              imageUserAction: _markdownImageUserAction,
                     );
                   }
                   return const SizedBox.shrink();
@@ -8122,6 +8343,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   ? ''
                   : '$_turnTailVersion:$turn',
               imageLoader: _markdownImageLoader,
+              imageUserAction: _markdownImageUserAction,
             ),
             if (item.detailDegraded)
               Padding(
@@ -10225,6 +10447,7 @@ class _AssistantBubble extends StatefulWidget {
   /// 解析缓存附加键：记录集合变化（新交付声明/改动摘要到达）时强制重新解析。
   final String codeTapKey;
   final MarkdownImageLoader? imageLoader;
+  final MarkdownImageUserAction? imageUserAction;
   const _AssistantBubble({
     required this.text,
     required this.api,
@@ -10239,6 +10462,7 @@ class _AssistantBubble extends StatefulWidget {
     this.codeTap,
     this.codeTapKey = '',
     this.imageLoader,
+    this.imageUserAction,
   });
 
   @override
@@ -10263,6 +10487,7 @@ class _AssistantBubbleState extends State<_AssistantBubble> {
         context,
         codeTap: widget.codeTap,
         imageLoader: widget.imageLoader,
+        imageUserAction: widget.imageUserAction,
       );
       if (_parseLogs < 3) {
         _parseLogs++;
