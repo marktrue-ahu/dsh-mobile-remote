@@ -1,4 +1,5 @@
 /// issue #93：全部分支图（all=true）+ focus 定位 + 双向分页。
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:dsh_mobile_app/api.dart';
@@ -395,7 +396,7 @@ void main() {
     scroll.dispose();
   });
 
-  testWidgets('issue #93 widget：向上加载 prev 页后当前可见 commit 不跳', (tester) async {
+  testWidgets('issue #93/#100 widget：focus 首屏不被 prev 预取推走；真实上拉到顶才前插', (tester) async {
     final initial = [for (var index = 0; index < 16; index += 1) 'c$index'];
     final newer = ['n0', 'n1'];
     final api = _FakeGitApi()
@@ -417,18 +418,192 @@ void main() {
       ),
     ));
     await controller.open('session-a');
-    // 首屏在顶部且 prevCursor 存在 → 自动预取更新页（真实滚动监听同一路径）。
     await tester.pumpAndSettle();
-    final beforeFirstVisible = 'c0';
+    // issue #100：focus 首屏稳定后，后台不做 prev 预取，也不能自动向下滚。
+    expect(api.requests, hasLength(1), reason: 'focus 页加载后不得自动请求 prev');
+    expect(controller.state.commits.map((commit) => commit.oid), initial);
+    expect(scroll.offset, closeTo(0, 1.0), reason: 'focus 行不得被预取推走');
+
+    // 只有真实用户手势拉向顶部才触发 prefetch；仍在顶部则应用缓存页。
+    await tester.drag(find.byKey(const Key('git-graph-vertical')), const Offset(0, 120));
+    await tester.pumpAndSettle();
+    expect(api.requests, hasLength(2), reason: '真实到顶后才请求 prev');
     expect(controller.state.commits.take(2).map((commit) => commit.oid), newer);
-    // 前插 2 行后滚动补偿 2*rowHeight：原来顶部那行仍在顶部可见。
+    // 前插 2 行后补偿：当前可见首行 c0 仍在顶部。
     expect(scroll.offset, closeTo(newer.length * kGitGraphRowHeight, 1.0));
     final topIndex = (scroll.offset / kGitGraphRowHeight).round();
-    expect(controller.state.commits[topIndex].oid, beforeFirstVisible,
-        reason: '前插后当前可见 commit 必须保持不变');
+    expect(controller.state.commits[topIndex].oid, 'c0');
     controller.dispose();
     scroll.dispose();
   });
+
+  test('issue #100 controller：prefetch 只缓存不 emit，apply 才前插', () async {
+    final initial = [for (var index = 0; index < 16; index += 1) 'c$index'];
+    final newer = ['n0', 'n1'];
+    final api = _FakeGitApi()
+      ..onAll = (focus, snapshotId, cursor) async {
+        if (snapshotId == null) {
+          return _page(oids: initial, focusOid: 'c0', pageStart: 32, prevCursor: 'p1', nextCursor: 'n1');
+        }
+        return _page(oids: newer, snapshotId: 'snap-1', pageStart: 16, nextCursor: 'n2');
+      };
+    final controller = GitBrowserController(api, branchLimit: GitGraphBranchLimit.unlimited);
+    await controller.open('session-a');
+    await controller.openAllGraph();
+    expect(controller.state.commits.map((commit) => commit.oid), initial);
+    await controller.prefetchPrevGraphPage();
+    expect(controller.hasPendingPrevGraphPage, isTrue);
+    expect(controller.state.commits.map((commit) => commit.oid), initial,
+        reason: 'prefetch 不得改 commits/触发前插');
+    expect(controller.state.graphPrevCursor, 'p1');
+    await controller.applyPendingPrevGraphPage();
+    expect(controller.state.commits.take(2).map((commit) => commit.oid), newer);
+    expect(controller.hasPendingPrevGraphPage, isFalse);
+    controller.dispose();
+  });
+
+  testWidgets('issue #100 widget：focus 页中/320/深色/大字号下预取不自动滚', (tester) async {
+    final initial = [for (var index = 0; index < 16; index += 1) 'c$index'];
+    final newer = ['n0', 'n1'];
+    final api = _FakeGitApi()
+      ..onAll = (focus, snapshotId, cursor) async {
+        if (snapshotId == null) {
+          return _page(oids: initial, focusOid: 'c2', pageStart: 32, prevCursor: 'p1', nextCursor: 'n1');
+        }
+        return _page(oids: newer, snapshotId: 'snap-1', pageStart: 16, nextCursor: 'n2');
+      };
+    final controller = GitBrowserController(api, branchLimit: GitGraphBranchLimit.unlimited);
+    final store = AppStore()..gitGraphBranchLimit = GitGraphBranchLimit.unlimited;
+    final scroll = ScrollController();
+    tester.view.physicalSize = const Size(320, 640);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(MaterialApp(
+      theme: ThemeData.dark(),
+      builder: (context, child) => MediaQuery(
+        data: MediaQuery.of(context).copyWith(textScaler: const TextScaler.linear(1.5)),
+        child: child!,
+      ),
+      home: Scaffold(
+        body: GitBrowserSheet(controller: controller, scrollController: scroll, tabs: const ['graph'], store: store),
+      ),
+    ));
+    await controller.open('session-a');
+    await tester.pumpAndSettle();
+    expect(api.requests, hasLength(1), reason: 'focus 页中也不得自动 prev 预取');
+    expect(controller.state.commits.map((commit) => commit.oid), initial);
+    final row0 = tester.getSize(find.byKey(const Key('git-commit-c2'))).height;
+    final focusIndex = controller.state.commits.indexWhere((c) => c.oid == 'c2');
+    expect(scroll.offset, closeTo(focusIndex * row0, row0),
+        reason: 'focus 行应稳定在视口内');
+
+    // 用户真实拉到顶部：prefetch + 应用，可见首行保持。
+    await tester.drag(find.byKey(const Key('git-graph-vertical')), const Offset(0, 2000));
+    await tester.pumpAndSettle();
+    expect(api.requests, hasLength(2));
+    expect(controller.state.commits.take(2).map((commit) => commit.oid), newer);
+    expect(scroll.offset, greaterThan(0));
+    controller.dispose();
+    scroll.dispose();
+  });
+
+  testWidgets('issue #100 widget：prev 预取期间用户离开顶部→只缓存，回顶才前插', (tester) async {
+    final gate = Completer<void>();
+    final initial = [for (var index = 0; index < 16; index += 1) 'c$index'];
+    final newer = ['n0', 'n1'];
+    final api = _FakeGitApi()
+      ..onAll = (focus, snapshotId, cursor) async {
+        if (snapshotId == null) {
+          return _page(oids: initial, focusOid: 'c0', pageStart: 32, prevCursor: 'p1', nextCursor: 'n1');
+        }
+        await gate.future;
+        return _page(oids: newer, snapshotId: 'snap-1', pageStart: 16, nextCursor: 'n2');
+      };
+    final controller = GitBrowserController(api, branchLimit: GitGraphBranchLimit.unlimited);
+    final store = AppStore()..gitGraphBranchLimit = GitGraphBranchLimit.unlimited;
+    final scroll = ScrollController();
+    tester.view.physicalSize = const Size(400, 700);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: GitBrowserSheet(controller: controller, scrollController: scroll, tabs: const ['graph'], store: store),
+      ),
+    ));
+    await controller.open('session-a');
+    await tester.pumpAndSettle();
+    // 顶部下拉触发 prefetch（挂起）。
+    await tester.drag(find.byKey(const Key('git-graph-vertical')), const Offset(0, 120));
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(api.requests, hasLength(2));
+    expect(controller.state.commits.map((commit) => commit.oid), initial,
+        reason: '预取未完成不得前插');
+    // 预取挂起期间用户离开顶部。
+    await tester.drag(find.byKey(const Key('git-graph-vertical')), const Offset(0, -300));
+    await tester.pump(const Duration(milliseconds: 100));
+    gate.complete();
+    await tester.pumpAndSettle();
+    expect(controller.hasPendingPrevGraphPage, isTrue,
+        reason: '预取完成但用户不在顶部 → 缓存 pending');
+    expect(controller.state.commits.map((commit) => commit.oid), initial,
+        reason: 'pending 不得自动 prepend/滚动');
+    // 用户主动回到顶部 → 应用缓存，不再发请求。
+    await tester.drag(find.byKey(const Key('git-graph-vertical')), const Offset(0, 2000));
+    await tester.pumpAndSettle();
+    expect(api.requests, hasLength(2), reason: '应用 pending 不得重复请求');
+    expect(controller.state.commits.take(2).map((commit) => commit.oid), newer);
+    expect(controller.hasPendingPrevGraphPage, isFalse);
+    controller.dispose();
+    scroll.dispose();
+  });
+
+  testWidgets('issue #100 P2：程序性 jumpTo/animateTo(0) 不得请求 prev', (tester) async {
+    final initial = [for (var index = 0; index < 16; index += 1) 'c$index'];
+    final newer = ['n0', 'n1'];
+    final api = _FakeGitApi()
+      ..onAll = (focus, snapshotId, cursor) async {
+        if (snapshotId == null) {
+          return _page(oids: initial, focusOid: 'c2', pageStart: 32, prevCursor: 'p1', nextCursor: 'n1');
+        }
+        return _page(oids: newer, snapshotId: 'snap-1', pageStart: 16, nextCursor: 'n2');
+      };
+    final controller = GitBrowserController(api, branchLimit: GitGraphBranchLimit.unlimited);
+    final store = AppStore()..gitGraphBranchLimit = GitGraphBranchLimit.unlimited;
+    final scroll = ScrollController();
+    tester.view.physicalSize = const Size(400, 700);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: GitBrowserSheet(controller: controller, scrollController: scroll, tabs: const ['graph'], store: store),
+      ),
+    ));
+    await controller.open('session-a');
+    await tester.pumpAndSettle();
+    expect(api.requests, hasLength(1));
+    expect(scroll.offset, greaterThan(0), reason: 'focus 在页中');
+    // 程序性 jumpTo(0)：无 dragDetails，不得当作真实用户到顶。
+    scroll.jumpTo(0);
+    await tester.pumpAndSettle();
+    expect(api.requests, hasLength(1), reason: 'jumpTo(0) 不得请求 prev');
+    expect(controller.state.commits.map((commit) => commit.oid), initial);
+    expect(controller.hasPendingPrevGraphPage, isFalse);
+    // 程序性 animateTo(0) 同样不得请求。
+    scroll.jumpTo(120);
+    await tester.pump();
+    unawaited(scroll.animateTo(0, duration: const Duration(milliseconds: 120), curve: Curves.easeOut));
+    await tester.pumpAndSettle();
+    expect(api.requests, hasLength(1), reason: 'animateTo(0) 不得请求 prev');
+    expect(controller.state.commits.map((commit) => commit.oid), initial);
+    // 真实手势仍可触发（回归保护）。
+    await tester.drag(find.byKey(const Key('git-graph-vertical')), const Offset(0, 80));
+    await tester.pumpAndSettle();
+    expect(api.requests, hasLength(2));
+    expect(controller.state.commits.take(2).map((commit) => commit.oid), newer);
+    controller.dispose();
+    scroll.dispose();
+  });
+
   testWidgets('issue #95：all 模式刷新后标题仍“全部分支”，数据 all=true', (tester) async {
     final api = _FakeGitApi();
     final controller = GitBrowserController(api, branchLimit: GitGraphBranchLimit.unlimited);

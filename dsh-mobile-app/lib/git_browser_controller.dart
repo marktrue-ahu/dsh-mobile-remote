@@ -221,6 +221,12 @@ class GitBrowserController extends ChangeNotifier {
   int _previewGeneration = 0;
   Future<void>? _graphPageRequest;
   bool _graphPageWantedNewer = false;
+  // issue #100：prev 预取先缓存，不立即前插；用户真实到顶才应用。
+  GitGraphPage? _pendingPrevPage;
+  String? _pendingPrevSnapshotId;
+  String? _pendingPrevCursor;
+  int _pendingPrevGeneration = -1;
+  bool _prevPrefetchInFlight = false;
   Future<void>? _filesPageRequest;
   bool _disposed = false;
 
@@ -951,6 +957,7 @@ class GitBrowserController extends ChangeNotifier {
 
   /// issue #93：加载更**新**一页（全部分支模式向左/上拖）。
   Future<void> loadPrevGraphPage() {
+    if (_pendingPrevPage != null) return applyPendingPrevGraphPage();
     if (_graphPageRequest != null) return _graphPageRequest!;
     if (!graphAllMode ||
         _state.stale ||
@@ -1005,8 +1012,87 @@ class GitBrowserController extends ChangeNotifier {
     return request;
   }
 
+  void _resetPendingPrev() {
+    _pendingPrevPage = null;
+    _pendingPrevSnapshotId = null;
+    _pendingPrevCursor = null;
+    _pendingPrevGeneration = -1;
+    _prevPrefetchInFlight = false;
+  }
+
+  /// issue #100：是否有已缓存、等待用户主动到顶再应用的更新页。
+  bool get hasPendingPrevGraphPage => _pendingPrevPage != null;
+
+  /// issue #100：后台预取更新页——只缓存，不 emit commits/不改滚动锚点。
+  Future<void> prefetchPrevGraphPage() async {
+    final api = _allApi;
+    final sessionId = _state.sessionId;
+    final repository = _state.repository;
+    final cursor = _state.graphPrevCursor;
+    final snapshotId = _state.snapshotId;
+    if (api == null ||
+        sessionId == null ||
+        repository == null ||
+        cursor == null ||
+        snapshotId == null ||
+        !graphAllMode ||
+        _state.stale ||
+        _state.loadingGraphPage ||
+        _state.graphPageTimedOut ||
+        _prevPrefetchInFlight ||
+        _pendingPrevPage != null) {
+      return;
+    }
+    final generation = _generation;
+    final graphGeneration = _graphGeneration;
+    _prevPrefetchInFlight = true;
+    try {
+      final page = await api.graphAll(
+        sessionId,
+        repository.repositoryId,
+        all: true,
+        snapshotId: snapshotId,
+        cursor: cursor,
+        limit: graphAllPageSize,
+        timeout: const Duration(seconds: 35),
+      );
+      if (generation != _generation ||
+          graphGeneration != _graphGeneration ||
+          _state.snapshotId != snapshotId ||
+          _state.graphPrevCursor != cursor) {
+        return;
+      }
+      _pendingPrevPage = page;
+      _pendingPrevSnapshotId = snapshotId;
+      _pendingPrevCursor = cursor;
+      _pendingPrevGeneration = graphGeneration;
+    } catch (_) {
+      // 后台预取失败静默；用户真正到顶时会重新尝试。
+    } finally {
+      _prevPrefetchInFlight = false;
+    }
+  }
+
+  /// issue #100：应用缓存页；只由用户真实到顶触发（UI 负责时机）。
+  Future<void> applyPendingPrevGraphPage() async {
+    final page = _pendingPrevPage;
+    if (page == null) return;
+    final valid = _pendingPrevGeneration == _graphGeneration &&
+        _pendingPrevSnapshotId == _state.snapshotId &&
+        _pendingPrevCursor == _state.graphPrevCursor &&
+        !_state.stale &&
+        !_state.loadingGraphPage;
+    _pendingPrevPage = null;
+    _pendingPrevSnapshotId = null;
+    _pendingPrevCursor = null;
+    _pendingPrevGeneration = -1;
+    if (!valid) return;
+    _applyAllGraphPage(page, initial: false, newer: true);
+  }
+
   /// issue #93：打开全部分支图（首页或 focus 页）。
   Future<void> openAllGraph({String? focus}) async {
+    _resetPendingPrev();
     if (!graphAllMode) return;
     final generation = _generation;
     final graphGeneration = ++_graphGeneration;
@@ -1067,6 +1153,53 @@ class GitBrowserController extends ChangeNotifier {
     return request;
   }
 
+  void _applyAllGraphPage(
+    GitGraphPage page, {
+    required bool initial,
+    required bool newer,
+  }) {
+    if (initial) _resetPendingPrev();
+    final existing = _state.commits;
+    final List<GitCommitSummary> commits;
+    if (initial) {
+      commits = page.commits;
+    } else if (newer) {
+      final seen = {for (final commit in existing) commit.oid};
+      commits = [
+        ...page.commits.where((commit) => seen.add(commit.oid)),
+        ...existing,
+      ];
+    } else {
+      final seen = {for (final commit in existing) commit.oid};
+      commits = [
+        ...existing,
+        ...page.commits.where((commit) => seen.add(commit.oid)),
+      ];
+    }
+    _emit(_state.copyWith(
+      commits: commits,
+      snapshotId: page.snapshotId,
+      // issue #95（#93 review）：older 页只更新 next、newer 页只更新 prev；
+      // 不能用响应里的另一侧 cursor 覆盖当前浏览方向已加载页的锚点。
+      graphNextCursor: initial
+          ? page.nextCursor
+          : (newer ? _state.graphNextCursor : page.nextCursor),
+      graphPrevCursor: initial
+          ? page.prevCursor
+          : (newer ? page.prevCursor : _state.graphPrevCursor),
+      graphFocusOid: initial ? page.focusOid : _state.graphFocusOid,
+      graphPageStart: initial ? page.pageStart : _state.graphPageStart,
+      graphAll: true,
+      loadingGraph: false,
+      loadingGraphPage: false,
+      graphTimedOut: false,
+      graphPageTimedOut: false,
+      graphPageTimedOutNewer: false,
+      stale: false,
+      error: null,
+    ));
+  }
+
   Future<void> _loadAllGraphPage({
     required int generation,
     required int graphGeneration,
@@ -1097,45 +1230,7 @@ class GitBrowserController extends ChangeNotifier {
         return;
       }
       _cancelGraphTimeout();
-      final existing = _state.commits;
-      final List<GitCommitSummary> commits;
-      if (initial) {
-        commits = page.commits;
-      } else if (newer) {
-        final seen = {for (final commit in existing) commit.oid};
-        commits = [
-          ...page.commits.where((commit) => seen.add(commit.oid)),
-          ...existing,
-        ];
-      } else {
-        final seen = {for (final commit in existing) commit.oid};
-        commits = [
-          ...existing,
-          ...page.commits.where((commit) => seen.add(commit.oid)),
-        ];
-      }
-      _emit(_state.copyWith(
-        commits: commits,
-        snapshotId: page.snapshotId,
-        // issue #95（#93 review）：older 页只更新 next、newer 页只更新 prev；
-        // 不能用响应里的另一侧 cursor 覆盖当前浏览方向已加载页的锚点。
-        graphNextCursor: initial
-            ? page.nextCursor
-            : (newer ? _state.graphNextCursor : page.nextCursor),
-        graphPrevCursor: initial
-            ? page.prevCursor
-            : (newer ? page.prevCursor : _state.graphPrevCursor),
-        graphFocusOid: initial ? page.focusOid : _state.graphFocusOid,
-        graphPageStart: initial ? page.pageStart : _state.graphPageStart,
-        graphAll: true,
-        loadingGraph: false,
-        loadingGraphPage: false,
-        graphTimedOut: false,
-        graphPageTimedOut: false,
-        graphPageTimedOutNewer: false,
-        stale: false,
-        error: null,
-      ));
+      _applyAllGraphPage(page, initial: initial, newer: newer);
     } catch (error) {
       if (generation != _generation || graphGeneration != _graphGeneration) {
         return;
