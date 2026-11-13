@@ -14,6 +14,55 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+class _ResumeApi extends Api {
+  _ResumeApi()
+      : super(
+          client: MockClient(
+            (request) async => http.Response('{}', 200),
+          ),
+        );
+
+  int posts = 0;
+  int resumes = 0;
+  bool expireResume = false;
+
+  static Map<String, dynamic> _done() => {
+    'pluginUpdate': {
+      'state': 'up-to-date',
+      'reason': 'same-version',
+      'canSelfUpdate': true,
+      'checkLog': <Object>[],
+      'transaction': null,
+    },
+  };
+
+  @override
+  Future<Map<String, dynamic>> checkPluginUpdateAsync({
+    bool force = false,
+    Duration totalTimeout = const Duration(seconds: 35),
+    void Function(String state)? onProgress,
+    List<Duration>? pollDelays,
+  }) async {
+    posts += 1;
+    if (posts == 1) {
+      throw const PluginUpdateCheckTimeout('chk-ui');
+    }
+    return _done();
+  }
+
+  @override
+  Future<Map<String, dynamic>> resumePluginUpdateCheck(
+    String checkId, {
+    Duration totalTimeout = const Duration(seconds: 35),
+    void Function(String state)? onProgress,
+    List<Duration>? pollDelays,
+  }) async {
+    resumes += 1;
+    if (expireResume) throw PluginUpdateCheckExpired(checkId);
+    return _done();
+  }
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   setUp(() {
@@ -30,11 +79,13 @@ void main() {
     WidgetTester tester,
     MockClient client, {
     Duration checkTimeout = const Duration(seconds: 35),
+    Api? apiOverride,
   }) async {
-    final api = Api(client: client)
-      ..baseUrl = 'http://host:3080'
-      ..path = '/m'
-      ..token = 'tok';
+    final api = apiOverride ??
+        (Api(client: client)
+          ..baseUrl = 'http://host:3080'
+          ..path = '/m'
+          ..token = 'tok');
     final store = AppStore(apiClient: api);
     await store.loadPrefs();
     addTearDown(store.dispose);
@@ -122,161 +173,47 @@ void main() {
     expect(find.text('电脑端插件已是最新'), findsOneWidget);
     expect(find.text('检查中…'), findsNothing);
   });
-  testWidgets('超时保留 checkId，更新行“继续检查”用同一 checkId 续查成功', (tester) async {
-    var posts = 0;
-    var polls = 0;
-    final client = MockClient((request) async {
-      final path = request.url.path;
-      if (path.endsWith('/api/plugin-update/check') &&
-          request.method == 'POST') {
-        posts += 1;
-        return http.Response(
-          jsonEncode({'ok': true, 'state': 'checking', 'checkId': 'chk-resume'}),
-          200,
-        );
-      }
-      if (path.endsWith('/api/plugin-update/check') &&
-          request.url.queryParameters.containsKey('checkId')) {
-        polls += 1;
-        if (polls <= 2) {
-          return http.Response(
-            jsonEncode({'ok': true, 'state': 'checking', 'checkId': 'chk-resume'}),
-            200,
-          );
-        }
-        return http.Response(
-          jsonEncode({
-            'ok': true,
-            'state': 'done',
-            'checkId': 'chk-resume',
-            'pluginUpdate': {
-              'state': 'up-to-date',
-              'reason': 'same-version',
-              'canSelfUpdate': true,
-              'checkLog': <Object>[],
-              'transaction': null,
-            },
-          }),
-          200,
-        );
-      }
-      if (path == '/m/api/history') {
-        return http.Response(
-          jsonEncode({'ok': true, 'events': <Object>[], 'hasMore': false}),
-          200,
-        );
-      }
-      return http.Response('{}', 200);
-    });
+  testWidgets('超时保留 checkId，更新行“继续检查”复用原 checkId 不新 POST', (tester) async {
+    final fake = _ResumeApi();
     await pumpSettings(
       tester,
-      client,
-      checkTimeout: const Duration(seconds: 2),
+      MockClient((request) async => http.Response('{}', 200)),
+      apiOverride: fake,
     );
     final row = find
         .ancestor(of: find.text('更新电脑端插件'), matching: find.byType(InkWell))
         .first;
     await tester.tap(row);
     await tester.pump(const Duration(milliseconds: 100));
-    expect(find.text('检查中…'), findsOneWidget);
-    // API 总预算用真实 Stopwatch；轮询延迟是 fake timer：交替推进两者。
-    for (var i = 0; i < 24; i++) {
-      await tester.pump(const Duration(milliseconds: 100));
-      await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 100)));
-    }
-    await tester.pump(const Duration(milliseconds: 100));
+    expect(fake.posts, 1);
     expect(find.text('继续检查 ▸'), findsOneWidget);
 
     await tester.tap(row);
     await tester.pump(const Duration(milliseconds: 100));
-    for (var i = 0; i < 24; i++) {
-      await tester.pump(const Duration(milliseconds: 100));
-      await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 100)));
-    }
-    await tester.pump(const Duration(milliseconds: 200));
-    expect(posts, 1, reason: '续查不得重新 POST');
-    expect(polls, greaterThanOrEqualTo(2));
+    expect(fake.resumes, 1, reason: '续查必须复用原 checkId');
+    expect(fake.posts, 1, reason: '续查不得重新 POST');
+    expect(find.text('继续检查 ▸'), findsNothing);
   });
 
   testWidgets('续查 410 → 清旧 checkId 并自动重启新检查', (tester) async {
-    var posts = 0;
-    var polls = 0;
-    final client = MockClient((request) async {
-      final path = request.url.path;
-      if (path.endsWith('/api/plugin-update/check') &&
-          request.method == 'POST') {
-        posts += 1;
-        return http.Response(
-          jsonEncode({
-            'ok': true,
-            'state': 'checking',
-            'checkId': 'chk-${posts}',
-          }),
-          200,
-        );
-      }
-      if (path.endsWith('/api/plugin-update/check') &&
-          request.url.queryParameters.containsKey('checkId')) {
-        polls += 1;
-        if (polls <= 2) {
-          return http.Response(
-            jsonEncode({'ok': true, 'state': 'checking', 'checkId': 'chk-1'}),
-            200,
-          );
-        }
-        if (polls == 3) {
-          return http.Response(
-            jsonEncode({'ok': false, 'error': 'check-expired'}),
-            410,
-          );
-        }
-        return http.Response(
-          jsonEncode({
-            'ok': true,
-            'state': 'done',
-            'checkId': 'chk-2',
-            'pluginUpdate': {
-              'state': 'up-to-date',
-              'reason': 'same-version',
-              'canSelfUpdate': true,
-              'checkLog': <Object>[],
-              'transaction': null,
-            },
-          }),
-          200,
-        );
-      }
-      if (path == '/m/api/history') {
-        return http.Response(
-          jsonEncode({'ok': true, 'events': <Object>[], 'hasMore': false}),
-          200,
-        );
-      }
-      return http.Response('{}', 200);
-    });
+    final fake = _ResumeApi()..expireResume = true;
     await pumpSettings(
       tester,
-      client,
-      checkTimeout: const Duration(seconds: 2),
+      MockClient((request) async => http.Response('{}', 200)),
+      apiOverride: fake,
     );
     final row = find
         .ancestor(of: find.text('更新电脑端插件'), matching: find.byType(InkWell))
         .first;
     await tester.tap(row);
-    for (var i = 0; i < 24; i++) {
-      await tester.pump(const Duration(milliseconds: 100));
-      await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 100)));
-    }
     await tester.pump(const Duration(milliseconds: 100));
     expect(find.text('继续检查 ▸'), findsOneWidget);
+
     await tester.tap(row);
     await tester.pump(const Duration(milliseconds: 100));
-    for (var i = 0; i < 30; i++) {
-      await tester.pump(const Duration(milliseconds: 100));
-      await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 100)));
-    }
-    await tester.pump(const Duration(milliseconds: 200));
-    expect(posts, 2, reason: '410 后应自动重启检查');
+    expect(fake.resumes, 1);
+    expect(fake.posts, 2, reason: '410 后应自动重启检查');
+    expect(find.text('继续检查 ▸'), findsNothing);
   });
 
 }
