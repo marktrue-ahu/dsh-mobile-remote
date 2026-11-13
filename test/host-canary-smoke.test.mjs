@@ -242,7 +242,7 @@ test('Docker CLI driver validates output and never returns raw logs', async () =
   await assert.rejects(hostile.wait(id,undefined,'runtime'), e => e.code === 'docker-output-invalid' && !String(e).includes('secret-token'));
   const overflowed = dockerCliDriver(async () => ({code:0,stdout:'0',overflow:true}));
   await assert.rejects(overflowed.wait(id,undefined,'install'),e => e.code === 'docker-operation-failed');
-  const names = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer'];
+  const names = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer','subagents.catalog','subagents.interrupt'];
   const checks = ['auth','bootstrap','diagnostics',...names.map(key => `host-capability:${key}:ok`)];
   const parse = (status,data,phase) => dockerCliDriver(async args => ({code:0,stdout:args[0] === 'wait' ? String(status) : JSON.stringify(data)})).wait(id,undefined,phase);
   assert.deepEqual(await parse(0,{ok:true,checks},'runtime'),{exitCode:0,ok:true,checks,errorCode:null});
@@ -263,7 +263,9 @@ test('Docker CLI driver validates output and never returns raw logs', async () =
   ]) await assert.rejects(parse(status,data,phase),e => e.code === 'docker-output-invalid');
   assert.equal((await parse(2,{ok:false,errorCode:'install-failed'},'install')).errorCode,'install-failed');
   assert.equal((await parse(1,{ok:false,errorCode:'compatibility-check-failed',checks:['auth']},'runtime')).errorCode,'compatibility-check-failed');
-  assert.equal((await parse(2,{ok:false,errorCode:'host-capabilities-inconclusive',checks:[...checks.slice(0,-1),'host-capability:gateway.eventsPeer:missing']},'runtime')).errorCode,'host-capabilities-inconclusive');
+  const gatewayMissingChecks = [...checks];
+  gatewayMissingChecks[checks.indexOf('host-capability:gateway.eventsPeer:ok')] = 'host-capability:gateway.eventsPeer:missing';
+  assert.equal((await parse(2,{ok:false,errorCode:'host-capabilities-inconclusive',checks:gatewayMissingChecks},'runtime')).errorCode,'host-capabilities-inconclusive');
   for (const code of [...HINT_CODES,'host-process-spawn-failed','host-process-spawn-inconclusive','host-process-exited','host-process-exited-zero','host-process-exited-nonzero','host-process-exited-signal','host-process-exited-hint-eacces','host-process-exited-hint-erofs','host-process-exited-hint-enoent','host-process-exited-hint-enospc','host-process-exited-hint-user-lookup','host-process-exited-hint-module-not-found','host-process-exited-hint-native-load','host-process-exited-hint-startup-audit','host-process-state-inconclusive','host-ready-timeout','host-auth-response-inconclusive']) {
     assert.equal((await parse(2,{ok:false,errorCode:code,checks:[]},'runtime')).errorCode,code);
   }
@@ -391,7 +393,7 @@ test('source identity requires exact commit and clean tracked content', async t 
     assert.equal(listed.status,0); assert.match(listed.stdout,/lib\/a\.js/);
   } finally { await removeSourceArchive(archived.root); }
   const containers = new Map(); let next = 0, runtimeFailure = null, installFailure = null, omitBundle = false;
-  const names = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer'];
+  const names = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer','subagents.catalog','subagents.interrupt'];
   const checks = ['auth','bootstrap','diagnostics',...names.map(name => `host-capability:${name}:ok`)];
   const fake = {
     ensureImage: async () => imageEnv,
@@ -728,7 +730,7 @@ test('runtime worker restores the bundle declaration that npm install overwrites
 
 test('mocked canary reports a successful isolated run', async () => {
   const calls = [];
-  const checks = ['auth','bootstrap','diagnostics',...['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer'].map(name => `host-capability:${name}:ok`)];
+  const checks = ['auth','bootstrap','diagnostics',...['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer','subagents.catalog','subagents.interrupt'].map(name => `host-capability:${name}:ok`)];
   const result = await runCanary({hostVersion:'1.2.3', pluginRoot:'/plugin', pluginSha:'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}, {
     prepare: async () => { calls.push('prepare'); return '/isolated'; },
     install: async () => calls.push('install'),
@@ -770,7 +772,7 @@ test('a real 0.2.1-rc.5 payload shape satisfies the probed contract', () => {
   // serving this plugin, including fields the canary does not read. One verbatim
   // sample guards against tightening the contract into something no real host
   // actually emits.
-  const names = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer'];
+  const names = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer','subagents.catalog','subagents.interrupt'];
   const caps = Object.fromEntries(names.map(name => [name,'ok']));
   const pid = 24451;
   const unauth = {status:401,body:{error:'auth-required',detail:'访问口令未通过验证'}};
@@ -800,7 +802,7 @@ test('browser-session-gated capabilities are reported but never decide the verdi
   // never opens a browser by design, so they stay missing/drift; judging them
   // would make every run inconclusive regardless of real compatibility. Their
   // compatibility is the human on-device verification the canary asks for.
-  const names = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer'];
+  const names = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer','subagents.catalog','subagents.interrupt'];
   const pid = 7;
   const unauth = {status:401,body:{error:'auth-required'}};
   const bootstrap = {status:200,body:{ok:true,auth:{enabled:true},plugin:{name:'dsh-mobile-remote',version:'1.0.0',pid},capabilities:{}}};
@@ -816,7 +818,7 @@ test('browser-session-gated capabilities are reported but never decide the verdi
 });
 
 test('response contract checks identity, authentication, diagnostics and capability drift', () => {
-  const names = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer'];
+  const names = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer','subagents.catalog','subagents.interrupt'];
   const caps = Object.fromEntries(names.map(name => [name,'ok']));
   const unauth = {status:401,body:{error:'auth-required'}};
   const bootstrap = {status:200,body:{ok:true,auth:{enabled:true},plugin:{name:'dsh-mobile-remote',version:'1.0.0',pid:123},capabilities:{}}};
@@ -834,7 +836,7 @@ test('response contract checks identity, authentication, diagnostics and capabil
 });
 
 test('probe waits through non-ready responses without visiting arbitrary endpoints', async () => {
-  const names = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer'];
+  const names = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer','subagents.catalog','subagents.interrupt'];
   const bootstrap = {status:200,body:{ok:true,auth:{enabled:true},plugin:{name:'dsh-mobile-remote',version:'1.0.0',pid:9},capabilities:{}}};
   const diagnostics = {status:200,body:{ok:true,plugin:{name:'dsh-mobile-remote',version:'1.0.0'},runtime:{authEnabled:true,lanBridge:{listening:false}},services:{webServer:true},checks:{hostCapabilities:Object.fromEntries(names.map(name => [name,'ok']))}}};
   const boot = {status:401,body:{error:'auth-required'}};
@@ -870,7 +872,7 @@ test('probe waits through non-ready responses without visiting arbitrary endpoin
 });
 
 test('probe rejects exit during diagnostics even with valid responses', async () => {
-  const names = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer'];
+  const names = ['jobs.callerShape','jobs.eventsApi','settings.read','gateway.wireStream','permissionPresets.apply','permissionPresets.catalog','workspaceRegistry.stateWrite','gateway.eventsPeer','subagents.catalog','subagents.interrupt'];
   const denied = {status:401,body:{error:'auth-required'}};
   const bootstrap = {status:200,body:{ok:true,auth:{enabled:true},plugin:{name:'dsh-mobile-remote',version:'1.0.0',pid:9},capabilities:{}}};
   const diagnostics = {status:200,body:{ok:true,plugin:{name:'dsh-mobile-remote',version:'1.0.0'},runtime:{authEnabled:true,lanBridge:{listening:false}},services:{webServer:true},checks:{hostCapabilities:Object.fromEntries(names.map(name => [name,'ok']))}}};

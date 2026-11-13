@@ -565,9 +565,9 @@
 
 环境诊断在 `checks` 下提供宿主兼容自检（ADR 0017，**纯增量字段，旧 App 忽略即可**）：
 
-- `checks.hostCapabilities`：逐项三态 `ok` / `drift` / `missing`。`drift` = 能力语义漂移（服务在、调用不报错、成员形状或实参语义已变）。包含 `jobs.callerShape`、`jobs.eventsApi`、`settings.read`、`gateway.wireStream`、`gateway.eventsPeer`（issue #34，0.2.1 的进程内 Peer 来源）、`permissionPresets.apply`、`permissionPresets.catalog`、`workspaceRegistry.stateWrite`。
+- `checks.hostCapabilities`：逐项三态 `ok` / `drift` / `missing`。`drift` = 能力语义漂移（服务在、调用不报错、成员形状或实参语义已变）。包含 `jobs.callerShape`、`jobs.eventsApi`、`settings.read`、`gateway.wireStream`、`gateway.eventsPeer`（issue #34，0.2.1 的进程内 Peer 来源）、`permissionPresets.apply`、`permissionPresets.catalog`、`workspaceRegistry.stateWrite`，以及 issue #87 的 `subagents.catalog`（`listDescendants` 或 `listChildren` 至少一个可用）与 `subagents.interrupt`（`interruptByUser` 或 `interruptByParent` 至少一个可用）。
 - `checks.hostCapabilityReasons`：仅对 `drift` 项给出的允许清单原因码（如 `settings.read` 的 `settings-get-threw`；`gateway.eventsPeer` 的 `gateway-peer-source-missing`）。
-- `checks.hostGeneration`：插件实际走到的代际路径——`jobsCaller`（`sessionId` / `agent`）、`settingsRead`（`describe` / `get`）、`wireStreamArgs`（`controlArg` / `legacyArg`）、`eventsPeer`（`createPeer` / `operatorPeer` / `legacy` / `none` / `unknown`）。
+- `checks.hostGeneration`：插件实际走到的代际路径——`jobsCaller`（`sessionId` / `agent`）、`settingsRead`（`describe` / `get`）、`wireStreamArgs`（`controlArg` / `legacyArg`）、`eventsPeer`（`createPeer` / `operatorPeer` / `legacy` / `none` / `unknown`），以及 issue #87 的 `subagents.catalog`（`descendants` / `children` / `none`）与 `subagents.interrupt`（`user` / `parent` / `none`）。
 - `checks.remoteEvents` / `checks.approvalMode`：`$events` 双端审批通道是否就绪与实际生效的审批呈现策略。
 
 详见 `docs/09-compatibility.md` §2.5/§2.6。

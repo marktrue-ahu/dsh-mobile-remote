@@ -41,7 +41,7 @@ class Request extends EventEmitter {
 const PARENT = "session-parent";
 const agent = { id: PARENT, session: { id: PARENT, header: { cwd: "/tmp/proj" } }, status: "idle" };
 
-function harness({ generation = "rc2", descendants = null, descendantsThrows = false, children = null, sessions = [], receipt = generation === "rc2" ? { accepted: true } : undefined } = {}) {
+function harness({ generation = "rc2", descendants = null, descendantsThrows = false, children = null, sessions = [], receipt = generation === "rc2" ? { accepted: true } : undefined, emptySubagents = false, omitSubagents = false } = {}) {
   const routes = [];
   const rpcCalls = [];
   const provided = new Map();
@@ -52,17 +52,17 @@ function harness({ generation = "rc2", descendants = null, descendantsThrows = f
   provided.set("agents", { get: (id) => (id === PARENT ? agent : undefined), list: () => [agent], roots: () => [] });
   provided.set("sessions", { get: (id) => sessionList.find((s) => s.id === id), list: () => sessionList });
   const subagents = {};
-  if (generation === "rc2") {
+  if (!emptySubagents && !omitSubagents && generation === "rc2") {
     subagents.listDescendants = async (root, signal) => {
       if (descendantsThrows) throw new Error("descendants unavailable");
       return descendants ?? [];
     };
     subagents.interruptByUser = async () => ({ accepted: true });
-  } else {
+  } else if (!emptySubagents && !omitSubagents) {
     subagents.interruptByParent = async () => undefined;
   }
-  if (children !== null) subagents.listChildren = async (parent, signal) => children;
-  provided.set("subagents", subagents);
+  if (!emptySubagents && !omitSubagents && children !== null) subagents.listChildren = async (parent, signal) => children;
+  if (!omitSubagents) provided.set("subagents", subagents);
   const gateway = {
     async invokeRpc(endpoint, payload, signal, peer) {
       rpcCalls.push({ endpoint, args: payload?.args ?? payload });
@@ -210,6 +210,24 @@ test("issue #87：rc.2 listDescendants 失败时回退 listChildren（不标 deg
     assert.deepEqual(res.body.subagents.map((row) => row.id), ["child-legacy"]);
     assert.equal(res.body.subagents[0].createdAt, 2000);
   } finally { h.dispose(); }
+});
+
+test("issue #87：hostCapabilities subagents 三态可区分 drift/missing", async () => {
+  const drift = harness({ generation: "rc2", emptySubagents: true });
+  try {
+    const res = await drift.request("/m/api/diagnostics");
+    assert.equal(res.status, 200);
+    assert.equal(res.body.checks.hostCapabilities["subagents.catalog"], "drift");
+    assert.equal(res.body.checks.hostCapabilities["subagents.interrupt"], "drift");
+    assert.deepEqual(res.body.checks.hostGeneration.subagents, { catalog: "none", interrupt: "none" });
+  } finally { drift.dispose(); }
+  const missing = harness({ generation: "rc2", omitSubagents: true });
+  try {
+    const res = await missing.request("/m/api/diagnostics");
+    assert.equal(res.status, 200);
+    assert.equal(res.body.checks.hostCapabilities["subagents.catalog"], "missing");
+    assert.equal(res.body.checks.hostCapabilities["subagents.interrupt"], "missing");
+  } finally { missing.dispose(); }
 });
 
 test("issue #87：hostCapabilities/hostGeneration 按能力探测两代 subagents", async () => {
