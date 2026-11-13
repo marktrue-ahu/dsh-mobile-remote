@@ -587,6 +587,24 @@ class _MarkdownImageState extends State<_MarkdownImage> {
 
   String _reason(Object error) {
     if (error is ApiException) {
+      if (error.code == 'consent-required') {
+        return L10n.t(
+          '需要授权读取该图片',
+          'Authorization is required to read this image',
+        );
+      }
+      if (error.code == 'consent-invalid') {
+        return L10n.t(
+          '图片授权已失效，请重新授权',
+          'Image authorization expired; please authorize again',
+        );
+      }
+      if (error.code == 'consent-root-not-allowed') {
+        return L10n.t(
+          '该目录不允许授权读取图片',
+          'This directory cannot be authorized for images',
+        );
+      }
       if (error.code == 'workspace-not-authorized') {
         return L10n.t(
           '当前工作区未授权读取图片（或电脑端版本过旧）',
@@ -614,7 +632,11 @@ class _MarkdownImageState extends State<_MarkdownImage> {
     return L10n.t('图片加载失败', 'Failed to load image');
   }
 
-  Widget _placeholder(String reason, {bool loading = false}) {
+  Widget _placeholder(
+    String reason, {
+    bool loading = false,
+    VoidCallback? onRetry,
+  }) {
     final ink3 = DshColors.ink3(context);
     return Container(
       key: const Key('markdown-image-placeholder'),
@@ -657,6 +679,23 @@ class _MarkdownImageState extends State<_MarkdownImage> {
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(fontSize: 11, color: ink3),
                 ),
+                if (onRetry != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: TextButton(
+                      key: const Key('markdown-image-retry'),
+                      style: TextButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                        minimumSize: const Size(0, 32),
+                        padding: const EdgeInsets.symmetric(horizontal: 4),
+                      ),
+                      onPressed: onRetry,
+                      child: Text(
+                        L10n.t('重试', 'Retry'),
+                        style: const TextStyle(fontSize: 11.5),
+                      ),
+                    ),
+                  ),
               ],
             ),
           ),
@@ -749,7 +788,15 @@ class _MarkdownImageState extends State<_MarkdownImage> {
           return _placeholder(L10n.t('图片加载中…', 'Loading image…'), loading: true);
         }
         if (snapshot.hasError || snapshot.data == null) {
-          return _placeholder(_reason(snapshot.error ?? Object()));
+          return _placeholder(
+            _reason(snapshot.error ?? Object()),
+            onRetry: () {
+              final future = _load();
+              setState(() {
+                _future = future;
+              });
+            },
+          );
         }
         return _resizedImage(snapshot.data!.bytes);
       },
