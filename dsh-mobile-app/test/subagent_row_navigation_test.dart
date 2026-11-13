@@ -47,6 +47,23 @@ Api _fakeApi() => Api(client: MockClient((request) async {
       ..path = '/m'
       ..token = '';
 
+Api _diagnosticApi() => Api(client: MockClient((request) async {
+      if (request.url.path == '/m/api/subagents') {
+        return _json({
+          'ok': true,
+          'subagents': [
+            {'id': 'diag-u', 'kind': 'diagnostic', 'status': 'unsupported', 'title': 'U'},
+            {'id': 'diag-c', 'kind': 'diagnostic', 'status': 'corrupt', 'title': 'C'},
+            {'id': 'diag-a', 'kind': 'diagnostic', 'status': 'unavailable', 'title': 'A'},
+          ],
+        });
+      }
+      return _json({'ok': true});
+    }))
+      ..baseUrl = 'http://subagent.test'
+      ..path = '/m'
+      ..token = '';
+
 Future<void> _openSheet(WidgetTester tester, AppStore store, Api apiClient) async {
   await tester.pumpWidget(MaterialApp(
     home: Scaffold(
@@ -77,6 +94,15 @@ void main() {
   // openChat → store.setSession 会 await SharedPreferences：不 mock 的话 push 之前就停住，
   // 测试里表现为「会话已切、ChatScreen 没出现」。
   setUp(() => SharedPreferences.setMockInitialValues({}));
+
+  testWidgets('issue #87：diagnostic 三枚举在子代理面板有明确文案', (tester) async {
+    final fakeApi = _diagnosticApi();
+    final store = AppStore()..sessionId = parentId;
+    await _openSheet(tester, store, fakeApi);
+    expect(find.textContaining('不受支持的子代理'), findsOneWidget);
+    expect(find.textContaining('目录数据损坏'), findsOneWidget);
+    expect(find.textContaining('目录不可用'), findsOneWidget);
+  });
 
   testWidgets('点子代理行 → 切到该子代理会话，返回后恢复原会话', (tester) async {
     final fakeApi = _fakeApi();

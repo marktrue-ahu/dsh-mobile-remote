@@ -357,6 +357,7 @@ class _SubagentsTabState extends State<_SubagentsTab> with SingleTickerProviderS
           // 后者在休眠父会话下恒为 inactive，会与实时状态自相矛盾（issue #17）。
           final rowState = widget.store.rowStateOf(id);
           final createdAt = subagentCreatedAt(s);
+          final diagnosticReason = subagentDiagnosticReason(s);
           return InkWell(
             // v3.1.5（#11 复核补正）：整行可点 → 跳到该子代理会话；右侧箭头提示可进入。
             onTap: id.isEmpty ? null : () => widget.onOpenSubagent(id),
@@ -387,11 +388,20 @@ class _SubagentsTabState extends State<_SubagentsTab> with SingleTickerProviderS
                           overflow: TextOverflow.ellipsis,
                         ),
                         Text(
-                          // 状态不再印英文 activity（改由指示器表达，避免与 store 冲突）；
-                          // 时间与排序同源，让"为什么是这个顺序"自解释。
-                          createdAt == null
-                              ? id
-                              : [id, relTime(createdAt)].join(' · '),
+                          // issue #87：rc.2 diagnostic 行按三枚举显示明确原因；
+                          // 其它行仍由指示器表达状态，时间与排序同源。
+                          diagnosticReason != null
+                              ? [
+                                  switch (diagnosticReason) {
+                                    'corrupt' => L10n.t('目录数据损坏', 'Corrupt catalog'),
+                                    'unavailable' => L10n.t('目录不可用', 'Catalog unavailable'),
+                                    _ => L10n.t('不受支持的子代理', 'Unsupported subagent'),
+                                  },
+                                  id,
+                                ].join(' · ')
+                              : createdAt == null
+                                  ? id
+                                  : [id, relTime(createdAt)].join(' · '),
                           style: TextStyle(fontSize: 11.5, color: ink3),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,

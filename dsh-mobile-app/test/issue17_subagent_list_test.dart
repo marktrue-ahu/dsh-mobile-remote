@@ -116,6 +116,24 @@ void main() {
     });
   });
 
+  group('issue #87 diagnostic 三枚举', () {
+    test('kind=diagnostic + status 三枚举原样返回', () {
+      for (final status in ['unsupported', 'corrupt', 'unavailable']) {
+        expect(
+          subagentDiagnosticReason({'kind': 'diagnostic', 'status': status}),
+          status,
+        );
+      }
+    });
+
+    test('非 diagnostic / 未知状态 / 缺 status 返回 null（按普通行展示）', () {
+      expect(subagentDiagnosticReason({'kind': 'child', 'status': 'running'}), isNull);
+      expect(subagentDiagnosticReason({'kind': 'diagnostic', 'status': 'unknown'}), isNull);
+      expect(subagentDiagnosticReason({'kind': 'diagnostic'}), isNull);
+      expect(subagentDiagnosticReason({}), isNull);
+    });
+  });
+
   group('subagentCreatedAt 解析', () {
     test('接受 int 与 num，拒绝缺失/非法', () {
       expect(subagentCreatedAt({'createdAt': 123}), 123);
