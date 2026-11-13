@@ -61,6 +61,53 @@ test("issue #99: surface 字段严格校验——仅非负 safe integer，禁止
   assert.deepEqual(surfaceWireFields(null), {});
 });
 
+test("issue #99: surfaceOp union——真实字符串 append 与对象 append/replace", () => {
+  // 真实 DSH 形状：字符串 append + sourceEventSeqs。
+  assert.deepEqual(
+    surfaceWireFields({ seq: 10, surfaceOp: "append", sourceEventSeqs: [3] }),
+    { surfaceOp: "append", sourceEventSeqs: [3] },
+  );
+  // 对象 append 可省略 start/end；带则规范化。
+  assert.deepEqual(
+    surfaceWireFields({ seq: 10, surfaceOp: { op: "append" } }),
+    { surfaceOp: { op: "append" } },
+  );
+  assert.deepEqual(
+    surfaceWireFields({ seq: 10, surfaceOp: { op: "append", startSeq: 8, endSeq: 9 } }),
+    { surfaceOp: { op: "append", startSeq: 8, endSeq: 9 } },
+  );
+  // 对象 replace 仍是现有形状。
+  assert.deepEqual(
+    surfaceWireFields({ seq: 10, surfaceOp: { op: "replace", startSeq: 9, endSeq: 9 } }),
+    { surfaceOp: { op: "replace", startSeq: 9, endSeq: 9 } },
+  );
+});
+
+test("issue #99: surfaceOp union 非法值整组丢弃（字符串/对象 append 含 source）", () => {
+  for (const surfaceOp of ["replace", "APPEND", "", "append ", true, false, null, 1, [], ["append"]]) {
+    assert.deepEqual(
+      surfaceWireFields({ seq: 10, surfaceOp, sourceEventSeqs: [3] }),
+      {},
+      JSON.stringify(surfaceOp),
+    );
+  }
+  for (const surfaceOp of [
+    { op: "append", startSeq: 3 }, // 只有 start
+    { op: "append", endSeq: 3 }, // 只有 end
+    { op: "append", startSeq: 9, endSeq: 3 }, // 倒序
+    { op: "append", startSeq: null, endSeq: 3 },
+    { op: "append", startSeq: "3", endSeq: "4" },
+    { op: "other", startSeq: 3, endSeq: 3 },
+  ]) {
+    assert.deepEqual(surfaceWireFields({ seq: 10, surfaceOp }), {}, JSON.stringify(surfaceOp));
+  }
+  // append + 非法 source 也必须整组丢弃。
+  assert.deepEqual(
+    surfaceWireFields({ seq: 10, surfaceOp: "append", sourceEventSeqs: [3, 10] }),
+    {},
+  );
+});
+
 test("issue #99: surfaceOp 非法时整个字段省略（null/false/''/true/字符串/负数/倒序）", () => {
   const invalidOps = [
     null,

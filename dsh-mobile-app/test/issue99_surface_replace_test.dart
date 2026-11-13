@@ -95,6 +95,60 @@ void main() {
     expect(ok.sourceEventSeqs, [2, 3, 9142]);
   });
 
+  test('issue #99 P2：surfaceOp union——真实字符串 append 不触发 shadow 且保留 source', () {
+    final append = ChatEvent.fromJson({
+      'seq': 10,
+      'type': 'tool/result',
+      'data': {'turn': 220, 'step': 1, 'callId': 'c-append', 'name': 'bash', 'text': 'ok'},
+      'surfaceOp': 'append',
+      'sourceEventSeqs': [3],
+    });
+    expect(append.surfaceOp?.op, 'append');
+    expect(append.surfaceOp?.startSeq, isNull);
+    expect(append.isSurfaceReplace, isFalse);
+    expect(append.sourceEventSeqs, [3]);
+
+    final reducer = TimelineReducer();
+    reducer.apply(append);
+    expect(reducer.isShadowedSeq(3), isFalse, reason: 'append 不得遮蔽 source');
+    reducer.apply(_event(3, 'tool/result', {'turn': 220, 'step': 1, 'callId': 'c-old', 'name': 'bash', 'text': 'old'}));
+    expect(reducer.isShadowedSeq(3), isFalse);
+
+    // 对象 append：可省略 start/end；带则保留。
+    final objectAppend = ChatEvent.fromJson({
+      'seq': 20,
+      'type': 'tool/result',
+      'data': {},
+      'surfaceOp': {'op': 'append'},
+      'sourceEventSeqs': [3],
+    });
+    expect(objectAppend.surfaceOp?.op, 'append');
+    expect(objectAppend.sourceEventSeqs, [3]);
+  });
+
+  test('issue #99 P2：surfaceOp union 非法值矩阵（字符串/对象 append/对象 replace）', () {
+    for (final surfaceOp in <Object?>[
+      'replace', 'APPEND', '', 'append ', true, false, null, 1, [], ['append'],
+      {'op': 'append', 'startSeq': 3},
+      {'op': 'append', 'endSeq': 3},
+      {'op': 'append', 'startSeq': 9, 'endSeq': 3},
+      {'op': 'append', 'startSeq': null, 'endSeq': 3},
+      {'op': 'append', 'startSeq': '3', 'endSeq': '4'},
+      {'op': 'other', 'startSeq': 3, 'endSeq': 3},
+      {'op': 'replace', 'startSeq': 1},
+    ]) {
+      final event = ChatEvent.fromJson({
+        'seq': 10,
+        'type': 'tool/result',
+        'data': {},
+        'surfaceOp': surfaceOp,
+        'sourceEventSeqs': [3],
+      });
+      expect(event.surfaceOp, isNull, reason: '${surfaceOp}');
+      expect(event.sourceEventSeqs, isEmpty, reason: '坏 surfaceOp 时 source 也不得解释');
+    }
+  });
+
   test('issue #99：原 9142 + replace 13283 合并为同一工具行，不追加 replay 行', () {
     final reducer = TimelineReducer();
     reducer.apply(_event(9139, 'tool/call', {'turn': 148, 'step': 1, 'callId': _callId, 'name': 'bash', 'arguments': 'ls'}));
@@ -214,6 +268,35 @@ void main() {
           reason: '原 9142 与 replay 13283 必须合并为一张卡，不能各生成一张');
       expect(find.text('历史工具结果（无过程上下文）'), findsNothing,
           reason: 'surface replay 不能生成历史工具结果卡');
+    });
+
+    testWidgets('SSE append（真实字符串 shape）：不触发 shadow/不丢 source', (tester) async {
+      final backend = _Backend(events: fixture(withReplay: false));
+      final store = AppStore()
+        ..sessionId = 'session-99'
+        ..sessions = [Session(id: 'session-99', title: 'S', cwd: null, createdAt: 1)];
+      await tester.pumpWidget(MaterialApp(
+        home: ChatScreen(store: store, apiClient: backend.api, onTitleChanged: () {}),
+      ));
+      await tester.pump(const Duration(milliseconds: 350));
+      await tester.pump(const Duration(milliseconds: 150));
+      expect(find.text('1 组 · 1 次工具调用'), findsOneWidget);
+      store.injectFrame({
+        'type': 'session/event',
+        'sessionId': 'session-99',
+        'event': {
+          'seq': 13283,
+          'type': 'tool/result',
+          'data': {'turn': 220, 'step': 1, 'callId': 'c-now', 'name': 'bash', 'text': 'append result'},
+          'surfaceOp': 'append',
+          'sourceEventSeqs': [4],
+        },
+      });
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(find.text('1 组 · 1 次工具调用'), findsOneWidget, reason: 'append 不新增卡/组');
+      expect(find.text('历史工具结果（无过程上下文）'), findsNothing);
+      store.dispose();
+      await tester.pumpWidget(const SizedBox());
     });
 
     testWidgets('原工具事件后到：replay 先到也不重复，仍只一张历史卡', (tester) async {

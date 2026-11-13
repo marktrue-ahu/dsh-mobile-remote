@@ -528,28 +528,42 @@ class AppNotification {
 }
 
 // 消息流事件（服务端摘要格式）。新增 detail 元数据后，旧插件/旧 App 仍可互相忽略未知字段。
-/// issue #99：compaction surface 投影操作（仅 envelope 元数据，不改变事件内容）。
+/// issue #99：compaction surface 投影操作 union（与 DSH 真实落盘一致）。
+///
+/// - 字符串 `"append"`（真实常见）→ [op] append，无 start/end；
+/// - 对象 `{op:"replace"|"append", startSeq?, endSeq?}`；replace 必须带 start/end，
+///   append 可省略（若出现则必须成对且有序）。
+/// 只有对象 replace 触发 shadow；append 的 [ChatEvent.sourceEventSeqs] 仍保留。
 class SurfaceOp {
   final String op;
-  final int startSeq;
-  final int endSeq;
+  final int? startSeq;
+  final int? endSeq;
 
-  const SurfaceOp({
-    required this.op,
-    required this.startSeq,
-    required this.endSeq,
-  });
+  const SurfaceOp({required this.op, this.startSeq, this.endSeq});
+
+  bool get isReplace => op == 'replace';
 
   static SurfaceOp? fromJson(Object? value) {
+    if (value is String) {
+      return value == 'append' ? const SurfaceOp(op: 'append') : null;
+    }
     if (value is! Map) return null;
     final op = value['op'];
-    final start = value['startSeq'];
-    final end = value['endSeq'];
-    // 与服务端同口径：只接受非负整数，不接受 null/false/''/true/字符串/小数。
-    if (op is! String || op.trim().isEmpty) return null;
-    if (start is! int || end is! int || start < 0 || end < 0) return null;
-    if (start > end) return null;
-    return SurfaceOp(op: op, startSeq: start, endSeq: end);
+    if (op != 'replace' && op != 'append') return null;
+    final rawStart = value['startSeq'];
+    final rawEnd = value['endSeq'];
+    if (op == 'replace') {
+      if (rawStart is! int || rawEnd is! int) return null;
+      if (rawStart < 0 || rawEnd < 0 || rawStart > rawEnd) return null;
+      return SurfaceOp(op: op, startSeq: rawStart, endSeq: rawEnd);
+    }
+    // append：start/end 可整体省略；若出现则必须同时存在、非负且有序。
+    if (rawStart == null && rawEnd == null) {
+      return const SurfaceOp(op: 'append');
+    }
+    if (rawStart is! int || rawEnd is! int) return null;
+    if (rawStart < 0 || rawEnd < 0 || rawStart > rawEnd) return null;
+    return SurfaceOp(op: op, startSeq: rawStart, endSeq: rawEnd);
   }
 }
 
@@ -613,6 +627,7 @@ class ChatEvent {
   factory ChatEvent.fromJson(Map<String, dynamic> j) {
     final detail = j['detail'];
     final d = detail is Map ? detail : const <String, dynamic>{};
+    final surfaceOp = SurfaceOp.fromJson(j['surfaceOp']);
     return ChatEvent(
       seq: (j['seq'] as num?)?.toInt(),
       type: j['type'] as String? ?? 'unknown',
@@ -631,8 +646,12 @@ class ChatEvent {
       resultSummary: j['type'] == 'tool/result' && j['data'] is Map
           ? ToolResultSummary.fromJson((j['data'] as Map)['summary'])
           : null,
-      surfaceOp: SurfaceOp.fromJson(j['surfaceOp']),
-      sourceEventSeqs: _surfaceSourceSeqs(j['sourceEventSeqs'], j['seq']),
+      surfaceOp: surfaceOp,
+      // surfaceOp 存在但非法 → 整组 envelope 视为非法，source 也不解释（与 server 同口径）；
+      // 纯 source（无 surfaceOp 键）仍保留，供旧/未来 envelope。
+      sourceEventSeqs: j.containsKey('surfaceOp') && surfaceOp == null
+          ? const []
+          : _surfaceSourceSeqs(j['sourceEventSeqs'], j['seq']),
     );
   }
 }
