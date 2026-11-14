@@ -7206,16 +7206,20 @@ class _ChatScreenState extends State<ChatScreen> {
         // issue #70：组展开态与渲染同口径（运行中强制展开；用户手动收起优先）。
         List<bool>? groupExpandedFlags;
         if (grouping) {
+          // issue #104 P2：简洁运行中用户手动展开整段后，组默认展开（一次点击
+          // 就能看到内容）；用户手动收起组仍优先。
+          final manualSegmentExpanded = conciseLive && manual == true;
           groupExpandedFlags = [
             for (final group in segment.groups)
               _groupExpansions['$key:${group.step ?? 'x'}'] ??
-                  !groupAutoCollapsed(
-                    group,
-                    policy: policy,
-                    // 简洁运行中即使手动展开了整轮，组也默认折叠，等待用户再展开组。
-                    turnRunning: running &&
-                        policy.mode != WorkStepDisplayMode.concise,
-                  ),
+                  (manualSegmentExpanded
+                      ? true
+                      : !groupAutoCollapsed(
+                          group,
+                          policy: policy,
+                          turnRunning: running &&
+                              policy.mode != WorkStepDisplayMode.concise,
+                        )),
           ];
         }
         // issue #84：活动条去重只认「真正可见」的工具行——segment 展开（occupied）、
@@ -7415,15 +7419,19 @@ class _ChatScreenState extends State<ChatScreen> {
           if (!hasVisibleRow) continue;
           final groupKey = '${plan.intervalKey}:${group.step ?? 'x'}';
           final manual = _groupExpansions[groupKey];
-          // 默认折叠规则走纯函数（唯一实现）：运行中的组强制展开，完成态默认折叠。
+          // issue #104 P2：简洁运行中手动展开整段后，组默认展开（一次点击见内容）；
+          // 手动收起组仍优先。标准/详细运行中保持强制展开。
+          final conciseLiveDefaultExpanded =
+              conciseLive && plan.expanded;
           final groupExpanded = manual ??
-              !groupAutoCollapsed(
-                group,
-                policy: policy,
-                // 简洁运行中组默认折叠；标准/详细运行中保持强制展开。
-                turnRunning: !process.ended &&
-                    policy.mode != WorkStepDisplayMode.concise,
-              );
+              (conciseLiveDefaultExpanded
+                  ? true
+                  : !groupAutoCollapsed(
+                      group,
+                      policy: policy,
+                      turnRunning: !process.ended &&
+                          policy.mode != WorkStepDisplayMode.concise,
+                    ));
           // issue #61（note 1791）：抬头只信真实运行态——组内还有未 settled 的工具行，
           // 且轮次尚未结束。此前「最后一段最后一组强制 running」的兜底会让已完成的
           // 工具一直挂着「正在调用工具…」，直到整轮结束（alpha.7 真机截图问题 4）。

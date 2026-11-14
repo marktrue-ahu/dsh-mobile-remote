@@ -154,21 +154,20 @@ void main() {
     await tester.pumpWidget(const SizedBox());
   });
 
-  testWidgets('手动展开组后，result/新事件不抢回；收起后保持收起', (tester) async {
+  testWidgets('手动展开段一次见内容；组/卡手动状态与 result 互不抢回', (tester) async {
     final backend = _Backend(events: _runningFixture());
     final store = await _pump(tester, backend);
     await tester.tap(_summary());
     await tester.pump(const Duration(milliseconds: 150));
-    final group = find.textContaining('正在调用工具');
-    expect(group, findsOneWidget);
-    await tester.tap(group);
-    await tester.pump(const Duration(milliseconds: 150));
-    expect(_toolCard('c1'), findsOneWidget, reason: '手动展开组后工具卡可见');
+    // P2：一次点击摘要就应看到工具卡，不需要再点组。
+    expect(_toolCard('c1'), findsOneWidget, reason: '手动展开段后内容直接可见');
+
+    // 手动展开工具卡。
     await tester.tap(_toolCard('c1'));
     await tester.pump(const Duration(milliseconds: 150));
-    expect(find.textContaining('callId: c1'), findsOneWidget,
-        reason: '手动展开工具卡后正文可见');
+    expect(find.textContaining('callId: c1'), findsOneWidget);
 
+    // result 到达：段/组/卡的手动展开都不得被抢回。
     await _inject(tester, store, {
       'seq': 4,
       'type': 'tool/result',
@@ -180,12 +179,14 @@ void main() {
         'text': 'ok',
       },
     });
-    expect(_toolCard('c1'), findsOneWidget, reason: '手动展开组不被 result 抢回');
+    expect(_toolCard('c1'), findsOneWidget, reason: 'result 不得抢回手动展开组/卡');
     expect(find.textContaining('callId: c1'), findsOneWidget,
         reason: '手动展开的卡 result 后仍保持展开');
 
     // 手动收起组：后续新工具事件也不得自动展开。
-    await tester.tap(find.textContaining('1 次工具调用').first);
+    final group = find.textContaining('1 次工具调用');
+    expect(group, findsOneWidget);
+    await tester.tap(group);
     await tester.pump(const Duration(milliseconds: 150));
     expect(_toolCard('c1'), findsNothing);
     await _inject(tester, store, {
@@ -200,15 +201,12 @@ void main() {
       },
     });
     expect(_toolCard('c2'), findsNothing, reason: '手动收起后新事件不得自动展开');
-    await tester.pumpWidget(const SizedBox());
   });
 
   testWidgets('切轮后新轮简洁仍默认一行', (tester) async {
     final backend = _Backend(events: _runningFixture());
     final store = await _pump(tester, backend);
     await tester.tap(_summary());
-    await tester.pump(const Duration(milliseconds: 150));
-    await tester.tap(find.textContaining('正在调用工具'));
     await tester.pump(const Duration(milliseconds: 150));
     expect(_toolCard('c1'), findsOneWidget);
 

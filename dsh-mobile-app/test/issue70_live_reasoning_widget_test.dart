@@ -822,6 +822,8 @@ void main() {
         case WorkStepDisplayMode.concise:
           expect(find.byKey(const ValueKey<String>('activity-bar')), findsOneWidget,
               reason: '简洁运行中当前状态由活动条表达');
+          expect(find.text('正在调用 shell…'), findsOneWidget,
+              reason: '活动条 toolLabel 仍表达当前工具');
           expect(find.textContaining('（shell）'), findsNothing);
           expect(find.text('check layout'), findsNothing);
           expect(find.text('思维链 12 字'), findsNothing);
