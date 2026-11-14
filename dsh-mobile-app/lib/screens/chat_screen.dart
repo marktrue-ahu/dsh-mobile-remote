@@ -7152,11 +7152,13 @@ class _ChatScreenState extends State<ChatScreen> {
       if (start == null) continue; // 历史截断：没有 turn/start，不构造过程块
       anchoredTurns.add(turn);
       final segments = segmentsOf(process);
+      final conciseLive =
+          policy.mode == WorkStepDisplayMode.concise && !process.ended;
       final expandedByDefault = !turnAutoCollapsed(
         process,
         policy: policy,
         humanUserSeqs: humanUserSeqs,
-      );
+      ) && !conciseLive;
       final limit = _processRowLimits[turn] ?? processBatchSize;
       final running = !process.ended;
       // 单轮过程行 >50 行分批：分批规则走纯函数 batchProcessRows（唯一实现）。
@@ -7165,6 +7167,7 @@ class _ChatScreenState extends State<ChatScreen> {
         for (final row in batchWindow.visible) row.seq,
       };
       final hiddenTotal = batchWindow.hidden;
+      final forceLiveExpanded = process.forceExpanded && !conciseLive;
       for (var si = 0; si < segments.length; si++) {
         final segment = segments[si];
         // 宿主：该段第一条过程行所在的（或其后最近的）条目——过程块渲染在它之前。
@@ -7186,7 +7189,9 @@ class _ChatScreenState extends State<ChatScreen> {
         if (host == null || host.seq == null) continue;
         final key = '$turn:$si';
         final manual = _turnExpansions[key];
-        final occupied = process.forceExpanded
+        // issue #104：简洁运行中整组默认折叠成一行，只有手动展开才铺开；
+        // 其他档运行中仍强制展开。
+        final occupied = forceLiveExpanded
             ? true
             : (manual ?? expandedByDefault);
         final grouping = running
@@ -7207,7 +7212,9 @@ class _ChatScreenState extends State<ChatScreen> {
                   !groupAutoCollapsed(
                     group,
                     policy: policy,
-                    turnRunning: running,
+                    // 简洁运行中即使手动展开了整轮，组也默认折叠，等待用户再展开组。
+                    turnRunning: running &&
+                        policy.mode != WorkStepDisplayMode.concise,
                   ),
           ];
         }
@@ -7339,7 +7346,10 @@ class _ChatScreenState extends State<ChatScreen> {
         process.groups.every((g) => g.rows.every((row) => row.isTool));
     // 强制展开（未结束 / 有插话 / 异常结束）时摘要不可点——点了也收不起来，
     // 与其给一个无效点按，不如禁用并保留箭头缺失的静态态。
-    final forced = process.forceExpanded;
+    // issue #104：简洁运行中不强制展开（一行摘要+活动条），摘要可点。
+    final conciseLive =
+        policy.mode == WorkStepDisplayMode.concise && !process.ended;
+    final forced = process.forceExpanded && !conciseLive;
     final children = <Widget>[];
     if (toolOnlyReplay) {
       children.add(Padding(
@@ -7410,7 +7420,9 @@ class _ChatScreenState extends State<ChatScreen> {
               !groupAutoCollapsed(
                 group,
                 policy: policy,
-                turnRunning: !process.ended,
+                // 简洁运行中组默认折叠；标准/详细运行中保持强制展开。
+                turnRunning: !process.ended &&
+                    policy.mode != WorkStepDisplayMode.concise,
               );
           // issue #61（note 1791）：抬头只信真实运行态——组内还有未 settled 的工具行，
           // 且轮次尚未结束。此前「最后一段最后一组强制 running」的兜底会让已完成的
