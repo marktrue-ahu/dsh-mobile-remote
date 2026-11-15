@@ -306,3 +306,48 @@ test("#110 P3: legacy holder 只有 pid 时按 pid 保守判活", () => {
 		assert.equal(lockHolderAlive(lockPath), false);
 	} finally { rmSync(base, { recursive: true, force: true }); }
 });
+
+test("#110 P2: arbiter legacy holder（只有 pid）活 → active/update-busy；死 → P1-C settle", () => {
+	const { base, stateFile, lockPath } = setup();
+	try {
+		const lock = acquireLock(lockPath, { opId: "op-legacy-live", pid: process.pid });
+		const lease = lock.lease;
+		writeRestartPending({
+			stateFile, lockPath, lease, target: TARGET,
+			startedAt: new Date(Date.now() - 3600_000).toISOString(),
+		});
+		// legacy holder：只有顶层 pid（无 worker/supervisor/starttime）。
+		writeFileSync(join(lockPath, "holder.json"), JSON.stringify({ pid: process.pid }));
+		const active = convergeStaleTransaction({
+			stateFile, lockPath, localContentSha256: TARGET, staleMs: 0,
+		});
+		assert.equal(active.action, "active", "活 legacy holder 不得被 settle");
+		assert.equal(readTransaction(stateFile).phase, "restart-pending");
+		assert.notEqual(readLock(lockPath), null, "不得清活 holder");
+		const busy = acquireLock(lockPath, { opId: "op-new" });
+		assert.equal(busy.ok, false);
+		assert.equal(busy.error, "update-busy");
+	} finally { rmSync(base, { recursive: true, force: true }); }
+
+	const second = setup();
+	try {
+		const lock = acquireLock(second.lockPath, { opId: "op-legacy-dead", pid: process.pid });
+		const lease = lock.lease;
+		writeRestartPending({
+			stateFile: second.stateFile,
+			lockPath: second.lockPath,
+			lease,
+			target: TARGET,
+			startedAt: new Date(Date.now() - 3600_000).toISOString(),
+		});
+		writeFileSync(join(second.lockPath, "holder.json"), JSON.stringify({ pid: 999999 }));
+		const settled = convergeStaleTransaction({
+			stateFile: second.stateFile,
+			lockPath: second.lockPath,
+			localContentSha256: TARGET,
+			staleMs: 0,
+		});
+		assert.equal(settled.action, "settled");
+		assert.equal(readLock(second.lockPath), null);
+	} finally { rmSync(second.base, { recursive: true, force: true }); }
+});
