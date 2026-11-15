@@ -193,6 +193,9 @@
 }
 ```
 
+- **默认排除零可见消息的空会话**（issue #109）：没有 `user/message`（真人发言）或非空 `assistant/message` 的会话不返回，避免“创建过但从未对话”的空会话出现在列表。`?includeEmpty=1` 返回全部（排查/清理用）；其他值（含缺失、`0`、`true`、非法串）按 false 处理。
+- “可见消息”与 `lastMessageAt` 同口径：仅 `user/message`（`source.kind` 为 `user`/旧内核无 source）和正文非空的 `assistant/message`；`tool/call`、`tool/result`、权限/sandbox/approval/model selection、`session/end-seed`、系统注入等都不计入。空会话仍可通过 includeEmpty 或深链访问。
+- 过滤在标题折叠与消息时间回填之后执行；休眠/归档空会话同样默认隐藏。无法确认（日志读取失败/超出回填预算）的会话**保留可见**，宁可多显示也不误删有消息会话。
 - 排序（规划中）：优先按 `lastMessageAt` 倒序，缺失时回退 `lastActivity`，再回退 `createdAt`；等值时以 `id` 为次级键保证顺序稳定。数据源：优先 `sessionQuery.listSessions()`（含休眠会话），回退 `ctx.sessions.list()`（仅活动会话）。
 - `archived`：是否已归档（见 3.4 归档接口）。
 - `lastActivity`：最近活跃时间（ms）。任意会话事件（SSE）与移动端"打开会话"（3.4 touch）都会更新，持久化于 `~/.dsh/mobile-remote/session-activity.json`。保留给旧版 App，且在消息时间缺失时仍作为排序回退值；旧 App 调用 `touch` 或内部事件发生时，这类会话仍可能重排。
