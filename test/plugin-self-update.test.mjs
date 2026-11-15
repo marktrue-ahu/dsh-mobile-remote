@@ -477,10 +477,10 @@ test("reportPendingUpdate：任意非终态都会在持有者消失后收敛，�
 			targetContentSha256: "a".repeat(64),
 		}));
 
-		// 新实例已生效 → matched（插件只报告，不自行回滚）
+		// 新实例已生效且无存活 holder → adoptable（由启动路径认领结算，不自行回滚）
 		assert.equal(
 			reportPendingUpdate({ stateFile: file, lockPath, localContentSha256: "a".repeat(64) }).action,
-			"matched",
+			"adoptable",
 		);
 		// 持有者存活 → 继续等
 		const holder = acquireLock(lockPath, { opId: "op", pid: process.pid });
@@ -497,8 +497,11 @@ test("reportPendingUpdate：任意非终态都会在持有者消失后收敛，�
 			timeoutMs: 0,
 			now: () => Date.now() + 60_000,
 		});
-		assert.equal(expired.action, "waiting", "可能已损坏安装时不能无恢复标普通FAILED");
-		assert.equal(expired.transaction.phase, TRANSACTION_PHASE.RESTART_PENDING);
+		// issue #110 P1-C：restart-pending + holder 全死 + stale 且内容不匹配 →
+		// failed(confirmation-lost)，不再无限 waiting。
+		assert.equal(expired.action, "expired");
+		assert.equal(expired.transaction.phase, TRANSACTION_PHASE.FAILED);
+		assert.equal(expired.transaction.result.reason, "confirmation-lost");
 
 		// 非 restart-pending 的非终态（staging）同样会被收敛（F6 的关键一条）
 		await writeFile(file, JSON.stringify({
