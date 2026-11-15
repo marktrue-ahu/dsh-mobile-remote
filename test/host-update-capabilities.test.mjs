@@ -75,6 +75,31 @@ test("bundle 准入：updatable=false 或带 readOnlyReason 一律拒绝", () =>
 	assert.equal(hostManagerAcceptsBundle({ updatable: true }).ok, true);
 });
 
+test("bundle 准入：rc.1 updatable 与 rc.2 update=registry/git 都接受", () => {
+	assert.equal(hostManagerAcceptsBundle({ updatable: true }).ok, true, "rc.1");
+	assert.equal(hostManagerAcceptsBundle({ update: "registry" }).ok, true, "rc.2 registry");
+	assert.equal(hostManagerAcceptsBundle({ update: "git" }).ok, true, "rc.2 git");
+	assert.equal(hostManagerAcceptsBundle({ update: "none" }).ok, false);
+	assert.equal(hostManagerAcceptsBundle({ update: "registry", readOnlyReason: "management-required" }).ok, false);
+	assert.equal(hostManagerAcceptsBundle({ updatable: false }).ok, false);
+	// 两字段同时出现时以 rc.2 的 update 为准（rc.2 不再提供 updatable）。
+	assert.equal(hostManagerAcceptsBundle({ updatable: false, update: "registry" }).ok, true);
+});
+
+test("汇总探测：rc.2 bundle + HMR → host-manager 通道", async () => {
+	const service = {
+		updateBundle: async () => ({}),
+		listBundles: async () => [{ name: "pkg", update: "registry", version: "3.2.4-alpha.17" }],
+	};
+	const result = await detectHostUpdateCapabilities({
+		ctx: fakeCtx({ pluginManager: service, hmr: { reconcileProfile: async () => ({}) } }),
+		packageName: "pkg",
+	});
+	assert.equal(result.state, HOST_MANAGER_STATE.READY);
+	assert.equal(result.channel, UPDATE_CHANNEL.HOST_MANAGER);
+	assert.equal(result.managerReason, "");
+});
+
 test("汇总探测：可用 + HMR → ready；可用无 HMR → restart-required", async () => {
 	const service = { updateBundle: async () => ({}), listBundles: async () => [{ name: "pkg", updatable: true, version: "1.0.0" }] };
 	const ready = await detectHostUpdateCapabilities({
