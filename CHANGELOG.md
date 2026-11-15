@@ -1,5 +1,40 @@
 # Changelog
 
+## v3.2.4-alpha.17（build 49，issues #103 / #104 / #109）— 展开贴底、简洁折叠与空会话过滤
+
+> 插件 `3.2.4-alpha.17` / App `3.2.4+49` / 载体 `3.2.4-alpha.17-app`。
+
+### 工具卡展开后的贴底与空白（#103）
+
+- 新增统一 content layout 回调：工具卡/过程组/轮/「显示更多」/思考行展开收起统一清理旧底部占位 → 帧后 measure → 已贴底时回底并多帧 settle（4 帧），避免懒加载 SliverList extent 修正后停在真实内容之外；
+- `_scrollToBottom` 支持 settle，修复展开路径只单跳一次的问题；监听 `ScrollMetricsNotification`，惰性构建引起的 content extent-only 变化也会更新贴底状态与回底按钮；
+- 底部占位仅在 `maxScrollExtent<=1` 的短内容态启用，内容增长立即清零旧占位，避免大段尾部空白；
+- 代码块移除嵌套竖直滚动（maxHeight 260），改为裁剪 +「查看全文」底部弹层；长代码/工具结果不再抢占父列表竖直手势，上翻更顺畅；
+- 320/深色/1.5x 字号回归。
+
+### 简洁模式运行中折叠过程组与工具卡（#104）
+
+- concise 运行中：过程组默认折叠为一行摘要，不强制展开、不铺工具卡；当前思考/工具仍由活动条表达（抬头不附工具名）；
+- 手动展开优先：整段手动展开后组仍默认折叠（等用户再点组）；组/工具卡手动展开后，新事件与 result 不抢回；手动收起后新事件不自动展开；未手动展开的卡在 result 到达时保持折叠；切轮按默认重新折叠；
+- 标准/详细/完全展开三档行为不变；completed 简洁轮仍保持一行。
+
+### 会话列表默认隐藏空会话（#109）
+
+- `/m/api/sessions` 默认排除零可见消息的空会话；`?includeEmpty=1` 返回全部（排查/清理用），其他值（缺失、`0`、`true`、非法串）按 false 处理；
+- 「可见消息」与 `lastMessageAt` 同口径：真人 `user/message` + 非空正文 `assistant/message`；tool/result、权限/sandbox/approval/model selection、session/end-seed、系统注入、空 assistant 均不计；判空只看事件可见性、不看 `time`——可见消息缺时间戳仍保留（排序回退 `lastActivity`/`createdAt`）；
+- 过滤在标题折叠与消息时间回填之后执行，休眠/归档空会话同样默认隐藏；只有本次请求成功读到且确认无可见消息的会话才删除，读取失败、超预算、仍在途或旧缓存一律保留可见，宁可多显示也不误删；
+- 未知休眠会话的判定读取受单次 deadline + 总 2.5s 硬上限约束，并发 ≤4，不会挂死列表请求；空会话仍可通过 `includeEmpty` 或深链访问。
+
+### 文档
+
+- docs/03-api §3.3 增加 `includeEmpty` 参数与「可见消息」定义、过滤时序、有界回填与保留策略。
+
+### 验证
+
+- 本机发布门禁：node 测试 **1181**（1168 通过 / 13 跳过 / 0 失败）、flutter test **1450** 全绿、flutter analyze 0 error/warning（24 条既有 info）；首轮 node 全量 1 例 session-list-title-refresh 临时目录清理竞态（ENOTEMPTY，非断言失败），单文件 17/17 与全量重跑均全绿；
+- 真机/320/深色、5/10/all、图片授权、trigger 卡、动态 margin、折叠与贴底列为本版验收项（发布后按验收清单执行）。
+
+
 ## v3.2.4-alpha.16（build 48，issues #87 / #90 / #92 / #94 / #96 / #97 / #98 / #99 / #100 / #101 / #102）— 宿主兼容、触发卡与图片授权
 
 > 插件 `3.2.4-alpha.16` / App `3.2.4+48` / 载体 `3.2.4-alpha.16-app`。
