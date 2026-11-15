@@ -23,6 +23,7 @@ import {
 } from "../lib/plugin-update-transaction.js";
 import { reportPendingUpdate } from "../lib/plugin-self-update.js";
 import { defaultRestart } from "../lib/update-supervisor.js";
+import { createPluginUpdateController } from "../lib/plugin-update-controller.js";
 import { respawnCommandOf } from "../lib/plugin-self-update.js";
 
 const TARGET = "a".repeat(64);
@@ -169,4 +170,139 @@ test("#110 P2：defaultRestart 透传原始 argv（保留 --port 3082），不�
 	assert.equal(result.ok, true);
 	assert.ok(script.includes("--port 3082"), script);
 	assert.ok(!script.includes("web --profile web"), "不得丢掉原参数");
+});
+
+test("#110 P1: fixed-version-deployed（localContent != target）不 adopt，stale 后明确 failed", () => {
+	const { base, stateFile, lockPath } = setup();
+	try {
+		const lock = acquireLock(lockPath, { opId: "op-fixed", pid: process.pid });
+		const lease = lock.lease;
+		writeRestartPending({
+			stateFile,
+			lockPath,
+			lease,
+			target: TARGET,
+			startedAt: new Date(Date.now() - 3600_000).toISOString(),
+		});
+		makeDeadHolder(lockPath, lease);
+		const reported = reportPendingUpdate({
+			stateFile, lockPath, localContentSha256: OTHER, holderAlive: false, timeoutMs: 0,
+		});
+		assert.notEqual(reported.action, "adoptable");
+		assert.equal(reported.action, "expired");
+		assert.equal(reported.transaction.phase, "failed");
+		assert.equal(reported.transaction.result.reason, "confirmation-lost",
+			"已部署修复版时不得假称 settled");
+	} finally { rmSync(base, { recursive: true, force: true }); }
+});
+
+test("#110 P1: finish lease-lost / holder.json 缺失 → fallback converge 不永久 pending", () => {
+	const { base, stateFile, lockPath } = setup();
+	try {
+		const lock = acquireLock(lockPath, { opId: "op-null-holder", pid: process.pid });
+		const lease = lock.lease;
+		writeRestartPending({ stateFile, lockPath, lease, target: TARGET });
+		// 模拟现场 holder=null：holder.json 存在但内容 null，finish 必然 lease-lost。
+		writeFileSync(join(lockPath, "holder.json"), "null\n");
+		const reported = reportPendingUpdate({
+			stateFile, lockPath, localContentSha256: TARGET, holderAlive: false,
+		});
+		assert.equal(reported.action, "adoptable");
+		assert.throws(() => finishOwnedTerminal(stateFile, {
+			phase: "settled",
+			result: { ok: true, matched: "loaded-target-content-adopted" },
+			expectedPhases: ["restart-pending"],
+		}, { lockPath, lease: reported.transaction.lease, currentFile: stateFile }));
+		const converged = convergeStaleTransaction({
+			stateFile, lockPath, localContentSha256: TARGET, staleMs: 0,
+		});
+		assert.equal(converged.action, "settled");
+		assert.equal(readTransaction(stateFile).phase, "settled");
+	} finally { rmSync(base, { recursive: true, force: true }); }
+
+	const second = setup();
+	try {
+		const lock = acquireLock(second.lockPath, { opId: "op-missing-holder", pid: process.pid });
+		const lease = lock.lease;
+		writeRestartPending({ stateFile: second.stateFile, lockPath: second.lockPath, lease, target: TARGET });
+		rmSync(join(second.lockPath, "holder.json"), { force: true });
+		const converged = convergeStaleTransaction({
+			stateFile: second.stateFile,
+			lockPath: second.lockPath,
+			localContentSha256: TARGET,
+			staleMs: 0,
+		});
+		assert.equal(converged.action, "settled", "holder.json 缺失也不能永久 recent");
+		assert.equal(readTransaction(second.stateFile).phase, "settled");
+	} finally { rmSync(second.base, { recursive: true, force: true }); }
+});
+
+test("#110 P2: supervisor 路径优先事务/tx respawn，不落回 profile 默认命令", () => {
+	let script = "";
+	const result = defaultRestart({
+		restartForm: "web-foreground",
+		port: 3082,
+		hostPid: 999999,
+		respawnCommand: "/usr/bin/node /opt/dsh/bin/dsh web --no-open --port 3082",
+		spawnSyncImpl: (shell, args) => { script = args.join(" "); return { error: null, status: 0 }; },
+	});
+	assert.equal(result.ok, true);
+	assert.ok(script.includes("--port 3082"));
+	assert.ok(!script.includes("web --profile web"));
+	// 没有 tx/proc 原命令时明确失败，不得猜默认命令（可能改端口）。
+	const missing = defaultRestart({
+		restartForm: "web-foreground",
+		port: 3082,
+		hostPid: 999999,
+		respawnCommand: "",
+		spawnSyncImpl: () => ({ error: null, status: 0 }),
+	});
+	assert.equal(missing.ok, false);
+	assert.equal(missing.error, "restart-command-missing");
+});
+
+test("#110 P3: submit 收敛带 localContentSha256，旧 restart-pending 内容匹配时 settled 而非一律 failed", async () => {
+	const { base, stateFile, lockPath } = setup();
+	try {
+		const lock = acquireLock(lockPath, { opId: "op-submit", pid: process.pid });
+		const lease = lock.lease;
+		writeRestartPending({
+			stateFile,
+			lockPath,
+			lease,
+			target: TARGET,
+			startedAt: new Date(Date.now() - 3600_000).toISOString(),
+		});
+		makeDeadHolder(lockPath, lease);
+		const controller = createPluginUpdateController({
+			home: base,
+			configValue: "npm",
+			profileDir: base,
+			packageName: "pkg",
+			npmPackageView: async () => { throw new Error("registry down"); },
+			capabilities: () => ({ canSelfUpdate: true, updateChannel: "restart" }),
+			localVersion: "3.2.4",
+			localContentSha256: TARGET,
+			status: {},
+			log: () => {},
+			checkTimeoutMs: 50,
+		});
+		const result = await controller.submit({});
+		const tx = readTransaction(stateFile);
+		assert.notEqual(tx.phase, "restart-pending", "submit 前应收敛旧事务");
+		assert.equal(tx.phase, "settled");
+		assert.equal(tx.result.matched, "loaded-target-content-adopted");
+		assert.equal(result.status, 503, "之后检查不可用应如实 503，而不是 update-busy");
+	} finally { rmSync(base, { recursive: true, force: true }); }
+});
+
+test("#110 P3: legacy holder 只有 pid 时按 pid 保守判活", () => {
+	const { base, lockPath } = setup();
+	try {
+		mkdirSync(lockPath, { recursive: true });
+		writeFileSync(join(lockPath, "holder.json"), JSON.stringify({ pid: process.pid }));
+		assert.equal(lockHolderAlive(lockPath), true);
+		writeFileSync(join(lockPath, "holder.json"), JSON.stringify({ pid: 999999 }));
+		assert.equal(lockHolderAlive(lockPath), false);
+	} finally { rmSync(base, { recursive: true, force: true }); }
 });
