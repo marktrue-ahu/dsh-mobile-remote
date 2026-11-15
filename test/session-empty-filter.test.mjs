@@ -68,7 +68,14 @@ function harness({ records = [], liveSessions = [], query = null, noQuery = fals
     await finished;
     return { status: res.statusCode, body: JSON.parse(res.chunks.join("") || "{}") };
   }
-  return { request, provide(name, value) { provided.set(name, value); }, dispose() { dispose?.(); } };
+  function start(url, { method = "GET" } = {}) {
+    const req = new Request(url, method);
+    const res = new Response();
+    const finished = new Promise((resolve) => res.once("finish", resolve));
+    route(req, res);
+    return { req, res, finished };
+  }
+  return { request, start, provide(name, value) { provided.set(name, value); }, dispose() { dispose?.(); } };
 }
 
 function fixtureQuery() {
@@ -172,5 +179,111 @@ test("issue #109：回填失败/未知的会话不误删（宁可多显示）", 
     const def = await h.request("/m/api/sessions");
     assert.deepEqual(def.body.sessions.map((s) => s.id), ["unknown"],
       "无法确认空/非空时保留，不能把有消息会话误删");
+  } finally { h.dispose(); }
+});
+
+test("issue #109 P2：time 缺失仍可见；空 assistant/系统注入不算可见消息", async () => {
+  const h = harness({
+    noQuery: true,
+    liveSessions: [
+      liveSession("time-missing", [{ seq: 1, type: "user/message", data: { message: { id: "u", content: [{ type: "text", text: "hi" }] } } }]),
+      liveSession("empty-assistant", [assistantEvent(2, 2000, "")]),
+      liveSession("injected", [{ seq: 3, type: "user/message", time: 3000, data: { message: { id: "i", content: [{ type: "text", text: "plugin" }] }, source: { kind: "plugin" } } }]),
+      liveSession("assistant-ok", [assistantEvent(4, 4000, "answer")]),
+    ],
+  });
+  try {
+    const def = await h.request("/m/api/sessions");
+    assert.deepEqual(def.body.sessions.map((s) => s.id).sort(), ["assistant-ok", "time-missing"]);
+  } finally { h.dispose(); }
+});
+
+test("issue #109 P2：旧空缓存不删——先空后出现消息，下一次请求仍保留", async () => {
+  let events = [configEvent(1)];
+  const h = harness();
+  h.provide("sessionQuery", {
+    async listSessions() { return [recorded("target")]; },
+    async readSession() { return { events }; },
+    async readTitleSnapshots(ids) { return ids.map((id) => ({ status: "fulfilled", value: { title: { title: id } } })); },
+  });
+  try {
+    const first = await h.request("/m/api/sessions");
+    assert.deepEqual(first.body.sessions, [], "旧空会话默认隐藏");
+    events = [{ seq: 2, type: "user/message", data: { message: { id: "u", content: [{ type: "text", text: "new" }] } } }];
+    const second = await h.request("/m/api/sessions");
+    assert.deepEqual(second.body.sessions.map((s) => s.id), ["target"],
+      "本次读取到可见消息时不得被旧 ok 缓存误删（time 缺失也要保留）");
+  } finally { h.dispose(); }
+});
+
+test("issue #109 P2：120 会话超预算不删、总时长有硬上限、读取并发≤4", async () => {
+  let active = 0;
+  let maxActive = 0;
+  let reads = 0;
+  const records = Array.from({ length: 120 }, (_, i) => recorded(`s-${i}`));
+  const h = harness();
+  h.provide("sessionQuery", {
+    async listSessions() { return records; },
+    readSession() {
+      reads += 1;
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      // 永不 resolve 的读：必须被单次 deadline/总预算 race 掉，不能挂住请求。
+      return new Promise(() => {});
+    },
+    async readTitleSnapshots(ids) { return ids.map((id) => ({ status: "fulfilled", value: { title: { title: id } } })); },
+  });
+  try {
+    const started = performance.now();
+    const res = await h.request("/m/api/sessions");
+    const elapsed = performance.now() - started;
+    assert.equal(res.status, 200);
+    assert.equal(res.body.sessions.length, 120, "未确认的会话必须保留，不得因超预算删除");
+    assert.ok(elapsed >= 2300 && elapsed < 4500, `总预算应约 2.5s，实际 ${elapsed}`);
+    assert.ok(reads >= 1, "至少进入读取");
+    // 并发上限由独立有限延迟用例精确断言；这里挂起读的底层 promise 无法取消，
+    // active 计数会保留到进程结束，故只验证硬时限+不删。
+  } finally { h.dispose(); }
+});
+
+test("issue #109 P2：同步可见性读取并发≤4（有限延迟场景）", async () => {
+  let active = 0;
+  let maxActive = 0;
+  const records = Array.from({ length: 120 }, (_, i) => recorded(`c-${i}`));
+  const h = harness();
+  h.provide("sessionQuery", {
+    async listSessions() { return records; },
+    async readSession() {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      active -= 1;
+      return { events: [userEvent(1, 1000)] };
+    },
+    async readTitleSnapshots(ids) { return ids.map((id) => ({ status: "fulfilled", value: { title: { title: id } } })); },
+  });
+  try {
+    const res = await h.request("/m/api/sessions");
+    assert.equal(res.status, 200);
+    assert.equal(res.body.sessions.length, 120);
+    assert.ok(maxActive <= 4, `并发上限应为 4，实际 ${maxActive}`);
+  } finally { h.dispose(); }
+});
+
+test("issue #109 P2：请求取消后不再写响应（readSession 挂起也不无限等待）", async () => {
+  const h = harness();
+  h.provide("sessionQuery", {
+    async listSessions() { return [recorded("cancelled")]; },
+    readSession() { return new Promise(() => {}); },
+    async readTitleSnapshots(ids) { return ids.map((id) => ({ status: "fulfilled", value: { title: { title: id } } })); },
+  });
+  try {
+    const pending = h.start("/m/api/sessions");
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    pending.res.emit("close"); // 客户端断开
+    let finished = false;
+    pending.finished.then(() => { finished = true; });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(finished, false, "断开后不得写响应");
   } finally { h.dispose(); }
 });
