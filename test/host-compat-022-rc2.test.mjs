@@ -8,7 +8,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { apply } from "../lib/index.js";
+import { apply, firstAgent } from "../lib/index.js";
 
 const CONFIG = {
   path: "/m", authToken: "1234567890123456", cookieName: "dsh_mobile_token",
@@ -41,7 +41,7 @@ class Request extends EventEmitter {
 const PARENT = "session-parent";
 const agent = { id: PARENT, session: { id: PARENT, header: { cwd: "/tmp/proj" } }, status: "idle" };
 
-function harness({ generation = "rc2", descendants = null, descendantsThrows = false, children = null, sessions = [], receipt = generation === "rc2" ? { accepted: true } : undefined, emptySubagents = false, omitSubagents = false } = {}) {
+function harness({ generation = "rc2", descendants = null, descendantsThrows = false, children = null, sessions = [], receipt = generation === "rc2" ? { accepted: true } : undefined, emptySubagents = false, omitSubagents = false, agentsRegistry = null, rpcValue = null } = {}) {
   const routes = [];
   const rpcCalls = [];
   const provided = new Map();
@@ -49,7 +49,7 @@ function harness({ generation = "rc2", descendants = null, descendantsThrows = f
     { id: PARENT, header: { id: PARENT, cwd: "/tmp/proj", createdAt: 1000 } },
     ...sessions,
   ];
-  provided.set("agents", { get: (id) => (id === PARENT ? agent : undefined), list: () => [agent], roots: () => [] });
+  provided.set("agents", agentsRegistry ?? { get: (id) => (id === PARENT ? agent : undefined), list: () => [agent], roots: () => [] });
   provided.set("sessions", { get: (id) => sessionList.find((s) => s.id === id), list: () => sessionList });
   const subagents = {};
   if (!emptySubagents && !omitSubagents && generation === "rc2") {
@@ -66,7 +66,7 @@ function harness({ generation = "rc2", descendants = null, descendantsThrows = f
   const gateway = {
     async invokeRpc(endpoint, payload, signal, peer) {
       rpcCalls.push({ endpoint, args: payload?.args ?? payload });
-      return { ok: true, value: receipt };
+      return { ok: true, value: rpcValue ?? receipt };
     },
     async openWireStream(endpoint, payload, uplink, peer, signal, control) {
       throw new Error("unused");
@@ -247,4 +247,67 @@ test("issue #87：hostCapabilities/hostGeneration 按能力探测两代 subagent
     assert.equal(res.body.checks.hostCapabilities["subagents.interrupt"], "ok");
     assert.deepEqual(res.body.checks.hostGeneration.subagents, { catalog: "children", interrupt: "parent" });
   } finally { rc1.dispose(); }
+});
+
+// issue #112：DSH 0.2.2-rc.2 AgentRegistry 移除 roots()。firstAgent 必须按能力探测，
+// 不能直接调用 roots()；catalog/diagnostics 在仅 list 的 registry 下不得 500。
+
+test("issue #112 rc.2：仅 list 的 AgentRegistry → catalog 200、modelsRpc true", async () => {
+  const listOnly = { get: (id) => (id === PARENT ? agent : undefined), list: () => [agent] };
+  const h = harness({
+    agentsRegistry: listOnly,
+    rpcValue: { groups: [{ models: [{ id: "m1" }] }] },
+  });
+  try {
+    const catalog = await h.request("/m/api/catalog");
+    assert.equal(catalog.status, 200, JSON.stringify(catalog.body));
+    assert.notEqual(catalog.body.error, "internal");
+    const diagnostics = await h.request("/m/api/diagnostics");
+    assert.equal(diagnostics.status, 200);
+    assert.equal(diagnostics.body.checks.modelsRpc, true);
+  } finally { h.dispose(); }
+});
+
+test("issue #112 rc.2：roots 抛错 → 退回 list；catalog/diagnostics 不抛", async () => {
+  const rootsThrows = {
+    get: () => undefined,
+    roots: () => { throw new TypeError("agents.roots is not a function"); },
+    list: () => [agent],
+  };
+  const h = harness({
+    agentsRegistry: rootsThrows,
+    rpcValue: { groups: [{ models: [{ id: "m1" }] }] },
+  });
+  try {
+    const catalog = await h.request("/m/api/catalog");
+    assert.equal(catalog.status, 200, JSON.stringify(catalog.body));
+    const diagnostics = await h.request("/m/api/diagnostics");
+    assert.equal(diagnostics.status, 200);
+    assert.equal(diagnostics.body.checks.modelsRpc, true);
+  } finally { h.dispose(); }
+});
+
+test("issue #112 rc.2：roots/list 都缺失 → firstAgent undefined 不抛；catalog 200/modelsRpc false", async () => {
+  const empty = {};
+  const h = harness({ agentsRegistry: empty });
+  try {
+    const catalog = await h.request("/m/api/catalog");
+    assert.equal(catalog.status, 200, JSON.stringify(catalog.body));
+    const diagnostics = await h.request("/m/api/diagnostics");
+    assert.equal(diagnostics.status, 200);
+    assert.equal(diagnostics.body.checks.modelsRpc, false);
+  } finally { h.dispose(); }
+});
+
+test("issue #112 firstAgent：roots 非空优先；空数组/抛错退回 list；都缺失 undefined", () => {
+  const rootFirst = { id: "root-first" };
+  const listSecond = { id: "list-second" };
+  assert.equal(firstAgent({ roots: () => [rootFirst], list: () => [listSecond] }).id, "root-first");
+  assert.equal(firstAgent({ roots: () => [], list: () => [listSecond] }).id, "list-second");
+  assert.equal(firstAgent({ roots: () => { throw new Error("drift"); }, list: () => [listSecond] }).id, "list-second");
+  assert.equal(firstAgent({ list: () => [listSecond] }).id, "list-second");
+  assert.equal(firstAgent({}), undefined);
+  assert.equal(firstAgent(null), undefined);
+  assert.equal(firstAgent({ roots: () => { throw new Error("drift"); }, list: () => { throw new Error("drift2"); } }), undefined);
+  assert.equal(firstAgent({ roots: () => [rootFirst], list: () => { throw new Error("list"); } }).id, "root-first");
 });
