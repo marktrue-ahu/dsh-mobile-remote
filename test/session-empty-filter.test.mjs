@@ -94,7 +94,7 @@ function fixtureQuery() {
   };
 }
 
-test("issue #109：默认排除零可见消息；includeEmpty=1 返回全部；仅配置/工具空会话不出现", async () => {
+test("issue #109：默认排除配置空会话；tool-only 保留；includeEmpty=1 返回全部", async () => {
   const h = harness({
     liveSessions: [
       liveSession("live-empty", [configEvent(1)]),
@@ -108,12 +108,12 @@ test("issue #109：默认排除零可见消息；includeEmpty=1 返回全部；�
     const def = await h.request("/m/api/sessions");
     assert.equal(def.status, 200, JSON.stringify(def.body));
     const ids = def.body.sessions.map((s) => s.id);
-    assert.deepEqual(ids.sort(), ["dormant-message", "live-message"]);
+    assert.deepEqual(ids.sort(), ["dormant-message", "dormant-tool-only", "live-message"]);
     assert.ok(!ids.includes("dormant-empty"));
-    assert.ok(!ids.includes("dormant-tool-only"), "tool/call 不算可见对话消息");
+    assert.ok(ids.includes("dormant-tool-only"), "tool-only 是有价值的会话，不得当空会话删除");
     assert.ok(!ids.includes("archived-empty"));
-    // 排序：dormant-message 2000 > live-message 1000；标题仍为已折叠标题而非裸 id
-    assert.deepEqual(def.body.sessions.map((s) => s.id), ["dormant-message", "live-message"]);
+    // 排序：dormant-message 2000 > live-message 1000；tool-only 无消息时间按 createdAt 回退。
+    assert.deepEqual(def.body.sessions.map((s) => s.id), ["dormant-message", "dormant-tool-only", "live-message"]);
     for (const row of def.body.sessions) assert.ok(typeof row.title === "string" && row.title !== "", "标题不得回退为空");
     assert.match(def.body.sessions.find((s) => s.id === "dormant-message").title, /标题 /);
 
@@ -285,5 +285,70 @@ test("issue #109 P2：请求取消后不再写响应（readSession 挂起也不�
     pending.finished.then(() => { finished = true; });
     await new Promise((resolve) => setTimeout(resolve, 250));
     assert.equal(finished, false, "断开后不得写响应");
+  } finally { h.dispose(); }
+});
+
+test("issue #109 实机回归：300+ 休眠会话用 persistence metadata 过滤，不做逐个 readSession", async () => {
+  const empty = Array.from({ length: 324 }, (_, i) => {
+    const id = `session-empty-${i}`;
+    return { snapshot: { header: { id, createdAt: 1000, cwd: "/tmp" }, eventCount: 4 + (i % 3), sizeBytes: 330 + (i % 5) }, record: recorded(id) };
+  });
+  const visible = Array.from({ length: 30 }, (_, i) => {
+    const id = `session-visible-${i}`;
+    return { snapshot: { header: { id, createdAt: 2000 + i, cwd: "/tmp" }, eventCount: 22 + i, sizeBytes: 40000 + i }, record: recorded(id) };
+  });
+  const timeMissing = Array.from({ length: 7 }, (_, i) => {
+    const id = `session-time-missing-${i}`;
+    return { snapshot: { header: { id, createdAt: 3000 + i, cwd: "/tmp" }, eventCount: 30 + i, sizeBytes: 50000 + i }, record: recorded(id) };
+  });
+  const all = [...empty, ...visible, ...timeMissing];
+  let reads = 0;
+  const h = harness();
+  h.provide("sessionQuery", {
+    async listSessions() { return all.map((e) => e.record); },
+    async readSession() { reads += 1; throw new Error("must not read 300+ logs"); },
+    async readTitleSnapshots(ids) { return ids.map((id) => ({ status: "fulfilled", value: { title: { title: id.startsWith("session-empty-") ? id : `标题 ${id}` } } })); },
+  });
+  h.provide("sessionPersistence", { list: async () => all.map((e) => e.snapshot) });
+  try {
+    const started = performance.now();
+    const def = await h.request("/m/api/sessions");
+    const elapsed = performance.now() - started;
+    assert.equal(def.status, 200);
+    assert.equal(def.body.sessions.length, 37, "324 个 4–7 事件的空会话必须默认隐藏，37 个正常保留");
+    assert.ok(def.body.sessions.every((row) => !row.id.startsWith("session-empty-")), "空会话不得出现");
+    assert.ok(reads <= 4, `metadata 足够时不得逐个 readSession（后台回填至多4个在途，实际 ${reads}）`);
+    assert.ok(elapsed < 1000, `300+ 批量应 <1s，实际 ${elapsed}ms`);
+    const byId = new Map(def.body.sessions.map((row) => [row.id, row]));
+    assert.ok(byId.has("session-time-missing-0"), "eventCount 大的 time 缺失会话保留");
+    assert.match(byId.get("session-visible-0").title, /标题 /);
+
+    const allRes = await h.request("/m/api/sessions?includeEmpty=1");
+    assert.equal(allRes.body.sessions.length, 361);
+  } finally { h.dispose(); }
+});
+
+test("issue #109：eventCount 缺失时 sizeBytes 小才判空；size 大/未知保留", async () => {
+  const h = harness();
+  h.provide("sessionQuery", {
+    async listSessions() { return [recorded("small"), recorded("large"), recorded("tool-only"), recorded("unknown-size")]; },
+    async readSession() { return { events: [configEvent(1)] }; },
+    async readTitleSnapshots(ids) { return ids.map((id) => ({ status: "fulfilled", value: { title: { title: id } } })); },
+  });
+  h.provide("sessionPersistence", {
+    list: async () => [
+      { header: { id: "small", createdAt: 1 }, sizeBytes: 400 },
+      { header: { id: "large", createdAt: 1 }, sizeBytes: 40000 },
+      // 事件数少但文件大：可能含工具调用/长参数，不能只按 eventCount 判空。
+      { header: { id: "tool-only", createdAt: 1 }, eventCount: 5, sizeBytes: 40000 },
+      { header: { id: "unknown-size", createdAt: 1 } },
+    ],
+  });
+  try {
+    const def = await h.request("/m/api/sessions");
+    const ids = def.body.sessions.map((s) => s.id).sort();
+    assert.deepEqual(ids, ["large", "tool-only", "unknown-size"], "size 小才判空；eventCount 小但文件大/无大小的未知保留");
+    const all = await h.request("/m/api/sessions?includeEmpty=1");
+    assert.equal(all.body.sessions.length, 4);
   } finally { h.dispose(); }
 });
