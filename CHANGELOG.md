@@ -1,5 +1,42 @@
 # Changelog
 
+## v3.2.4-alpha.19（build 51，issues #108 / #109 / #111）— 工作步骤四档 v4 与空会话 metadata 过滤
+
+> 插件 `3.2.4-alpha.19` / App `3.2.4+51` / 载体 `3.2.4-alpha.19-app`。
+
+### 工作步骤展示四档 v4（#108）
+
+- **运行中**：
+  - 简洁：过程段摘要；活动条隐藏；手动展开段后组默认展开（一次见到组抬头 + 行），详情收起；
+  - 标准：过程段展开、过程组抬头折叠（显示 step 工具数/进行中状态，不铺行、不残留导轨）；活动条常显当前工具/思考；
+  - 详细：过程段展开、组抬头展开 + 行摘要；详情收起；
+  - 完全展开：不分组平铺；当前运行轮详情自动展开（长结果裁剪 +「查看全文」）；完成/历史轮详情不自动展开；完成态不分组、行摘要；
+- **已完成**：简洁/标准整轮一行；详细段展开 + 组抬头折叠；完全展开不分组 + 行摘要、详情收起；「回答结束后」立即收起，「下条真人消息」保持段展开；
+- **优先级与边界**：手动展开/收起优先，新事件与 result 不抢回；切轮/异常/插话只强制段展开（组与详情按档位）；完全展开自动详情不展开插话详情；50 行分批照旧；活动条按档位隐藏/常显/去重；320/深色/1.5x 不溢出；
+- 设置页移除「思考内容」「思维链默认展开」；两个旧 prefs key 保留但不读取、不迁移、不报错；思考行/活动条正文默认不展开；
+- 新增 `TurnFoldPolicy` v4 维度（liveSegment/liveGroups/liveRowsVisible/liveDetailsAutoExpanded/activityBar/completedSegment/completedGroups），ChatScreen 按新维度重算段/组/行/详情/活动条。
+
+### 空会话过滤：persistence metadata 判空（#109 / #111）
+
+- 新增 `isEmptyConversationSessionEvents`：**零可见对话消息且无 `tool/call`/`tool/result`** 才判空；tool-only 是有价值会话必须保留；空 assistant、系统注入、纯配置/生命周期不算活动；判空不看 `time`，可见消息缺时间戳仍保留；
+- 优先用 `ctx.sessionPersistence.list()` 廉价 metadata：生产 JSONL backend 无 eventCount，以 `sizeBytes` 为主——
+  - `sizeBytes ≤ 1024` 才直接判空（实测空会话 329–704B、正常对话最小 40KB）；若同时有 eventCount 且 >8 则视为非空；
+  - `1024 < sizeBytes ≤ 2048` 为灰区，不直接删，回退 `readSession` 用 tool-aware 事件判定（防小 tool-only/only-user 误删）；
+  - `sizeBytes > 2048` 非空；size 缺失为未知走有界读；eventCount 不能单独判空；
+- `loadPersistenceSnapshots` 请求级 1.5s 上限，失败/超时退回有界 read；metadata 不足（服务缺失/条目缺失）才退回有界 `readSession`（单读 deadline + abort race、总 2.5s、并发 ≤4）；
+- 361 会话批量实测 324 空隐藏 / 37 保留 / <1s、不逐条读；live/query/fallback/archived 同一过滤；`includeEmpty=1` 仍全量；只删本次请求成功读到且确认空者，读取失败/超预算/在途/旧缓存保留；App 侧列表不再出现无标题空会话。
+
+### 文档
+
+- 新增 ADR 0029《手机端工作步骤展示四档语义（v4）》：术语与层级、运行中/已完成矩阵、手动覆盖优先级、旧设置处理、性能与安全边界；ADR 0027/0028 关联修订；
+- CONTEXT 增补过程段、过程段摘要、思考行、工具卡详情术语；docs/03-api 同步空会话 metadata 阈值、tool 活动口径与本次确认/兜底规则。
+
+### 验证
+
+- 本机发布门禁：node 测试 **1197**（1184 通过 / 13 跳过 / 0 失败）、flutter test **1464** 全绿、flutter analyze 0 error/warning（24 条既有 info）；首轮即全绿；
+- 真机/320/深色、5/10/all、图片授权、trigger 卡、动态 margin、四档展示与空会话列表列为本版验收项（发布后按验收清单执行）。
+
+
 ## v3.2.4-alpha.18（build 50，issues #110）— rc.2 更新通道恢复与 restart-pending 收尾
 
 > 插件 `3.2.4-alpha.18` / App `3.2.4+50` / 载体 `3.2.4-alpha.18-app`。
