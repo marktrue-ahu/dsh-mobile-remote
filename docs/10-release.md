@@ -406,9 +406,12 @@ NODE
 
 ## 8. 正式发布
 
-前提：§5 预检通过、§7 试发布（如需要）通过、已取得发布授权，且演练门禁满足：
-- **CI 默认链路**：演练在 CI 内执行（tag 触发后由 workflow 运行 `package-release.sh --drill`，失败即阻断发布），本机推 tag 前不需要预跑演练。
-- **人工兜底链路**：本机须先跑通 §6 演练（`RESULT: PASS`，或用 `package-release.sh --drill` 由脚本阻断失败），再 `npm publish`。
+前提：§7 试发布（如需要）通过、已取得发布授权，且预检与演练门禁按发布方式满足：
+
+| 门禁 | CI 默认链路 | 人工兜底链路 |
+|---|---|---|
+| §5 预检 | tag 触发后由 workflow 构建产物并预检，本机无需先行打包 | 本机须对拟发布 `<dist>` 跑通 §5 预检 |
+| §6 演练 | tag 触发后由 workflow 运行 `package-release.sh --drill`，失败即阻断发布 | 本机须先跑通 `RESULT: PASS`，再 `npm publish` |
 
 ### 8.1 发布方式：CI workflow（默认）与人工兜底
 
@@ -562,7 +565,7 @@ NODE
 - 产物身份：清单 `app.sha256`/`plugin.sha256`/`plugin.contentSha256`、载体 tarball sha256+size、插件 tgz sha256+size。
 - 演练结果：`run.json` 路径、`RESULT`、耗时、失败 reason（如有）。
 - 试发布（如有）：包名、版本、dist-tag、unpublish 窗口、镜像核验结果。
-- 正式发布：两次 `npm publish` 的结果与 registry 核验输出、Release URL、部分成功状态。
+- 正式发布：两次 `npm publish` 的结果与 registry 核验输出、部分成功状态。**当前发布链不创建 GitHub Release**；若本次为人工兜底发布，另记录所发布的 tarball 文件名与本地 `<dist>` 路径以便追溯。
 - 发布政策：release-meta 的 commit、全局 build 分配依据（watermark/历史 tag/发布前沿/next）、发布意图状态（submitted/published/unknown/failed）、发布前/后 channel/app/latest 指针。
 - 发布状态：`fresh` / `partial-carrier` / `fully-published`（旧 tag 重跑为只读幂等），以及 tag 可达性证据（alpha→develop、rc/stable→release/v<core>）。
 - 回滚（如有）：原因、时间、恢复版本、验证结果。
