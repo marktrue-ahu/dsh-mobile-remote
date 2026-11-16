@@ -158,10 +158,29 @@ function request(route, {
 	}));
 }
 
+/**
+ * 载体发现隔离（本文件所有用例的默认前提）。
+ *
+ * `discoverAppCarrier()` 默认扫描**本插件根**的 `node_modules`（`lib/app-carrier.js`
+ * `collectCarrierCandidates`）。开发工作树按根 `package.json` 的精确载体别名装了
+ * `@marktrue/dsh-mobile-remote-app`（真实 89MB APK），因此不显式隔离时：
+ *   - 这些 HTTP 契约用例会读到宿主环境里的真载体，而不是本文件用 `updateDir` 建的夹具
+ *     （`/update/apk` 无参数请求返回 200 + 89MB，而用例期望夹具结论）；
+ *   - 断言字节不等时会为 89MB 生成巨大 diff 字符串，整文件跑直接 V8 OOM。
+ * 用例语义本来就是"托管区/人工区夹具"，与工作树是否装了载体依赖无关，故默认指向一个
+ * **没有载体依赖**的隔离插件根；需要验证载体发现的用例（随包载体、载体导入）显式传
+ * `runtime.carrier.pluginRoot` 覆盖它。
+ */
+let isolatedPluginRoot;
+
+function harnessRuntime(runtime = {}) {
+	return { ...runtime, carrier: { pluginRoot: isolatedPluginRoot, ...runtime.carrier } };
+}
+
 async function withHarness(options, callback) {
 	const { config: overrides = {}, runtime = {} } = options ?? {};
 	const harness = createContext();
-	apply(harness.ctx, config(overrides), runtime);
+	apply(harness.ctx, config(overrides), harnessRuntime(runtime));
 	try {
 		return await callback({ ...harness, api: apiRouteOf(harness.routes) });
 	} finally {
@@ -239,6 +258,13 @@ function storePath(...segments) {
 test.before(async () => {
 	testHome = await mkdtemp(join(tmpdir(), "dsh-carrier-routes-home-"));
 	process.env.HOME = testHome;
+	// 隔离插件根：同名/同版本、**不声明也不安装**载体依赖 → 载体发现稳定返回 carrier-not-installed。
+	isolatedPluginRoot = join(testHome, "plugin-root");
+	await mkdir(isolatedPluginRoot, { recursive: true });
+	await writeFile(join(isolatedPluginRoot, "package.json"), JSON.stringify({
+		name: PLUGIN_NAME,
+		version: PLUGIN_VERSION,
+	}));
 	({ apply } = await import("../lib/index.js"));
 });
 
@@ -806,7 +832,7 @@ test("LAN 桥投影：不把 127.0.0.1 发给手机（用桥的 LAN 侧网卡 + 
 			updateDir: fixture.carrierDir,
 			updateProfileDir: fixture.profileDir,
 			lanBridge: { enabled: true, host: "127.0.0.1", port: bridgePort },
-		}));
+		}), harnessRuntime());
 		try {
 			let boot;
 			for (let attempt = 0; attempt < 100; attempt++) {

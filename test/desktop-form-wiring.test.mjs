@@ -32,6 +32,14 @@ let Config;
 let orderEndpointOrigins;
 let resolveDshHome;
 let testHome;
+/**
+ * 载体发现隔离：`discoverAppCarrier()` 默认扫**本插件根**的 `node_modules`。开发工作树按根
+ * `package.json` 的精确载体别名会装上 `@marktrue/dsh-mobile-remote-app`（真实 89MB APK），
+ * 不隔离时这些"人工区/托管区夹具"用例会读到宿主环境里的真载体（下载 200、appArtifact=ok），
+ * 与用例前提（无载体）冲突。用例语义与工作树是否装了载体依赖无关，故默认指向一个**没有
+ * 载体依赖**的隔离插件根；真正测试载体发现的用例显式传 `runtime.carrier.pluginRoot`。
+ */
+let isolatedPluginRoot;
 
 class MockResponse extends Writable {
 	constructor() {
@@ -148,10 +156,14 @@ function request(route, {
 	}));
 }
 
+function harnessRuntime(runtime = {}) {
+	return { ...runtime, carrier: { pluginRoot: isolatedPluginRoot, ...runtime.carrier } };
+}
+
 async function withHarness(options, callback) {
 	const { config: overrides = {}, runtime = {}, services = {}, upstreamPort = 3080, webServerHost = "127.0.0.1" } = options ?? {};
 	const harness = createContext({ upstreamPort, services, webServerHost });
-	apply(harness.ctx, config(overrides), runtime);
+	apply(harness.ctx, config(overrides), harnessRuntime(runtime));
 	try {
 		return await callback({ ...harness, api: apiRouteOf(harness.routes) });
 	} finally {
@@ -252,6 +264,13 @@ function writeHostManifest(dir, { name = "app.apk", bytes = Buffer.from("wiring-
 test.before(async () => {
 	testHome = await mkdtemp(join(tmpdir(), "dsh-desktop-wiring-base-home-"));
 	process.env.HOME = testHome;
+	// 隔离插件根：同名/同版本、**不声明也不安装**载体依赖 → 载体发现稳定返回 carrier-not-installed。
+	isolatedPluginRoot = join(testHome, "plugin-root");
+	await mkdir(isolatedPluginRoot, { recursive: true });
+	await writeFile(join(isolatedPluginRoot, "package.json"), JSON.stringify({
+		name: PLUGIN_NAME,
+		version: PLUGIN_VERSION,
+	}));
 	({ apply, Config, orderEndpointOrigins, resolveDshHome } = await import("../lib/index.js"));
 });
 
@@ -1024,7 +1043,7 @@ test("R8：dispose 关闭 bridge listener（端口释放、无残留），重载
 	await withIsolatedHome(async () => {
 		const bridgePort = await freePort();
 		const first = createContext({ upstreamPort: 3080 });
-		apply(first.ctx, config({ lanBridge: { enabled: true, host: "127.0.0.1", port: bridgePort } }), {});
+		apply(first.ctx, config({ lanBridge: { enabled: true, host: "127.0.0.1", port: bridgePort } }), harnessRuntime());
 		const firstApi = apiRouteOf(first.routes);
 		try {
 			const bridge = await waitForBridge(firstApi, true);
@@ -1039,7 +1058,7 @@ test("R8：dispose 关闭 bridge listener（端口释放、无残留），重载
 
 			// 重载（新实例，同端口）：不得因旧实例残留而 listen 失败。
 			const second = createContext({ upstreamPort: 3080 });
-			apply(second.ctx, config({ lanBridge: { enabled: true, host: "127.0.0.1", port: bridgePort } }), {});
+			apply(second.ctx, config({ lanBridge: { enabled: true, host: "127.0.0.1", port: bridgePort } }), harnessRuntime());
 			const secondApi = apiRouteOf(second.routes);
 			try {
 				const reloaded = await waitForBridge(secondApi, true);
