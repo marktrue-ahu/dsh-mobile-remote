@@ -84,10 +84,12 @@ App 版本 `X.Y.Z+<build>`，载体版本 `<完整插件版本>-app`。App 与�
    `app`/channel/`latest` 并校验指针不回退。失败或可见性未知按手册 §10 恢复：**不得把超时当作未发布，
    不得删 tag 重新分配**。
 9. **发布后验证与设备验收**（手册 §9）：`npm view @marktrue/dsh-mobile-remote dist-tags versions --json`
-   确认 tag/通道指针符合政策；以 **CI 发布的 carrier 内清单**为版本配对与 APK size/SHA-256 的权威，
-   与本地 tgz 比对仅作参考——CI 是现场重新构建，二进制字节**允许不同**，不能用本地 tgz 的
-   `dist.integrity` 作为「必须一致」的判据（仅当确认 CI 复用了同一 tarball 时才可比）。release-meta 中
-   发布意图应为 `published`；再按 `docs/06-install-run.md` 在真机验证 App 更新/首装，记录机型、网络与结果。
+   确认 tag/通道指针符合政策；**实际下载** carrier 与插件 tarball，分别计算 SHA-512 SRI 与各自
+   `npm view dist.integrity` 对比，并解包 carrier 核对内部 APK 的 size/sha256 与 carrier 内 `manifest.json` 吻合
+   （把 `dist.integrity` 直接与 `npm view` 同一字段自比不能证明下载字节正确）。CI 是现场重新构建，
+   **不要求**与本地 tgz 字节一致，不能用本地 tgz 的 `dist.integrity` 作「必须一致」判据。
+   release-meta 中发布意图应为 `published`；再按 `docs/06-install-run.md` 在真机验证 App 更新/首装，
+   记录机型、网络与结果。
 10. 大更新在 DSH 社区发帖；`CHANGELOG.md` 保持完整历史。
 
 **版本保留原则**：
