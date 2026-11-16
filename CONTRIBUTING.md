@@ -54,28 +54,40 @@ App 版本 `X.Y.Z+<build>`，载体版本 `<完整插件版本>-app`。App 与�
 1. **发布前检查**（手册 §2）：`git fetch --multiple --tags origin github` → `node tools/next-build.mjs` 必须
    `RESULT: PASS`；目标版本未在 npm 占用；`git status --short` 干净；发布授权已取得。
 2. **跑门禁**（手册 §2 的隔离子 shell；**禁止在运行中 profile 的 HOME 下跑**）：`node --test test/*.mjs` +
-   `flutter analyze` + `flutter test` 全绿；发布插件/载体前还要跑发版演练
-   （`node tools/npm-drill.mjs --dist <产物目录>` 或 `package-release.sh --drill`）并得到 `RESULT: PASS`（手册 §6）。
+   `flutter analyze` + `flutter test` 全绿。此步不带产物，**不跑发版演练**（演练的对象是构建产物，见第 5 步）。
 3. **原子 bump**：`node tools/prepare-release.mjs --version <完整插件版本> --build <next>`（如
    `--version 3.2.4-alpha.N`），一次写入插件版本、
    精确 carrier 别名、`dsh-mobile-app/pubspec.yaml` 的 `X.Y.Z+N` 与 `CHANGELOG.md` 骨架；填写 CHANGELOG 正文，
    确认 `git diff --check` 干净。
-4. **本地打包与预检**：`cd dsh-mobile-app && flutter build apk --release`，再 `bash dsh-mobile-app/tools/package-release.sh`
-   在 `dsh-mobile-app/dist/` 产出发布产物（APK、插件 tgz、`manifest.json`、载体 tgz、构建记录 `app-carrier.json`）
-   并跑离线预检；预检/演练失败即停，不手改 `dist/`。本机打包**不发布 npm**；`UPDATE_DIR`、`MANIFEST_VERSION`、
+4. **bump 后复跑门禁**：版本号变更后重跑第 2 步的门禁，确认 bump 未破坏构建与测试。
+5. **本机打包与预检（可选，仅本地验证）**：这一步**不是发布必经步骤**——CI 会在发布时现场构建签名 APK
+   并跑演练（见第 7 步）。如需在本机先自查，从**仓库根**执行：
+
+   ```bash
+   (cd dsh-mobile-app && flutter build apk --release)
+   bash dsh-mobile-app/tools/package-release.sh
+   ```
+
+   产物在 `dsh-mobile-app/dist/`（APK、插件 tgz、`manifest.json`、载体 tgz、`app-carrier.json`），并跑离线预检；
+   同一目录可追加演练 `bash dsh-mobile-app/tools/package-release.sh --drill`。预检/演练失败即停，不手改 `dist/`。
+   **本机打包不发布 npm**，也不写任何共享更新目录；`UPDATE_DIR`、`MANIFEST_VERSION`、
    `ALLOW_TEST_MANIFEST_VERSION` 已退役（传入即 fail-closed）。
-5. **提交并推送分支**（经授权）：alpha 推 `develop`，rc/stable 推 `release/vX.Y.Z`；两个远端都要推
+   ⚠ 注意 shell 相对路径：`cd dsh-mobile-app` 之后的命令在同一 shell 里找不到 `dsh-mobile-app/...`，
+   需要回到仓库根或使用子 shell（如上）。
+6. **提交并推送分支**（经授权）：alpha 推 `develop`，rc/stable 推 `release/vX.Y.Z`；两个远端都要推
    （本仓库 `origin` 为 GitLab 备份、`github` 为 PR 与 CI 源，两边必须一致）。
-6. **打并推 tag**（经授权）：`git tag -a v<完整插件版本> -m "Release v<完整插件版本>"`；**先推分支、再推 tag**，
+7. **打并推 tag**（经授权）：`git tag -a v<完整插件版本> -m "Release v<完整插件版本>"`；**先推分支、再推 tag**，
    两个远端都要推。tag 就是 CI 的触发条件（workflow 只监听 `v*` tag）。
-7. **CI 发布**：workflow 校验 tag 可达性（alpha → `origin/develop`；rc/stable → 对应 `release/vX.Y.Z`）与
+8. **CI 发布**：workflow 校验 tag 可达性（alpha → `origin/develop`；rc/stable → 对应 `release/vX.Y.Z`）与
    `release-meta` 政策，现场构建签名 APK、校验证书、跑发版演练，先载体后插件发布，再按决策移动
    `app`/channel/`latest` 并校验指针不回退。失败或可见性未知按手册 §10 恢复：**不得把超时当作未发布，
    不得删 tag 重新分配**。
-8. **发布后验证与设备验收**（手册 §9）：`npm view @marktrue/dsh-mobile-remote dist-tags versions --json`；
-   `dist.integrity` 与本地 tgz 一致；release-meta 中发布意图为 `published`；再按 `docs/06-install-run.md`
-   在真机验证 App 更新/首装，记录机型、网络与结果。
-9. 大更新在 DSH 社区发帖；`CHANGELOG.md` 保持完整历史。
+9. **发布后验证与设备验收**（手册 §9）：`npm view @marktrue/dsh-mobile-remote dist-tags versions --json`
+   确认 tag/通道指针符合政策；以 **CI 发布的 carrier 内清单**为版本配对与 APK size/SHA-256 的权威，
+   与本地 tgz 比对仅作参考——CI 是现场重新构建，二进制字节**允许不同**，不能用本地 tgz 的
+   `dist.integrity` 作为「必须一致」的判据（仅当确认 CI 复用了同一 tarball 时才可比）。release-meta 中
+   发布意图应为 `published`；再按 `docs/06-install-run.md` 在真机验证 App 更新/首装，记录机型、网络与结果。
+10. 大更新在 DSH 社区发帖；`CHANGELOG.md` 保持完整历史。
 
 **版本保留原则**：
 
