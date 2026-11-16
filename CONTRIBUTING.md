@@ -61,12 +61,13 @@ App 版本 `X.Y.Z+<build>`，载体版本 `<完整插件版本>-app`。App 与�
    确认 `git diff --check` 干净。
 4. **bump 后复跑门禁**：版本号变更后重跑第 2 步的门禁，确认 bump 未破坏构建与测试。
 5. **本机打包与预检（可选，仅本地验证）**：这一步**不是发布必经步骤**——CI 会在发布时现场构建签名 APK
-   并跑演练（见第 7 步）。如需在本机先自查，从**仓库根**执行：
+   并跑演练（见第 8 步）。如需在本机先自查，从**仓库根**执行：
 
    ```bash
-   (cd dsh-mobile-app && flutter build apk --release)
-   bash dsh-mobile-app/tools/package-release.sh
+   (cd dsh-mobile-app && flutter build apk --release) && bash dsh-mobile-app/tools/package-release.sh
    ```
+
+   用 `&&` 串联：APK 构建失败时不进入打包步，避免把上一次残留的旧 APK 当成新产物。
 
    产物在 `dsh-mobile-app/dist/`（APK、插件 tgz、`manifest.json`、载体 tgz、`app-carrier.json`），并跑离线预检；
    同一目录可追加演练 `bash dsh-mobile-app/tools/package-release.sh --drill`。预检/演练失败即停，不手改 `dist/`。
