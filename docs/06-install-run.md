@@ -321,7 +321,7 @@ flutter build apk --release
         updateDir: ~/.dsh/mobile-remote/update/
 ```
 
-重启插件（或触发 patch 热重放）后，手机 App 切「主机」源即可检查/下载。产物可用 `tools/verify-update-manifest.mjs` 校验。
+重启插件（或触发 patch 热重放）后，手机 App 切「主机」源即可检查/下载。产物可用 `dsh-mobile-app/tools/verify-update-manifest.mjs` 校验。
 
 > 安全/兼容提醒：`authToken` 必须开启（更新通道暴露 APK 等于暴露分发面）；签名变更会导致「签名不一致」被预检拦截——正式分发请用同一 keystore，确实换签需先卸载旧版（§8.3）。
 
