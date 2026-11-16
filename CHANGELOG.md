@@ -1,5 +1,44 @@
 # Changelog
 
+## v3.2.4-alpha.18（build 50，issues #110）— rc.2 更新通道恢复与 restart-pending 收尾
+
+> 插件 `3.2.4-alpha.18` / App `3.2.4+50` / 载体 `3.2.4-alpha.18-app`。
+
+### DSH 0.2.2-rc.2 插件更新通道（#110）
+
+- `hostManagerAcceptsBundle` 同时接受 rc.1 `updatable===true` 与 rc.2 `update==='registry'|'git'`；存在 `update` 字段时以其为准，仍拒绝 `readOnlyReason`；
+- rc.2 + HMR 重新走 host-manager 通道，不再静默降级为重启方式更新；App 的「电脑端插件更新尚未确认」卡住问题随之恢复。
+
+### restart-pending 启动认领与失败收敛（#110）
+
+- 新增 `/proc/<pid>/stat` starttime 身份判活（不再只靠 `kill(0)`）；holder worker/supervisor 任一存活才视为活；
+- `reportPendingUpdate`：restart-pending + 运行内容等于 target + holder 已死 → `adoptable`，启动路径用 transaction lease 调 `finishOwnedTerminal` 结算 settled（`matched=loaded-target-content-adopted`），保留 artifact/snapshot 元数据并清 holder；holder 还活着时仍只报告 matched；
+- 启动认领 finish 失败（holder null / lease-lost）→ 有界重试 3 次后回退 `convergeStaleTransaction(staleMs:0, localContentSha256)`，不再永久 pending；
+- 死 holder + stale 收敛：内容匹配 → settled（如实标注已生效，不假称回滚成功）；不匹配 → failed `confirmation-lost`，不再无限 pending；缺时间戳按 stale 处理；
+- `fixed-version-deployed`（localContent 不等于 target）不 adopt，stale 后明确 failed `confirmation-lost`，不假称 settled、不重试死循环；
+- submit 收敛传 `localContentSha256` 并接受 settled 动作，旧 restart-pending 内容已生效时不再一律 failed。
+
+### holder 判活与重启参数（#110）
+
+- arbiter `available` / P1-C `active` 改用 holderAlive，兼容 legacy `holder.pid`：有 starttime 比 starttime，无 `/proc` 时回退 `kill(pid,0)` 保守判活；活 legacy holder + restart-pending/stale 保持 active、不 settle、不清 holder，acquire 仍返回 update-busy；
+- 宿主 workerOptions 写入 `respawnCommandOf(host process argv)` 随事务持久化；supervisor `defaultRestart` 优先 `tx.respawnCommand`，其次读 `/proc/<hostPid>/cmdline`；都拿不到时明确 `restart-command-missing`，不再猜 `dsh web --profile web`（避免端口漂移）；
+- 新增真实 supervisor 路径测试：事务保留原命令（含 `--port 3082`）；无原命令明确失败。
+
+### 重要说明
+
+- 本版针对「插件已更新到 alpha.17、但 App 卡在电脑端更新尚未确认」的现场：用户 App 已完成更新，**现场 failed 事务无需恢复**；新版本更新统一走 host-manager 通道；
+- 恢复 runbook 已追加到 issue #110（备份 → alpha.17 内容哈希校验 → converge/finish → 确认 settled → 再部署修复版），脚本未自动执行，未改写现场 `~/.dsh`。
+
+### 文档
+
+- 本次发布范围为更新链路修复，未改 API 契约；issue #110 note 含一次性恢复 runbook。
+
+### 验证
+
+- 本机发布门禁：node 测试 **1193**（1180 通过 / 13 跳过 / 0 失败）、flutter test **1450** 全绿、flutter analyze 0 error/warning（24 条既有 info）；首轮 node 全量 1 例 host-canary 已知时序 flake（#40），单文件 46/46 与全量重跑均全绿；
+- 真机/320/深色、5/10/all、图片授权、trigger 卡、动态 margin、折叠与贴底列为本版验收项（发布后按验收清单执行）。
+
+
 ## v3.2.4-alpha.17（build 49，issues #103 / #104 / #109）— 展开贴底、简洁折叠与空会话过滤
 
 > 插件 `3.2.4-alpha.17` / App `3.2.4+49` / 载体 `3.2.4-alpha.17-app`。
