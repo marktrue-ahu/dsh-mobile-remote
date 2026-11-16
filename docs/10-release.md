@@ -124,6 +124,8 @@ npm 全局前缀需可写（本机为 `~/.local`，已验证可用）；若 `EAC
       > `set -euo pipefail` 保证前一步失败不会继续执行后续门禁。
 - [ ] 构建机环境就绪（附录 A）；签名 keystore 已备份、未丢失。
 - [ ] 演练环境就绪：`verdaccio --version`；且已在当前 HEAD 的发布目录上跑通 §6 演练（`RESULT: PASS`）。
+  - 走 **CI 默认链路**时，演练由 workflow 在 tag 触发后于 CI 内执行（`package-release.sh --drill`，失败即阻断发布）；本机无需预先构建产物。
+  - 走 **人工兜底链路**时，必须先在拟发布的本地 `<dist>` 上跑通演练，再执行 `npm publish`。
 - [ ] 已取得本次**发布授权**（试发布与正式发布均需授权；本手册不代授权）。
 - [ ] 发布窗口内不再 rebase/改版本/重打产物；发布记录人、时间、版本已登记。
 
@@ -473,11 +475,17 @@ NODE
 1. **registry 元数据**：`npm view @marktrue/dsh-mobile-remote dist-tags versions --json`；
    - alpha/rc：决策为 move 时对应 channel = 本次版本；决策为 keep 时 channel 已等于候选；决策为 staging 时 channel 必须保持发布前值（未回退）。`app` 指向本次 carrier（或保持更高原值），`latest` 与发布前一致；
    - stable：`latest` 指向本次稳定版本（或保持更高的既有 stable）。
-2. **字节一致**：查询本次插件版本与 carrier 版本的 `dist.integrity`，与本地 tgz `sha512` 一致；下载后 sha256 同样一致。
+2. **字节一致（按发布方式区分）**：
+   - **CI 默认链路**：CI 现场 `flutter build apk --release` 重新构建（workflow `Build, verify, and publish` 步骤），产物字节与本地构建**允许不同**。此时以 **CI 发布的 carrier 内 `manifest.json`** 为版本配对与 APK size/SHA-256 的权威：核对 registry 上 carrier 的 `dist.integrity` 与 `npm view` 返回一致、解包后 carrier 内清单与实际 APK 一致。**不得**要求 registry 上的 tgz 与本地 tgz 的 `dist.integrity` 相等。
+   - **人工兜底链路**：`npm publish` 的是本地 `<dist>` 产物，此时才要求 registry 上的 tgz 与本地 tgz `sha512`（`dist.integrity`）逐字节一致，下载后 sha256 同样一致。
 3. **发布意图状态**：`git show origin/release-meta:build-policy.json` 中本次 tag 的意图应为 `published`，且没有为其它 tag 的未关闭 `submitted`/`unknown` 意图；未知状态按 §10.3 人工恢复。
 4. **镜像可取性**：在有代表性的镜像/网络环境重试上述查询与下载（记录耗时）。
 5. **全新安装冒烟**：在隔离 HOME/新目录 `pnpm add @marktrue/dsh-mobile-remote@<本次插件版本>`，确认精确别名目录存在且版本为 `<本次插件版本>-app`、APK 哈希与清单一致。
-6. **载体产物一致性（npm 分发，无 GitHub Release）**：下载本次 carrier tarball（`npm pack @marktrue/dsh-mobile-remote@<本次载体版本>`，或按 `npm view … dist.tarball` 直接下载），解包核对其中 APK 与清单和本地 `<dist>` 产物的 sha256 / 大小逐字节一致；主插件 tarball 用 `npm view @marktrue/dsh-mobile-remote@<本次插件版本> dist.integrity` 与本地 tgz 的 sha512 对照。**当前发布链不创建 GitHub Release。**
+6. **载体产物一致性（npm 分发，无 GitHub Release）**：按发布方式区分——
+   - **CI 默认链路**：CI 现场重建 APK 与载体，**不要求**与本地 `<dist>` 产物字节一致。核对点时以下载的 carrier tarball 内 `manifest.json` 为权威：解包核对其中 APK 的 sha256/大小与清单吻合、carrier 的 `dist.integrity` 与 `npm view @marktrue/dsh-mobile-remote@<本次载体版本> dist.integrity` 一致、主插件 `dist.integrity` 与 `npm view` 一致。
+   - **人工兜底链路**：发布的是本地 `<dist>` 产物，此时才要求下载解包后的 APK 与清单和本地 `<dist>` 的 sha256/大小逐字节一致、主插件 tarball 的 `dist.integrity` 与本地 tgz `sha512` 对照一致。
+
+   **当前发布链不创建 GitHub Release。**
 7. **宿主更新目录（仅应急手工兜底）**：发布脚本不再写更新目录（`UPDATE_DIR` 已退役）；如确需人工区兜底，由人工放入**同一次发布**的完整清单与 APK，确认 `manifest.json` 可解析、清单内 size/sha256 与实际 APK 一致，宿主重启后更新入口可用。自动更新候选只来自 npm（ADR 0024）。
 8. **真机**：按 `docs/06-install-run.md` 手工验证 App 更新/首装（本手册不自动化真机），记录机型、网络与结果。
 9. **回滚预案**：确认上一版本插件 tgz/载体/APK 仍可取得（本地 dist 与 Release 记录），并知道回滚操作（§10）。
