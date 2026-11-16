@@ -1,18 +1,30 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { Writable } from "node:stream";
 import { test } from "node:test";
 import { once } from "node:events";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const TOKEN = "0123456789abcdef0123456789abcdef";
 const COOKIE_NAME = "dsh_mobile_token";
 const APK_BYTES = Buffer.from("test apk bytes\n");
+const PLUGIN_VERSION = JSON.parse(
+	readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"),
+).version;
 let apply;
 let testHome;
+/**
+ * 载体发现隔离：`discoverAppCarrier()` 默认扫**本插件根**的 `node_modules`。开发工作树按根
+ * `package.json` 的精确载体别名会装上 `@marktrue/dsh-mobile-remote-app`（真实 89MB APK），
+ * 不隔离时"人工区夹具"用例会被宿主环境的真载体顶掉（无参数下载返回 200 + 89MB）。
+ * 本文件只测 update 路由契约，与工作树是否装了载体依赖无关，故默认指向无载体依赖的隔离插件根。
+ */
+let isolatedPluginRoot;
 
 class MockResponse extends Writable {
 	constructor() {
@@ -149,7 +161,7 @@ async function fixture({ manifest = {}, manifestText, apkBytes = APK_BYTES } = {
 
 async function withHarness(updateDir, callback, options = {}) {
 	const harness = createContext(options);
-	apply(harness.ctx, config(updateDir, options));
+	apply(harness.ctx, config(updateDir, options), { carrier: { pluginRoot: isolatedPluginRoot } });
 	try {
 		return await callback({ ...harness, api: apiRouteOf(harness.routes) });
 	} finally {
@@ -186,6 +198,13 @@ async function fetchRetry(url, init) {
 test.before(async () => {
 	testHome = await mkdtemp(join(tmpdir(), "dsh-mobile-update-home-"));
 	process.env.HOME = testHome;
+	// 隔离插件根：同名/同版本、**不声明也不安装**载体依赖 → 载体发现稳定返回 carrier-not-installed。
+	isolatedPluginRoot = join(testHome, "plugin-root");
+	await mkdir(isolatedPluginRoot, { recursive: true });
+	await writeFile(join(isolatedPluginRoot, "package.json"), JSON.stringify({
+		name: "@marktrue/dsh-mobile-remote",
+		version: PLUGIN_VERSION,
+	}));
 	({ apply } = await import("../lib/index.js"));
 });
 

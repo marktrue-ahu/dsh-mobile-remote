@@ -29,7 +29,7 @@
 | 术语 | 英文 | 做什么 | 是否接触公共 npm | 何时跑 |
 |---|---|---|---|---|
 | **预检** | preflight | 离线校验本地产物与元数据（清单/APK/载体 tarball/构建记录/发布字段/离线 `npm pack --dry-run`） | 否 | 构建后、发布前 |
-| **演练** | drill | 用**临时本地 registry** 真实跑一遍「发布 → 全新安装 → 载体发现 → 版本更新 → 失败路径」 | 否（只连 `127.0.0.1`） | 预检通过后、试发布/正式发布前 |
+| **演练** | drill | 用**临时本地 registry** 真实跑一遍「发布 → 全新安装 → 载体发现 → 版本更新 → 失败路径」 | 否（只连 `127.0.0.1`） | 预检通过后、正式发布前。CI 链路在 tag 触发后由 workflow 执行；人工兜底链路须在本机发布前跑通 |
 | **试发布** | canary publish | 向**真实 npm** 发**一次性包名**探针，验证真实 registry 的接收/体积/标签链路（预发布版本方式与现有纯 X.Y.Z 契约冲突，见 §7.1） | **是（需授权）** | 首次发版/大版本/链路变更时 |
 
 相关既有词汇：**发布清单**（`manifest.json`，配对权威）、**内容标识**（`plugin.contentSha256`）、**App 载体版本**（`X.Y.Z-app`，同包名预发布版本）。演练另有两个演练子域词汇：**演练 registry**（临时本地 Verdaccio 实例）、**演练版本**（`9.9.<随机补丁号>`，载体对应 `9.9.<补丁号>-app`；纯 X.Y.Z，不占正式版本线）。三词详细定义见 develop 的 `CONTEXT.md`（决策记录只落 develop，不在本分支重复）。
@@ -54,11 +54,11 @@
 | Node.js | ≥ 22.15（仓库开发基线 v24） | `node --version` |
 | npm | 11.x | `npm --version` |
 | pnpm | 11.x（演练安装用） | `pnpm --version` |
-| Verdaccio | **6.10.6**，全局安装（演练用，一次性） | `verdaccio --version` |
+| Verdaccio | **6.10.6**，全局安装（演练用，一次性）——**仅人工兜底链路或本机自查需要**；CI 默认链路由 workflow 自行安装，本机无需 | `verdaccio --version` |
 | Flutter/Android SDK | 构建 App 时（见附录 A） | `flutter doctor -v` |
 | Git 工作区 | 发布 HEAD 干净；分支/版本经授权 | `git status --short` |
 
-安装演练依赖（只装一次，脚本不会自动安装）：
+安装演练依赖（只装一次，脚本不会自动安装；**仅在本机跑演练时需要**，CI 默认链路由 workflow 安装）：
 
 ```bash
 npm i -g verdaccio@6.10.6
@@ -71,7 +71,7 @@ npm 全局前缀需可写（本机为 `~/.local`，已验证可用）；若 `EAC
 
 1. **公共版本号不可回收**：同一包名同一版本一旦发布，内容不可变、不可覆盖；发布失败/内容有误只能申请**新版本**重来。
 2. **先载体、后插件**：载体 `X.Y.Z-app` 必须先发布成功并可解析，再发布主插件 `X.Y.Z`（发布窗口内主插件 404 属预期 fail-closed）。
-3. **正式发布前必须演练通过**：`npm-drill` 演练失败一律阻断正式发布（本地工作流规则同步此门禁）。
+3. **正式发布前必须演练通过**：`npm-drill` 演练失败一律阻断正式发布（本地工作流规则同步此门禁）。执行主体按发布方式：CI 默认链路在 CI 内执行（见 §2「演练门禁」/§8），人工兜底链路在本机执行。
 4. **alpha 线在 develop**：`vX.Y.Z-alpha.N` tag 允许直接打在 `origin/develop` 的可达提交上；rc/stable tag 只允许对应 core 的 `release/vX.Y.Z`。CI 只校验**可达性**，不声称“tag 来自哪条分支”。
 5. **发布 build 号全局单调**：`+N` 由全局分配规则决定（`release-meta` 水位 + 历史 tag + 发布前沿 +1），不是某条分支的本地计数器；发布前必须用 `tools/next-build.mjs` 分配、`tools/prepare-release.mjs` 原子 bump。
 6. **发布政策记录唯一权威**：迁移水位、legacy tag 白名单、legacy carrier 核验映射与发布意图都在受保护分支 `release-meta` 的 `build-policy.json`；缺失/非法/双远端不一致 fail-closed，分支内副本不作为依据。
@@ -95,6 +95,8 @@ npm 全局前缀需可写（本机为 `~/.local`，已验证可用）；若 `EAC
 ## 2. 发布前检查
 
 按顺序执行；任一项不满足即停止，不放行发布。
+
+> **CI 默认链路的时间顺序**：本表大部分项在推 tag **之前**完成。其中「演练门禁」一项的 CI 分支由 workflow 在 tag 触发后执行、失败在实际 `npm publish` 之前阻断——它**不阻塞**授权与推 tag，属未来时点的门禁而非前置条件。人工兜底链路则必须在本机预跑演练后才能发布。
 
 - [ ] **先读发布政策记录**：`git fetch --multiple --tags origin github` 后运行 `node tools/next-build.mjs`，必须 `RESULT: PASS`；输出 next build 与 release-meta 的 watermark/发布前沿一致，且 `origin/release-meta` 与 `github/release-meta` 内容一致（双远端）。缺失/不一致/存在未关闭发布意图 → 停止。
 - [ ] 规划中的插件版本 `<X.Y.Z[-prerelease]>` 与载体版本 `<X.Y.Z[-prerelease]>-app` 都未在 npm 上占用；`node tools/prepare-release.mjs` 会用只读 `npm view` 预检。alpha tag 必须落在 develop 可达提交上，rc/stable 必须落在对应 `release/vX.Y.Z`。
@@ -123,7 +125,9 @@ npm 全局前缀需可写（本机为 `~/.local`，已验证可用）；若 `EAC
       > `XDG_CONFIG_HOME`/`PUB_CACHE`。统一 `export` 让 Node 与 Flutter 子进程共用同一临时根；
       > `set -euo pipefail` 保证前一步失败不会继续执行后续门禁。
 - [ ] 构建机环境就绪（附录 A）；签名 keystore 已备份、未丢失。
-- [ ] 演练环境就绪：`verdaccio --version`；且已在当前 HEAD 的发布目录上跑通 §6 演练（`RESULT: PASS`）。
+- [ ] 演练门禁（按发布方式执行）：
+  - 走 **CI 默认链路**：演练由 workflow 在 tag 触发后于 CI 内执行（workflow 安装 Verdaccio 后运行 `package-release.sh --drill`，失败即阻断，无 continue-on-error）。**本检查项不在推 tag 前阻塞**：它是由 workflow 在未来执行的发布前门禁，失败会在实际 `npm publish` 之前阻断。因此本机推 tag 前无需预跑演练、无需本机 Verdaccio。
+  - 走 **人工兜底链路**：本机需就绪 `verdaccio --version`，并先在拟发布的本地 `<dist>` 上跑通 §6 演练（`RESULT: PASS`），再执行 `npm publish`。
 - [ ] 已取得本次**发布授权**（试发布与正式发布均需授权；本手册不代授权）。
 - [ ] 发布窗口内不再 rebase/改版本/重打产物；发布记录人、时间、版本已登记。
 
@@ -186,18 +190,11 @@ bash dsh-mobile-app/tools/package-release.sh
 
 产物在 `dsh-mobile-app/dist/`（见 §1.2）。脚本行为：先 `npm pack` 主插件，再由 tgz + APK 生成清单，最后打载体并跑**离线预检**；任何一步失败即非零退出，不产出可发布产物。
 
-> `UPDATE_DIR=<插件 updateDir>` 可把 APK + 清单 + 插件 tgz 拷入主机更新目录（人工区）。正式发布前确认目标目录，不要在宿主运行中重启验证时误清。
+> 本脚本**不写**主机更新目录（人工区）：`UPDATE_DIR` 已于 issue #113 退役，传入即在写任何产物前 fail-closed 退出 1；自动更新的候选与包只来自 npm（ADR 0024）。人工区只在应急手工兜底时由人工放置完整清单（见 §10.3 末尾），正式发布前确认目标目录，不要在宿主运行中重启验证时误清。
 
-### 4.2 测试 manifest（仅联调，不用于发布）
+### 4.2 测试 manifest（已于 issue #113 退役）
 
-反复验证 App 自动更新时可手工覆盖清单版本（APK 构建号保持不变，清单写更高 build）：
-
-```bash
-ALLOW_TEST_MANIFEST_VERSION=1 MANIFEST_VERSION="X.Y.Z+99" \
-  bash dsh-mobile-app/tools/package-release.sh
-```
-
-该通道**不构建载体、不走载体配对门禁**，脚本会打印 `WARN`；正式发布严禁设置这两个变量。
+`MANIFEST_VERSION` / `ALLOW_TEST_MANIFEST_VERSION` 假版本清单路径已退役：这类清单会写出与 APK 实际身份不符的版本，`package-release.sh` 现在对这两个变量 **fail-closed 退出 1**（不写任何产物）。重复验证自动更新改走 npm 通道：`node tools/next-build.mjs` 分配更高的全局 build → `node tools/prepare-release.mjs` 原子 bump → 经授权推 tag 由 CI 发布 alpha，或在本地跑 §6 演练（`tools/npm-drill.mjs`）复现安装/更新链路。
 
 > 分支侧文档只保留构建最短路径与排障附录；App 架构、安装、重建等日常说明仍看 `docs/06-install-run.md`。
 
@@ -239,7 +236,7 @@ node dsh-mobile-app/tools/verify-update-manifest.mjs dsh-mobile-app/dist \
 > `package-release.sh`）。演练属于插件发布，因此位于根 `tools/`。
 
 
-演练用临时本地 registry 完整预演发布与安装链路，**不接触公共 npm、不消耗任何公共版本号**。演练通过是正式发布的前置门禁。
+演练用临时本地 registry 完整预演发布与安装链路，**不接触公共 npm、不消耗任何公共版本号**。演练通过是正式发布的前置门禁；CI 默认链路由 workflow 在 CI 内执行该演练，人工兜底链路需在本机对拟发布产物先跑通。
 
 ### 6.1 前置
 
@@ -332,6 +329,10 @@ CLI 契约：
 
 目的：验证公共 npm 的**真实接收能力**（体积/请求体上限、认证、dist-tag 机制、镜像可取性）——这些是本地演练覆盖不到的。试发布是**真源补充**，不能替代 §5 预检与 §6 演练。
 
+> **与演练门禁的先后关系**：本手册有两种「向真实 npm 写入」的动作，不要混淆：
+> 1. **同包名 alpha/rc 预发布**（正常发布线）：由 tag 触发 workflow，CI 在该次运行内执行演练并在失败时阻断——本机推 tag 前不需要预跑演练，也不存在「先试发布、后才有机会演练」的死锁。
+> 2. **一次性包名探针**（§7.1，可选）：人工执行 `npm publish`，与正式发布线的 tag/workflow 无关，**不经过 CI 演练**，因此不能替代 §6 演练门禁；执行前按 §7.1 取授权，并先满足本机演练要求（如走人工兜底链路）。
+
 > **同包名 prerelease**：发布工具与运行时现已支持经授权的 `X.Y.Z-<pre>` 插件版本，载体精确配对为 `<插件完整版本>-app`。alpha 示例：插件 `3.2.4-alpha.N`、App `3.2.4+<全局 build>`、载体 `3.2.4-alpha.N-app`；载体使用 `app` tag（只有决策允许前进时才移动）。
 >
 > GitHub Actions [`publish-npm.yml`](../.github/workflows/publish-npm.yml) 自 issue #43 起按发布政策执行：tag 可达性（alpha→develop、rc/stable→release/vX.Y.Z）、`release-meta` 权威记录、已发布状态判定与 build 前沿、发布意图/unknown、app 先比较后移动、latest 仅 stable 前进。稳定版使用 `latest`，预发布使用 prerelease 第一段（如 `alpha`）；**预发布永不移动 `latest`**。发布 alpha 前不再要求 `latest` 是稳定版（bootstrap 例外），但仍须通过 §5 预检与 §6 演练。所有真实发布会话必须由本手册的授权流程触发，不能绕过 workflow 的 fail-closed 校验。
@@ -396,16 +397,21 @@ NODE
 - **版本不可回收**：任何试发布（含探针）发布的版本都不可覆盖；探针版本号也占该一次性名的不可变版本（用一个版本即可，勿反复发同版本）。
 - **72 小时 unpublish 边界**：公共 npm 对 `unpublish` 有严格限制（超过 72 小时的版本一般不可删；受政策/依赖/下载量约束），即使删成功也可能已被镜像缓存。
 - **包名长期可见**：一次性包名可能被镜像站长期保留；命名必须可识别为试验包（`-probe-<时间>`）并记录用途/回收说明。
-- **验证边界**：探针**不能**验证载体别名解析、载体发现、安装布局与版本更新——这些只由 §6 演练（使用真实配对产物）覆盖；也不得用探针结果绕开预检/演练。
+- **验证边界**：探针**不能**验证载体别名解析、载体发现、安装布局与版本更新——这些只由 §6 演练（使用真实配对产物）覆盖；也不得用探针结果绕开预检/演练门禁（演练执行主体见 §2「演练门禁」）。
 - **授权**：任何真实 npm 写入（探针或正式发布）都要事先取得发布授权并记录包名/版本/时间。
 
-> 试发布只补公共接收/镜像这一环；**正式发布仍必须**先过 §5 预检与 §6 演练。
+> 试发布只补公共接收/镜像这一环；**正式发布仍必须**满足 §5 预检与 §6 演练门禁——CI 默认链路的演练由 workflow 在 tag 触发后执行并在失败时阻断，人工兜底链路须在本机先跑通。
 
 ---
 
 ## 8. 正式发布
 
-前提：§5 预检通过、§6 演练通过（`RESULT: PASS`，或使用 `package-release.sh --drill` 由脚本阻断失败）、§7 试发布（如需要）通过、已取得发布授权。
+前提：§7 试发布（如需要）通过、已取得发布授权，且预检与演练门禁按发布方式满足：
+
+| 门禁 | CI 默认链路 | 人工兜底链路 |
+|---|---|---|
+| §5 预检 | tag 触发后由 workflow 构建产物并预检，本机无需先行打包 | 本机须对拟发布 `<dist>` 跑通 §5 预检 |
+| §6 演练 | tag 触发后由 workflow 运行 `package-release.sh --drill`，失败即阻断发布 | 本机须先跑通 `RESULT: PASS`，再 `npm publish` |
 
 ### 8.1 发布方式：CI workflow（默认）与人工兜底
 
@@ -480,12 +486,18 @@ NODE
 1. **registry 元数据**：`npm view @marktrue/dsh-mobile-remote dist-tags versions --json`；
    - alpha/rc：决策为 move 时对应 channel = 本次版本；决策为 keep 时 channel 已等于候选；决策为 staging 时 channel 必须保持发布前值（未回退）。`app` 指向本次 carrier（或保持更高原值），`latest` 与发布前一致；
    - stable：`latest` 指向本次稳定版本（或保持更高的既有 stable）。
-2. **字节一致**：查询本次插件版本与 carrier 版本的 `dist.integrity`，与本地 tgz `sha512` 一致；下载后 sha256 同样一致。
+2. **字节一致（按发布方式区分）**：
+   - **CI 默认链路**：CI 现场 `flutter build apk --release` 重新构建（workflow `Build, verify, and publish` 步骤），产物字节与本地构建**允许不同**。核对方式：**实际下载** registry 上的 carrier 与插件 tarball，分别计算其 SHA-512 SRI，与各自 `npm view <pkg>@<ver> dist.integrity` 对比；再解包 carrier，核对内部 APK 的 size/sha256 与 carrier 内 `manifest.json` 吻合。**不得**只把 `dist.integrity` 与 `npm view` 返回的同一字段自比（那是同一份元数据，无法证明实际下载的字节正确），也**不得**要求 registry 上的 tgz 与本地 tgz 的 `dist.integrity` 相等。
+   - **人工兜底链路**：`npm publish` 的是本地 `<dist>` 产物，此时才要求 registry 上的 tgz 与本地 tgz `sha512`（`dist.integrity`）逐字节一致，下载后 sha256 同样一致。
 3. **发布意图状态**：`git show origin/release-meta:build-policy.json` 中本次 tag 的意图应为 `published`，且没有为其它 tag 的未关闭 `submitted`/`unknown` 意图；未知状态按 §10.3 人工恢复。
 4. **镜像可取性**：在有代表性的镜像/网络环境重试上述查询与下载（记录耗时）。
 5. **全新安装冒烟**：在隔离 HOME/新目录 `pnpm add @marktrue/dsh-mobile-remote@<本次插件版本>`，确认精确别名目录存在且版本为 `<本次插件版本>-app`、APK 哈希与清单一致。
-6. **载体产物一致性（npm 分发，无 GitHub Release）**：下载本次 carrier tarball（`npm pack @marktrue/dsh-mobile-remote@<本次载体版本>`，或按 `npm view … dist.tarball` 直接下载），解包核对其中 APK 与清单和本地 `<dist>` 产物的 sha256 / 大小逐字节一致；主插件 tarball 用 `npm view @marktrue/dsh-mobile-remote@<本次插件版本> dist.integrity` 与本地 tgz 的 sha512 对照。**当前发布链不创建 GitHub Release。**
-7. **宿主更新目录**：如使用 `UPDATE_DIR`，确认清单/APK/tgz 已落位且 `manifest.json` 可解析；宿主重启后更新入口可用。
+6. **载体产物一致性（npm 分发，无 GitHub Release）**：按发布方式区分——
+   - **CI 默认链路**：CI 现场重建 APK 与载体，**不要求**与本地 `<dist>` 产物字节一致。核对点时：**实际下载** carrier tarball 与插件 tgz，分别计算 SHA-512 SRI 并与各自 `npm view <pkg>@<ver> dist.integrity` 对比；解包 carrier，核对内部 APK 的 sha256/大小与 carrier 内 `manifest.json` 吻合。不要把 `dist.integrity` 与 `npm view` 的同一字段自比——那不能证明下载到的字节正确。
+   - **人工兜底链路**：发布的是本地 `<dist>` 产物，此时才要求下载解包后的 APK 与清单和本地 `<dist>` 的 sha256/大小逐字节一致、主插件 tarball 的 `dist.integrity` 与本地 tgz `sha512` 对照一致。
+
+   **当前发布链不创建 GitHub Release。**
+7. **宿主更新目录（仅应急手工兜底）**：发布脚本不再写更新目录（`UPDATE_DIR` 已退役）；如确需人工区兜底，由人工放入**同一次发布**的完整清单与 APK，确认 `manifest.json` 可解析、清单内 size/sha256 与实际 APK 一致，宿主重启后更新入口可用。自动更新候选只来自 npm（ADR 0024）。
 8. **真机**：按 `docs/06-install-run.md` 手工验证 App 更新/首装（本手册不自动化真机），记录机型、网络与结果。
 9. **回滚预案**：确认上一版本插件 tgz/载体/APK 仍可取得（本地 dist 与 Release 记录），并知道回滚操作（§10）。
 
@@ -540,7 +552,7 @@ NODE
 - tag 已创建但 CI 失败且**从未提交 publish 请求**（无发布意图/unknown）时，才可在授权后删除 tag 重新分配；已部分发布或状态未知时必须走恢复流程。
 - 迟到可见的版本不得覆盖已分配/已发布的更高 build；release-meta 的恢复记录保留。
 
-> 应急手工兜底：从受信发布源/维护者取得**同一次发布**的 APK + 完整清单，放入人工区（宿主不自动改写人工区），经导入校验后服务；不要用其他版本的 APK 顶替。
+> 应急手工兜底：从受信发布源/维护者取得**同一次发布**的 APK + 完整清单，放入人工区（宿主不自动改写人工区），由宿主**读取时校验**后服务——校验发生在 `/update/manifest` 的清单结构校验与 `/update/plugin` 的 sha256 比对，人工区没有导入动作；不要用其他版本的 APK 顶替。
 
 ---
 
@@ -553,7 +565,7 @@ NODE
 - 产物身份：清单 `app.sha256`/`plugin.sha256`/`plugin.contentSha256`、载体 tarball sha256+size、插件 tgz sha256+size。
 - 演练结果：`run.json` 路径、`RESULT`、耗时、失败 reason（如有）。
 - 试发布（如有）：包名、版本、dist-tag、unpublish 窗口、镜像核验结果。
-- 正式发布：两次 `npm publish` 的结果与 registry 核验输出、Release URL、部分成功状态。
+- 正式发布：两次 `npm publish` 的结果与 registry 核验输出、部分成功状态。**当前发布链不创建 GitHub Release**；若本次为人工兜底发布，另记录所发布的 tarball 文件名与本地 `<dist>` 路径以便追溯。
 - 发布政策：release-meta 的 commit、全局 build 分配依据（watermark/历史 tag/发布前沿/next）、发布意图状态（submitted/published/unknown/failed）、发布前/后 channel/app/latest 指针。
 - 发布状态：`fresh` / `partial-carrier` / `fully-published`（旧 tag 重跑为只读幂等），以及 tag 可达性证据（alpha→develop、rc/stable→release/v<core>）。
 - 回滚（如有）：原因、时间、恢复版本、验证结果。
@@ -615,7 +627,9 @@ node tools/next-build.mjs
 node tools/prepare-release.mjs --version 3.2.4-alpha.N --build <next>
 git diff --check
 
-# 4) 本地门禁：node --test test/*.mjs + flutter analyze/test + 发布预检/演练
+# 4) 本地门禁：node --test test/*.mjs + flutter analyze/test
+#    （产物预检与演练不在本机做：CI 在 tag 触发后执行 package-release.sh --drill 并阻断失败；
+#      仅人工兜底链路或本机自查时才在本地构建产物并跑预检/演练）
 # 5) 提交 bump；经授权打 annotated tag 并推送 develop 与 tag 到双远端
 git tag -a v3.2.4-alpha.N -m "Release v3.2.4-alpha.N"
 git push origin develop && git push github develop
@@ -721,34 +735,9 @@ dsh-mobile-app/build/app/outputs/apk/release/app-release.apk
 
 直接 Gradle 构建适合排查具体 Android 任务；日常发布仍建议使用 Flutter CLI。
 
-### A.3.1 测试构建：APK 版本不变，manifest 使用 `+99`
+### A.3.1 测试构建：假版本清单（已于 issue #113 退役）
 
-需要反复验证主机源自动更新时，保持 `pubspec.yaml` 和 APK 内置版本不变，只覆盖 manifest 的版本号。例如当前 APK 为 `3.1.5+22`，测试 manifest 使用 `3.1.5+99`。
-
-```bash
-cd dsh-mobile-app
-flutter analyze
-flutter test
-flutter build apk --release
-
-# MANIFEST_VERSION 是显式测试覆盖，必须保持语义版本并提高 build 号
-ALLOW_TEST_MANIFEST_VERSION=1 \
-MANIFEST_VERSION="3.1.5+99" \
-UPDATE_DIR="$HOME/.dsh/mobile-remote/update" \
-bash tools/package-release.sh
-```
-
-Windows PowerShell：
-
-```powershell
-$env:ALLOW_TEST_MANIFEST_VERSION = '1'
-$env:MANIFEST_VERSION = '3.1.5+99'
-$env:UPDATE_DIR = "$HOME/.dsh/mobile-remote/update"
-.\tools\package-release.ps1
-Remove-Item Env:ALLOW_TEST_MANIFEST_VERSION, Env:MANIFEST_VERSION, Env:UPDATE_DIR
-```
-
-验收：检查 `updateDir/manifest.json` 的 `version` 为 `3.1.5+99`，并校验其中的 `sha256`、`size` 与 APK 一致；更新完成后可再次执行同一流程重复测试。只有显式设置 `ALLOW_TEST_MANIFEST_VERSION=1` 才允许覆盖；正式发布不得设置该变量，发布脚本还会要求测试 manifest 与 APK 语义版本一致且 build 更大。测试结束后清理测试 manifest 并恢复正式版本。
+原「APK 内置版本不变、只把 manifest 写成 `+99`」的测试配方（`ALLOW_TEST_MANIFEST_VERSION` / `MANIFEST_VERSION` / `UPDATE_DIR`）已随 issue #113 退役：假清单与 APK 实际身份不符，`package-release.sh` 现在对这三个变量 **fail-closed 退出 1**（不写任何产物）。重复验证自动更新改走 npm 通道，见 §4.2 与 §6（`tools/npm-drill.mjs`）。
 
 ### A.4 首次构建需要出网（代理由 .env 驱动）
 

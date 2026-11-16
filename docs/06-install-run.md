@@ -296,39 +296,9 @@ flutter build apk --release
 
 ### 8.5 测试构建与重复自动更新验证
 
-测试构建的目标是：APK 内置版本保持不变，主机源 `manifest.json` 使用更大的测试 build 号（通常为 `+99`），这样每次打开「检查更新」都能再次触发更新流程。
+> 假版本清单路径已于 issue #113 退役：`MANIFEST_VERSION` / `ALLOW_TEST_MANIFEST_VERSION`（以及人工目录落位的 `UPDATE_DIR`）不再可用——假清单会写出与 APK 实际身份不符的版本，`package-release.sh` 现在对这三个变量 **fail-closed 退出 1**（不写任何产物）。
 
-1. 不修改 `dsh-mobile-app/pubspec.yaml`，也不要给 Flutter 构建命令传入新的 `--build-number`：
-
-   ```bash
-   cd dsh-mobile-app
-   flutter analyze
-   flutter test
-   flutter build apk --release
-   ```
-
-2. 使用 manifest 覆盖变量打包并部署。`MANIFEST_VERSION` 只写入 manifest，不会改变 APK 内置的 `versionName/versionCode`：
-
-   ```bash
-   ALLOW_TEST_MANIFEST_VERSION=1 \
-   MANIFEST_VERSION="3.1.5+99" \
-   UPDATE_DIR="$HOME/.dsh/mobile-remote/update" \
-   bash tools/package-release.sh
-   ```
-
-   Windows PowerShell：
-
-   ```powershell
-   $env:ALLOW_TEST_MANIFEST_VERSION = '1'
-   $env:MANIFEST_VERSION = '3.1.5+99'
-   $env:UPDATE_DIR = "$HOME/.dsh/mobile-remote/update"
-   .\tools\package-release.ps1
-   Remove-Item Env:ALLOW_TEST_MANIFEST_VERSION, Env:MANIFEST_VERSION, Env:UPDATE_DIR
-   ```
-
-3. 验证 `manifest.json` 的 `version` 为 `3.1.5+99`，并确认 `sha256`、`size` 与 manifest 指向的 APK 一致；随后在 App 中检查更新并完成覆盖安装。
-
-> `+99` 仅用于测试；发布脚本默认拒绝覆盖，必须显式设置 `ALLOW_TEST_MANIFEST_VERSION=1` 才可用。测试完成后清空 `updateDir` 或重新部署正式 manifest，避免用户持续收到测试更新。APK 与已安装版本必须使用同一签名。
+重复验证自动更新改走 npm 通道：先用 `node tools/next-build.mjs` 分配比手机已装 build 更高的全局 build，再 `node tools/prepare-release.mjs` 原子 bump（pubspec 与清单随之更新，安装身份真实递增），然后按发布流程推 tag 由 CI 发布 alpha，手机走 npm 配对更新。不联网复现「安装 → 更新」链路用发版演练（`docs/10-release.md` §6：`node tools/npm-drill.mjs`）。普通构建仍是 §8.2 的 `flutter build apk --release`；APK 与已安装版本必须使用同一签名。
 
 ### 8.6 App 自动更新（双更新源，v3.0.0+）
 
@@ -336,9 +306,9 @@ flutter build apk --release
 
 **GitHub 源**：App 直连 `api.github.com/.../releases/latest`，取首个 `DSH-Remote-*.apk` 资产下载。无需配置；GitHub 不可达时明确报错（可切主机源）。
 
-**主机源部署（发布者 3 步）**：
-1. 构建并打包（Linux/WSL：`bash dsh-mobile-app/tools/package-release.sh`；Windows：`package-release.ps1`）——产出 `DSH-Remote-vX.Y.Z.apk`、`dsh-mobile-remote-vX.Y.Z.tgz`、`manifest.json`（共享生成器 `tools/gen-manifest.js`：version 含 build / sha256 / size / notes=CHANGELOG 最新条目全文）。
-2. 把 APK + `manifest.json` 拷入插件 `updateDir`（可用 `UPDATE_DIR=<路径> bash ...package-release.sh` 直接落位）。
+**主机源部署（发布者 3 步；仅应急手工兜底，自动更新走 npm）**：
+1. 构建并打包（`bash dsh-mobile-app/tools/package-release.sh`，唯一本机打包入口）——产出 `DSH-Remote-vX.Y.Z.apk`、`dsh-mobile-remote-vX.Y.Z.tgz`、`manifest.json`（共享生成器 `tools/gen-manifest.js`：version 含 build / sha256 / size / notes=CHANGELOG 最新条目全文）。
+2. 由人工把 APK + `manifest.json` 拷入插件 `updateDir`（`UPDATE_DIR` 自动落位已随 issue #113 退役，脚本不写更新目录）；自动更新的候选与包只来自 npm（ADR 0024），人工放置的文件只供主机源读取，不形成自动更新候选。
 3. 插件配置 `updateDir`（缺省空 = 未配置该源）：
 
 ```yaml
@@ -351,7 +321,7 @@ flutter build apk --release
         updateDir: ~/.dsh/mobile-remote/update/
 ```
 
-重启插件（或触发 patch 热重放）后，手机 App 切「主机」源即可检查/下载。产物可用 `tools/verify-update-manifest.mjs` 校验。
+重启插件（或触发 patch 热重放）后，手机 App 切「主机」源即可检查/下载。产物可用 `dsh-mobile-app/tools/verify-update-manifest.mjs` 校验。
 
 > 安全/兼容提醒：`authToken` 必须开启（更新通道暴露 APK 等于暴露分发面）；签名变更会导致「签名不一致」被预检拦截——正式分发请用同一 keystore，确实换签需先卸载旧版（§8.3）。
 

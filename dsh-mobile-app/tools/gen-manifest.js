@@ -9,7 +9,7 @@
 //                     插件能从已安装副本自行复算，见 lib/plugin-content-digest.js）
 // 决定「要不要下载新版本」只看内容标识；版本号只用于生成对齐提示文案。
 //
-// package-release.sh 与 package-release.ps1 共用本生成器，保证双端产出等价：
+// package-release.sh 调用本生成器产出清单（Windows 手工打包入口已于 issue #113 退役）：
 // JSON.stringify 保证合法（notes 含引号/反斜杠自动转义）、UTF-8 无 BOM、
 // notes 取 CHANGELOG 最新条目全文、哈希一律小写 hex、size 一律字节数。
 //
