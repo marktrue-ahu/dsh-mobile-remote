@@ -47,7 +47,7 @@
 1. 文档同步（API/行为变化时更新 docs/03 等）
 2. `git commit`（一句话说明改动）+ `git push origin main`
 3. `git tag -a vX.Y.Z -m "..."` + `git push origin main --tags`
-4. **本地归档**：运行 `dsh-mobile-app\tools\package-release.ps1` → 生成两个带版本号的文件：`dist\DSH-Remote-vX.Y.Z.apk`（App）与 `dist\dsh-mobile-remote-vX.Y.Z.tgz`（插件包）
+4. **本地归档**：运行 `bash dsh-mobile-app/tools/package-release.sh`（唯一本机打包入口）→ 生成两个带版本号的文件：`dsh-mobile-app/dist/DSH-Remote-vX.Y.Z.apk`（App）与 `dsh-mobile-app/dist/dsh-mobile-remote-vX.Y.Z.tgz`（插件包）
 5. GitHub 网页创建 **Release**：选新 tag → 标题 `DSH Remote vX.Y.Z` → 说明写清本次改动 → **同时上传上面两个附件**
 6. 大更新在 DSH 社区发帖；CHANGELOG 保持完整历史
 

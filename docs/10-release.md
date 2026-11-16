@@ -186,18 +186,11 @@ bash dsh-mobile-app/tools/package-release.sh
 
 产物在 `dsh-mobile-app/dist/`（见 §1.2）。脚本行为：先 `npm pack` 主插件，再由 tgz + APK 生成清单，最后打载体并跑**离线预检**；任何一步失败即非零退出，不产出可发布产物。
 
-> `UPDATE_DIR=<插件 updateDir>` 可把 APK + 清单 + 插件 tgz 拷入主机更新目录（人工区）。正式发布前确认目标目录，不要在宿主运行中重启验证时误清。
+> 本脚本**不写**主机更新目录（人工区）：`UPDATE_DIR` 已于 issue #113 退役，传入即在写任何产物前 fail-closed 退出 1；自动更新的候选与包只来自 npm（ADR 0024）。人工区只在应急手工兜底时由人工放置完整清单（见 §10.3 末尾），正式发布前确认目标目录，不要在宿主运行中重启验证时误清。
 
-### 4.2 测试 manifest（仅联调，不用于发布）
+### 4.2 测试 manifest（已于 issue #113 退役）
 
-反复验证 App 自动更新时可手工覆盖清单版本（APK 构建号保持不变，清单写更高 build）：
-
-```bash
-ALLOW_TEST_MANIFEST_VERSION=1 MANIFEST_VERSION="X.Y.Z+99" \
-  bash dsh-mobile-app/tools/package-release.sh
-```
-
-该通道**不构建载体、不走载体配对门禁**，脚本会打印 `WARN`；正式发布严禁设置这两个变量。
+`MANIFEST_VERSION` / `ALLOW_TEST_MANIFEST_VERSION` 假版本清单路径已退役：这类清单会写出与 APK 实际身份不符的版本，`package-release.sh` 现在对这两个变量 **fail-closed 退出 1**（不写任何产物）。重复验证自动更新改走 npm 通道：`node tools/next-build.mjs` 分配更高的全局 build → `node tools/prepare-release.mjs` 原子 bump → 经授权推 tag 由 CI 发布 alpha，或在本地跑 §6 演练（`tools/npm-drill.mjs`）复现安装/更新链路。
 
 > 分支侧文档只保留构建最短路径与排障附录；App 架构、安装、重建等日常说明仍看 `docs/06-install-run.md`。
 
@@ -485,7 +478,7 @@ NODE
 4. **镜像可取性**：在有代表性的镜像/网络环境重试上述查询与下载（记录耗时）。
 5. **全新安装冒烟**：在隔离 HOME/新目录 `pnpm add @marktrue/dsh-mobile-remote@<本次插件版本>`，确认精确别名目录存在且版本为 `<本次插件版本>-app`、APK 哈希与清单一致。
 6. **载体产物一致性（npm 分发，无 GitHub Release）**：下载本次 carrier tarball（`npm pack @marktrue/dsh-mobile-remote@<本次载体版本>`，或按 `npm view … dist.tarball` 直接下载），解包核对其中 APK 与清单和本地 `<dist>` 产物的 sha256 / 大小逐字节一致；主插件 tarball 用 `npm view @marktrue/dsh-mobile-remote@<本次插件版本> dist.integrity` 与本地 tgz 的 sha512 对照。**当前发布链不创建 GitHub Release。**
-7. **宿主更新目录**：如使用 `UPDATE_DIR`，确认清单/APK/tgz 已落位且 `manifest.json` 可解析；宿主重启后更新入口可用。
+7. **宿主更新目录（仅应急手工兜底）**：发布脚本不再写更新目录（`UPDATE_DIR` 已退役）；如确需人工区兜底，由人工放入**同一次发布**的完整清单与 APK，确认 `manifest.json` 可解析、清单内 size/sha256 与实际 APK 一致，宿主重启后更新入口可用。自动更新候选只来自 npm（ADR 0024）。
 8. **真机**：按 `docs/06-install-run.md` 手工验证 App 更新/首装（本手册不自动化真机），记录机型、网络与结果。
 9. **回滚预案**：确认上一版本插件 tgz/载体/APK 仍可取得（本地 dist 与 Release 记录），并知道回滚操作（§10）。
 
@@ -540,7 +533,7 @@ NODE
 - tag 已创建但 CI 失败且**从未提交 publish 请求**（无发布意图/unknown）时，才可在授权后删除 tag 重新分配；已部分发布或状态未知时必须走恢复流程。
 - 迟到可见的版本不得覆盖已分配/已发布的更高 build；release-meta 的恢复记录保留。
 
-> 应急手工兜底：从受信发布源/维护者取得**同一次发布**的 APK + 完整清单，放入人工区（宿主不自动改写人工区），经导入校验后服务；不要用其他版本的 APK 顶替。
+> 应急手工兜底：从受信发布源/维护者取得**同一次发布**的 APK + 完整清单，放入人工区（宿主不自动改写人工区），由宿主**读取时校验**后服务——校验发生在 `/update/manifest` 的清单结构校验与 `/update/plugin` 的 sha256 比对，人工区没有导入动作；不要用其他版本的 APK 顶替。
 
 ---
 
@@ -721,34 +714,9 @@ dsh-mobile-app/build/app/outputs/apk/release/app-release.apk
 
 直接 Gradle 构建适合排查具体 Android 任务；日常发布仍建议使用 Flutter CLI。
 
-### A.3.1 测试构建：APK 版本不变，manifest 使用 `+99`
+### A.3.1 测试构建：假版本清单（已于 issue #113 退役）
 
-需要反复验证主机源自动更新时，保持 `pubspec.yaml` 和 APK 内置版本不变，只覆盖 manifest 的版本号。例如当前 APK 为 `3.1.5+22`，测试 manifest 使用 `3.1.5+99`。
-
-```bash
-cd dsh-mobile-app
-flutter analyze
-flutter test
-flutter build apk --release
-
-# MANIFEST_VERSION 是显式测试覆盖，必须保持语义版本并提高 build 号
-ALLOW_TEST_MANIFEST_VERSION=1 \
-MANIFEST_VERSION="3.1.5+99" \
-UPDATE_DIR="$HOME/.dsh/mobile-remote/update" \
-bash tools/package-release.sh
-```
-
-Windows PowerShell：
-
-```powershell
-$env:ALLOW_TEST_MANIFEST_VERSION = '1'
-$env:MANIFEST_VERSION = '3.1.5+99'
-$env:UPDATE_DIR = "$HOME/.dsh/mobile-remote/update"
-.\tools\package-release.ps1
-Remove-Item Env:ALLOW_TEST_MANIFEST_VERSION, Env:MANIFEST_VERSION, Env:UPDATE_DIR
-```
-
-验收：检查 `updateDir/manifest.json` 的 `version` 为 `3.1.5+99`，并校验其中的 `sha256`、`size` 与 APK 一致；更新完成后可再次执行同一流程重复测试。只有显式设置 `ALLOW_TEST_MANIFEST_VERSION=1` 才允许覆盖；正式发布不得设置该变量，发布脚本还会要求测试 manifest 与 APK 语义版本一致且 build 更大。测试结束后清理测试 manifest 并恢复正式版本。
+原「APK 内置版本不变、只把 manifest 写成 `+99`」的测试配方（`ALLOW_TEST_MANIFEST_VERSION` / `MANIFEST_VERSION` / `UPDATE_DIR`）已随 issue #113 退役：假清单与 APK 实际身份不符，`package-release.sh` 现在对这三个变量 **fail-closed 退出 1**（不写任何产物）。重复验证自动更新改走 npm 通道，见 §4.2 与 §6（`tools/npm-drill.mjs`）。
 
 ### A.4 首次构建需要出网（代理由 .env 驱动）
 
