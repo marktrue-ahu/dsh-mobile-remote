@@ -71,7 +71,7 @@ npm 全局前缀需可写（本机为 `~/.local`，已验证可用）；若 `EAC
 
 1. **公共版本号不可回收**：同一包名同一版本一旦发布，内容不可变、不可覆盖；发布失败/内容有误只能申请**新版本**重来。
 2. **先载体、后插件**：载体 `X.Y.Z-app` 必须先发布成功并可解析，再发布主插件 `X.Y.Z`（发布窗口内主插件 404 属预期 fail-closed）。
-3. **正式发布前必须演练通过**：`npm-drill` 演练失败一律阻断正式发布（本地工作流规则同步此门禁）。
+3. **正式发布前必须演练通过**：`npm-drill` 演练失败一律阻断正式发布（本地工作流规则同步此门禁）。执行主体按发布方式：CI 默认链路在 CI 内执行（见 §5/§8），人工兜底链路在本机执行。
 4. **alpha 线在 develop**：`vX.Y.Z-alpha.N` tag 允许直接打在 `origin/develop` 的可达提交上；rc/stable tag 只允许对应 core 的 `release/vX.Y.Z`。CI 只校验**可达性**，不声称“tag 来自哪条分支”。
 5. **发布 build 号全局单调**：`+N` 由全局分配规则决定（`release-meta` 水位 + 历史 tag + 发布前沿 +1），不是某条分支的本地计数器；发布前必须用 `tools/next-build.mjs` 分配、`tools/prepare-release.mjs` 原子 bump。
 6. **发布政策记录唯一权威**：迁移水位、legacy tag 白名单、legacy carrier 核验映射与发布意图都在受保护分支 `release-meta` 的 `build-policy.json`；缺失/非法/双远端不一致 fail-closed，分支内副本不作为依据。
@@ -234,7 +234,7 @@ node dsh-mobile-app/tools/verify-update-manifest.mjs dsh-mobile-app/dist \
 > `package-release.sh`）。演练属于插件发布，因此位于根 `tools/`。
 
 
-演练用临时本地 registry 完整预演发布与安装链路，**不接触公共 npm、不消耗任何公共版本号**。演练通过是正式发布的前置门禁。
+演练用临时本地 registry 完整预演发布与安装链路，**不接触公共 npm、不消耗任何公共版本号**。演练通过是正式发布的前置门禁；CI 默认链路由 workflow 在 CI 内执行该演练，人工兜底链路需在本机对拟发布产物先跑通。
 
 ### 6.1 前置
 
