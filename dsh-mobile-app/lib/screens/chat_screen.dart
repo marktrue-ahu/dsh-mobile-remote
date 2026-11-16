@@ -7226,9 +7226,10 @@ class _ChatScreenState extends State<ChatScreen> {
       anchoredTurns.add(turn);
       final segments = segmentsOf(process);
       final liveNow = !process.ended;
-      // issue #108 v4：运行中/已完成分别按档位决定段默认展开；异常/插话强制段展开。
+      // issue #108：运行中插话强制段展开（简洁档也一样）；异常结束同样强制。
+      final forcedLive = liveNow && process.hasInterjection;
       final segmentExpandedByDefault = liveNow
-          ? policy.liveSegment == LiveSegmentMode.expanded
+          ? (policy.liveSegment == LiveSegmentMode.expanded || forcedLive)
           : (process.forceExpanded ||
               !turnAutoCollapsed(
                 process,
@@ -7410,11 +7411,16 @@ class _ChatScreenState extends State<ChatScreen> {
     // 与其给一个无效点按，不如禁用并保留箭头缺失的静态态。
     final liveNow = !process.ended;
     // issue #108 v4：完全展开只自动展开当前运行轮的详情；完成/历史不自动。
-    final autoDetail = policy.liveDetailsAutoExpanded && liveNow;
-    // 强制展开（运行中/插话/异常）保持不可收起；简洁运行中的摘要仍可手动展开。
+    // 完全展开：当前运行轮自动展开详情；运行中插话/异常不自动展开。
+    final autoDetail =
+        policy.liveDetailsAutoExpanded && liveNow && !process.hasInterjection;
+    // 强制展开（运行中/插话/异常）保持不可收起；简洁正常运行中的摘要仍可手动展开。
+    final forcedLive = liveNow && process.hasInterjection;
     final forced =
         process.forceExpanded &&
-        !(policy.mode == WorkStepDisplayMode.concise && liveNow);
+        !(policy.mode == WorkStepDisplayMode.concise &&
+            liveNow &&
+            !forcedLive);
     final children = <Widget>[];
     if (toolOnlyReplay) {
       children.add(Padding(
@@ -7688,7 +7694,9 @@ class _ChatScreenState extends State<ChatScreen> {
     required bool historyView,
     required TurnFoldPolicy policy,
   }) {
-    final autoDetail = policy.liveDetailsAutoExpanded && !process.ended;
+    final autoDetail = policy.liveDetailsAutoExpanded &&
+        !process.ended &&
+        !process.hasInterjection;
     if (row.isReasoning) {
       final key = '${process.turn}:${row.seq}';
       final expanded = _reasoningRowExpansions[key] ?? autoDetail;

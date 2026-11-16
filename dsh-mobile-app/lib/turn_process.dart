@@ -499,8 +499,7 @@ enum LiveGroupMode {
   flat,
 }
 
-/// issue #108 v4：已完成轮的过程段/过程组。
-enum CompletedSegmentMode { collapsed, expanded }
+/// issue #108 v4：已完成轮的过程组。
 enum CompletedGroupMode { hidden, collapsed, flat }
 
 /// 展示模式 → 折叠策略的映射表（issue #52 note 1700 / 桌面
@@ -537,26 +536,11 @@ class TurnFoldPolicy {
         WorkStepDisplayMode.expanded => LiveGroupMode.flat,
       };
 
-  /// 运行中是否能看到过程行（简洁/标准默认看不到；详细/完全展开可见）。
-  bool get liveRowsVisible =>
-      mode == WorkStepDisplayMode.detailed ||
-      mode == WorkStepDisplayMode.expanded;
-
   /// 运行中详情是否自动展开：仅完全展开的**当前轮**；完成/历史不自动。
   bool get liveDetailsAutoExpanded => mode == WorkStepDisplayMode.expanded;
 
-  /// 已完成详情永不自动展开（手动可开）。
-  bool get completedDetailsAutoExpanded => false;
-
   /// 活动条：简洁隐藏；标准常显；详细/完全展开按可见行去重。
   bool get liveActivityBarVisible => mode != WorkStepDisplayMode.concise;
-
-  /// 已完成过程段：简洁/标准默认整轮一行；详细/完全展开段展开。
-  CompletedSegmentMode get completedSegment =>
-      mode == WorkStepDisplayMode.concise ||
-              mode == WorkStepDisplayMode.standard
-          ? CompletedSegmentMode.collapsed
-          : CompletedSegmentMode.expanded;
 
   /// 已完成过程组：详细显示折叠抬头；完全展开平铺；简洁/标准不显示。
   CompletedGroupMode get completedGroups => switch (mode) {

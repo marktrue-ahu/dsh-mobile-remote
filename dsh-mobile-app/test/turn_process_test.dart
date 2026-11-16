@@ -308,17 +308,17 @@ void main() {
 
   group('展示模式四档策略表（issue #52 note 1700 / 桌面 presentation-policy）', () {
     const cases = <WorkStepDisplayMode, (bool, LiveSegmentMode, LiveGroupMode,
-        bool, bool) >{
-      // mode: (foldCompletedTurns, liveSegment, liveGroups, liveRowsVisible,
+        bool) >{
+      // mode: (foldCompletedTurns, liveSegment, liveGroups,
       //        liveDetailsAutoExpanded)
       WorkStepDisplayMode.concise:
-          (true, LiveSegmentMode.summary, LiveGroupMode.hidden, false, false),
+          (true, LiveSegmentMode.summary, LiveGroupMode.hidden, false),
       WorkStepDisplayMode.standard:
-          (true, LiveSegmentMode.expanded, LiveGroupMode.collapsed, false, false),
+          (true, LiveSegmentMode.expanded, LiveGroupMode.collapsed, false),
       WorkStepDisplayMode.detailed:
-          (false, LiveSegmentMode.expanded, LiveGroupMode.expanded, true, false),
+          (false, LiveSegmentMode.expanded, LiveGroupMode.expanded, false),
       WorkStepDisplayMode.expanded:
-          (false, LiveSegmentMode.expanded, LiveGroupMode.flat, true, true),
+          (false, LiveSegmentMode.expanded, LiveGroupMode.flat, true),
     };
     for (final entry in cases.entries) {
       test('${entry.key.name} 档策略', () {
@@ -326,10 +326,7 @@ void main() {
         expect(policy.foldCompletedTurns, entry.value.$1);
         expect(policy.liveSegment, entry.value.$2);
         expect(policy.liveGroups, entry.value.$3);
-        expect(policy.liveRowsVisible, entry.value.$4);
-        expect(policy.liveDetailsAutoExpanded, entry.value.$5);
-        // completed 维度
-        expect(policy.completedDetailsAutoExpanded, isFalse);
+        expect(policy.liveDetailsAutoExpanded, entry.value.$4);
       });
     }
 
@@ -345,7 +342,6 @@ void main() {
         expect(policy.liveDetailsAutoExpanded,
             mode == WorkStepDisplayMode.expanded,
             reason: mode.name);
-        expect(policy.completedDetailsAutoExpanded, isFalse, reason: mode.name);
       }
     });
   });

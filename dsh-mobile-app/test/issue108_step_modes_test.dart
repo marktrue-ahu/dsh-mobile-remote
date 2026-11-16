@@ -211,6 +211,58 @@ Finder _groupHeader() => find.byWidgetPredicate(
     );
 Finder _activityBar() => find.byKey(const ValueKey<String>('activity-bar'));
 
+
+List<Map<String, dynamic>> _interjectionRunningTurn() => [
+      {'seq': 1, 'type': 'turn/start', 'data': {'turn': 1}, 'time': 1000},
+      {
+        'seq': 2,
+        'type': 'user/message',
+        'data': {'messageId': 'u1', 'text': '问题', 'sourceKind': 'user'},
+      },
+      {
+        'seq': 3,
+        'type': 'assistant/message',
+        'data': {
+          'turn': 1,
+          'step': 1,
+          'messageId': 'a1',
+          'text': '',
+          'reasoning': 'check layout',
+          'reasoningChars': 12,
+        },
+        'time': 1100,
+      },
+      {
+        'seq': 4,
+        'type': 'tool/call',
+        'data': {
+          'turn': 1,
+          'step': 1,
+          'callId': 'c1',
+          'name': 'shell',
+          'arguments': '{"cmd":"ls"}',
+        },
+        'time': 1200,
+      },
+      {
+        'seq': 5,
+        'type': 'user/message',
+        'data': {'messageId': 'u2', 'text': '插话', 'sourceKind': 'user'},
+      },
+      {
+        'seq': 6,
+        'type': 'tool/call',
+        'data': {
+          'turn': 1,
+          'step': 2,
+          'callId': 'c2',
+          'name': 'read_file',
+          'arguments': '{"path":"a"}',
+        },
+        'time': 1300,
+      },
+    ];
+
 void main() {
   test('policy：四档运行中/已完成维度', () {
     final concise = const TurnFoldPolicy(mode: WorkStepDisplayMode.concise);
@@ -222,13 +274,11 @@ void main() {
     final standard = const TurnFoldPolicy(mode: WorkStepDisplayMode.standard);
     expect(standard.liveSegment, LiveSegmentMode.expanded);
     expect(standard.liveGroups, LiveGroupMode.collapsed);
-    expect(standard.liveRowsVisible, isFalse);
     expect(standard.liveActivityBarVisible, isTrue);
     expect(standard.foldCompletedTurns, isTrue);
 
     final detailed = const TurnFoldPolicy(mode: WorkStepDisplayMode.detailed);
     expect(detailed.liveGroups, LiveGroupMode.expanded);
-    expect(detailed.liveRowsVisible, isTrue);
     expect(detailed.liveDetailsAutoExpanded, isFalse);
     expect(detailed.foldCompletedTurns, isFalse);
     expect(detailed.completedGroups, CompletedGroupMode.collapsed);
@@ -434,4 +484,105 @@ void main() {
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
   });
+
+  testWidgets('简洁运行中插话：强制段展开（无摘要），组展开行可见且不可收起；标准/详细不回归', (tester) async {
+    await _pump(
+      tester,
+      _Backend(_interjectionRunningTurn()),
+      mode: WorkStepDisplayMode.concise,
+    );
+    expect(_summary(), findsNothing, reason: '插话强制段展开');
+    expect(_groupHeader(), findsWidgets);
+    expect(find.text('shell'), findsWidgets, reason: '简洁强制展开后组默认展开');
+    expect(find.text('参数'), findsNothing, reason: '详情仍按档位收起');
+    expect(find.text('收起过程'), findsNothing, reason: '强制段不可收起');
+    await tester.pumpWidget(const SizedBox.shrink());
+
+    await _pump(
+      tester,
+      _Backend(_interjectionRunningTurn()),
+      mode: WorkStepDisplayMode.standard,
+    );
+    expect(_summary(), findsNothing);
+    expect(_groupHeader(), findsWidgets);
+    expect(find.text('shell'), findsNothing, reason: '标准插话仍组抬头折叠');
+    expect(find.text('参数'), findsNothing);
+    await tester.pumpWidget(const SizedBox.shrink());
+
+    await _pump(
+      tester,
+      _Backend(_interjectionRunningTurn()),
+      mode: WorkStepDisplayMode.detailed,
+    );
+    expect(_summary(), findsNothing);
+    expect(find.text('shell'), findsWidgets);
+    expect(find.text('参数'), findsNothing);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('完全展开运行中插话：不分组行可见，但详情不自动展开', (tester) async {
+    await _pump(
+      tester,
+      _Backend(_interjectionRunningTurn()),
+      mode: WorkStepDisplayMode.expanded,
+    );
+    expect(_summary(), findsNothing);
+    expect(find.textContaining('工具调用'), findsNothing, reason: '不分组');
+    expect(find.text('shell'), findsWidgets);
+    expect(find.text('参数'), findsNothing, reason: '插话详情不自动展开');
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('简洁运行中止/异常结束：强制段展开但组按完成态折叠', (tester) async {
+    final aborted = _completedTurn();
+    aborted[6]['data'] = {
+      'turn': 1,
+      'reason': {'kind': 'aborted'},
+    };
+    await _pump(
+      tester,
+      _Backend(aborted),
+      mode: WorkStepDisplayMode.concise,
+    );
+    expect(_summary(), findsNothing, reason: '异常结束强制段展开');
+    expect(_groupHeader(), findsOneWidget);
+    expect(find.text('shell'), findsNothing);
+    expect(find.text('参数'), findsNothing);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+
+  testWidgets('切轮复位：手动展开 turn1 不影响新 turn2 的默认摘要', (tester) async {
+    final events = <Map<String, dynamic>>[
+      ..._completedTurn(),
+      {'seq': 8, 'type': 'turn/start', 'data': {'turn': 2}, 'time': 5000},
+      {
+        'seq': 9,
+        'type': 'user/message',
+        'data': {'messageId': 'u2', 'text': '第二个问题', 'sourceKind': 'user'},
+      },
+      {
+        'seq': 10,
+        'type': 'tool/call',
+        'data': {
+          'turn': 2,
+          'step': 1,
+          'callId': 'c2',
+          'name': 'read_file',
+          'arguments': '{"path":"b"}',
+        },
+        'time': 5100,
+      },
+    ];
+    await _pump(tester, _Backend(events), mode: WorkStepDisplayMode.concise);
+    expect(_summary(), findsNWidgets(2), reason: 'turn1/turn2 各一行摘要');
+    await tester.tap(_summary().first);
+    await tester.pump(const Duration(milliseconds: 150));
+    expect(_summary(), findsOneWidget, reason: '只展开 turn1；turn2 仍是摘要');
+    expect(_groupHeader(), findsOneWidget);
+    expect(find.text('shell'), findsNothing, reason: '已完成 turn1 组默认折叠');
+    expect(find.text('read_file'), findsNothing, reason: 'turn2 未手动展开');
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
 }
