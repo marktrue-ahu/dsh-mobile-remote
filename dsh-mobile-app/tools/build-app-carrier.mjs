@@ -445,10 +445,9 @@ function main() {
 			console.log(`  carrier  : ${carrierFile} (${carrierStat.size} B, sha256 ${record.sha256})`);
 			console.log(`  record   : ${recordFile}`);
 			console.log(`  版本配对 : ${pluginName}@${pluginVersion} ↔ @${appCarrierVersion}（App core=${pluginCore}）`);
-			console.log(`  主插件发布 : npm publish ${tgzFile} --tag ${pluginTag}`
-				+ `${pluginTag === "latest" ? "   # 稳定版：随 latest" : "   # 预发布：显式 alpha，不移动 latest"}`);
-			console.log(`  载体发布   : npm publish ${carrierFile} --tag app   # 本工具绝不执行；dist-tag 固定 app`);
-			info("未向任何 registry 发布（仅 npm pack 本地打包）；发布顺序由发布流程保证：先载体后主包");
+			console.log(`  插件期望 tag : ${pluginTag}   # 由 CI 按 tag 发布；本机不手工 publish`);
+			console.log(`  载体期望 tag : app              # 由 CI 配对发布；本机不手工 publish`);
+			info("未向任何 registry 发布（仅 npm pack 本地打包）；公共 npm 发布由版本 tag 触发 CI");
 			info("发布前预检：node dsh-mobile-app/tools/publish-carrier-check.mjs <dist目录>（离线，不发布）");
 		} finally {
 			fs.rmSync(carrierStage, { recursive: true, force: true });

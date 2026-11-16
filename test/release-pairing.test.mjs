@@ -320,8 +320,10 @@ test("正常顺序：先插件 tgz 后载体；清单/载体/APK/tgz 四者一�
 		assert.ok(String(carrierPkg.description ?? "").trim() !== "", "description 非空");
 		assertPassLine(build, "publishConfig.tag 必须是 app");
 		// 发布 tag 契约（task-28）：稳定版主插件用 latest；载体恒为 app。
-		assert.match(build.stdout, /主插件发布[^\n]*--tag latest/, "稳定版主插件发布 hint 必须是 --tag latest");
-		assert.match(build.stdout, /载体发布[^\n]*--tag app/, "载体发布 hint 必须是 --tag app");
+		// issue #113：builder 只报告 CI 期望 tag，不再打印手工 npm publish 命令行（公共发布由 tag 触发 CI）。
+		assert.match(build.stdout, /插件期望 tag\s*:\s*latest/, "稳定版主插件期望 tag 必须是 latest");
+		assert.match(build.stdout, /载体期望 tag\s*:\s*app/, "载体期望 tag 必须是 app");
+		assert.doesNotMatch(build.stdout, /npm publish/, "builder 不得再打印手工 npm publish 提示");
 
 		// 严格发布门禁
 		const verify = verifyPairing(f);
@@ -730,9 +732,11 @@ test("预发布配对：插件 3.2.1-alpha.1 + App 3.2.1+24 + 载体 3.2.1-alpha
 		assertExitPass(build, "预发布载体构建应成功");
 		assert.match(build.stdout, /实读 versionName=3\.2\.1 versionCode=24/);
 		// 发布 tag：主插件预发布用 alpha（不移动 latest）；载体恒 app。
-		assert.match(build.stdout, /主插件发布[^\n]*--tag alpha/, "预发布主插件发布 hint 必须是 --tag alpha");
-		assert.doesNotMatch(build.stdout, /主插件发布[^\n]*--tag latest/, "预发布不得提示 latest");
-		assert.match(build.stdout, /载体发布[^\n]*--tag app/);
+		// issue #113：builder 只报告 CI 期望 tag，不再打印手工 npm publish 命令行。
+		assert.match(build.stdout, /插件期望 tag\s*:\s*alpha/, "预发布主插件期望 tag 必须是 alpha");
+		assert.doesNotMatch(build.stdout, /插件期望 tag\s*:\s*latest/, "预发布不得提示 latest");
+		assert.match(build.stdout, /载体期望 tag\s*:\s*app/);
+		assert.doesNotMatch(build.stdout, /npm publish/);
 
 		const manifest = JSON.parse(await readFile(f.manifestPath, "utf8"));
 		assert.equal(manifest.schema, 1);
