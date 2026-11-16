@@ -1,5 +1,32 @@
 # Changelog
 
+## v3.2.4-alpha.20（build 52，issues #112）— rc.2 AgentRegistry 兼容（catalog/modelsRpc/send/receipt/approval）
+
+> 插件 `3.2.4-alpha.20` / App `3.2.4+52` / 载体 `3.2.4-alpha.20-app`。
+
+### DSH 0.2.2-rc.2 AgentRegistry 无 `roots` 兼容（#112）
+
+- 新增导出 `firstAgent(agents)` 能力探测：`roots` 是函数才调用；roots 为空/非数组/抛错均回退 `agents.list()`；list 缺失/抛错返回 `undefined`，绝不向上抛；
+- 修复 rc.2（仅 `list` 的 registry）下 `/m/api/catalog` 同步 500，以及 diagnostics 中 `modelsRpc=false` 的误判（真实 host harness 验证 rc.2 仅 list → `/catalog` 200、`diagnostics.modelsRpc=true`）；
+- 剩余直接 `agents.roots()` 调用全部并入 `firstAgent`：
+  - `/send` 无 `sessionId` 时不再因 roots 缺失抛 TypeError；
+  - `/send-receipt` 走 `firstAgent(...)?.id`，rc.2 下返回 `404 receipt-not-found` 而不是 500；
+  - `/dev/approval-test` 合成审批正常返回；
+  - `grep -n "\.roots()" lib/index.js` 归零；
+- roots 抛错、roots/list 都缺失等异常路径均不 500：catalog 走 503/降级、modelsRpc 如实为 false。
+
+### 测试覆盖（#112）
+
+- 单元：roots 非空优先、roots 空数组/抛错退回 list、仅 list、无 agents、roots+list 同时抛错、roots 正常但 list 抛错；
+- 真实 host harness（rc.2 仅 list registry）：`/catalog` 200、`diagnostics.modelsRpc=true`；roots 抛错 fallback；roots/list 都缺失不 500 且 modelsRpc=false；
+- 扩展用例：rc.2 仅 list 下 `/send` 无 sessionId 200、`/send-receipt` 404 receipt-not-found、合成审批 200；roots 抛错同样 fallback。
+
+### 验证
+
+- 本机发布门禁：node 测试 **1203**（1190 通过 / 13 跳过 / 0 失败）、flutter test **1464** 全绿、flutter analyze 0 error/warning（24 条既有 info）；首轮即全绿；
+- 真机 catalog / modelsRpc / send / receipt / approval 列为本版验收项（发布后按验收清单执行）。
+
+
 ## v3.2.4-alpha.19（build 51，issues #108 / #109 / #111）— 工作步骤四档 v4 与空会话 metadata 过滤
 
 > 插件 `3.2.4-alpha.19` / App `3.2.4+51` / 载体 `3.2.4-alpha.19-app`。
