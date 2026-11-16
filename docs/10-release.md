@@ -29,7 +29,7 @@
 | 术语 | 英文 | 做什么 | 是否接触公共 npm | 何时跑 |
 |---|---|---|---|---|
 | **预检** | preflight | 离线校验本地产物与元数据（清单/APK/载体 tarball/构建记录/发布字段/离线 `npm pack --dry-run`） | 否 | 构建后、发布前 |
-| **演练** | drill | 用**临时本地 registry** 真实跑一遍「发布 → 全新安装 → 载体发现 → 版本更新 → 失败路径」 | 否（只连 `127.0.0.1`） | 预检通过后、试发布/正式发布前 |
+| **演练** | drill | 用**临时本地 registry** 真实跑一遍「发布 → 全新安装 → 载体发现 → 版本更新 → 失败路径」 | 否（只连 `127.0.0.1`） | 预检通过后、正式发布前。CI 链路在 tag 触发后由 workflow 执行；人工兜底链路须在本机发布前跑通 |
 | **试发布** | canary publish | 向**真实 npm** 发**一次性包名**探针，验证真实 registry 的接收/体积/标签链路（预发布版本方式与现有纯 X.Y.Z 契约冲突，见 §7.1） | **是（需授权）** | 首次发版/大版本/链路变更时 |
 
 相关既有词汇：**发布清单**（`manifest.json`，配对权威）、**内容标识**（`plugin.contentSha256`）、**App 载体版本**（`X.Y.Z-app`，同包名预发布版本）。演练另有两个演练子域词汇：**演练 registry**（临时本地 Verdaccio 实例）、**演练版本**（`9.9.<随机补丁号>`，载体对应 `9.9.<补丁号>-app`；纯 X.Y.Z，不占正式版本线）。三词详细定义见 develop 的 `CONTEXT.md`（决策记录只落 develop，不在本分支重复）。
@@ -54,11 +54,11 @@
 | Node.js | ≥ 22.15（仓库开发基线 v24） | `node --version` |
 | npm | 11.x | `npm --version` |
 | pnpm | 11.x（演练安装用） | `pnpm --version` |
-| Verdaccio | **6.10.6**，全局安装（演练用，一次性） | `verdaccio --version` |
+| Verdaccio | **6.10.6**，全局安装（演练用，一次性）——**仅人工兜底链路或本机自查需要**；CI 默认链路由 workflow 自行安装，本机无需 | `verdaccio --version` |
 | Flutter/Android SDK | 构建 App 时（见附录 A） | `flutter doctor -v` |
 | Git 工作区 | 发布 HEAD 干净；分支/版本经授权 | `git status --short` |
 
-安装演练依赖（只装一次，脚本不会自动安装）：
+安装演练依赖（只装一次，脚本不会自动安装；**仅在本机跑演练时需要**，CI 默认链路由 workflow 安装）：
 
 ```bash
 npm i -g verdaccio@6.10.6
@@ -96,6 +96,8 @@ npm 全局前缀需可写（本机为 `~/.local`，已验证可用）；若 `EAC
 
 按顺序执行；任一项不满足即停止，不放行发布。
 
+> **CI 默认链路的时间顺序**：本表大部分项在推 tag **之前**完成。其中「演练门禁」一项的 CI 分支由 workflow 在 tag 触发后执行、失败在实际 `npm publish` 之前阻断——它**不阻塞**授权与推 tag，属未来时点的门禁而非前置条件。人工兜底链路则必须在本机预跑演练后才能发布。
+
 - [ ] **先读发布政策记录**：`git fetch --multiple --tags origin github` 后运行 `node tools/next-build.mjs`，必须 `RESULT: PASS`；输出 next build 与 release-meta 的 watermark/发布前沿一致，且 `origin/release-meta` 与 `github/release-meta` 内容一致（双远端）。缺失/不一致/存在未关闭发布意图 → 停止。
 - [ ] 规划中的插件版本 `<X.Y.Z[-prerelease]>` 与载体版本 `<X.Y.Z[-prerelease]>-app` 都未在 npm 上占用；`node tools/prepare-release.mjs` 会用只读 `npm view` 预检。alpha tag 必须落在 develop 可达提交上，rc/stable 必须落在对应 `release/vX.Y.Z`。
 - [ ] `latest` 语义按 ADR 0025 收敛：alpha/rc 发布前后 `latest` 必须不变；只有 stable 可前进。bootstrap 期 `latest` 允许暂为 prerelease（当前为 `3.2.3-rc.1`），首个 stable 发布后必须指向 stable；不为满足规则自动发布 stable、不删除/改名历史版本。
@@ -124,7 +126,7 @@ npm 全局前缀需可写（本机为 `~/.local`，已验证可用）；若 `EAC
       > `set -euo pipefail` 保证前一步失败不会继续执行后续门禁。
 - [ ] 构建机环境就绪（附录 A）；签名 keystore 已备份、未丢失。
 - [ ] 演练门禁（按发布方式执行）：
-  - 走 **CI 默认链路**：演练由 workflow 在 tag 触发后于 CI 内执行（workflow 安装 Verdaccio 后运行 `package-release.sh --drill`，失败即阻断，无 continue-on-error）。**推 tag 前无需在本机预跑演练、无需本机 verdaccio**；但需确认 CI 侧 verdaccio 可用（由 workflow 固定安装 `verdaccio@6.10.6`）。
+  - 走 **CI 默认链路**：演练由 workflow 在 tag 触发后于 CI 内执行（workflow 安装 Verdaccio 后运行 `package-release.sh --drill`，失败即阻断，无 continue-on-error）。**本检查项不在推 tag 前阻塞**：它是由 workflow 在未来执行的发布前门禁，失败会在实际 `npm publish` 之前阻断。因此本机推 tag 前无需预跑演练、无需本机 Verdaccio。
   - 走 **人工兜底链路**：本机需就绪 `verdaccio --version`，并先在拟发布的本地 `<dist>` 上跑通 §6 演练（`RESULT: PASS`），再执行 `npm publish`。
 - [ ] 已取得本次**发布授权**（试发布与正式发布均需授权；本手册不代授权）。
 - [ ] 发布窗口内不再 rebase/改版本/重打产物；发布记录人、时间、版本已登记。
@@ -326,6 +328,8 @@ CLI 契约：
 > **需授权**：试发布会向真实 npm 发布内容。未经明确授权不得执行。本手册不实现自动化。
 
 目的：验证公共 npm 的**真实接收能力**（体积/请求体上限、认证、dist-tag 机制、镜像可取性）——这些是本地演练覆盖不到的。试发布是**真源补充**，不能替代 §5 预检与 §6 演练。
+
+> **与演练门禁的先后关系**：试发布向真实 npm 发布一次预发布版本，属独立动作。走 CI 默认链路时，试发布同样由 tag 触发 workflow，CI 会在该次 workflow 内执行演练并在失败时阻断——**不需要在本机先跑演练**；走人工兜底链路时，须先在本机跑通 §6 演练。两种链路都不存在「先试发布、后才有机会演练」的死锁。
 
 > **同包名 prerelease**：发布工具与运行时现已支持经授权的 `X.Y.Z-<pre>` 插件版本，载体精确配对为 `<插件完整版本>-app`。alpha 示例：插件 `3.2.4-alpha.N`、App `3.2.4+<全局 build>`、载体 `3.2.4-alpha.N-app`；载体使用 `app` tag（只有决策允许前进时才移动）。
 >
