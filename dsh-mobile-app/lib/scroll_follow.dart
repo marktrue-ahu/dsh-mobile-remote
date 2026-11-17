@@ -232,24 +232,11 @@ class ScrollFollowCoordinator {
 
   /// 非用户驱动的几何变化（滚动 tick / ScrollMetricsNotification）。
   ///
-  /// 只更新派生展示；**不**因“接近底部”而恢复意图（§5.2：near-bottom 不得反过来
-  /// 偷偷改变意图）。但有一个例外：**像素位置向顶部移动**且没有用户拖拽时，说明
-  /// 有程序性滚动把视口移离末端（如测试/外部 ensureVisible）——此时按“上翻”进入
-  /// 阅读，避免已排队的跟随校正把视口拉回底部。内容增高/缩短只改 max、不改 pixels，
-  /// 不会触发这条；缩短时的 clamp 会落在末端（atBottom），也不触发。
+  /// 只更新派生展示；**不**改意图。意图只由真实用户手势（拖拽/惯性结束）、显式
+  /// 导航/回底/强制定位改变——不能从 pixels 移动方向逆推（§5.2：几何不得反写意图；
+  /// 键盘/视口/框架布局调整同样会移动 pixels，programmaticDepth 也覆盖不全）。
   void onMetrics(ScrollGeometry geometry) {
-    final previous = _lastGeometry;
-    final movedTowardTop =
-        previous != null &&
-        !_dragging &&
-        geometry.pixels < previous.pixels - 0.5;
     _updateDisplay(geometry);
-    if (movedTowardTop &&
-        _intent == FollowIntent.followLatest &&
-        !_isAtBottom(geometry)) {
-      _intent = FollowIntent.reading;
-      _refreshShowJumpToLatest();
-    }
   }
 
   // ── 世代 / 模式 ───────────────────────────────────────────────────

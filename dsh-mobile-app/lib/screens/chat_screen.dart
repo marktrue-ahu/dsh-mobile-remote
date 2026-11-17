@@ -734,6 +734,10 @@ class _ChatScreenState extends State<ChatScreen> {
   @visibleForTesting
   bool get debugShowJumpToLatest => _showJumpToLatest;
 
+  /// 当前跟随意图（只读探针）：需求/按钮用例直接断言意图，而不是用几何反推。
+  @visibleForTesting
+  FollowIntent get debugFollowIntent => _scrollFollow.intent;
+
   /// 调度契约探针：owner 的 ensureFrame → 生产实现必须自己调度一帧
   /// （post-frame 回调本身不调度帧，必须 ensureVisualUpdate）。
   @visibleForTesting

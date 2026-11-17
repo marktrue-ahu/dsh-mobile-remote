@@ -204,16 +204,18 @@ void main() {
       expect(h.coordinator.showJumpToLatest, isTrue);
     });
 
-    test('无用户拖拽时像素向顶部移动 → 进入阅读（程序性移离末端）', () {
+    test('onMetrics 不因 pixels 移动方向改意图（意图只由用户手势/显式动作改变）', () {
       final h = _Harness();
-      h.coordinator.onMetrics(_geo(pixels: 900, max: 1000));
+      h.coordinator.onMetrics(_geo(pixels: 1000, max: 1000));
       expect(h.coordinator.intent, FollowIntent.followLatest);
       h.coordinator.onMetrics(_geo(pixels: 500, max: 1000));
       expect(
         h.coordinator.intent,
-        FollowIntent.reading,
-        reason: '程序性滚动把视口移离末端 → 阅读，避免已排队校正抢回',
+        FollowIntent.followLatest,
+        reason: '像素向顶部移动不是意图信号（§5.2：几何不得反写意图）',
       );
+      h.coordinator.onMetrics(_geo(pixels: 900, max: 1000));
+      expect(h.coordinator.intent, FollowIntent.followLatest);
     });
   });
 

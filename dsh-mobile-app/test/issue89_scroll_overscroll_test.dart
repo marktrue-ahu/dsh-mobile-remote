@@ -13,6 +13,7 @@ import 'dart:convert';
 import 'package:dsh_mobile_app/api.dart';
 import 'package:dsh_mobile_app/models.dart';
 import 'package:dsh_mobile_app/screens/chat_screen.dart';
+import 'package:dsh_mobile_app/scroll_follow.dart';
 import 'package:dsh_mobile_app/store.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -282,15 +283,14 @@ void main() {
     await tester.drag(scroll, const Offset(0, 500));
     await tester.pump(const Duration(milliseconds: 400));
     _expectWithinRange(tester);
-    final pos = _position(tester);
-    // #114 P2 产品行为变更：阅读态始终显示「回到底部」；只有真正到底（跟随态）才隐藏。
-    // 旧断言按“160px 内即视为贴底”推导，会与新的“真正到底才钉”冲突。
-    final atTrueBottom = pos.maxScrollExtent - pos.pixels <= 1;
-    expect(
-      _jumpVisible(tester),
-      !atTrueBottom,
-      reason: '阅读态必须始终有回底入口；仅在真正到底（跟随）时隐藏',
-    );
+    // issue #114 P2-1：直接断言**意图**与按钮表达，不用几何反推意图。
+    final st = tester.state(find.byType(ChatScreen)) as dynamic;
+    expect(st.debugFollowIntent, FollowIntent.reading,
+        reason: '真实上翻后处于阅读态（未真正到底）');
+    expect(st.debugShowJumpToLatest, isTrue,
+        reason: '阅读态必须始终显示回底入口');
+    expect(_jumpVisible(tester), isTrue,
+        reason: '意图与按钮表达一致');
     await _finishTimers(tester);
   });
   testWidgets('长换行内容：上翻出圆钮（padding38）→拖回底部（padding16）pixels 不越界、无大块空白', (tester) async {

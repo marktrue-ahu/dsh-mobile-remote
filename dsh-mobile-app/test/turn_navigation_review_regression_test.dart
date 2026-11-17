@@ -222,17 +222,25 @@ void main() {
     testWidgets('离开底部区间内跨多轮滚动，高亮跟随', (tester) async {
       final backend = _Backend(initialEvents: _turnEvents(1, 8));
       await _pumpChat(tester, backend: backend);
+      final scroll = find.byType(CustomScrollView);
 
-      _position(tester).jumpTo(0);
-      await tester.pumpAndSettle();
+      // #114 P1：用真实手势持续上翻（不用 jumpTo 伪装用户滚动）。
+      for (var i = 0; i < 60; i++) {
+        if (_position(tester).pixels <= 1 && _rail(tester).activeTurn == 1) break;
+        await tester.drag(scroll, const Offset(0, 600));
+        await tester.pump(const Duration(milliseconds: 120));
+      }
       expect(find.byType(TurnNavigatorRail), findsOneWidget);
       expect(_rail(tester).activeTurn, 1);
 
-      final max = _position(tester).maxScrollExtent;
-      _position(tester).jumpTo(max * 0.55);
-      await tester.pumpAndSettle();
+      // 持续向下滚（真实手势），高亮应跨多轮跟随、不能停在第一轮。
+      for (var i = 0; i < 60; i++) {
+        await tester.drag(scroll, const Offset(0, -400));
+        await tester.pump(const Duration(milliseconds: 120));
+        if (_rail(tester).activeTurn != 1) break;
+      }
       expect(_rail(tester).activeTurn, isNot(1),
-          reason: '始终在 160px 阈值外，滚动本身也必须触发几何校准');
+          reason: '真实持续滚动跨多轮，高亮必须跟随几何校准');
     });
 
     testWidgets('长回复导致起始边界被回收时，用可见轮次推断而不跳到最新轮', (tester) async {

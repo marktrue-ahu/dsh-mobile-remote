@@ -140,6 +140,19 @@ ScrollPosition _pos(WidgetTester tester) => tester
     .position;
 
 /// 消息列表第一条 live SliverPadding 的右 padding（与轨道显隐同帧）。
+Finder get _jumpButton => find.byWidgetPredicate(
+      (w) => w.runtimeType.toString() == '_JumpToLatestButton',
+    );
+
+bool _jumpVisible(WidgetTester tester) {
+  final finder = _jumpButton;
+  if (finder.evaluate().isEmpty) return false;
+  final animated =
+      find.descendant(of: finder, matching: find.byType(AnimatedOpacity));
+  if (animated.evaluate().isEmpty) return false;
+  return tester.widget<AnimatedOpacity>(animated.first).opacity > 0.5;
+}
+
 double _liveRightPadding(WidgetTester tester) {
   final paddings = tester
       .widgetList<SliverPadding>(find.descendant(
@@ -161,10 +174,6 @@ double? _visibleUserTextRight(WidgetTester tester) {
   }
   return null;
 }
-
-Finder get _jumpButton => find.byWidgetPredicate(
-      (w) => w.runtimeType.toString() == '_JumpToLatestButton',
-    );
 
 void main() {
   testWidgets('390：轨道 28/右 8、正文右让 action gutter、gutter 不命中', (tester) async {
@@ -227,6 +236,18 @@ void main() {
     await tester.pump(const Duration(milliseconds: 200));
     expect(_pos(tester).pixels, closeTo(before, 1));
     expect(tester.takeException(), isNull);
+    await tester.pump(const Duration(milliseconds: 900));
+  });
+
+  testWidgets('底部跟随：既无轨道也无圆钮 → padding 16', (tester) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+    await _pumpChat(tester, _TurnBackend(turns: 6));
+    // 停在真正的底部（follow）：轨道只在离开底部时出现；圆钮在 follow+真正到底时隐藏。
+    expect(_rail, findsNothing, reason: '在底部时轨道隐藏');
+    expect(_jumpVisible(tester), isFalse, reason: 'follow + 真正到底 → 圆钮隐藏');
+    expect(_liveRightPadding(tester), 16, reason: '既无轨道也无圆钮 → 默认 16dp');
     await tester.pump(const Duration(milliseconds: 900));
   });
 
