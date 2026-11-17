@@ -53,8 +53,9 @@ App 版本 `X.Y.Z+<build>`，载体版本 `<完整插件版本>-app`。App 与�
 
 **维护者步骤**：
 
-1. **发布前检查**（手册 §2）：`git fetch --multiple --tags origin github` → `node tools/next-build.mjs` 必须
-   `RESULT: PASS`；目标版本未在 npm 占用；`git status --short` 干净；发布授权已取得。
+1. **发布前检查**（手册 §2）：`git fetch --multiple --tags origin github` → `node tools/next-build.mjs --remotes github` 必须
+   `RESULT: PASS`（**必须带 `--remotes github`**：`release-meta` 只在 GitHub 保留，不带该参数会按默认双远端校验以
+   `release-meta-diverged` fail-closed；GitLab 上可能残留旧 `release-meta`，是历史快照不是权威）；目标版本未在 npm 占用；`git status --short` 干净；发布授权已取得。
 2. **跑门禁**（手册 §2 的隔离子 shell；**禁止在运行中 profile 的 HOME 下跑**）：`node --test test/*.mjs` +
    `flutter analyze` + `flutter test` 全绿。此步不带产物，**不跑发版演练**（演练的对象是构建产物，见第 5 步）。
 3. **原子 bump**：`node tools/prepare-release.mjs --version <完整插件版本> --build <next>`（如
