@@ -1,5 +1,39 @@
 # Changelog
 
+## v3.2.4-rc.1（build 54，issues #113 #114）— 发布工具链精简 + 聊天滚动跟随单一 owner
+
+> 插件 `3.2.4-rc.1` / App `3.2.4+54` / 载体 `3.2.4-rc.1-app`。本 fork 的 RC 发布候选：插件发布到 npm `rc` dist-tag，`latest` 保持 `3.2.3-rc.1` 不动（只有 stable 可前进）。release 线从 develop `aae26a7` 切出，本版本只接受修复、版本号与 CHANGELOG。
+
+### 本机发布工具链精简（#113）
+
+- 退役三个旧本机发布入口：`tools/restart-dsh-web-service.sh`、`tools/postrestart-check.sh`、`dsh-mobile-app/tools/package-release.ps1`（发布集中在 GitHub Actions tag 触发链路；部署后恢复由已确认的容器/服务管理机制负责，不另造替代脚本）；
+- `dsh-mobile-app/tools/package-release.sh` 删除 `UPDATE_DIR` 人工目录复制与 `MANIFEST_VERSION` / `ALLOW_TEST_MANIFEST_VERSION` 假版本清单分支；对三个退役变量在写入任何产物/共享目录之前 fail-closed，`--drill` / `--drill-only` / `--check-only` 三条路径保留；
+- 新增 `test/release-retired-entrypoints.test.mjs`（退役变量单独/组合 fail-closed、不创建目标目录、守卫先于写盘、dry-run 路径不受影响）；`build-app-carrier.mjs` 只报告 CI 期望 tag，不再打印手工 `npm publish` 命令；
+- 修复测试夹具的载体发现：相关 HTTP 契约用例的插件根改为隔离目录，不再读到宿主真载体，消除整文件 V8 OOM（根因与前后对比见 #113）；
+- 文档同步：`docs/10-release.md` 按 tag 触发 CI 链路重写发布步骤，`docs/06-install-run.md` 与 `CONTRIBUTING.md` 发布清单同步。
+
+### 聊天滚动跟随收口单一 owner（#114）
+
+- 新增 `dsh-mobile-app/lib/scroll_follow.dart`（`ScrollFollowCoordinator`，零 Flutter 依赖）：把跟随意图、几何事实、用户拖拽、导航/会话世代、待执行校正收口为一个可单测的 owner；near-bottom 与回底按钮显隐只作派生展示，不再反写意图；
+- 三个已复现缺陷修复：① 初始定位/布局后校正留下大块空白；② 帧后校正被饿死（执行时重查拖拽/意图/世代）；③ 拖拽前 160px 内被程序性校正抢回手势；
+- 校正自己保证有帧（post-frame + `ensureVisualUpdate`，合并、有界、收敛即停）；强制定位（初始打开/回 live/发送/显式回底）统一走有界收敛入口；
+- **真正到底才钉底**：跟随意图只在真实用户拖拽/惯性结束时按「真正到底」（|距末端| ≤ 1px，越过末端同样算）判定；程序性 jump/`ensureVisible` 及其 ballistic `ScrollEnd` 不参与；160px 仅保留为回底按钮/刻度轨/活动条去重的派生展示阈值；
+- **阅读态始终显示回底按钮**（判据 `intent==reading || !nearBottom`），消除「近底但无入口」死角；嵌套滚动 `depth≠0` 的拖动/metrics 不再改写主列表意图或几何快照；
+- `chat_screen.dart` 删除 `_pinnedToBottom`/`_userDragActive`/`_followBottomScheduled`/`_settledFollowScheduled`/`_settleToBottom`/`_scrollToBottom` 等分散状态与补丁；测试新增动态回放测量闭环、真正到底四情形、惯性生命周期、程序性移动、调度契约、1 帧调度与内层滚动用例（关键守卫 13 项变异反证）。
+
+### 决策记录与文档
+
+- ADR 0030：`release-meta` 只在 GitHub 保留（唯一权威），本机分配用 `node tools/next-build.mjs --remotes github`；单远端仅限该分支，代码分支与 tag 仍推双远端；
+- ADR 0031：滚动跟随保留单一 owner 与三条不变量（自己保证有帧 / 执行时重查意图 / 强制定位有界收敛）；
+- `CONTEXT.md` 新增「跟随意图 / 真正到底 / 末端残差 / 滚动校正 / 滚动跟随协调器 / 发布政策记录单远端」术语，并修正发布政策记录的权威位置；
+- `docs/10-release.md`、`docs/06-install-run.md`、`CONTRIBUTING.md` 与 `publish-npm.yml` 注释统一单远端口径（照抄执行的 `next-build` 调用补 `--remotes github`）。
+
+### 验证
+
+- 本机发布门禁（bump 后树，隔离 HOME）：flutter analyze 0 error / 0 warning（24 条既有 info）、flutter test **1513** 全绿、timeline-contract **179 PASS / 0 FAIL**、account-usage **15 通过 / 0 失败**、Kotlin `UsagePanelModelTest` 27 用例 0 失败（`--rerun-tasks` 强制重跑，BUILD SUCCESSFUL）；
+- 真机滚动跟随四档验收列为发布后验收项（与 alpha.21 相同范围）。
+
+
 ## v3.2.4-alpha.21（build 53，issues #114）— 聊天滚动跟随重写：单一 owner + 真正到底才钉底
 
 > 插件 `3.2.4-alpha.21` / App `3.2.4+53` / 载体 `3.2.4-alpha.21-app`。
