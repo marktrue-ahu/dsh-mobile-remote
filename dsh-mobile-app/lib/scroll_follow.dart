@@ -144,7 +144,8 @@ class ScrollFollowCoordinator {
   /// 生产实现要同时满足：注册 post-frame 回调 + 确保下一帧被调度。
   final void Function() ensureFrame;
 
-  /// 「接近底部」的产品阈值：只用于回底按钮等派生展示，不用于意图判定。
+  /// 「接近底部」的**产品展示**阈值：只用于回底按钮/刻度轨显隐，不用于意图判定。
+  /// 维护者口径（#114 task-11）：意图必须「真正到底」才钉住；160px 只是按钮产品阈值。
   final double nearBottomThreshold;
 
   /// 收敛容差（logical px）：`|distanceToEnd| <= tolerance` 且无越界即视为已到达。
@@ -171,6 +172,7 @@ class ScrollFollowCoordinator {
   int _cancelledByUserCount = 0;
   int _cancelledByIntentCount = 0;
   int _staleGenerationCount = 0;
+  int _programmaticDragInterrupts = 0;
 
   // ── 只读状态（生产/测试共用） ──────────────────────────────────────
   FollowIntent get intent => _intent;
@@ -195,6 +197,7 @@ class ScrollFollowCoordinator {
   int get cancelledByUserCount => _cancelledByUserCount;
   int get cancelledByIntentCount => _cancelledByIntentCount;
   int get staleGenerationCount => _staleGenerationCount;
+  int get programmaticDragInterrupts => _programmaticDragInterrupts;
 
   // ── 用户动作 ───────────────────────────────────────────────────────
   /// 真实用户拖拽开始（只允许由带 dragDetails 的 ScrollStart/Update 调用）。
@@ -213,46 +216,68 @@ class ScrollFollowCoordinator {
 
   /// 真实用户手势结束（滚动活动停止，含惯性结束）。
   ///
-  /// 意图恢复只由「用户动作 + 几何判据」决定：停在接近底部 → 恢复跟随；
-  /// 否则进入阅读。内容/布局变化本身不改变意图（§5.2）。
+  /// 意图恢复只由「用户动作 + 几何判据」决定：**真正到底**（容差内）才恢复跟随；
+  /// 其余一律进入阅读（不是 160px 产品阈值——那是按钮显隐用的）。
+  /// 滚动生命周期：Flutter 在滚动活动真正结束时才派发 ScrollEnd，其几何即停稳后的
+  /// 几何；惯性（ballistic）结束后没有第二个 ScrollEnd，所以这里必须按最终几何判定。
+  /// 内容/布局变化本身不改变意图（§5.2）。
   void onUserScrollEnd(ScrollGeometry geometry) {
     _dragging = false;
     _updateDisplay(geometry);
-    _intent = _isNearBottom(geometry)
+    _intent = _isAtBottom(geometry)
         ? FollowIntent.followLatest
         : FollowIntent.reading;
-    _cancelPending();
+    _refreshShowJumpToLatest();
   }
 
   /// 非用户驱动的几何变化（滚动 tick / ScrollMetricsNotification）。
   ///
-  /// 只更新派生展示；**不**改意图（§5.2：near-bottom 不得反过来偷偷改变意图）。
+  /// 只更新派生展示；**不**因“接近底部”而恢复意图（§5.2：near-bottom 不得反过来
+  /// 偷偷改变意图）。但有一个例外：**像素位置向顶部移动**且没有用户拖拽时，说明
+  /// 有程序性滚动把视口移离末端（如测试/外部 ensureVisible）——此时按“上翻”进入
+  /// 阅读，避免已排队的跟随校正把视口拉回底部。内容增高/缩短只改 max、不改 pixels，
+  /// 不会触发这条；缩短时的 clamp 会落在末端（atBottom），也不触发。
   void onMetrics(ScrollGeometry geometry) {
+    final previous = _lastGeometry;
+    final movedTowardTop =
+        previous != null &&
+        !_dragging &&
+        geometry.pixels < previous.pixels - 0.5;
     _updateDisplay(geometry);
+    if (movedTowardTop &&
+        _intent == FollowIntent.followLatest &&
+        !_isAtBottom(geometry)) {
+      _intent = FollowIntent.reading;
+      _refreshShowJumpToLatest();
+    }
   }
 
   // ── 世代 / 模式 ───────────────────────────────────────────────────
-  /// 会话切换：丢弃旧世代与旧意图。
+  /// 会话切换：世代前进、意图复位跟随。
+  ///
+  /// 待执行校正**不在这里直接丢弃**：保留下一个帧去执行时由 [takeCorrection] 的
+  /// 世代检查丢弃并计入 `staleGenerationCount`——这样这条守卫是真正可达、可测的
+  /// （否则“先取消 pending”会让它永远走不到）。
   void onSessionChanged() {
     _generation += 1;
     _intent = FollowIntent.followLatest;
     _dragging = false;
-    _cancelPending();
+    _refreshShowJumpToLatest();
   }
 
-  /// 显式轮次定位/历史导航开始：暂停自动跟随，旧校正一律作废。
+  /// 显式轮次定位/历史导航开始：暂停自动跟随；旧世代校正由执行时守卫丢弃。
   void onNavigationStarted() {
     _generation += 1;
     _intent = FollowIntent.reading;
-    _cancelPending();
+    _refreshShowJumpToLatest();
   }
 
-  /// 历史/实时视图切换等「重新定位」场景：世代前进并作废旧校正。
+  /// 历史/实时视图切换等「重新定位」场景：世代前进；旧世代校正由执行时守卫丢弃。
   void bumpGeneration({FollowIntent? intent}) {
     _generation += 1;
     if (intent != null) _intent = intent;
     _dragging = false;
-    _cancelPending();
+    _refreshShowJumpToLatest();
   }
 
   // ── 请求 ───────────────────────────────────────────────────────────
@@ -275,7 +300,11 @@ class ScrollFollowCoordinator {
   }) {
     if (_disposed) return;
     _intent = FollowIntent.followLatest;
-    if (geometry != null) _updateDisplay(geometry);
+    if (geometry != null) {
+      _updateDisplay(geometry);
+    } else {
+      _refreshShowJumpToLatest();
+    }
     _book(reason, budget ?? defaultBudget);
   }
 
@@ -371,8 +400,15 @@ class ScrollFollowCoordinator {
 
   // ── 程序性滚动标记 ─────────────────────────────────────────────────
   /// 程序性滚动期间，所有 ScrollEnd 都不得被当作「用户手势结束」。
+  ///
+  /// 同时：程序性滚动会取消正在进行的 DragScrollActivity（框架行为），所以拖拽
+  /// 状态必须一起失效，否则会出现“僵尸拖拽”（flag=true 但物理手势已被取消）。
   void beginProgrammaticScroll() {
     _programmaticDepth += 1;
+    if (_dragging) {
+      _dragging = false;
+      _programmaticDragInterrupts += 1;
+    }
   }
 
   void endProgrammaticScroll() {
@@ -394,6 +430,11 @@ class ScrollFollowCoordinator {
     if (userGesture) _cancelledByUserCount += 1;
   }
 
+  /// 意图判据：**真正到底**（容差内；越过末端也算到底）。不看 160px 产品阈值。
+  bool _isAtBottom(ScrollGeometry geometry) =>
+      geometry.distanceToEnd <= convergeTolerance;
+
+  /// 展示判据：产品阈值（接近底部），只影响回底按钮/刻度轨。
   bool _isNearBottom(ScrollGeometry geometry) =>
       geometry.distanceToEnd <= nearBottomThreshold;
 
@@ -403,9 +444,17 @@ class ScrollFollowCoordinator {
 
   void _updateDisplay(ScrollGeometry geometry) {
     _lastGeometry = geometry;
-    final near = _isNearBottom(geometry);
-    if (near != _nearBottom) _nearBottom = near;
-    final show = !near;
+    _nearBottom = _isNearBottom(geometry);
+    _refreshShowJumpToLatest();
+  }
+
+  /// 回底按钮/刻度轨显隐 = 派生展示：按 160px 产品阈值（近底隐藏）。
+  ///
+  /// 已知产品取舍（#114 task-11 汇报）：意图改为“真正到底才钉”后，用户停在
+  /// 距底 ≤160px 但 >容差处会处于阅读态而按钮隐藏（看不到显式恢复入口）。
+  /// 本任务不擅自改按钮产品阈值——保留既有 160px 行为，把该死角上报产品决策。
+  void _refreshShowJumpToLatest() {
+    final show = !_nearBottom;
     if (show != _showJumpToLatest) _showJumpToLatest = show;
   }
 }

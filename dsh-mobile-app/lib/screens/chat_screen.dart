@@ -696,8 +696,6 @@ class _ChatScreenState extends State<ChatScreen> {
   // 意图判定、合并、预算、执行时守卫都在 ScrollFollowCoordinator 内（可单测）。
   late final ScrollFollowCoordinator _scrollFollow;
   bool _scrollFollowFrameBooked = false;
-  /// 程序性校正引发的回弹/越界修正期间：不得被当成「用户上翻」去拉更早历史。
-  bool _autoCorrectionSettling = false;
   // ── issue #77：活跃会话滚动贴底 ────────────────────────────────────
   // 内容短于视口时用顶部占位把消息列表底部对齐视口底部（否则 center 布局会顶对齐、
   // 下方留大片空白）；内容增长不算「上翻」（只有用户拖动才停止跟随）。
@@ -731,6 +729,15 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @visibleForTesting
   double get debugLiveBottomGap => _liveBottomGap;
+
+  /// 派生展示：回底按钮/刻度轨是否可见（只读探针，供需求用例断言）。
+  @visibleForTesting
+  bool get debugShowJumpToLatest => _showJumpToLatest;
+
+  /// 调度契约探针：owner 的 ensureFrame → 生产实现必须自己调度一帧
+  /// （post-frame 回调本身不调度帧，必须 ensureVisualUpdate）。
+  @visibleForTesting
+  void debugEnsureScrollFollowFrame() => _ensureScrollFollowFrame();
 
   /// 实际执行过的程序性校正次数与最后一次目标（issue §6.2「校正次数」）。
   @visibleForTesting
@@ -798,7 +805,6 @@ class _ChatScreenState extends State<ChatScreen> {
       );
     }
     debugFollowJumps += 1;
-    _autoCorrectionSettling = true;
     _scrollFollow.beginProgrammaticScroll();
     try {
       position.jumpTo(correction.targetPixels);
@@ -1131,13 +1137,6 @@ class _ChatScreenState extends State<ChatScreen> {
     final pos = _scrollCtrl.position;
     if (!pos.hasContentDimensions) return;
     _scrollFollow.onMetrics(_geometryOfPosition(pos));
-    if (_autoCorrectionSettling &&
-        !_scrollFollow.hasPendingCorrection &&
-        !pos.isScrollingNotifier.value &&
-        _scrollFollow.lastGeometry != null &&
-        _scrollFollow.lastGeometry!.rangeError <= 1) {
-      _autoCorrectionSettling = false;
-    }
     _syncScrollFollowDisplay();
     // issue #24：持续滚动也要校准当前轮。跨 160px 阈值只覆盖显隐切换，
     // 一直停留在"离开底部"时页面不会重建，高亮就会停在旧值。
@@ -2178,6 +2177,9 @@ class _ChatScreenState extends State<ChatScreen> {
   /// 的 drag 路径；单独监听 ScrollMetricsNotification，避免 pinned/回底按钮 stale。
   bool _onLiveScrollMetrics(ScrollMetricsNotification n) {
     if (!mounted || _inHistory) return false;
+    // issue #114 task-11：只接受**外层**消息列表的 metrics。工具卡/注入块等内层
+    // SingleChildScrollView 的 metrics 冒泡上来（depth>0）时不得污染 owner 几何快照。
+    if (n.depth != 0) return false;
     // 几何只作为事实喂给 owner：更新派生展示（回底按钮/刻度轨），不改意图。
     _scrollFollow.onMetrics(_geometryOfMetrics(n.metrics));
     _syncScrollFollowDisplay();
@@ -2185,14 +2187,23 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   bool _onLiveScroll(ScrollNotification n) {
+    // issue #114 task-11：内层滚动（工具卡详情/注入块里的 SingleChildScrollView）
+    // 的通知会冒泡到这里；depth>0 一律忽略——否则用户只是滚内层内容，主对话就
+    // 被当成“用户手势结束”改写意图（违反“拉到最底部就钉住”）。
+    if (n.depth != 0) return false;
     // issue #77/#114：只有带 dragDetails 的真实手势才改变拖拽意图；程序性
     // jump/animate 的 ScrollStart/End 一律不参与（避免“僵尸守卫”与误判上翻）。
-    // 用户手势（含松手后的惯性）结束由 owner 按几何判据恢复/保持意图。
+    // 用户手势（含松手后的惯性）结束由 owner 按最终几何恢复/保持意图；只有
+    // 当前确实处于用户拖拽状态时才把 ScrollEnd 当成用户手势结束。
     if (n is ScrollStartNotification && n.dragDetails != null) {
       _scrollFollow.onUserScrollStart(_geometryOfMetrics(n.metrics));
     } else if (n is ScrollUpdateNotification && n.dragDetails != null) {
       _scrollFollow.onUserScrollUpdate(_geometryOfMetrics(n.metrics));
-    } else if (n is ScrollEndNotification && !_scrollFollow.isProgrammaticScroll) {
+    } else if (n is ScrollEndNotification && _scrollFollow.isDragging) {
+      // 只有「当前确实处于用户拖拽/惯性」时的滚动结束才允许改写意图：
+      // - 程序性 jump/ensureVisible 的 ScrollEnd：isDragging 为 false（begin 时已清）；
+      // - 校正后的异步 ballistic（如下标越界回弹）也没有用户拖拽态；
+      // 两者都不会把阅读/跟随意图改错。用户拖拽的惯性结束仍由 owner 按最终几何判定。
       _scrollFollow.onUserScrollEnd(_geometryOfMetrics(n.metrics));
     }
     _syncScrollFollowDisplay();
@@ -2212,8 +2223,8 @@ class _ChatScreenState extends State<ChatScreen> {
     // 不得触发更早历史分页（否则短内容首屏校正会把同一页重复 prepend）。
     final programmaticUpdate =
         n is ScrollUpdateNotification && n.dragDetails == null;
-    final suppressForCorrection = programmaticUpdate &&
-        (_autoCorrectionSettling || _scrollFollow.hasPendingCorrection);
+    final suppressForCorrection =
+        programmaticUpdate && _scrollFollow.hasPendingCorrection;
     if (!_suppressOlderPaging &&
         !suppressForCorrection &&
         shouldLoadOlderFromScroll(n, infiniteMode: _infiniteMode)) {
@@ -5631,7 +5642,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }
     // 只有「活动条当前可能有重复候选」时才需要几何重建；没有运行中工具不影响活动条。
     final hasGeometryCandidate = plan != null &&
-        _scrollFollow.isFollowing &&
+        _scrollFollow.nearBottom &&
         _activeTools.keys.any(plan.visibleToolCallIds.contains);
     if (!_activityGeometryResolved &&
         !_activityGeometryRefreshScheduled &&
@@ -5649,7 +5660,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final tools = [
       for (final entry in _activeTools.entries)
         if (!(plan != null &&
-            _scrollFollow.isFollowing &&
+            _scrollFollow.nearBottom &&
             plan.visibleToolCallIds.contains(entry.key) &&
             _isProcessToolRowInViewport(entry.key)))
           entry.value,
@@ -5708,7 +5719,7 @@ class _ChatScreenState extends State<ChatScreen> {
         if (!tick.loaded) tick.turn,
     };
     final showTurnRail = shouldShowTurnRail(
-      nearBottom: _scrollFollow.isFollowing,
+      nearBottom: _scrollFollow.nearBottom,
       turnCount: turnTicks.length,
     );
     // issue #80：轨道可见性与列表右 padding 同帧（历史浏览视图不显示轨道，保持 16dp）。
