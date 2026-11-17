@@ -1,5 +1,36 @@
 # Changelog
 
+## v3.2.4-alpha.21（build 53，issues #114）— 聊天滚动跟随重写：单一 owner + 真正到底才钉底
+
+> 插件 `3.2.4-alpha.21` / App `3.2.4+53` / 载体 `3.2.4-alpha.21-app`。
+
+### 滚动跟随收口单一 owner（#114）
+
+- 新增 `dsh-mobile-app/lib/scroll_follow.dart`（`ScrollFollowCoordinator`）：把跟随意图、几何事实、用户拖拽、导航/会话世代、待执行校正收口为一个可单测的 owner；near-bottom 与回底按钮显隐只作派生展示，不再反写意图；
+- 三个已复现缺陷修复：① 初始定位/布局后校正留下大块空白；② 帧后校正被饿死（校正执行时重查拖拽/意图/世代）；③ 拖拽前 160px 内被程序性校正抢回手势；
+- 校正自己保证有帧（post-frame + `ensureVisualUpdate`，合并、有界、收敛即停）；强制定位（初始打开/回 live/发送/显式回底）统一走有界收敛入口；
+- `chat_screen.dart` 删除 `_pinnedToBottom`/`_userDragActive`/`_followBottomScheduled`/`_settledFollowScheduled`/`_settleToBottom`/`_scrollToBottom` 等分散状态与补丁；A1 测量层保持只读并映射到 owner；程序性滚动统一标记，避免 `ScrollEnd` 误清拖拽状态。
+
+### 滚动跟随行为变更（#114）
+
+- **真正到底才钉底**：跟随意图只在真实用户拖拽/惯性结束时按「真正到底」（|距末端| ≤ 1px，越过末端同样算）判定；程序性 jump/`ensureVisible` 及其 ballistic `ScrollEnd` 一律不参与；160px 仅保留为回底按钮/刻度轨/活动条去重的派生展示阈值，展示不反写意图；
+- **阅读态始终显示回底按钮**：按钮显隐判据由 `!nearBottom` 改为 `intent==reading || !nearBottom`，消除「近底但无入口」死角；跟随态近底仍隐藏；
+- **嵌套滚动 depth 过滤**：内层滚动（depth≠0）的拖动/metrics 不再改写主列表意图或几何快照；
+- **删除像素逆推意图**：程序性移动的像素方向不再反推阅读意图（几何不反写意图），相应用例改为真实手势驱动；
+- 结构性思考行/工具增量/异步详情/活动条显隐/展开收起均显式请求布局后校正；程序性校正回弹不再触发更早历史分页。
+
+### 测试覆盖（#114）
+
+- 新增动态回放测量闭环 `issue114_scroll_follow_replay_test.dart`：一次挂载真实 ChatScreen，逐帧测量意图/末端残差/阅读锚点残差/range；另新增 `issue114_true_bottom_follow_test.dart` 与 `scroll_follow_coordinator_test.dart`；
+- 策略/调度单测累计 26 条；新增 11 条 widget 用例覆盖真正到底四情形、惯性生命周期、程序性移动、调度契约、1 帧调度、内层滚动；
+- 既有 issue74/80/89/turn_navigation 用例改为真实手势驱动并同步产品行为断言（阅读态显示回底按钮）；关键守卫均做变异反证（13 项实跑变红）。
+
+### 验证
+
+- 本机发布门禁（bump 后树，隔离 HOME）：flutter analyze 0 error/warning（24 条既有 info）、flutter test **1513** 全绿、timeline-contract **179 PASS / 0 FAIL**、account-usage **15 通过 / 0 失败**、Kotlin `UsagePanelModelTest` 27 用例 0 失败（BUILD SUCCESSFUL）；
+- 真机滚动跟随四档验收列为发布后验收项。
+
+
 ## v3.2.4-alpha.20（build 52，issues #112）— rc.2 AgentRegistry 兼容（catalog/modelsRpc/send/receipt/approval）
 
 > 插件 `3.2.4-alpha.20` / App `3.2.4+52` / 载体 `3.2.4-alpha.20-app`。
