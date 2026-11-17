@@ -140,6 +140,19 @@ ScrollPosition _pos(WidgetTester tester) => tester
     .position;
 
 /// 消息列表第一条 live SliverPadding 的右 padding（与轨道显隐同帧）。
+Finder get _jumpButton => find.byWidgetPredicate(
+      (w) => w.runtimeType.toString() == '_JumpToLatestButton',
+    );
+
+bool _jumpVisible(WidgetTester tester) {
+  final finder = _jumpButton;
+  if (finder.evaluate().isEmpty) return false;
+  final animated =
+      find.descendant(of: finder, matching: find.byType(AnimatedOpacity));
+  if (animated.evaluate().isEmpty) return false;
+  return tester.widget<AnimatedOpacity>(animated.first).opacity > 0.5;
+}
+
 double _liveRightPadding(WidgetTester tester) {
   final paddings = tester
       .widgetList<SliverPadding>(find.descendant(
@@ -161,10 +174,6 @@ double? _visibleUserTextRight(WidgetTester tester) {
   }
   return null;
 }
-
-Finder get _jumpButton => find.byWidgetPredicate(
-      (w) => w.runtimeType.toString() == '_JumpToLatestButton',
-    );
 
 void main() {
   testWidgets('390：轨道 28/右 8、正文右让 action gutter、gutter 不命中', (tester) async {
@@ -230,7 +239,19 @@ void main() {
     await tester.pump(const Duration(milliseconds: 900));
   });
 
-  testWidgets('轨道隐藏（<2 轮）时 padding 恢复 16，无轨道', (tester) async {
+  testWidgets('底部跟随：既无轨道也无圆钮 → padding 16', (tester) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+    await _pumpChat(tester, _TurnBackend(turns: 6));
+    // 停在真正的底部（follow）：轨道只在离开底部时出现；圆钮在 follow+真正到底时隐藏。
+    expect(_rail, findsNothing, reason: '在底部时轨道隐藏');
+    expect(_jumpVisible(tester), isFalse, reason: 'follow + 真正到底 → 圆钮隐藏');
+    expect(_liveRightPadding(tester), 16, reason: '既无轨道也无圆钮 → 默认 16dp');
+    await tester.pump(const Duration(milliseconds: 900));
+  });
+
+  testWidgets('轨道隐藏（<2 轮）时仍按圆钮 38：阅读态回底入口始终可见', (tester) async {
     tester.view.physicalSize = const Size(390, 844);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
@@ -238,10 +259,13 @@ void main() {
     await _scrollUp(tester);
 
     expect(_rail, findsNothing, reason: '<2 轮不渲染轨道');
-    expect(_liveRightPadding(tester), 16, reason: '轨道隐藏时恢复默认 16dp');
+    // #114 P2 产品行为变更：阅读态始终显示「回到底部」圆钮（不再只按 160px 几何隐藏）。
+    // 因此这里 padding 取圆钮 gutter 38，而不是旧断言的无 gutter 16。
+    expect(_liveRightPadding(tester), 38,
+        reason: '轨道隐藏，但阅读态回底圆钮可见 → gutter 38');
     final textRight = _visibleUserTextRight(tester);
     expect(textRight, isNotNull);
-    expect(textRight!, closeTo(390 - 16 - 12, 2));
+    expect(textRight!, closeTo(390 - 38 - 12, 2));
     await tester.pump(const Duration(milliseconds: 900));
   });
 

@@ -13,6 +13,7 @@ import 'dart:convert';
 import 'package:dsh_mobile_app/api.dart';
 import 'package:dsh_mobile_app/models.dart';
 import 'package:dsh_mobile_app/screens/chat_screen.dart';
+import 'package:dsh_mobile_app/scroll_follow.dart';
 import 'package:dsh_mobile_app/store.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -282,13 +283,14 @@ void main() {
     await tester.drag(scroll, const Offset(0, 500));
     await tester.pump(const Duration(milliseconds: 400));
     _expectWithinRange(tester);
-    final pos = _position(tester);
-    final atBottom = pos.maxScrollExtent - pos.pixels <= 160;
-    expect(
-      _jumpVisible(tester),
-      !atBottom,
-      reason: '回底按钮显隐必须与真实贴底状态一致',
-    );
+    // issue #114 P2-1：直接断言**意图**与按钮表达，不用几何反推意图。
+    final st = tester.state(find.byType(ChatScreen)) as dynamic;
+    expect(st.debugFollowIntent, FollowIntent.reading,
+        reason: '真实上翻后处于阅读态（未真正到底）');
+    expect(st.debugShowJumpToLatest, isTrue,
+        reason: '阅读态必须始终显示回底入口');
+    expect(_jumpVisible(tester), isTrue,
+        reason: '意图与按钮表达一致');
     await _finishTimers(tester);
   });
   testWidgets('长换行内容：上翻出圆钮（padding38）→拖回底部（padding16）pixels 不越界、无大块空白', (tester) async {

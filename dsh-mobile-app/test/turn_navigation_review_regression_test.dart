@@ -222,17 +222,62 @@ void main() {
     testWidgets('离开底部区间内跨多轮滚动，高亮跟随', (tester) async {
       final backend = _Backend(initialEvents: _turnEvents(1, 8));
       await _pumpChat(tester, backend: backend);
+      final scroll = find.byType(CustomScrollView);
 
-      _position(tester).jumpTo(0);
-      await tester.pumpAndSettle();
+      // #114 P1：用真实手势持续上翻（不用 jumpTo 伪装用户滚动）。
+      for (var i = 0; i < 60; i++) {
+        if (_position(tester).pixels <= 1 && _rail(tester).activeTurn == 1) break;
+        await tester.drag(scroll, const Offset(0, 600));
+        await tester.pump(const Duration(milliseconds: 120));
+      }
       expect(find.byType(TurnNavigatorRail), findsOneWidget);
       expect(_rail(tester).activeTurn, 1);
+      // 还原原测试的隐含前提：此时必须真正在顶端、且已离开底部 160px 区间。
+      expect(_position(tester).pixels, lessThanOrEqualTo(1));
+      expect(
+        _position(tester).maxScrollExtent - _position(tester).pixels,
+        greaterThan(160),
+        reason: '进入下滚循环前必须已离开底部区间（原 jumpTo(0) 的前提）',
+      );
 
-      final max = _position(tester).maxScrollExtent;
-      _position(tester).jumpTo(max * 0.55);
-      await tester.pumpAndSettle();
-      expect(_rail(tester).activeTurn, isNot(1),
-          reason: '始终在 160px 阈值外，滚动本身也必须触发几何校准');
+      // 持续向下滚（真实手势），高亮应跨多轮跟随、不能停在第一轮。
+      // 记录沿途 activeTurn，要求至少经过 1→2→3（跨 2 个轮次边界），而不是“刚 !=1”。
+      final observedTurns = <int>{1};
+      for (var i = 0; i < 60; i++) {
+        await tester.drag(scroll, const Offset(0, -400));
+        await tester.pump(const Duration(milliseconds: 120));
+        final turn = _rail(tester).activeTurn;
+        if (turn != null) observedTurns.add(turn);
+        if ((turn ?? 0) >= 3) break;
+      }
+      final endPos = _position(tester);
+      expect(
+        endPos.maxScrollExtent - endPos.pixels,
+        greaterThan(160),
+        reason: '循环结束时必须仍在底部 160px 区间之外（原 max*0.55 的前提）',
+      );
+      // 实测高亮可能快速跳跃（如 2→4），不强制包含 3；但必须证明真实经过了
+      // 第 1、2 轮，且至少跨过 2 个轮次边界（>1 的真实轮次不少于 2 个）。
+      expect(
+        observedTurns,
+        containsAll(<int>[1, 2]),
+        reason: '必须真实经过第 1、2 轮（null 不算轮次）',
+      );
+      expect(
+        observedTurns.where((turn) => turn > 1).length,
+        greaterThanOrEqualTo(2),
+        reason: '至少跨过 2 个轮次边界（观测：$observedTurns）',
+      );
+      expect(
+        observedTurns,
+        isNot(contains(0)),
+        reason: 'activeTurn 为 null 时不得记成 0 冒充轮次',
+      );
+      expect(
+        _rail(tester).activeTurn ?? 0,
+        greaterThanOrEqualTo(3),
+        reason: '结束时高亮至少跨到第 3 轮（跨 2 个轮次边界），不是“只要 !=1”',
+      );
     });
 
     testWidgets('长回复导致起始边界被回收时，用可见轮次推断而不跳到最新轮', (tester) async {
