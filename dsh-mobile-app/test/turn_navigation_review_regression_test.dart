@@ -246,9 +246,9 @@ void main() {
       for (var i = 0; i < 60; i++) {
         await tester.drag(scroll, const Offset(0, -400));
         await tester.pump(const Duration(milliseconds: 120));
-        final turn = _rail(tester).activeTurn ?? 0;
-        observedTurns.add(turn);
-        if (turn >= 3) break;
+        final turn = _rail(tester).activeTurn;
+        if (turn != null) observedTurns.add(turn);
+        if ((turn ?? 0) >= 3) break;
       }
       final endPos = _position(tester);
       expect(
@@ -256,10 +256,22 @@ void main() {
         greaterThan(160),
         reason: '循环结束时必须仍在底部 160px 区间之外（原 max*0.55 的前提）',
       );
+      // 实测高亮可能快速跳跃（如 2→4），不强制包含 3；但必须证明真实经过了
+      // 第 1、2 轮，且至少跨过 2 个轮次边界（>1 的真实轮次不少于 2 个）。
       expect(
-        observedTurns.length,
-        greaterThanOrEqualTo(3),
-        reason: '持续滚动应实际经过至少 3 个不同轮次（1→…→N，N>=3）',
+        observedTurns,
+        containsAll(<int>[1, 2]),
+        reason: '必须真实经过第 1、2 轮（null 不算轮次）',
+      );
+      expect(
+        observedTurns.where((turn) => turn > 1).length,
+        greaterThanOrEqualTo(2),
+        reason: '至少跨过 2 个轮次边界（观测：$observedTurns）',
+      );
+      expect(
+        observedTurns,
+        isNot(contains(0)),
+        reason: 'activeTurn 为 null 时不得记成 0 冒充轮次',
       );
       expect(
         _rail(tester).activeTurn ?? 0,
