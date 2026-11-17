@@ -35,8 +35,49 @@ import 'sheets.dart';
 import 'providers_screen.dart';
 import 'usage_screen.dart';
 
+/// issue #116：宿主拒绝后的稳定动作 → 可执行文案（未知动作返回空串，由调用方回退到 reason 文案）。
+///
+/// 只透传宿主 `error.code`，绝不展示宿主 diagnostic 原文（可能含路径/凭据）。
+String pluginUpdateNextActionText(String nextAction, String hostErrorCode) {
+  final known = <String, String>{
+    'restart-host': L10n.t(
+      '另有插件变更待重启，请先重启 DSH 后再试',
+      'Another plugin change is waiting for a restart — restart DSH and retry',
+    ),
+    'version-incompatible': L10n.t(
+      '目标版本与当前 DSH 不兼容',
+      'The target version is incompatible with this DSH',
+    ),
+    'invalid-target': L10n.t(
+      'DSH 不接受该更新目标（不是可更新插件或版本非法）',
+      'DSH rejected the update target (not an updatable plugin or invalid version)',
+    ),
+    'retry-or-diagnose': L10n.t(
+      'DSH 执行更新失败，可重试或查看诊断',
+      'DSH failed to apply the update — retry or check diagnostics',
+    ),
+    'diagnose': L10n.t(
+      'DSH 拒绝了更新，请查看诊断',
+      'DSH rejected the update — check diagnostics',
+    ),
+  };
+  final text = known[nextAction];
+  if (text == null) return '';
+  final code = hostErrorCode.trim();
+  return code.isEmpty ? text : '$text（$code）';
+}
+
 /// 失败原因的稳定码 → 可读文案（未知码原样显示，绝不隐藏）。
-String _pluginUpdateFailureReasonText(String reason) {
+///
+/// issue #116：宿主拒绝时优先按 `nextAction` 给可执行提示（并附 `hostErrorCode` 原码）；
+/// 旧插件没有两个新字段时回退到既有 reason 文案。
+String pluginUpdateFailureReasonText(
+  String reason, {
+  String hostErrorCode = '',
+  String nextAction = '',
+}) {
+  final actionText = pluginUpdateNextActionText(nextAction, hostErrorCode);
+  if (actionText.isNotEmpty) return actionText;
   const known = <String, String>{
     'npm-carrier-plugin-identity-mismatch': '载体清单与 NPM 包身份不一致（版本/大小校验失败）',
     'npm-carrier-manifest-unreadable': '载体清单不可读',
@@ -134,7 +175,9 @@ class _PluginUpdateDetailsPanelState extends State<_PluginUpdateDetailsPanel> {
     final reason = widget.transaction?.reason ?? '';
     if (reason.isNotEmpty) {
       final phase = widget.transaction?.phase ?? 'failed';
-      lines.add('# 安装结果：$phase · 原因：${_pluginUpdateFailureReasonText(reason)}');
+      lines.add(
+        '# 安装结果：$phase · 原因：${pluginUpdateFailureReasonText(reason, hostErrorCode: widget.transaction?.hostErrorCode ?? '', nextAction: widget.transaction?.nextAction ?? '')}',
+      );
     }
     return lines.join('\n');
   }
@@ -588,7 +631,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (progress.failed) {
       showToast(
         context,
-        '${L10n.t('插件更新失败：', 'Plugin update failed: ')}${_pluginUpdateFailureReasonText(tx.reason ?? 'unknown')}',
+        '${L10n.t('插件更新失败：', 'Plugin update failed: ')}${pluginUpdateFailureReasonText(tx.reason ?? 'unknown', hostErrorCode: tx.hostErrorCode, nextAction: tx.nextAction)}',
       );
     } else {
       showToast(
@@ -623,7 +666,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ? ''
           : (status.reason.isEmpty
                 ? '检查暂不可用'
-                : _pluginUpdateFailureReasonText(status.reason));
+                : pluginUpdateFailureReasonText(
+                    status.reason,
+                    hostErrorCode: status.hostErrorCode,
+                    nextAction: status.nextAction,
+                  ));
       final detail = status.checkLog.isNotEmpty
           ? status.checkLog.last
           : failureReason;
@@ -704,7 +751,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
       targetVersion = tx.targetVersion;
       appBuild = tx.targetAppVersion;
       if (progress.failed) {
-        failureReason = _pluginUpdateFailureReasonText(tx.reason ?? 'unknown');
+        failureReason = pluginUpdateFailureReasonText(
+          tx.reason ?? 'unknown',
+          hostErrorCode: tx.hostErrorCode,
+          nextAction: tx.nextAction,
+        );
       }
       final awaitingRelease =
           tx.phase == 'settled' &&

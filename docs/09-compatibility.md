@@ -37,6 +37,13 @@
 - `restart`：传统通道（`<0.2.2` 或宿主管理器不可用时）。安装后重启宿主，重启形态由 `restartForm` 给出（`web-systemd` / `web-foreground`）；前台 web 形态的 respawn **复用本进程原命令行**，因此 `--port` 等参数不会丢。
 - `guidance`：两条通道都不可用，只能给人工指引。
 
+**宿主拒绝的可执行提示（issue #116）**：`host-manager` 通道失败时，事务结果（`pluginUpdate.transaction.result`，以及检查响应里的同名结构）在保留 `reason: "host-manager-rejected"` 的同时新增：
+
+- `hostErrorCode`：宿主白名单错误码，原样保留未知码——`stop-profile` / `bundle-in-use` / `incompatible-version` / `not-bundle` / `invalid-spec` / `operation-error` 等；
+- `nextAction`：稳定动作枚举，只有五个值——`restart-host`（`stop-profile` / `bundle-in-use`，另有插件变更待重启）、`version-incompatible`、`invalid-target`（`not-bundle` / `invalid-spec`）、`retry-or-diagnose`（`operation-error`）、`diagnose`（未知码）。
+
+安全边界：**只透传 `code`**，绝不透传宿主 `diagnostic` 原文（可能含 registry URL、凭据或本机路径）；`nextAction` 只驱动提示，不自动重启、不自动重试、不自动 fallback 到重启通道。旧客户端忽略两个新字段；旧插件不发送时 App 回退既有 `reason` 文案。识别特征：更新失败但宿主机日志显示另有插件待重启 → 重启 DSH 后重试即可。
+
 `services` 一节同时新增 `pluginManager` / `hmr` 两项，可直接看到宿主是否提供这两项能力。
 
 **快速自检**：手机 App → 设置 → 环境诊断。`services` 一节列出每个内核服务是否存在；**v3.1.3+ 看 `checks.approvalMode`**（生效策略）与 **`checks.remoteEvents`**（`true` = `$events` 双端呈现通道就绪，`false` = both 降级 mobile 或配置即 mobile/desktop）；`notes` 说明当前审批策略实际语义与**任何非全绿的宿主能力**。
