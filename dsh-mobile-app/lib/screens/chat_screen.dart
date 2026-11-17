@@ -2810,6 +2810,37 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!mounted) return;
     _scheduleLiveBottomGapMeasure();
     _requestScrollFollow();
+    _clampOverscrollAfterShrink();
+  }
+
+  /// issue #118：内容因**布局变化**变短后，把越界的滚动位置拉回合法范围。
+  ///
+  /// 复现（详细档 + paged 会话，实测 `tailResidual=+526`、`max=0`、`px=-40`）：
+  /// 用户上翻加载过更早历史后 `paged=true`，#77 短内容底部占位被
+  /// `shortEnough = !paged && ...` 永久停用；随后本轮 `turn/end` 自动折叠把
+  /// live 内容从 1018dp 压到 100dp，`maxScrollExtent` 变成 0，而 `pixels`
+  /// 仍停在旧值 → 内容顶边被推到视口上方、下方留出大段空白，且阅读态恒显回底按钮。
+  ///
+  /// 这里**不启用底部占位**（维护者决定，避免重现 issue #76 的「占位与位置修正
+  /// 互相拉扯」），只把**越界**的 pixels 拉回 `[0, max]`。内容变短是布局变化导致、
+  /// 不是用户滚动，因此不违反「不抢用户位置」：用户看到的仍是同一段内容。
+  void _clampOverscrollAfterShrink() {
+    if (!mounted || _inHistory) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (!_scrollCtrl.hasClients) return;
+      final position = _scrollCtrl.position;
+      if (!position.hasContentDimensions) return;
+      final max = position.maxScrollExtent;
+      final pixels = position.pixels;
+      // 只在「不可滚动 + 越界」这一确定异常态纠正；可滚动时的越界由
+      // BallisticScrollActivity 自行回弹，不在这里抢。
+      if (max > 0.5 || pixels >= -0.5) return;
+      _runProgrammaticScroll(() {
+        _scrollCtrl.jumpTo(0);
+      });
+      _syncScrollFollowDisplay();
+    });
   }
 
   /// 返回 `true` = 本次处理改变了消息区布局或视口高度（需要 [_onEventLayoutChanged]）。
