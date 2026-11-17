@@ -3,9 +3,12 @@ name: Publish npm release
 # 发布政策（issue #43 / ADR 0025 / docs/design/alpha-release-global-build.md rev.3）：
 #   - alpha tag 允许在 develop；rc/stable tag 只允许在对应 core 的 release/vX.Y.Z；
 #     只校验**可达性**（merge-base --is-ancestor），不声称 Git 不存在的“tag 来源分支”。
-#   - 全局单调 build：权威记录是受保护分支 release-meta 的 build-policy.json；
-#     本 workflow 的 `origin` 是 GitHub，因此 CI 读 `origin/release-meta`；本机分配端
-#     另需校验 `github/release-meta` 完全一致（见 tools/next-build.mjs）。
+#   - 全局单调 build：权威记录是受保护分支 release-meta 的 build-policy.json，唯一权威
+#     在 GitHub（单远端策略，见 AGENT-RULES.md「release-meta 单远端策略」）；本 workflow
+#     的 `origin` 是 GitHub，因此 CI 读 `origin/release-meta`；本机分配端用
+#     `node tools/next-build.mjs --remotes github` 只校验 GitHub（不带该参数时脚本默认
+#     要求 origin+github 一致，会以 release-meta-diverged fail-closed）。GitLab 上可能
+#     残留历史 release-meta，是旧快照不是权威，不要求两端一致。
 #   - 已发布状态判定先于动态通道校验：两者都可见 → 只读幂等成功（旧 tag 重跑不要求
 #     当前 channel 仍等于旧版本）；carrier 已发/插件未发 → 排除自身 carrier 后校验；
 #     新发布 → build 必须 > 发布前沿。**不使用全量 tag 最大值**。
@@ -19,10 +22,11 @@ name: Publish npm release
 #   - secret RELEASE_META_TOKEN（或允许 GitHub Actions 绕过分支保护的 github.token），
 #     具备 contents:write；workflow 在未配置可写 token 时会在发布前失败。
 #   - environment npm-publish 的签名 secret 与 ANDROID_CERT_SHA256 保持原样。
-#   - 可选 vars.RELEASE_META_SECONDARY_REMOTE_URL：配置第二个 release-meta 远端 URL
-#     （如 GitLab 镜像）时，workflow 会 `git remote add` 并校验双远端 release-meta
-#     SHA 与内容逐字节一致；未配置时 CI 只以 origin（GitHub）为权威（本机分配端
-#     tools/next-build.mjs 始终校验 origin+github 双远端）。
+#   - 可选 vars.RELEASE_META_SECONDARY_REMOTE_URL：若显式配置第二个 release-meta 远端
+#     URL，workflow 会 `git remote add` 并校验两端 release-meta SHA 与内容逐字节一致。
+#     本仓库当前**不配置**该变量（release-meta 单远端策略：只在 GitHub 保留），因此 CI
+#     只以 origin（GitHub）为权威；本机分配端同样只校验 GitHub：
+#     `node tools/next-build.mjs --remotes github`。
 
 on:
   push:

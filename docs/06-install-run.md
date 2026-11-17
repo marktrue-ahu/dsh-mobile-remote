@@ -298,7 +298,7 @@ flutter build apk --release
 
 > 假版本清单路径已于 issue #113 退役：`MANIFEST_VERSION` / `ALLOW_TEST_MANIFEST_VERSION`（以及人工目录落位的 `UPDATE_DIR`）不再可用——假清单会写出与 APK 实际身份不符的版本，`package-release.sh` 现在对这三个变量 **fail-closed 退出 1**（不写任何产物）。
 
-重复验证自动更新改走 npm 通道：先用 `node tools/next-build.mjs` 分配比手机已装 build 更高的全局 build，再 `node tools/prepare-release.mjs` 原子 bump（pubspec 与清单随之更新，安装身份真实递增），然后按发布流程推 tag 由 CI 发布 alpha，手机走 npm 配对更新。不联网复现「安装 → 更新」链路用发版演练（`docs/10-release.md` §6：`node tools/npm-drill.mjs`）。普通构建仍是 §8.2 的 `flutter build apk --release`；APK 与已安装版本必须使用同一签名。
+重复验证自动更新改走 npm 通道：先用 `node tools/next-build.mjs --remotes github` 分配比手机已装 build 更高的全局 build（必须带 `--remotes github`：`release-meta` 只在 GitHub 保留，不带该参数会按默认双远端校验 fail-closed），再 `node tools/prepare-release.mjs` 原子 bump（pubspec 与清单随之更新，安装身份真实递增），然后按发布流程推 tag 由 CI 发布 alpha，手机走 npm 配对更新。不联网复现「安装 → 更新」链路用发版演练（`docs/10-release.md` §6：`node tools/npm-drill.mjs`）。普通构建仍是 §8.2 的 `flutter build apk --release`；APK 与已安装版本必须使用同一签名。
 
 ### 8.6 App 自动更新（双更新源，v3.0.0+）
 

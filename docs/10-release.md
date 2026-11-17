@@ -73,8 +73,8 @@ npm 全局前缀需可写（本机为 `~/.local`，已验证可用）；若 `EAC
 2. **先载体、后插件**：载体 `X.Y.Z-app` 必须先发布成功并可解析，再发布主插件 `X.Y.Z`（发布窗口内主插件 404 属预期 fail-closed）。
 3. **正式发布前必须演练通过**：`npm-drill` 演练失败一律阻断正式发布（本地工作流规则同步此门禁）。执行主体按发布方式：CI 默认链路在 CI 内执行（见 §2「演练门禁」/§8），人工兜底链路在本机执行。
 4. **alpha 线在 develop**：`vX.Y.Z-alpha.N` tag 允许直接打在 `origin/develop` 的可达提交上；rc/stable tag 只允许对应 core 的 `release/vX.Y.Z`。CI 只校验**可达性**，不声称“tag 来自哪条分支”。
-5. **发布 build 号全局单调**：`+N` 由全局分配规则决定（`release-meta` 水位 + 历史 tag + 发布前沿 +1），不是某条分支的本地计数器；发布前必须用 `tools/next-build.mjs` 分配、`tools/prepare-release.mjs` 原子 bump。
-6. **发布政策记录唯一权威**：迁移水位、legacy tag 白名单、legacy carrier 核验映射与发布意图都在受保护分支 `release-meta` 的 `build-policy.json`；缺失/非法/双远端不一致 fail-closed，分支内副本不作为依据。
+5. **发布 build 号全局单调**：`+N` 由全局分配规则决定（`github/release-meta` 水位 + 历史 tag + 发布前沿 +1），不是某条分支的本地计数器；发布前必须用 `tools/next-build.mjs --remotes github` 分配、`tools/prepare-release.mjs` 原子 bump。
+6. **发布政策记录唯一权威**：迁移水位、legacy tag 白名单、legacy carrier 核验映射与发布意图都在受保护分支 `release-meta` 的 `build-policy.json`；**唯一权威在 GitHub（`github/release-meta`），不要求 GitLab `origin` 存在镜像**，缺失/非法 fail-closed，分支内副本不作为依据。
 
 ### 1.5 发布政策记录（`release-meta`）与全局 build 分配（issue #43）
 
@@ -82,13 +82,13 @@ npm 全局前缀需可写（本机为 `~/.local`，已验证可用）；若 `EAC
 
 - **alpha 线在 develop**：`vX.Y.Z-alpha.N` tag 允许直接打在 `origin/develop` 的可达提交上；rc/stable 仍只允许 `release/vX.Y.Z`。CI 用 `git merge-base --is-ancestor` 校验可达性，不声称 Git 不存在的“来源分支”语义。
 - **发布 build 号全局单调**：`next = max(release-meta.watermark, 历史 tag build, 发布前沿) + 1`；发布前沿 = npm 上已发布 carrier 的 `appVersion` build 与 `legacyCarriers.appBuild` 的最大值。工作区 pubspec、未发布 tag、设备安装记录都不构成发布前沿。
-- **全局权威是受保护分支 `release-meta` 的 `build-policy.json`**（`schema`、`watermark`、`legacyTags`、`legacyCarriers`、发布意图）。本机分配端同时校验 `origin/release-meta` 与 `github/release-meta` 的 SHA/内容完全一致；CI（`origin`=GitHub）读取自己的 `origin/release-meta`。**分支内同名文件只是提案镜像，不是分配或校验依据**；缺失、非法、双远端不一致一律 fail-closed。
+- **全局权威是受保护分支 `release-meta` 的 `build-policy.json`**（`schema`、`watermark`、`legacyTags`、`legacyCarriers`、发布意图），**唯一权威在 GitHub（`github/release-meta`）**：本机分配端用 `node tools/next-build.mjs --remotes github` 只校验该远端；CI（`origin`=GitHub）读取自己的 `origin/release-meta`。**分支内同名文件只是提案镜像，不是分配或校验依据**；缺失、非法一律 fail-closed。GitLab 上可能残留历史 `release-meta`（停在某个旧提交），它是**历史快照、不是权威**，不要用同步它来“修复”发布状态。
 - **发布意图**：每次发布在提交 npm publish 之前，把 tag / 插件与 carrier 版本 / build / 期望 integrity / 状态 `submitted` 写入 release-meta；确认可见后标记 `published`。提交后无法确认可见性（E409/staged、轮询超时、响应丢失）时标记 `unknown`，阻断后续发布与通道移动，必须人工查询 registry 后恢复；**不得把超时当作“确定未发布”，不得删除 tag 重新分配**。
 - **迁移水位**：迁移时 `watermark = 32`（develop 当前 build），历史 8 个 tag 进入 `legacyTags`，8 个已发布 carrier 逐一登记 `legacyCarriers`（3 个缺顶层 `appVersion` 的旧 carrier 必须下载 tarball、按 `dist.integrity` 校验后读内嵌清单/APK build）。初始化/校验命令见 §12。
 - **app / channel 指针只前进**：`app` 按 carrier 的**配对插件版本**（剥离 `-app`）比较，只有候选更新才移动；alpha/rc 的插件 channel 同样先比较后移动，候选 ≤ 当前时插件用 `<channel>-staging` 发布、channel 保持不变（反回退）。latest 只有 stable 可前进。
 - **RC 期间不再冻结 develop tag**：alpha 与 rc 可交错发布，按发布时间安装的 versionCode 单调。本期只保证**同 core** 交错；跨 core 更新仍需人工安装（见 §12.4）。
 
-工具：`node tools/next-build.mjs`（只读分配）、`node tools/prepare-release.mjs`（原子 bump）、`node tools/release-gate.mjs`（CI 判定/发布意图/指针校验/BUILD 与 manifest 断言）、`node tools/release-meta-bootstrap.mjs`（迁移种子与校验）。所有 git/npm 外部命令都有界超时（挂起会以稳定 reason fail-closed，如 `npm-metadata-unavailable` / `git-metadata-unavailable`）。
+工具：`node tools/next-build.mjs --remotes github`（只读分配；必须带 `--remotes github`，否则脚本按默认 `origin + github` 双远端校验并以 `release-meta-diverged` fail-closed）、`node tools/prepare-release.mjs`（原子 bump）、`node tools/release-gate.mjs`（CI 判定/发布意图/指针校验/BUILD 与 manifest 断言）、`node tools/release-meta-bootstrap.mjs`（迁移种子与校验）。所有 git/npm 外部命令都有界超时（挂起会以稳定 reason fail-closed，如 `npm-metadata-unavailable` / `git-metadata-unavailable`）。
 
 ---
 
@@ -98,7 +98,7 @@ npm 全局前缀需可写（本机为 `~/.local`，已验证可用）；若 `EAC
 
 > **CI 默认链路的时间顺序**：本表大部分项在推 tag **之前**完成。其中「演练门禁」一项的 CI 分支由 workflow 在 tag 触发后执行、失败在实际 `npm publish` 之前阻断——它**不阻塞**授权与推 tag，属未来时点的门禁而非前置条件。人工兜底链路则必须在本机预跑演练后才能发布。
 
-- [ ] **先读发布政策记录**：`git fetch --multiple --tags origin github` 后运行 `node tools/next-build.mjs`，必须 `RESULT: PASS`；输出 next build 与 release-meta 的 watermark/发布前沿一致，且 `origin/release-meta` 与 `github/release-meta` 内容一致（双远端）。缺失/不一致/存在未关闭发布意图 → 停止。
+- [ ] **先读发布政策记录**：`git fetch --multiple --tags origin github` 后运行 `node tools/next-build.mjs --remotes github`，必须 `RESULT: PASS`；输出 next build 与 release-meta 的 watermark/发布前沿一致。权威记录只在 `github/release-meta`：一是**必须带 `--remotes github`**（不带时脚本默认要求 `origin + github` 一致，会以 `release-meta-diverged` fail-closed）；二是 **GitLab 上可能残留历史 `release-meta`，是旧快照不是权威，不要求两端一致**。缺失/存在未关闭发布意图 → 停止。
 - [ ] 规划中的插件版本 `<X.Y.Z[-prerelease]>` 与载体版本 `<X.Y.Z[-prerelease]>-app` 都未在 npm 上占用；`node tools/prepare-release.mjs` 会用只读 `npm view` 预检。alpha tag 必须落在 develop 可达提交上，rc/stable 必须落在对应 `release/vX.Y.Z`。
 - [ ] `latest` 语义按 ADR 0025 收敛：alpha/rc 发布前后 `latest` 必须不变；只有 stable 可前进。bootstrap 期 `latest` 允许暂为 prerelease（当前为 `3.2.3-rc.1`），首个 stable 发布后必须指向 stable；不为满足规则自动发布 stable、不删除/改名历史版本。
 - [ ] 当前分支与 HEAD 符合发布授权；`git status --short` 干净（或仅有不影响产物的明确变更）。
@@ -138,8 +138,10 @@ npm 全局前缀需可写（本机为 `~/.local`，已验证可用）；若 `EAC
 插件版本可为稳定版 `X.Y.Z`，或经授权的 npm prerelease `X.Y.Z-<pre>`（如 `3.2.1-alpha.1`）；App 版本仍为 `X.Y.Z+N`，其 core 必须与插件 core `X.Y.Z` 相同，`+N` 只增不减以防 Android 降级。载体版本始终是**插件完整版本追加 `-app`**，例如 `3.2.1-alpha.1-app`。**不要手工逐处改版本号**（容易漏掉精确 carrier alias，导致发布预检失败）。统一用工具：
 
 ```bash
-# 1) 只读分配全局下一个 build（读 release-meta 双远端 + 历史 tag + npm 已发布 carrier）
-node tools/next-build.mjs          # 期望 RESULT: PASS，并记录 next build
+# 1) 只读分配全局下一个 build（读 github/release-meta + 历史 tag + npm 已发布 carrier）
+#    必须带 --remotes github：release-meta 只在 GitHub 保留；不带该参数时脚本默认要求
+#    origin + github 双远端一致，会以 release-meta-diverged fail-closed。
+node tools/next-build.mjs --remotes github   # 期望 RESULT: PASS，并记录 next build
 
 # 2) 原子 bump：package.json version + 精确 carrier alias + pubspec + CHANGELOG 骨架
 node tools/prepare-release.mjs --version X.Y.Z[-pre] --build <next>
@@ -194,7 +196,7 @@ bash dsh-mobile-app/tools/package-release.sh
 
 ### 4.2 测试 manifest（已于 issue #113 退役）
 
-`MANIFEST_VERSION` / `ALLOW_TEST_MANIFEST_VERSION` 假版本清单路径已退役：这类清单会写出与 APK 实际身份不符的版本，`package-release.sh` 现在对这两个变量 **fail-closed 退出 1**（不写任何产物）。重复验证自动更新改走 npm 通道：`node tools/next-build.mjs` 分配更高的全局 build → `node tools/prepare-release.mjs` 原子 bump → 经授权推 tag 由 CI 发布 alpha，或在本地跑 §6 演练（`tools/npm-drill.mjs`）复现安装/更新链路。
+`MANIFEST_VERSION` / `ALLOW_TEST_MANIFEST_VERSION` 假版本清单路径已退役：这类清单会写出与 APK 实际身份不符的版本，`package-release.sh` 现在对这两个变量 **fail-closed 退出 1**（不写任何产物）。重复验证自动更新改走 npm 通道：`node tools/next-build.mjs --remotes github` 分配更高的全局 build → `node tools/prepare-release.mjs` 原子 bump → 经授权推 tag 由 CI 发布 alpha，或在本地跑 §6 演练（`tools/npm-drill.mjs`）复现安装/更新链路。
 
 > 分支侧文档只保留构建最短路径与排障附录；App 架构、安装、重建等日常说明仍看 `docs/06-install-run.md`。
 
@@ -419,7 +421,7 @@ NODE
 
 1. tag 身份、精确 carrier alias、pubspec `+N` 校验；
 2. 可达性：alpha → `origin/develop`；rc/stable → `origin/release/v<core>` 且分支 core 匹配；
-3. 读取受保护 `release-meta` 的 `build-policy.json`（缺失/非法/双远端不一致 → fail-closed）；
+3. 读取受保护 `release-meta` 的 `build-policy.json`（缺失/非法 → fail-closed；仅在显式配置 `vars.RELEASE_META_SECONDARY_REMOTE_URL` 时才额外校验两远端一致）；
 4. 已发布状态判定 → build 前沿校验 → app/latest/channel 决策（`tools/release-gate.mjs`；channel 反回退：候选不大于当前 channel 时用 staging tag）；
 5. 现场构建签名 APK、校验证书、跑完整发版演练，并断言 BUILD = `manifest.app.version` = carrier 记录/内嵌清单（`verify-package`）；
 6. 在 release-meta 记录发布意图（`submitted`）；
@@ -475,7 +477,7 @@ NODE
 - **不要冻结 develop tag**：alpha/rc 可交错；但必须先通过 `next-build` 基于最新发布前沿分配 build，再 bump/tag。
 - 发布期间不要改分支、不要重跑构建；如需重来必须申请新版本。已发布的 tag 不得删除/移动；未发布 tag 只有在确认**从未提交 publish 请求**（无 intent/unknown）且获授权时才可删除重打。
 - 发布 token 需能写入受保护分支 `release-meta`；未配置时 workflow 在发布前 fail-closed。
-- 若配置 `vars.RELEASE_META_SECONDARY_REMOTE_URL`（第二 release-meta 远端，如 GitLab 镜像），workflow 会 `git remote add` 并校验双远端 SHA/内容一致；未配置时 CI 以 `origin`（GitHub）为权威，本机分配端仍校验 origin+github。
+- CI 以 `origin`（GitHub）为权威；仅当显式配置 `vars.RELEASE_META_SECONDARY_REMOTE_URL`（第二 release-meta 远端）时，workflow 才 `git remote add` 并校验两端 SHA/内容一致——本仓库当前**不配置**该变量（`release-meta` 单远端策略：只在 GitHub 保留）。本机分配端同样只校验 GitHub：`node tools/next-build.mjs --remotes github`。
 
 ---
 
@@ -489,7 +491,7 @@ NODE
 2. **字节一致（按发布方式区分）**：
    - **CI 默认链路**：CI 现场 `flutter build apk --release` 重新构建（workflow `Build, verify, and publish` 步骤），产物字节与本地构建**允许不同**。核对方式：**实际下载** registry 上的 carrier 与插件 tarball，分别计算其 SHA-512 SRI，与各自 `npm view <pkg>@<ver> dist.integrity` 对比；再解包 carrier，核对内部 APK 的 size/sha256 与 carrier 内 `manifest.json` 吻合。**不得**只把 `dist.integrity` 与 `npm view` 返回的同一字段自比（那是同一份元数据，无法证明实际下载的字节正确），也**不得**要求 registry 上的 tgz 与本地 tgz 的 `dist.integrity` 相等。
    - **人工兜底链路**：`npm publish` 的是本地 `<dist>` 产物，此时才要求 registry 上的 tgz 与本地 tgz `sha512`（`dist.integrity`）逐字节一致，下载后 sha256 同样一致。
-3. **发布意图状态**：`git show origin/release-meta:build-policy.json` 中本次 tag 的意图应为 `published`，且没有为其它 tag 的未关闭 `submitted`/`unknown` 意图；未知状态按 §10.3 人工恢复。
+3. **发布意图状态**：`git show github/release-meta:build-policy.json`（注意本机 `origin` 是 GitLab，其 `release-meta` 只是历史快照）中本次 tag 的意图应为 `published`，且没有为其它 tag 的未关闭 `submitted`/`unknown` 意图；未知状态按 §10.3 人工恢复。
 4. **镜像可取性**：在有代表性的镜像/网络环境重试上述查询与下载（记录耗时）。
 5. **全新安装冒烟**：在隔离 HOME/新目录 `pnpm add @marktrue/dsh-mobile-remote@<本次插件版本>`，确认精确别名目录存在且版本为 `<本次插件版本>-app`、APK 哈希与清单一致。
 6. **载体产物一致性（npm 分发，无 GitHub Release）**：按发布方式区分——
@@ -518,7 +520,7 @@ NODE
 | build 不大于已发布前沿（过期发布） | 排队期间更高 build 已发布 | 不发布；确认从未提交 publish 请求且获授权后才可删 tag 重新分配；绝不覆盖已发布版本 |
 | 部分发布（carrier 已发、插件未发） | 恢复会话 | 用同一 tag 重跑；CI 排除自身 carrier 后校验 build；若已有更高版本发布则拒绝恢复，重新分配 |
 | 提交后可见性未知（E409/staged/轮询超时/响应丢失） | 发布意图 `unknown` | 阻断后续发布；按 §10.3 人工查询 registry 后恢复；不得删除 tag 重新分配 |
-| release-meta 缺失/schema 非法/双远端不一致 | 政策记录不可用 | fail-closed：先按 §12 修复 release-meta，不得跳过或改用分支内副本 |
+| release-meta 缺失/schema 非法（或显式配置的第二远端不一致） | 政策记录不可用 | fail-closed：先按 §12 修复 release-meta，不得跳过或改用分支内副本 |
 | 历史 legacy carrier 缺 `appVersion` 且未登记 | 无发布前沿证据 | 按 §12 下载核验并登记后才可参与前沿；不得静默跳过 |
 | app 指针指向非 carrier / 异常历史 | 无法自动比较 | 不自动移动；记录稳定 reason，人工确认后再发布或修指针 |
 | 跨 core 更新失败（先 core 后 build 的判定） | 本期明确不承诺 | 卸载重装/人工安装，不在应用内降级或回退通道 |
@@ -546,7 +548,7 @@ NODE
        --tag "$TAG" --status published --integrity "$REMOTE_INTEGRITY"
      ```
      确认未接受 → `--status failed`（该 tag 才可按 §10.2 授权后重新分配）；
-  3. 经授权提交并推送 `release-meta`，再继续后续发布。
+  3. 经授权提交并推送 `release-meta`（只推 `github`），再继续后续发布。
 - 部分恢复：carrier 已发布、插件未发布的会话允许用同一 tag 重跑；CI 使用“排除自身 carrier 后的发布前沿”校验 build。若期间已有更高版本发布，恢复必须被拒绝（不能借恢复把通道回退），只能重新分配。
 - **残留 submitted 意图**：若插件与 carrier 都已可见但发布意图仍是 `submitted`（例如上次 job 在 publish 后、mark-published 前退出），fully-published 重跑会**只读成功**并在输出中报告 `leftover-intent`。按本节人工恢复：用 registry 实际 integrity 执行 `mark-intent --status published` 并推送 release-meta；不要重新发布、不要删 tag。
 - tag 已创建但 CI 失败且**从未提交 publish 请求**（无发布意图/unknown）时，才可在授权后删除 tag 重新分配；已部分发布或状态未知时必须走恢复流程。
@@ -594,7 +596,7 @@ NODE
 node tools/release-meta-bootstrap.mjs --out /tmp/release-meta-build-policy.json --evidence /tmp/legacy-carrier-evidence.json [--keep]
 #    检查 watermark=32、8 个 legacyTags、8 个 legacyCarriers（3 个缺 appVersion 的旧 carrier
 #    必须带 integrity + 从内嵌 manifest/APK 读出的 appBuild）
-# 2) 校验种子与观测数据一致（可对尚未推送的种子文件或 origin/release-meta 运行）：
+# 2) 校验种子与观测数据一致（可对尚未推送的种子文件或 github/release-meta 运行）：
 #    policy watermark 允许高于观测值（迁移时人工上调过），只有低于观测值才报 regressed；
 #    --watermark N 可把“观测水位”抬高后再比较。
 node tools/release-meta-bootstrap.mjs --check --policy /tmp/release-meta-build-policy.json [--watermark N]
@@ -602,10 +604,11 @@ node tools/release-meta-bootstrap.mjs --check --policy /tmp/release-meta-build-p
 node tools/release-meta-bootstrap.mjs --write-ref
 #    --force 覆盖已存在的本地/远端 release-meta 前会读取现有 build-policy.json，
 #    强制 watermark 不得降低、已登记 legacyTags/legacyCarriers 不得被丢弃。
-# 4) 经授权推送双远端；然后在 GitLab/GitHub 设为受保护分支
-git push origin release-meta && git push github release-meta
+# 4) 经授权只推 GitHub；然后在 GitHub 设为受保护分支（release-meta 单远端策略：
+#    GitLab 不维护镜像，其残留分支是历史快照，不作为权威）
+git push github release-meta
 # 5) 首次分配：期望 next build = 33（若 npm/设备存在更高 build 则更高）
-node tools/next-build.mjs
+node tools/next-build.mjs --remotes github
 ```
 
 - `watermark = 32` 取自迁移时 develop 的 build；迁移前必须人工核对是否还有“已安装/未打 tag”的更高 build，如有则上调（工具支持 `--watermark N`）。
@@ -620,8 +623,8 @@ node tools/next-build.mjs
 git switch develop && git pull --ff-only origin develop
 git fetch --multiple --tags origin github
 
-# 2) 只读分配全局下一个 build
-node tools/next-build.mjs
+# 2) 只读分配全局下一个 build（必须带 --remotes github，见 §1.5）
+node tools/next-build.mjs --remotes github
 
 # 3) 原子 bump（package version + 精确 carrier alias + pubspec + CHANGELOG 骨架）
 node tools/prepare-release.mjs --version 3.2.4-alpha.N --build <next>
