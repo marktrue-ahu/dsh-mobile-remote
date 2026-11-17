@@ -155,6 +155,21 @@ class _Probe {
   }
 }
 
+Finder get _jumpButton => find.byWidgetPredicate(
+  (w) => w.runtimeType.toString() == '_JumpToLatestButton',
+);
+
+bool _jumpVisible(WidgetTester tester) {
+  final finder = _jumpButton;
+  if (finder.evaluate().isEmpty) return false;
+  final animated = find.descendant(
+    of: finder,
+    matching: find.byType(AnimatedOpacity),
+  );
+  if (animated.evaluate().isEmpty) return false;
+  return tester.widget<AnimatedOpacity>(animated.first).opacity > 0.5;
+}
+
 Future<AppStore> _mount(
   WidgetTester tester,
   _Backend backend, {
@@ -299,8 +314,9 @@ void main() {
       reason: '用例前提：落在 160px 产品展示阈值内（用于验证死角修复）',
     );
     expect(probe.intentFollow, isFalse, reason: '真正到底才钉：130px 不是底部 → 阅读态');
-    // 注意：按钮显隐仍是既有 160px 产品阈值（本任务不改）；该场景按钮隐藏，
-    // 属已知死角，已在 task-11 汇报中提交产品决策。
+    // #114 P2：阅读态始终显示回底入口（该场景正是原死角：距底 130px 未到底）。
+    expect(probe.showJump, isTrue, reason: '阅读态必须始终看得到回底入口，否则无法恢复跟随');
+    expect(_jumpVisible(tester), isTrue);
 
     // 新消息：不滚动、内容向下延长。
     final tailBefore = probe.tailResidual;
@@ -449,10 +465,10 @@ void main() {
     expect(probe.intentFollow, isFalse);
     final readingPixels = probe.pos.pixels;
 
-    // 程序性直接跳到末端（不是用户手势、也不是显式回底按钮）。
+    // 程序性直接跳到末端（不是用户手势、也不是显式回底按钮）。lazy 估值可能先跳到
+    // 估值 max 再由布局修正，因此用 pumpAndSettle 等到停稳（程序性/异步 ScrollEnd 不改意图）。
     probe.pos.jumpTo(probe.pos.maxScrollExtent);
-    await tester.pump(const Duration(milliseconds: 16));
-    await tester.pump(const Duration(milliseconds: 16));
+    await tester.pumpAndSettle();
     expect(probe.pos.pixels, closeTo(probe.pos.maxScrollExtent, 1));
     expect(
       probe.intentFollow,
@@ -517,6 +533,70 @@ void main() {
     );
     await tester.pump(const Duration(milliseconds: 16));
     expect(probe.frameScheduled, isFalse, reason: '执行完一帧后不得自激');
+    await _flush(tester);
+  });
+
+  testWidgets('P2 按钮显隐1：阅读态 + 距底约 130px（原死角）→ 按钮显示', (tester) async {
+    await _mount(tester, _Backend(_history()), debug: false);
+    final probe = _Probe(tester);
+    await _flush(tester);
+    await tester.drag(find.byType(CustomScrollView), const Offset(0, 150));
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(probe.intentFollow, isFalse);
+    expect(probe.distanceToEnd, greaterThan(1));
+    expect(
+      probe.distanceToEnd,
+      lessThanOrEqualTo(160),
+      reason: '用例前提：落在 160px 产品展示阈值内（原死角）',
+    );
+    expect(probe.showJump, isTrue);
+    expect(_jumpVisible(tester), isTrue, reason: '阅读态必须始终显示回底圆钮');
+    await _flush(tester);
+  });
+
+  testWidgets('P2 按钮显隐2：阅读态 + 距底 10px（仍在 160 内）→ 按钮显示', (tester) async {
+    await _mount(tester, _Backend(_history()), debug: false);
+    final probe = _Probe(tester);
+    await _flush(tester);
+    // 程序性移动到距底 10px（未真正到底）：按“像素向顶部移动→阅读”进入阅读态。
+    probe.pos.jumpTo(probe.pos.maxScrollExtent - 10);
+    await tester.pump(const Duration(milliseconds: 16));
+    await tester.pump(const Duration(milliseconds: 16));
+    expect(probe.distanceToEnd, closeTo(10, 1));
+    expect(probe.intentFollow, isFalse, reason: '未真正到底（10px > 1px 容差）→ 阅读态');
+    expect(probe.showJump, isTrue);
+    expect(_jumpVisible(tester), isTrue);
+    await _flush(tester);
+  });
+
+  testWidgets('P2 按钮显隐3：跟随态 + 在底部 → 按钮隐藏（不能永远显示）', (tester) async {
+    await _mount(tester, _Backend(_history()), debug: false);
+    final probe = _Probe(tester);
+    await _flush(tester);
+    expect(probe.intentFollow, isTrue);
+    expect(probe.distanceToEnd.abs(), lessThanOrEqualTo(1));
+    expect(probe.showJump, isFalse);
+    expect(_jumpVisible(tester), isFalse, reason: '真正到底跟随时不显示回底圆钮');
+    await _flush(tester);
+  });
+
+  testWidgets('P2 按钮显隐5：阅读态点回底按钮 → 恢复跟随且按钮消失', (tester) async {
+    await _mount(tester, _Backend(_history()), debug: false);
+    final probe = _Probe(tester);
+    await _flush(tester);
+    await tester.drag(find.byType(CustomScrollView), const Offset(0, 400));
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(probe.intentFollow, isFalse);
+    expect(_jumpVisible(tester), isTrue);
+
+    await tester.tap(_jumpButton, warnIfMissed: false);
+    for (var i = 0; i < 8; i++) {
+      await tester.pump(const Duration(milliseconds: 16));
+    }
+    expect(probe.intentFollow, isTrue, reason: '点回底 = 显式进入跟随');
+    expect(probe.distanceToEnd.abs(), lessThanOrEqualTo(1));
+    expect(probe.showJump, isFalse, reason: '回到真正底部后按钮必须消失');
+    expect(_jumpVisible(tester), isFalse);
     await _flush(tester);
   });
 

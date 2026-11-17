@@ -230,7 +230,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 900));
   });
 
-  testWidgets('轨道隐藏（<2 轮）时 padding 恢复 16，无轨道', (tester) async {
+  testWidgets('轨道隐藏（<2 轮）时仍按圆钮 38：阅读态回底入口始终可见', (tester) async {
     tester.view.physicalSize = const Size(390, 844);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
@@ -238,10 +238,13 @@ void main() {
     await _scrollUp(tester);
 
     expect(_rail, findsNothing, reason: '<2 轮不渲染轨道');
-    expect(_liveRightPadding(tester), 16, reason: '轨道隐藏时恢复默认 16dp');
+    // #114 P2 产品行为变更：阅读态始终显示「回到底部」圆钮（不再只按 160px 几何隐藏）。
+    // 因此这里 padding 取圆钮 gutter 38，而不是旧断言的无 gutter 16。
+    expect(_liveRightPadding(tester), 38,
+        reason: '轨道隐藏，但阅读态回底圆钮可见 → gutter 38');
     final textRight = _visibleUserTextRight(tester);
     expect(textRight, isNotNull);
-    expect(textRight!, closeTo(390 - 16 - 12, 2));
+    expect(textRight!, closeTo(390 - 38 - 12, 2));
     await tester.pump(const Duration(milliseconds: 900));
   });
 

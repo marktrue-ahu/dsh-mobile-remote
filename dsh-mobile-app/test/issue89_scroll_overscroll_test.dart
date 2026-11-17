@@ -283,11 +283,13 @@ void main() {
     await tester.pump(const Duration(milliseconds: 400));
     _expectWithinRange(tester);
     final pos = _position(tester);
-    final atBottom = pos.maxScrollExtent - pos.pixels <= 160;
+    // #114 P2 产品行为变更：阅读态始终显示「回到底部」；只有真正到底（跟随态）才隐藏。
+    // 旧断言按“160px 内即视为贴底”推导，会与新的“真正到底才钉”冲突。
+    final atTrueBottom = pos.maxScrollExtent - pos.pixels <= 1;
     expect(
       _jumpVisible(tester),
-      !atBottom,
-      reason: '回底按钮显隐必须与真实贴底状态一致',
+      !atTrueBottom,
+      reason: '阅读态必须始终有回底入口；仅在真正到底（跟随）时隐藏',
     );
     await _finishTimers(tester);
   });

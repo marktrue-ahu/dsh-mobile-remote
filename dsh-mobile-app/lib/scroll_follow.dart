@@ -448,13 +448,13 @@ class ScrollFollowCoordinator {
     _refreshShowJumpToLatest();
   }
 
-  /// 回底按钮/刻度轨显隐 = 派生展示：按 160px 产品阈值（近底隐藏）。
+  /// 回底按钮/刻度轨显隐 = 派生展示。
   ///
-  /// 已知产品取舍（#114 task-11 汇报）：意图改为“真正到底才钉”后，用户停在
-  /// 距底 ≤160px 但 >容差处会处于阅读态而按钮隐藏（看不到显式恢复入口）。
-  /// 本任务不擅自改按钮产品阈值——保留既有 160px 行为，把该死角上报产品决策。
+  /// 维护者决策（#114 P2）：**阅读态始终显示回底入口**——用户上翻即取消钉底，
+  /// 必须始终能看到一个明确的“回到底部”；160px 产品阈值只用于跟随态（近底隐藏）。
+  /// 这消除了“reading + 距底 130px → 按钮隐藏但又不跟随”的死角。
   void _refreshShowJumpToLatest() {
-    final show = !_nearBottom;
+    final show = _intent == FollowIntent.reading || !_nearBottom;
     if (show != _showJumpToLatest) _showJumpToLatest = show;
   }
 }

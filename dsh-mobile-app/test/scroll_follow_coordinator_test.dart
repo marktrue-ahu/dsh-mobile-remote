@@ -143,7 +143,7 @@ void main() {
   });
 
   group('派生展示（按钮显隐）', () {
-    test('阅读态 + 距底 100px：按钮仍按 160px 阈值隐藏（已知死角，上报产品）', () {
+    test('阅读态始终显示回底入口（含距底 100px 的原死角）', () {
       final h = _Harness();
       // 距底 100px：超过“真正到底”容差，但仍在 160px 展示阈值内。
       h.coordinator.onUserScrollStart(_geo(pixels: 900, max: 1000));
@@ -156,8 +156,30 @@ void main() {
       );
       expect(
         h.coordinator.showJumpToLatest,
-        isFalse,
-        reason: '本任务保留既有产品阈值：该死角不改，只在汇报中提出',
+        isTrue,
+        reason: '阅读态必须始终看到回底入口，不能出现“不跟随又没入口”的死角',
+      );
+
+      // 距底 10px（仍在 160 内）→ 阅读态也必须显示。
+      h.coordinator.onUserScrollStart(_geo(pixels: 990, max: 1000));
+      h.coordinator.onUserScrollEnd(_geo(pixels: 990, max: 1000));
+      expect(h.coordinator.intent, FollowIntent.reading);
+      expect(
+        h.coordinator.showJumpToLatest,
+        isTrue,
+        reason: '距底 10px 未真正到底 → 阅读态，同样必须有入口',
+      );
+    });
+
+    test('跟随态 + 距底 200px（非末端）：按新规则显示回底入口', () {
+      final h = _Harness();
+      expect(h.coordinator.intent, FollowIntent.followLatest);
+      h.coordinator.onMetrics(_geo(pixels: 800, max: 1000));
+      expect(h.coordinator.intent, FollowIntent.followLatest);
+      expect(
+        h.coordinator.showJumpToLatest,
+        isTrue,
+        reason: '跟随态但不在末端：仍给出回底入口',
       );
     });
 
