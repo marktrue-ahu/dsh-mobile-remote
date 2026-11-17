@@ -18,6 +18,20 @@ const ALIAS = `${PKG}-app`;
 const INTEGRITY = "sha512-" + Buffer.from("plugin-integrity").toString("base64");
 const CARRIER_INTEGRITY = "sha512-" + Buffer.from("carrier-integrity").toString("base64");
 
+/**
+ * 本地版本 → NPM dist-tag 通道，与产品侧 npmUpdateChannel() 同口径：
+ * stable→latest / alpha.N→alpha / rc.N→rc。假 npm 必须按**实际通道**声明标签，
+ * 否则 rc/stable 发布时会查不到本通道标签，只跑 1 次 npm view 而假红。
+ */
+function updateChannel(version) {
+  const dash = version.indexOf("-");
+  if (dash === -1) return "latest";
+  const channel = version.slice(dash + 1).split(".")[0];
+  if (channel === "alpha" || channel === "rc") return channel;
+  throw new Error(`local version channel unsupported: ${version}`);
+}
+const CHANNEL = updateChannel(VERSION);
+
 class FakeResponse extends EventEmitter {
   constructor() { super(); this.headersSent = false; this.chunks = []; }
   writeHead(statusCode, headers = {}) { this.statusCode = statusCode; this.headers = headers; this.headersSent = true; }
@@ -87,7 +101,7 @@ test("#96 review handler：慢 npm 下 bootstrap + 立即 force 只跑一轮 npm
 echo x >> "${counter}"
 /bin/sleep 0.5
 case "$2" in
-  "${PKG}") echo '{"alpha":"${VERSION}"}' ;;
+  "${PKG}") echo '{"${CHANNEL}":"${VERSION}"}' ;;
   "${PKG}@${VERSION}") echo '{"version":"${VERSION}","optionalDependencies":{"${ALIAS}":"npm:${PKG}@${CARRIER_VERSION}"},"dist":{"integrity":"${INTEGRITY}"}}' ;;
   "${PKG}@${CARRIER_VERSION}") echo '{"version":"${CARRIER_VERSION}","dist":{"integrity":"${CARRIER_INTEGRITY}"}}' ;;
   *) echo '{}' ;;
