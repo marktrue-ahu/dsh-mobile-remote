@@ -57,6 +57,8 @@ class PluginUpdateStatus {
     this.updateChannelDescription = '',
     this.canRestartHost = false,
     this.hostManagerHmrAvailable,
+    this.hostErrorCode = '',
+    this.nextAction = '',
   });
 
   const PluginUpdateStatus.unknown()
@@ -74,7 +76,9 @@ class PluginUpdateStatus {
       updateChannel = '',
       updateChannelDescription = '',
       canRestartHost = false,
-      hostManagerHmrAvailable = null;
+      hostManagerHmrAvailable = null,
+      hostErrorCode = '',
+      nextAction = '';
 
   /// 检查结论：`up-to-date` / `update-available` / `local-ahead` / `unavailable` / `disabled` / `unknown`。
   final String state;
@@ -106,6 +110,12 @@ class PluginUpdateStatus {
   /// 宿主是否报告 HMR：`true` 表示宿主管理器更新可免重启生效；
   /// `false` 表示装了但要重启；`null` 表示旧宿主未下发。
   final bool? hostManagerHmrAvailable;
+
+  /// issue #116：宿主拒绝时的白名单错误码（旧插件为空串）。
+  final String hostErrorCode;
+
+  /// issue #116：宿主拒绝后的稳定动作枚举（旧插件为空串）。
+  final String nextAction;
 
   /// 本次更新会不会重启宿主（决定界面是否要预告"连接会短暂断开"）。
   bool get updateRestartsHost {
@@ -172,6 +182,8 @@ class PluginUpdateStatus {
       hostManagerHmrAvailable: (json['hostManager'] is Map)
           ? (json['hostManager'] as Map)['hmrAvailable'] == true
           : null,
+      hostErrorCode: (json['hostErrorCode'] as String?) ?? '',
+      nextAction: (json['nextAction'] as String?) ?? '',
     );
   }
 }

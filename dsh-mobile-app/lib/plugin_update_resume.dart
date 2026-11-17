@@ -46,6 +46,8 @@ class PluginTransaction {
     this.release,
     this.startedAt,
     this.resultOk,
+    this.hostErrorCode = '',
+    this.nextAction = '',
   });
 
   final String opId;
@@ -62,6 +64,13 @@ class PluginTransaction {
 
   /// 事务结果是否成功（result.ok）；未知为 null。
   final bool? resultOk;
+
+  /// issue #116：宿主拒绝时的白名单错误码（仅 code，不含 diagnostic 原文）。
+  final String hostErrorCode;
+
+  /// issue #116：宿主拒绝后的稳定动作枚举（restart-host / version-incompatible /
+  /// invalid-target / retry-or-diagnose / diagnose）；旧插件为空串。
+  final String nextAction;
 
   static PluginTransaction? fromJson(Map<String, dynamic>? json) {
     if (json == null) return null;
@@ -84,6 +93,12 @@ class PluginTransaction {
       resultOk: result is Map && result['ok'] is bool
           ? result['ok'] as bool
           : null,
+      hostErrorCode: result is Map
+          ? (result['hostErrorCode'] as String?) ?? ''
+          : '',
+      nextAction: result is Map
+          ? (result['nextAction'] as String?) ?? ''
+          : '',
     );
   }
 }
