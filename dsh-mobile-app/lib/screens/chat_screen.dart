@@ -3,7 +3,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
-import 'package:flutter/foundation.dart' show setEquals;
+import 'package:flutter/foundation.dart' show setEquals, visibleForTesting;
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart'
@@ -713,6 +713,35 @@ class _ChatScreenState extends State<ChatScreen> {
   double _lastLiveRightPadding = -1;
   // issue #89：右 padding 同帧变化会导致正文重排/max 收缩；帧后 clamp 越界。
   int _paddingReconcileAttempts = 0;
+
+  // ── issue #114（阶段 A）只读测量入口 ──────────────────────────────
+  // 「跟随意图」目前是散在的私有状态（`_pinnedToBottom`、拖拽标志、帧后贴底调度）。
+  // 动态回放用例需要记录**谁在什么时刻改变了意图**，而不是只从 pixels 反推。
+  // 这些 getter 只读、生产逻辑不读取；修复阶段（A3）由单一滚动 owner 统一承载。
+  @visibleForTesting
+  bool get debugPinnedToBottom => _pinnedToBottom;
+
+  @visibleForTesting
+  bool get debugUserDragActive => _userDragActive;
+
+  @visibleForTesting
+  bool get debugFollowBottomScheduled => _followBottomScheduled;
+
+  @visibleForTesting
+  bool get debugSettledFollowScheduled => _settledFollowScheduled;
+
+  @visibleForTesting
+  double get debugLiveBottomGap => _liveBottomGap;
+
+  /// 实际执行过的程序性回底次数与最后一次目标（issue §6.2「校正次数」）。
+  @visibleForTesting
+  int debugFollowJumps = 0;
+
+  @visibleForTesting
+  double? debugLastFollowTarget;
+
+  @visibleForTesting
+  int debugScrollToBottomCallbacks = 0;
 
   /// issue #89：padding 38/36/16 同帧切换后，宽度变化会清高度缓存并重排；
   /// 帧后把滚动位置 clamp 到新范围，重测底部占位，必要时有限帧收敛。
@@ -1757,6 +1786,7 @@ class _ChatScreenState extends State<ChatScreen> {
   void _scrollToBottom({bool force = false, bool settle = false}) {
     if (_inHistory) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      debugScrollToBottomCallbacks += 1;
       if (!_scrollCtrl.hasClients) return;
       final pos = _scrollCtrl.position;
       final target = pos.maxScrollExtent;
@@ -1771,6 +1801,8 @@ class _ChatScreenState extends State<ChatScreen> {
       // 避免大段 chunk 单帧推高内容后 220px 判定失效、输出掉出屏幕。
       if (force || _pinnedToBottom) {
         _pinnedToBottom = true;
+        debugFollowJumps += 1;
+        debugLastFollowTarget = target;
         _scrollCtrl.jumpTo(target);
         // issue #103：lazy SliverList 的 max 会随子项布局修正；展开/初始化/回底
         // 必须多帧 settle，单次 jump 可能落在真实内容外（整屏空白）。
