@@ -12,6 +12,29 @@ import { apply } from '../lib/index.js';
 const AUTH_TOKEN = 'a'.repeat(32);
 let home = '';
 
+function coreVersion(version) {
+  return /^\d+\.\d+\.\d+/.exec(version)?.[0] ?? version;
+}
+
+/**
+ * 本地版本 → 发布通道 + 严格更新的候选版本。
+ * 夹具跟着当前检出代码的**实际通道**走（alpha.N→alpha.N+1 / rc.N→rc.N+1 / 稳定版→下一个补丁），
+ * 与产品侧 npmUpdateChannel() 同口径；假设 alpha 会让任何 rc/stable 发布假红。
+ */
+function nextCandidate(version) {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.exec(version);
+  if (!match) throw new Error(`local version is not semver: ${version}`);
+  const core = `${match[1]}.${match[2]}.${match[3]}`;
+  const prerelease = match[4] === undefined ? [] : match[4].split('.');
+  // 稳定版：通道是 latest，候选是下一个补丁版本。
+  if (prerelease.length === 0) return { channel: 'latest', candidate: `${match[1]}.${match[2]}.${Number(match[3]) + 1}` };
+  const [channel, ordinal] = prerelease;
+  if ((channel !== 'alpha' && channel !== 'rc') || prerelease.length !== 2 || !/^\d+$/.test(ordinal)) {
+    throw new Error(`local version channel unsupported: ${version}`);
+  }
+  return { channel, candidate: `${core}-${channel}.${Number(ordinal) + 1}` };
+}
+
 function harness() {
   // 每个用例独立 HOME：事务文件/锁不跨用例残留。
   home = mkdtempSync(join(tmpdir(), 'hostchan-'));
@@ -33,17 +56,14 @@ function harness() {
     rateLimit: { maxFailures: 10, windowMs: 60000, blockMs: 60000 }, lanBridge: { enabled: false, host: '127.0.0.1', port: 39402 } };
   const docs = new Map();
   // 本地插件版本来自 package.json；远端候选必须严格更新，避免测试与发布版本号耦合。
+  // 候选版本与 dist-tag 都按本地版本的发布通道声明：产品侧只查「本机所在通道」的标签。
   const localVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
-  const nextAlpha = (v) => {
-    const m = /^(.*-alpha\.)(\d+)$/.exec(v);
-    if (!m) throw new Error(`local version is not alpha: ${v}`);
-    return `${m[1]}${Number(m[2]) + 1}`;
-  };
-  const P = nextAlpha(localVersion), C = `${P}-app`;
-  docs.set('@marktrue/dsh-mobile-remote', { 'dist-tags': { latest: '3.2.4-alpha.5', alpha: P, app: C } });
+  const { channel, candidate: P } = nextCandidate(localVersion), C = `${P}-app`;
+  docs.set('@marktrue/dsh-mobile-remote', { 'dist-tags': { [channel]: P, app: C } });
   docs.set(`@marktrue/dsh-mobile-remote@${P}`, { version: P, dist: { integrity: 'sha512-cGx1Z2lu' },
     optionalDependencies: { '@marktrue/dsh-mobile-remote-app': `npm:@marktrue/dsh-mobile-remote@${C}` } });
-  docs.set(`@marktrue/dsh-mobile-remote@${C}`, { version: C, appVersion: '3.2.4+39', dist: { integrity: 'sha512-Y2Fycmllcg==' } });
+  // 载体 App 的 core 必须与候选插件 core 配对（NPM 源按 core 校验），故由候选推导而非写死。
+  docs.set(`@marktrue/dsh-mobile-remote@${C}`, { version: C, appVersion: `${coreVersion(P)}+39`, dist: { integrity: 'sha512-Y2Fycmllcg==' } });
   apply(ctx, config, { pluginUpdates: {
     npmPackageView: async spec => docs.get(spec) ?? null,
     restartForm: () => 'unsupported',
@@ -51,7 +71,7 @@ function harness() {
     runSelfUpdate: async () => { throw new Error('重启通道不应被使用'); },
     hostCapabilities: { packageName: '@marktrue/dsh-mobile-remote', managerAvailable: true, managerReason: '',
       hmrAvailable: true, hmrReason: '', updatable: true, state: 'ready', channel: 'host-manager', installedVersion: localVersion },
-    runHostUpdate: async ({ targetVersion }) => { hostUpdateCalls++; return { ok: true, channel: 'host-manager', reason: '', from: '3.2.4-alpha.5', to: targetVersion, step: 'install', restored: false }; },
+    runHostUpdate: async ({ targetVersion }) => { hostUpdateCalls++; return { ok: true, channel: 'host-manager', reason: '', from: localVersion, to: targetVersion, step: 'install', restored: false }; },
   } });
   return { route: routes.find(r => r.kind === 'prefix'), jobs, profile, get calls() { return hostUpdateCalls; } };
 }
