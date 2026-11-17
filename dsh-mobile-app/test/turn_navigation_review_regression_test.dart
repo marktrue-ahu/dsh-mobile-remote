@@ -232,15 +232,40 @@ void main() {
       }
       expect(find.byType(TurnNavigatorRail), findsOneWidget);
       expect(_rail(tester).activeTurn, 1);
+      // 还原原测试的隐含前提：此时必须真正在顶端、且已离开底部 160px 区间。
+      expect(_position(tester).pixels, lessThanOrEqualTo(1));
+      expect(
+        _position(tester).maxScrollExtent - _position(tester).pixels,
+        greaterThan(160),
+        reason: '进入下滚循环前必须已离开底部区间（原 jumpTo(0) 的前提）',
+      );
 
       // 持续向下滚（真实手势），高亮应跨多轮跟随、不能停在第一轮。
+      // 记录沿途 activeTurn，要求至少经过 1→2→3（跨 2 个轮次边界），而不是“刚 !=1”。
+      final observedTurns = <int>{1};
       for (var i = 0; i < 60; i++) {
         await tester.drag(scroll, const Offset(0, -400));
         await tester.pump(const Duration(milliseconds: 120));
-        if (_rail(tester).activeTurn != 1) break;
+        final turn = _rail(tester).activeTurn ?? 0;
+        observedTurns.add(turn);
+        if (turn >= 3) break;
       }
-      expect(_rail(tester).activeTurn, isNot(1),
-          reason: '真实持续滚动跨多轮，高亮必须跟随几何校准');
+      final endPos = _position(tester);
+      expect(
+        endPos.maxScrollExtent - endPos.pixels,
+        greaterThan(160),
+        reason: '循环结束时必须仍在底部 160px 区间之外（原 max*0.55 的前提）',
+      );
+      expect(
+        observedTurns.length,
+        greaterThanOrEqualTo(3),
+        reason: '持续滚动应实际经过至少 3 个不同轮次（1→…→N，N>=3）',
+      );
+      expect(
+        _rail(tester).activeTurn ?? 0,
+        greaterThanOrEqualTo(3),
+        reason: '结束时高亮至少跨到第 3 轮（跨 2 个轮次边界），不是“只要 !=1”',
+      );
     });
 
     testWidgets('长回复导致起始边界被回收时，用可见轮次推断而不跳到最新轮', (tester) async {
