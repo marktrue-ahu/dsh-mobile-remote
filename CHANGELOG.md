@@ -1,5 +1,43 @@
 # Changelog
 
+## v3.2.4-rc.2（build 55，issues #116 #118 #119 #120）— 宿主错误透传、时间线清理与滚动跟随补全
+
+> 插件 `3.2.4-rc.2` / App `3.2.4+55` / 载体 `3.2.4-rc.2-app`。RC 候选：插件发布到 npm `rc` dist-tag，`latest` 保持 `3.2.3-rc.1` 不动（只有 stable 可前进）。本版是首个相对 `alpha.21` / `rc.1` 带**实质功能修复**的 RC。
+
+### 宿主拒绝时透传错误码与可执行动作（#116）
+
+- 插件更新被宿主拒绝时不再只显示 `host-manager-rejected`：新增 `hostErrorCode`（宿主白名单原码）与 `nextAction`（5 个稳定动作：`restart-host` / `version-incompatible` / `invalid-target` / `retry-or-diagnose` / `diagnose`）；
+- 映射集中在一处，未知 code 保留原码并归为 `diagnose`，空码不编造动作；**只透传 `code`，不透传宿主 `diagnostic` 原文**（可能含路径/凭据）；
+- `stop-profile` / `bundle-in-use` 文案明确「先重启 DSH 再试」；不自动重启、不自动重试；
+- 非宿主结论统一清空两字段，避免上次失败的动作文案残留到下次；
+- 旧插件无新字段时 App 回退既有 reason 文案。
+
+### 任务清单更新不再生成独立时间线卡（#119）
+
+- `todo/write` 归入调试专属事件：普通模式时间线不再出现「任务清单已更新」卡，**任务清单面板是唯一展示入口**；调试模式仍可查看；
+- 「复制整段」按同一可见性判定过滤，隐藏卡不会从复制文本泄漏（与渲染口径共用 `timelineTypeVisibleIn`）；
+- 事件本身继续消费：任务面板在实时、历史回放、catch-up 三处一致更新；
+- 推翻 v3.1.4「任务面板与时间线同时更新」的约定，注释已同步说明。
+
+### SSE 事件统一跟随出口（#118）
+
+- `_handleEvent` 拆为「内层处理 + 统一布局出口」：内层返回本次处理是否改变消息区布局/视口高度，出口统一做底部占位重测 + 有界跟随校正；**新增事件类型必须显式声明**，避免再漏（此前 `session/jobs` 让视口变矮后不跟随，实测视口停在距真实末端 35px 且 9 帧不恢复）；
+- 声明为改变布局：`session/jobs`、`question/*`、`approval/*`、`mobile/queue`、主路径（含 turn/end 自动折叠）、结构性 reasoning 行；
+- 档位/收起时机变化（会折叠或展开过程段，可能数百 px）同样收口；
+- 移除原先散落的重复跟随请求。
+
+### 问询归属定位日志与 agentId 归一（#120）
+
+- 新增 `[120-debug]` 观测日志（4 处）：记录帧 sessionId、当前页 sessionId、store sessionId 与 rpcId，可直接区分「帧归属错」还是「页面绑定错位」；
+- `onEventsWaterfall` 的 `frame.agentId` 不再裸用，改为剥离 `session:` 前缀（与同文件 `agentSessionId()` 同口径；该路径是四处中唯一未归一的位置）；
+- **根因未坐实**：本版只加观测，问询不弹的定位需真机日志。
+
+### 验证
+
+- 本机门禁 6 项全绿：`flutter analyze` 0 error/0 warning、`flutter test` **1546 全绿**、timeline-contract 179/0、account-usage 15/0、`node --test` 1220 例 1199 通过（4 项为本机 root 环境既有失败）、Kotlin `UsagePanelModelTest` BUILD SUCCESSFUL；
+- 每个修复均做变异反证：删掉修复后对应测试变红（#116 三组、#119 两组、#118 五组、#120 两组）；
+- 真机项目列为本版验收项。
+
 ## v3.2.4-rc.1（build 54，issues #113 #114）— 发布工具链精简 + 聊天滚动跟随单一 owner
 
 > 插件 `3.2.4-rc.1` / App `3.2.4+54` / 载体 `3.2.4-rc.1-app`。本 fork 的 RC 发布候选：插件发布到 npm `rc` dist-tag，`latest` 保持 `3.2.3-rc.1` 不动（只有 stable 可前进）。release 线从 develop `aae26a7` 切出，本版本只接受修复、版本号与 CHANGELOG。
