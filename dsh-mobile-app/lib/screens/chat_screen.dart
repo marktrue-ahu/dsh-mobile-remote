@@ -7657,6 +7657,11 @@ class _ChatScreenState extends State<ChatScreen> {
       });
     }
 
+    // issue #123 v3：身份快照按轮累积（v3 每组多存成员令牌 ≈ O(rows)），必须收口，
+    // 否则长会话/长窗口无界增长。只剪 live 视图，且只剪**快照**：
+    // 不再渲染的轮次在不可见期间不会发生键变化，滚回窗口时重建快照即可。
+    if (!historyView) _processFold.retainTurns(anchoredTurns);
+
     return _ProcessPlan(
       processVersion: _processVersion,
       epoch: _processEpoch,
