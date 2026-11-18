@@ -7692,10 +7692,12 @@ class _ChatScreenState extends State<ChatScreen> {
     // 否则长会话/长窗口无界增长。只剪 live 视图，且只剪**快照**：
     // 不再渲染的轮次在不可见期间不会发生键变化，滚回窗口时重建快照即可。
     if (!historyView) _segmentFold.retainTurns(anchoredTurns);
-    // 只在 live 计划**有内容**时过滤：reset/compaction 重载期间会出现「items 已清空、
-    // 新历史未到」的瞬时空计划，此时过滤会误清全部用户选择（DSH 的 key 列表始终
-    // 可用，不存在这个中间态，这是照搬时的必要适配）。
-    if (!historyView && _items.isNotEmpty) {
+    // 存在性过滤（DSH `retainAccountKeys` 等价物）：计划为空 → existing 为空 →
+    // 缓存被清空（历史真的为空时这是正确结果）。
+    // 注意：`_load` 的 `_items.clear()` 与重建在同一个同步 setState 块内（无 await），
+    // 不产生「旧列表已清空、新历史未到」的可渲染帧；是否存在组由 existingGroupIds
+    // 判定（计划输入是 `[..._items, ..._olderItems]`，不是只看 `_items`）。
+    if (!historyView) {
       _retainExistingGroupExpansions(existingGroupIds);
     }
 
