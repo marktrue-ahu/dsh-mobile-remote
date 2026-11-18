@@ -53,6 +53,23 @@ ProcessSegment _toolSegment(
   ]),
 );
 
+/// 工具行段（带每行自己的 step）：`(seq, callId, step)`。
+ProcessSegment _toolRowsSegment(
+  List<(int, String, int?)> rows, {
+  int? boundarySeq,
+}) => ProcessSegment(
+  boundarySeq: boundarySeq,
+  rows: List.unmodifiable([
+    for (final (seq, callId, step) in rows)
+      ProcessRow.tool(
+        seq: seq,
+        step: step,
+        callId: callId,
+        toolName: 'shell',
+      ),
+  ]),
+);
+
 ChatEvent _ev(int seq, String type, Map<String, dynamic> data) =>
     ChatEvent(seq: seq, type: type, data: data, time: seq * 10);
 
@@ -325,6 +342,159 @@ void main() {
         reason: 'null-step 行只能按 seq 认：seq 变则视为新段（不会串段，但会丢状态）',
       );
       expect(state.groupManual, isEmpty, reason: '旧键必须被删除，不能留到将来误读');
+    });
+  });
+
+  // ── v3：组身份按成员重叠迁移（step 会迟到；段键可能不变） ─────────────
+  group('#123 v3 组迁移：成员重叠 + step 迟到 + 冲突规则', () {
+    test('段键不变、step null→35：组状态按 callId 重叠迁移', () {
+      final state = ProcessFoldState();
+      final before = [_toolRowsSegment([(110, 'c1', null)], boundarySeq: 95)];
+      state.sync(1, before);
+      state.setGroupExpanded(groupKeyOf(before.single, 1, null), false);
+
+      // 段键仍是 1:95；只有组键变 1:95:x → 1:95:35。
+      final after = [_toolRowsSegment([(100, 'c1', 35)], boundarySeq: 95)];
+      state.sync(1, after);
+      expect(state.groupExpandedOf(after.single, 1, 35), isFalse,
+          reason: '段键不变时也必须触发组迁移（旧实现只看段键集合）');
+      expect(state.groupManual.containsKey('1:95:x'), isFalse);
+    });
+
+    test('段键变化 + step null→35：组状态也必须迁移', () {
+      final state = ProcessFoldState();
+      final before = [_toolRowsSegment([(110, 'c1', null)])];
+      state.sync(1, before);
+      state.setGroupExpanded(groupKeyOf(before.single, 1, null), false);
+
+      final after = [_toolRowsSegment([(100, 'c1', 35)], boundarySeq: 95)];
+      state.sync(1, after);
+      expect(state.groupExpandedOf(after.single, 1, 35), isFalse);
+      expect(state.groupManual.containsKey('1:head:x'), isFalse);
+    });
+
+    test('切分（等比例）：同键那部分继续持有，其余碎片用默认（不复制）', () {
+      final state = ProcessFoldState();
+      final before = [
+        _toolRowsSegment([(110, 'c1', null), (120, 'c2', null)], boundarySeq: 95),
+      ];
+      state.sync(1, before);
+      state.setGroupExpanded(groupKeyOf(before.single, 1, null), false);
+
+      // c2 拿到 step35 → 同一段内裂成两个组：step35{c2} / null{c1}。
+      final after = [
+        _toolRowsSegment([(110, 'c1', null), (120, 'c2', 35)], boundarySeq: 95),
+      ];
+      state.sync(1, after);
+      expect(state.groupExpandedOf(after.single, 1, null), isFalse,
+          reason: '平手时同键（null 组）视为延续，继续持有状态');
+      expect(state.groupExpandedOf(after.single, 1, 35), isNull,
+          reason: '碎片不得复制状态（否则一次操作收起两处）');
+    });
+
+    test('切分（不等比例）：重叠最高的新组继承，旧键删除', () {
+      final state = ProcessFoldState();
+      final before = [
+        _toolRowsSegment(
+          [(100, 'c1', null), (110, 'c2', null), (120, 'c3', null)],
+          boundarySeq: 95,
+        ),
+      ];
+      state.sync(1, before);
+      state.setGroupExpanded(groupKeyOf(before.single, 1, null), false);
+
+      // c1/c2 拿到 step35（0.67），c3 仍无 step（0.33）。
+      final after = [
+        _toolRowsSegment(
+          [(100, 'c1', 35), (110, 'c2', 35), (120, 'c3', null)],
+          boundarySeq: 95,
+        ),
+      ];
+      state.sync(1, after);
+      expect(state.groupExpandedOf(after.single, 1, 35), isFalse,
+          reason: '重叠最高的新组继承');
+      expect(state.groupExpandedOf(after.single, 1, null), isNull,
+          reason: '碎片用默认值');
+      expect(state.groupManual.containsKey('1:95:x'), isFalse,
+          reason: '迁移走的状态从旧键删除（旧键虽仍在渲染，也不再持有）');
+    });
+
+    test('合并 + 新组已有显式状态：不覆盖，旧状态让位并删除', () {
+      final state = ProcessFoldState();
+      final before = [
+        _toolRowsSegment([(100, 'c1', null), (110, 'c2', 35)], boundarySeq: 95),
+      ];
+      state.sync(1, before);
+      state.setGroupExpanded(groupKeyOf(before.single, 1, null), false);
+      state.setGroupExpanded(groupKeyOf(before.single, 1, 35), true);
+
+      // c1 也拿到 step35 → 两组合并成 35{c1,c2}（新键 = 旧 35 组键）。
+      final after = [
+        _toolRowsSegment([(100, 'c1', 35), (110, 'c2', 35)], boundarySeq: 95),
+      ];
+      state.sync(1, after);
+      expect(state.groupExpandedOf(after.single, 1, 35), isTrue,
+          reason: '新组已有显式状态（展开）不得被旧 x 组的收起覆盖');
+      expect(state.groupManual.containsKey('1:95:x'), isFalse);
+    });
+
+    test('合并 + 新组无状态：继承；多旧组冲突时收起(false)优先', () {
+      final state = ProcessFoldState();
+      // 两段（head / 95）各自一组；补页裁剪后合成新段 head{c1,c2}。
+      final before = [
+        _toolRowsSegment([(100, 'c1', 1)], boundarySeq: null),
+        _toolRowsSegment([(110, 'c2', 1)], boundarySeq: 95),
+      ];
+      state.sync(1, before);
+      state.setGroupExpanded('1:head:1', false);
+      state.setGroupExpanded('1:95:1', true);
+
+      final after = [
+        _toolRowsSegment([(100, 'c1', 1), (110, 'c2', 1)]),
+      ];
+      state.sync(1, after);
+      expect(state.groupExpandedOf(after.single, 1, 1), isFalse,
+          reason: '合并后无显式状态 → 继承；冲突时收起优先（保守）');
+      expect(state.groupManual.containsKey('1:95:1'), isFalse);
+    });
+
+    test('零交集：不迁移，旧键删除（不串到新组）', () {
+      final state = ProcessFoldState();
+      final before = [_toolRowsSegment([(100, 'c9', null)], boundarySeq: 95)];
+      state.sync(1, before);
+      state.setGroupExpanded(groupKeyOf(before.single, 1, null), false);
+
+      final after = [_toolRowsSegment([(200, 'c1', 35)], boundarySeq: 95)];
+      state.sync(1, after);
+      expect(state.groupExpandedOf(after.single, 1, 35), isNull);
+      expect(state.groupManual, isEmpty, reason: '零交集 → 旧状态删除');
+    });
+
+    test('同键 + 成员增长（流式追加）：状态原地保留', () {
+      final state = ProcessFoldState();
+      final before = [_toolRowsSegment([(100, 'c1', 35)], boundarySeq: 95)];
+      state.sync(1, before);
+      state.setGroupExpanded(groupKeyOf(before.single, 1, 35), false);
+
+      final after = [
+        _toolRowsSegment([(100, 'c1', 35), (110, 'c2', 35)], boundarySeq: 95),
+      ];
+      state.sync(1, after);
+      expect(state.groupExpandedOf(after.single, 1, 35), isFalse);
+    });
+
+    test('retainTurns：只剪不再渲染的轮次快照，不动手动状态', () {
+      final state = ProcessFoldState();
+      final turn1 = _toolRowsSegment([(100, 'c1', 35)], boundarySeq: 95);
+      final turn2 = _toolRowsSegment([(200, 'c2', 7)], boundarySeq: 96);
+      state.sync(1, [turn1]);
+      state.sync(2, [turn2]);
+      state.setGroupExpanded('1:95:35', false);
+      expect(state.snapshotTurns, {1, 2});
+      state.retainTurns({2});
+      expect(state.snapshotTurns, {2}, reason: '不再渲染的轮次快照被剪掉');
+      expect(state.groupExpandedOf(turn1, 1, 35), isFalse,
+          reason: '剪枝只剪快照，手动状态必须保留');
     });
   });
 }

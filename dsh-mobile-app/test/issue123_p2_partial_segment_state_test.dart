@@ -177,6 +177,67 @@ List<Map<String, dynamic>> _toolHistory() {
   return events;
 }
 
+/// v3 夹具 A（#123 第三轮）：**段键不变、只有 step 迟到**。
+///
+/// seq1 turn/start / seq2 提示词 / seq3 tool/call cC(step35) / seq4 tool/result cC（**无 step**）/
+/// seq5 思考行 step1 / seq6 回答（过程块宿主）。
+/// 初始窗口 = 最后 3 条（seq4..6）：段键 `1:head`（无插话边界），工具组键 `1:head:x`；
+/// 补页 seq1..3 只补入 call(step35) 与 turn/start：**段键仍是 `1:head`**，
+/// 组键变 `1:head:35`。当前实现只在段键集合变化时才迁移 → 这条路径完全没覆盖。
+List<Map<String, dynamic>> _noStepHistory({required bool withInterjection}) {
+  final events = <Map<String, dynamic>>[];
+  var seq = 1;
+  void add(String type, Map<String, dynamic> data) => events.add({
+    'seq': seq++,
+    'type': type,
+    'data': data,
+    'time': 1000 + seq * 10,
+  });
+
+  add('turn/start', {'turn': 1});
+  add('user/message', {
+    'messageId': 'u1',
+    'text': '先看滚动问题',
+    'sourceKind': 'user',
+  });
+  if (withInterjection) {
+    add('user/message', {
+      'messageId': 'u2',
+      'text': '插一句：先别动底部',
+      'sourceKind': 'user',
+    });
+  }
+  add('tool/call', {
+    'turn': 1,
+    'step': 35,
+    'callId': 'cC',
+    'name': 'shell-C',
+    'arguments': 'echo C',
+  });
+  // 缺 step 的 result：工具组初始键是 `...:x`。
+  add('tool/result', {
+    'turn': 1,
+    'callId': 'cC',
+    'name': 'shell-C',
+    'text': 'ok C',
+  });
+  add('assistant/message', {
+    'turn': 1,
+    'step': 1,
+    'messageId': 'r1',
+    'text': '',
+    'reasoning': '想一下：检查状态',
+    'reasoningChars': 9,
+  });
+  add('assistant/message', {
+    'turn': 1,
+    'step': 2,
+    'messageId': 'a1',
+    'text': '检查中……',
+  });
+  return events;
+}
+
 class _Backend {
   _Backend(this.history, {required this.initialLimit});
 
@@ -498,6 +559,98 @@ void main() {
       findsNothing,
       reason: '补入开段边界 + call 覆盖 seq 后，同一组的手动收起状态必须保持'
           '（按 seq 求交会匹配失败 → 弹回默认展开）',
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  // ── v3：段键不变、只有 step 迟到（null→35） ───────────────────────────
+  //
+  // 组键从 `1:head:x` 变 `1:head:35`，但**段键集合没变**；旧实现只在段键集合
+  // 变化时调用迁移 → 这条路径完全没覆盖（reviewer-11 实证：期望 false，实际 null）。
+  testWidgets('P2c 段键不变、只有 step 迟到（null→35）：手动收起的组仍必须保持收起',
+      (tester) async {
+    final backend = _Backend(
+      _noStepHistory(withInterjection: false),
+      initialLimit: 3,
+    );
+    await _mount(tester, backend, suffix: '-p2c');
+
+    expect(_headerCount(tester), 2, reason: '初始：无 step 工具组 + step1 思考组');
+    expect(find.textContaining('shell-C'), findsOneWidget);
+    expect(find.textContaining('想一下：检查状态'), findsOneWidget);
+    final targetIndex = _headerIndexAboveMarker(tester, 'shell-C');
+
+    // 真实点击：收起无 step 的工具组。
+    await tester.tap(_groupHeaders.at(targetIndex));
+    await tester.pump(const Duration(milliseconds: 120));
+    await tester.pumpAndSettle();
+    expect(_headerExpanded(tester, targetIndex), isFalse);
+    expect(find.textContaining('shell-C'), findsNothing);
+
+    // 真实上翻：补页只补入 call(step35) + turn/start（无插话 → 段键不变）。
+    final minBefore = _minExtent(tester);
+    await _dragUp(tester, 540);
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump(const Duration(milliseconds: 400));
+    // ignore: avoid_print
+    print('[123-P2c] afterPaging headers=${_headerCount(tester)} '
+        'min=${_minExtent(tester)} '
+        'C=${find.textContaining('shell-C').evaluate().length} '
+        'think=${find.textContaining('想一下：检查状态').evaluate().length}');
+    expect(_minExtent(tester), lessThan(minBefore - 20),
+        reason: '前提：这次上翻真的补进了更早历史');
+    expect(_headerCount(tester), 2, reason: '仅 step 迟到，组数不变');
+    expect(find.textContaining('想一下：检查状态'), findsOneWidget,
+        reason: '对照：另一组仍按档位默认展开');
+    expect(
+      find.textContaining('shell-C'),
+      findsNothing,
+      reason: 'step 从 null 变 35 后，同一组的手动收起状态必须保持'
+          '（段键没变，旧实现不触发迁移 → 弹回默认展开）',
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  // ── v3：段键变化 + step 迟到（null→35） ──────────────────────────────
+  //
+  // 补页同页带回插话边界 + call(step35)：段键 `1:head`→`1:3`，组键
+  // `1:head:x`→`1:3:35`。旧 `_migrateSegment` 按 step 值搬组状态，
+  // `to.steps.contains(null)` 为 false → 组状态丢失。
+  testWidgets('P2d 段键变化 + step 迟到（null→35）：手动收起的组仍必须保持收起',
+      (tester) async {
+    final backend = _Backend(
+      _noStepHistory(withInterjection: true),
+      initialLimit: 3,
+    );
+    await _mount(tester, backend, suffix: '-p2d');
+
+    expect(_headerCount(tester), 2);
+    expect(find.textContaining('shell-C'), findsOneWidget);
+    final targetIndex = _headerIndexAboveMarker(tester, 'shell-C');
+    await tester.tap(_groupHeaders.at(targetIndex));
+    await tester.pump(const Duration(milliseconds: 120));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('shell-C'), findsNothing);
+
+    // 真实上翻：同一页补入边界(3) + call(step35) + turn/start。
+    final minBefore = _minExtent(tester);
+    await _dragUp(tester, 540);
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump(const Duration(milliseconds: 400));
+    // ignore: avoid_print
+    print('[123-P2d] afterPaging headers=${_headerCount(tester)} '
+        'min=${_minExtent(tester)} '
+        'C=${find.textContaining('shell-C').evaluate().length} '
+        'think=${find.textContaining('想一下：检查状态').evaluate().length}');
+    expect(_minExtent(tester), lessThan(minBefore - 20),
+        reason: '前提：这次上翻真的补进了更早历史');
+    expect(_headerCount(tester), 2);
+    expect(find.textContaining('想一下：检查状态'), findsOneWidget,
+        reason: '对照：step1 思考组按默认展开');
+    expect(
+      find.textContaining('shell-C'),
+      findsNothing,
+      reason: '段键与 step 同时变化时，组的手动收起状态也必须保持',
     );
     expect(tester.takeException(), isNull);
   });
