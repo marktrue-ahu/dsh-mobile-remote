@@ -426,8 +426,8 @@ class _ChatScreenState extends State<ChatScreen> {
   Map<int, TurnProcess> _processTurnMap = const {};
   int _processVersion = 0; // 观察到的进化版本
   int _processBuiltVersion = -1; // 已折叠的版本
-  final Map<String, bool> _turnExpansions = {}; // 过程段手动展开/收起（turn:segment）
-  final Map<String, bool> _groupExpansions = {}; // 过程组手动展开（turn:segment:step）
+  final Map<String, bool> _turnExpansions = {}; // 过程段手动展开/收起（稳定段键：turn:开段插话边界，首段 head）
+  final Map<String, bool> _groupExpansions = {}; // 过程组手动展开（段稳定键:step）
   final Map<String, bool> _reasoningRowExpansions = {}; // 思考行手动展开（turn:seq）
   final Map<int, int> _processRowLimits = {}; // 分批展示：turn → 已展示行数
   // ── issue #53（ADR 0027 §3）：轮末产出物（两卡 + 按坐标预览） ─────────
@@ -7502,7 +7502,10 @@ class _ChatScreenState extends State<ChatScreen> {
           if (host == null || seq < (host.seq ?? 1 << 62)) host = item;
         }
         if (host == null || host.seq == null) continue;
-        final key = '$turn:$si';
+        // issue #122：段身份用「开段插话边界」而非位置索引 si。补页/裁剪/乱序补边
+        // 会让 si 整体移动，导致手动折叠状态失配或串段；边界 seq 只随 durable
+        // 插话变化，已渲染段的键保持稳定（见 `segmentKeyOf`）。
+        final key = segmentKeyOf(segment, turn);
         final manual = _turnExpansions[key];
         final occupied = manual ?? segmentExpandedByDefault;
         final groupStyle = liveNow ? policy.liveGroups : policy.completedGroups;
@@ -7526,7 +7529,9 @@ class _ChatScreenState extends State<ChatScreen> {
               : false; // 已完成详细：组抬头折叠
           groupExpandedFlags = [
             for (final group in segment.groups)
-              _groupExpansions['$key:${group.step ?? 'x'}'] ??
+              // issue #122：默认展开标志与组抬头点击必须用**同一个**组键公式，
+              // 统一走 groupKeyOf，避免两处独立拼接后漂移。
+              _groupExpansions[groupKeyOf(segment, turn, group.step)] ??
                   defaultGroupExpanded,
           ];
         }
@@ -7732,7 +7737,12 @@ class _ChatScreenState extends State<ChatScreen> {
             (row) => plan.visibleRowSeqs.contains(row.seq),
           );
           if (!hasVisibleRow) continue;
-          final groupKey = '${plan.intervalKey}:${group.step ?? 'x'}';
+          // issue #122：组键 = 段稳定键 + step（与段内组默认展开标志同源）。
+          final groupKey = groupKeyOf(
+            plan.segment,
+            plan.process.turn,
+            group.step,
+          );
           final manual = _groupExpansions[groupKey];
           // issue #108 v4：运行中简洁/详细组默认展开、标准折叠；已完成统一折叠。
           final defaultGroupExpanded = liveNow
@@ -7764,6 +7774,9 @@ class _ChatScreenState extends State<ChatScreen> {
                   historyView: plan.historyView,
                 );
           children.add(_ProcessGroupHeader(
+            // issue #122：该 key 只供测试观测「折叠状态按稳定组键存取」，
+            // 不参与产品逻辑；运行时行为与无 key 时一致。
+            key: ValueKey<String>('process-group:$groupKey'),
             text: processGroupHeader(
               group,
               running: groupRunning,
@@ -11563,6 +11576,7 @@ class _ProcessGroupHeader extends StatelessWidget {
   /// issue #76：仅思考组（#75）用 psychology 品牌图标，其余工具组用 ink2 工具图标。
   final bool reasoningOnly;
   const _ProcessGroupHeader({
+    super.key,
     required this.text,
     required this.expanded,
     required this.running,
@@ -13004,6 +13018,12 @@ class _ProcessBlockPlan {
   final ProcessSegment segment;
   final bool expanded;
   final bool grouping;
+
+  /// issue #122：过程段的**稳定**折叠键（`segmentKeyOf`：轮号 + 开段插话边界
+  /// seq，轮首段为 `head`）。`_turnExpansions` 与段收起行 key 都用它。
+  ///
+  /// 名称沿用 intervalKey：它标识「两条插话之间的 interval」，改后语义反而更准。
+  /// 不要换回 `turn:段索引`——补页/裁剪会让索引移动，折叠状态会串段。
   final String intervalKey;
   final bool isLastSegmentOfTurn;
   final int hiddenTotalInTurn;

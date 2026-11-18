@@ -626,7 +626,28 @@ class ProcessSegment {
   /// 段内过程行（按 seq 顺序）。
   final List<ProcessRow> rows;
 
-  const ProcessSegment({required this.rows});
+  /// issue #122：开段插话的持久 seq；`null` = 该轮首段（`head` 哨兵）。
+  ///
+  /// 只取自 durable 的真人 `user/message` seq（[TurnProcess.humanUserSeqs]，
+  /// 提示词已排除），与段内行内容**无关**——所以「插话切段 / reasoning 迟到 /
+  /// 工具行追加 / tool result 迟到 / 历史倒序回放」都不会改变已有段的该值。
+  /// 折叠状态用它做稳定身份键，见 [segmentKeyOf]。
+  ///
+  /// 不复用 [startSeq] 的两个原因：
+  /// - reasoning 迟到时首行 seq 会变小（实时 `noteReasoningStart` 取首个 delta，
+  ///   历史回放取 message seq），实时/历史会得到不同值；
+  /// - partial 轮（缺 `turn/start`）的 `TurnProcess.startSeq` 是合成锚点，会随
+  ///   历史窗口变化。首段一律用 `null` 哨兵可同时避开这两点。
+  ///
+  /// 已知不可达（如将来改动事件摄取顺序需重新评估）：把一条插话边界**补插进
+  /// 已渲染段内部**会让后半行搬进新段——当前 live seq 单调、catch-up 只追加
+  /// 更晚事件、补页只加更早事件，均不会触发。
+  ///
+  /// 已知局限：live 窗口裁剪删除边界会导致段合并，原段消失——任何键都保不住，
+  /// 见 `test/issue122_fold_key_contract_test.dart` 中标注 skip 的用例。
+  final int? boundarySeq;
+
+  const ProcessSegment({required this.rows, this.boundarySeq});
 
   bool get isEmpty => rows.isEmpty;
   int get startSeq => rows.first.seq;
@@ -676,6 +697,10 @@ class ProcessSegment {
 }
 
 /// 按轮内插话（真人 user/message）把过程行切成段，供渲染层逐段折叠。
+///
+/// issue #122：每段同时记录「开段插话 seq」[ProcessSegment.boundarySeq]（首段为
+/// null），供折叠状态用稳定身份作键（[segmentKeyOf]）。该值只依赖 durable 的
+/// 插话边界，不依赖行内容。
 List<ProcessSegment> segmentsOf(TurnProcess turn) {
   final rows = turn.rows;
   if (rows.isEmpty) return const [];
@@ -683,9 +708,14 @@ List<ProcessSegment> segmentsOf(TurnProcess turn) {
   final out = <ProcessSegment>[];
   var current = <ProcessRow>[];
   var boundaryIndex = 0;
+  // 当前段的开段边界：null = 轮首段（head）；否则为切出该段的插话 seq。
+  int? openingBoundary;
   void flush() {
     if (current.isNotEmpty) {
-      out.add(ProcessSegment(rows: List.unmodifiable(current)));
+      out.add(ProcessSegment(
+        rows: List.unmodifiable(current),
+        boundarySeq: openingBoundary,
+      ));
       current = <ProcessRow>[];
     }
   }
@@ -693,6 +723,7 @@ List<ProcessSegment> segmentsOf(TurnProcess turn) {
   for (final row in rows) {
     while (boundaryIndex < boundaries.length && row.seq > boundaries[boundaryIndex]) {
       flush();
+      openingBoundary = boundaries[boundaryIndex];
       boundaryIndex++;
     }
     current.add(row);
@@ -700,6 +731,26 @@ List<ProcessSegment> segmentsOf(TurnProcess turn) {
   flush();
   return List.unmodifiable(out);
 }
+
+/// issue #122：过程段折叠键——轮号 + 开段插话边界 seq（首段为 `head` 哨兵）。
+///
+/// 实测矩阵（`test/issue122_fold_key_contract_test.dart`）：
+/// - 段索引 `si` 在「补页先加载后段 / 补边切更早的段 / 窗口裁剪」时会整体移动，
+///   已收起的段会失配或串到别的段上——这是 #122 的根因方向；
+/// - 段首行 seq（[ProcessSegment.startSeq]）在 reasoning 迟到时会变小，且实时与
+///   历史回放不一致；
+/// - 开段边界只由 durable 插话 seq 决定，上述场景均不变。
+///
+/// `head` 哨兵保证轮首段的键不随 partial 轮的合成锚点变化。
+String segmentKeyOf(ProcessSegment segment, int turn) =>
+    '$turn:${segment.boundarySeq?.toString() ?? 'head'}';
+
+/// issue #122：过程组折叠键——段稳定键 + 内核步号（缺 step 时用 `x` 兜底）。
+///
+/// 组键与段键同源：两个构造点（默认展开标志 / 组抬头点击）必须都走这里，
+/// 否则用户点击写入的键与渲染读取的键会漂移（issue #122 审查要点）。
+String groupKeyOf(ProcessSegment segment, int turn, int? step) =>
+    '${segmentKeyOf(segment, turn)}:${step ?? 'x'}';
 
 const int processBatchSize = 50;
 
