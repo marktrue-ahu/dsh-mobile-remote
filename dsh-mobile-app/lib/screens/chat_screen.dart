@@ -434,6 +434,9 @@ class _ChatScreenState extends State<ChatScreen> {
   // 没有任何迁移/同步/指纹：identity 变化即视为新组（取档位默认）。
   final Map<String, bool> _groupUserExpanded = {};
 
+  /// 上次执行「存在性过滤」时的 `_processVersion`（避免每次 build 全量扫）。
+  int _groupRetainVersion = -1;
+
   // **段级**手动折叠状态仍在数据层：段键由 durable 的开段插话 seq 决定，
   // 只有 partial 窗口补入边界时的 `head → <seq>` 会变，由成员身份迁移处理。
   final SegmentFoldState _segmentFold = SegmentFoldState();
@@ -725,6 +728,9 @@ class _ChatScreenState extends State<ChatScreen> {
 
   // ── issue #114：A1 测量层（保持只读；状态已收口到 ScrollFollowCoordinator） ──
   @visibleForTesting
+  /// 测试只读：组选择缓存当前保留的 identity（验证存在性过滤）。
+  Set<String> get debugGroupUserExpandedKeys => _groupUserExpanded.keys.toSet();
+
   bool get debugPinnedToBottom => _scrollFollow.isFollowing;
 
   @visibleForTesting
@@ -1111,6 +1117,10 @@ class _ChatScreenState extends State<ChatScreen> {
     if (current != null && _mySessionId != null && current != _mySessionId) {
       _mySessionId = current;
       _clearImageConsentState();
+      // issue #123：identity 只含 turn/callId，跨会话可能撞名 → 换会话必须清空
+      // （同一会话内的 reset/compaction 不清，交给存在性过滤）。
+      _groupUserExpanded.clear();
+      _groupRetainVersion = -1;
       // issue #114：会话身份变化丢弃旧世代/旧跟随意图。
       _scrollFollow.onSessionChanged();
     }
@@ -2001,7 +2011,9 @@ class _ChatScreenState extends State<ChatScreen> {
         _processVersion++;
         _processBuiltVersion = -1;
         _segmentFold.clear();
-        _groupUserExpanded.clear();
+        // issue #123（照搬 DSH）：**不整表清空**组选择缓存——reset/compaction 后
+        // 由 live 计划重建时的存在性过滤清理（仍存在的 identity 保留用户选择）。
+        _groupRetainVersion = -1; // 强制下一次计划重建做一次存在性过滤
         _reasoningRowExpansions.clear();
         _processRowLimits.clear();
         _livePlanCache = null;
@@ -7459,6 +7471,9 @@ class _ChatScreenState extends State<ChatScreen> {
     // 仅用于活动条去重；renderedCallIds 仍表示「过程块承载」用于平铺卡抑制。
     final visibleToolCallIds = <String>{};
     final anchoredTurns = <int>{};
+    // issue #123（照搬 DSH `retainAccountKeys`）：收集本轮**当前存在的组身份**，
+    // 构建结束后按存在性过滤用户选择缓存（只留仍存在的 key，不做任何身份匹配）。
+    final existingGroupIds = <String>{};
     // 页脚需要「该轮最后一条助手消息」：只存 seq（渲染时再从当前列表取对象，
     // 避免反馈/详情原地替换后仍拿着旧对象）。
     final assistantSeqByTurn = <int, int>{};
@@ -7502,6 +7517,13 @@ class _ChatScreenState extends State<ChatScreen> {
       // 只在 live 视图同步：历史分段视图的窗口与 live 不同，两个窗口各自同步会
       // 互相误判「同一段」（同一个 turn 在两个窗口里可能段不同）。
       if (!historyView) _segmentFold.sync(turn, segments);
+      if (!historyView) {
+        for (final segment in segments) {
+          for (final group in segment.groups) {
+            existingGroupIds.add(groupIdentityOf(group, turn));
+          }
+        }
+      }
       final liveNow = !process.ended;
       // issue #108：运行中插话强制段展开（简洁档也一样）；异常结束同样强制。
       final forcedLive = liveNow && process.hasInterjection;
@@ -7670,6 +7692,12 @@ class _ChatScreenState extends State<ChatScreen> {
     // 否则长会话/长窗口无界增长。只剪 live 视图，且只剪**快照**：
     // 不再渲染的轮次在不可见期间不会发生键变化，滚回窗口时重建快照即可。
     if (!historyView) _segmentFold.retainTurns(anchoredTurns);
+    // 只在 live 计划**有内容**时过滤：reset/compaction 重载期间会出现「items 已清空、
+    // 新历史未到」的瞬时空计划，此时过滤会误清全部用户选择（DSH 的 key 列表始终
+    // 可用，不存在这个中间态，这是照搬时的必要适配）。
+    if (!historyView && _items.isNotEmpty) {
+      _retainExistingGroupExpansions(existingGroupIds);
+    }
 
     return _ProcessPlan(
       processVersion: _processVersion,
@@ -7682,6 +7710,32 @@ class _ChatScreenState extends State<ChatScreen> {
       provisionalRendered: provisionalRendered,
       reasoningRowVisible: reasoningRowVisible,
     );
+  }
+
+  /// issue #123（照搬 DSH `retainAccountKeys`）：**只按存在性**过滤组选择缓存。
+  ///
+  /// DSH（`packages/client/ui-workspace/src/client/stores.ts:99-105`）：
+  /// ```ts
+  /// setGroupExpanded: (d, key, expanded) => { d.groupExpansion[key] = expanded },
+  /// retainAccountKeys: (d, workspaceKeys) => {
+  ///   const retained = new Set(workspaceKeys)
+  ///   d.groupExpansion = Object.fromEntries(
+  ///     Object.entries(d.groupExpansion).filter(([key]) => retained.has(key)),
+  ///   )
+  /// }
+  /// ```
+  /// 这里一一对应：identity 仍存在 → 保留用户选择；不存在 → 删除。
+  ///
+  /// **不做**：事务分类、危险/安全事务、保守失效、视图访问世代、身份匹配。
+  /// 也不做「这个 identity 是否对应同一个逻辑组」的判断——那就是迁移。
+  ///
+  /// 触发时机：只在 `_processVersion` 变化后、且 live 计划重建时执行一次
+  /// （计划构建本来就要遍历所有轮次并算 `segmentsOf`，这里顺带收集 identity，
+  /// 零额外扫描；epoch 变化（展开态/档位）不会重复过滤）。
+  void _retainExistingGroupExpansions(Set<String> existing) {
+    if (_groupRetainVersion == _processVersion) return;
+    _groupRetainVersion = _processVersion;
+    _groupUserExpanded.removeWhere((key, _) => !existing.contains(key));
   }
 
   Widget _buildProcessBlockPlan(_ProcessBlockPlan plan) {
