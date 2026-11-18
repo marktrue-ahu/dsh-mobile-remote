@@ -1252,6 +1252,12 @@ void main() {
       expect(probe.pixels, greaterThanOrEqualTo(-0.5),
           reason: '修复后像素不得越界为负（内容顶不该被推到视口上方）'
               '${replay.recent()}');
+      // issue #118 第三种情况（真机会话 59aaa367 截图）：paged 会话内容矮于一屏时，
+      // 底部占位原先被 `!paged` 永久停用 → 内容停顶部、下方大片空白。
+      // 现在放宽为「已回到顶部对齐时也补占位」，因此 gap 必须 > 0。
+      expect(probe.liveBottomGap, greaterThan(0),
+          reason: 'paged 会话在顶部对齐且内容矮于视口时，必须补底部占位'
+              '（否则内容停顶部、下方留大片空白）${replay.recent()}');
       expect(tail, isNotNull, reason: '应能取到投影末端${replay.recent()}');
       // 回底按钮仍可见是 issue #114 定的产品行为（阅读态恒显入口），不是缺陷；
       // 但它必须真的能回到「内容底部」，而不是跳进空白区。
