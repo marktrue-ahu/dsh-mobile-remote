@@ -745,48 +745,40 @@ List<ProcessSegment> segmentsOf(TurnProcess turn) {
 String segmentKeyOf(ProcessSegment segment, int turn) =>
     '$turn:${segment.boundarySeq?.toString() ?? 'head'}';
 
-/// issue #122：过程组折叠键——段稳定键 + 内核步号（缺 step 时用 `x` 兜底）。
+/// issue #123（方案 D）：过程组的**widget 身份**（`ValueKey`），不是折叠状态键。
 ///
-/// 组键与段键同源：两个构造点（默认展开标志 / 组抬头点击）必须都走这里，
-/// 否则用户点击写入的键与渲染读取的键会漂移（issue #122 审查要点）。
-String groupKeyOf(ProcessSegment segment, int turn, int? step) =>
-    _groupKeyOfSegmentKey(segmentKeyOf(segment, turn), step);
-
-/// 组键的唯一拼接实现：段键 + step（缺 step 用 `x`）。
+/// 组的折叠状态由 `_ProcessGroupHeader` 自己的 `State` 持有（对齐 DSH 本体
+/// `useDisclosure(version)`）：identity 相同 → Flutter 复用 State（状态保持）；
+/// identity 不同 → 新 State（回落默认值）。因此这里只需要**唯一性**，不追求稳定：
+/// - 唯一性：每行只属于一个组、组首行互不相同（含 `1,2,1` / `null,2,null`
+///   这两种同段内同 step 重复的形状——见 `issue123_group_identity_test.dart`）；
+/// - 不稳定性是**可接受失败模式**：补页把更早的行插到组首会换 identity →
+///   新 State 回落默认，不会串状态；
+/// - 不含段键：段边界迟到（head→boundary）不应重置组状态（#122 契约）。
 ///
-/// 供 [groupKeyOf] 与 [ProcessFoldState] 的状态迁移共用——两处独立拼接会让
-/// 「迁移写入的键」和「渲染读取的键」漂移（与 #122 的组键同源要求一致）。
-String _groupKeyOfSegmentKey(String segmentKey, int? step) =>
-    '$segmentKey:${step ?? 'x'}';
-
-/// 一个过程组在某一时刻的身份快照：渲染键 + 成员行身份令牌 + 视觉序号。
-///
-/// issue #123（v3）：组的身份是**动态投影**（成员可增删、step 可迟到、段边界可
-/// 迟到），没有单一不变的身份；迁移只按**成员令牌重叠**做近似匹配。
-class GroupIdentitySnapshot {
-  const GroupIdentitySnapshot({
-    required this.key,
-    required this.memberIds,
-    required this.order,
-  });
-
-  final String key;
-
-  /// 组内行的身份令牌（见 [memberIdentityOf]）。
-  final Set<String> memberIds;
-
-  /// 该组在本轮过程块里的序号（跨段的视觉顺序；用于匹配平手时的稳定 tie-break）。
-  final int order;
+/// 取值按「组内首个工具 callId → 有 step 的思考行 step → 退化思考行 seq」：
+/// 前两者本身 durable（callId 不随 call/result 覆盖变化；step 是内核稳定步号），
+/// 第三种只用于旧内核/老历史的无 step 行。
+String groupIdentityOf(ProcessGroup group, int turn) {
+  for (final row in group.rows) {
+    if (!row.isTool) continue;
+    final callId = row.callId;
+    if (callId != null && callId.isNotEmpty) return '$turn#tool:$callId';
+    break;
+  }
+  final step = group.step;
+  if (step != null) return '$turn#think-step:$step';
+  return '$turn#think-seq:${group.rows.first.seq}';
 }
 
-/// 一轮过程的段身份快照：稳定键 + 成员行**身份令牌** + 组快照。
+/// 一轮过程的段身份快照：稳定键 + 成员行**身份令牌**。
 ///
-/// issue #123：只用于**成员身份比对**，不参与渲染判断。
+/// issue #123：只用于**段级**手动折叠状态的成员身份比对，不参与渲染判断。
+/// （组级折叠状态已按方案 D 移到 widget 层，不再有组级迁移。）
 class SegmentIdentitySnapshot {
   const SegmentIdentitySnapshot({
     required this.key,
     required this.memberIds,
-    required this.groups,
   });
 
   final String key;
@@ -795,9 +787,6 @@ class SegmentIdentitySnapshot {
   /// 工具行的 `reportedSeq` 会被后到的 `tool/call` 覆盖（result 先到时
   /// 110 → call 到达后 100），用 seq 求交会让「同一行」看起来是两行。
   final Set<String> memberIds;
-
-  /// 段内组快照（按渲染顺序）。
-  final List<GroupIdentitySnapshot> groups;
 }
 
 /// 过程行的**可迁移身份令牌**（issue #123）。
@@ -830,46 +819,38 @@ String memberIdentityOf(ProcessRow row) {
   return step == null ? 'think-seq:${row.seq}' : 'think-step:$step';
 }
 
-/// issue #123：过程段/过程组**手动折叠状态**的唯一容器 + 可持续身份迁移。
+/// issue #123：**段级**手动折叠状态的唯一容器 + 可持续身份迁移。
 ///
-/// 键仍是 [segmentKeyOf] / [groupKeyOf]（轮号 + durable 开段边界 + step）；它们是
-/// **渲染定位键**，不是身份。身份会迟到变化的两条真实路径：
+/// 组级折叠状态已按方案 D（对齐 DSH 本体 `useDisclosure(version)`）移到
+/// `_ProcessGroupHeader` 的 `State`：identity 相同 → State 复用；identity 变 →
+/// 新 State 回落默认。那里**没有任何迁移逻辑**，也不再需要组级手动状态容器。
 ///
-/// 1. **段边界迟到**：partial 窗口（初始 REST 只给最后 N 条）缺开段插话 → 段键
-///    `head`；`before` 补页把真实边界补进来 → 段键变 `<seq>`（组键一起变）。
-/// 2. **step 迟到**：`tool/result` 可能不带 step → 组键 `..:x`；后到的 `tool/call`
-///    带 step → 组键 `..:<step>`。这条路径**段键可能完全不变**。
+/// 段级仍留在数据层：段键 `segmentKeyOf` 由 durable 的开段插话 seq 决定，
+/// 唯一会变的是 partial 窗口补入边界时的 `head → <seq>`（#122 已修复的路径）。
+/// 迁移判据是**成员行身份令牌**（见 [memberIdentityOf]，工具行按 callId、
+/// reasoning 行按内核 step），不是键字符串、也不是行 seq：
+/// 1. 每次渲染前 [sync] 记录本轮的段身份快照；
+/// 2. 段键集合变化时，用「旧段成员在新段里的保留比例」做 1:1 贪心匹配
+///    （阈值 [residualMatchRatio]），把旧段键的手动状态写进新段键；
+/// 3. 迁移后删除旧键，避免将来复用同一个键（例如再次回到 `head`）时把别人的
+///    状态读回来。
 ///
-/// 所以迁移判据统一用**成员令牌重叠**（见 [memberIdentityOf]：工具行按 callId、
-/// 思考行按内核 step），不用键字符串、不用行 seq、也不按 step 值对应：
-///
-/// - **段**：旧段成员在新段里的保留比例 ≥ [residualMatchRatio] 时，按比例降序做
-///   1:1 贪心匹配；切段只让匹配到的部分继承，合段继承保留比例最高的旧段；
-///   补入更早的段（旧段键与成员都不变）不触发迁移。迁移一律从旧键删除。
-/// - **组**：每个旧组在新组里找「成员重叠比例最高」的后继（平手时优先**同键**，
-///   即视为同一组的延续、不迁移；再平手按视觉序号）。多旧组指向同一新组时：
-///   新组已有显式状态 → **不覆盖**；否则继承，多值冲突时**收起(false)优先**
-///   （保守，避免内容突然铺开）。零交集不迁移。迁移一律从旧键删除（避免将来
-///   旧键复用时串组）。
-///
-/// [sync] 只在**真的变化**时做匹配：段键集合变化 → 段迁移；组指纹（组键 → 成员
-/// 令牌集合）变化 → 组迁移。组指纹门控是必须的：`sync` 在渲染路径里、每轮每帧
-/// 都会跑，无条件匹配会放大成 `O(G_old×G_new)` × 每次 build × 每轮。
-class ProcessFoldState {
-  ProcessFoldState({this.residualMatchRatio = 0.5});
+/// 冲突策略（真切段/合段）：
+/// - **切段**：按保留比例从高到低 1:1 匹配，只有被匹配的那一部分继承手动状态，
+///   其余部分用档位默认值——不复制状态，避免「一个操作让两段同时收起」；
+/// - **合段**：合并后的段继承保留比例最高的旧段状态，另一个随旧键删除；
+/// - **补入更早的段**：旧段键与成员都不变，走原来的键查找。
+class SegmentFoldState {
+  SegmentFoldState({this.residualMatchRatio = 0.5});
 
-  /// 「旧成员在新成员里的保留比例」达到该值才认为仍是同一段/同一组。
+  /// 「旧成员在新成员里的保留比例」达到该值才认为仍是同一段。
   final double residualMatchRatio;
 
   final Map<String, bool> _segmentManual = {};
-  final Map<String, bool> _groupManual = {};
   final Map<int, List<SegmentIdentitySnapshot>> _snapshots = {};
 
   /// 诊断/单测只读：段级手动状态（键 = `segmentKeyOf`）。
   Map<String, bool> get segmentManual => Map.unmodifiable(_segmentManual);
-
-  /// 诊断/单测只读：组级手动状态（键 = `groupKeyOf`）。
-  Map<String, bool> get groupManual => Map.unmodifiable(_groupManual);
 
   /// 诊断/单测只读：当前保留身份快照的轮次（[retainTurns] 的观测口）。
   Set<int> get snapshotTurns => _snapshots.keys.toSet();
@@ -877,12 +858,10 @@ class ProcessFoldState {
   /// 会话重载/换会话：手动状态与快照一起清空。
   void clear() {
     _segmentManual.clear();
-    _groupManual.clear();
     _snapshots.clear();
   }
 
-  /// 丢弃不再渲染的轮次的身份快照（长会话防无界增长；issue #123 v3 新增组快照后
-  /// 每轮多存 O(rows) 令牌，必须收口）。
+  /// 丢弃不再渲染的轮次的身份快照（长会话防无界增长）。
   ///
   /// 只清**快照**，不清手动状态：轮次滚回窗口时用默认值重建快照即可——它在不可见
   /// 期间不会发生键变化，不存在需要迁移的窗口。只在 live plan 构建结束后调用。
@@ -895,44 +874,24 @@ class ProcessFoldState {
   bool? segmentExpandedOf(ProcessSegment segment, int turn) =>
       _segmentManual[segmentKeyOf(segment, turn)];
 
-  /// 组级手动状态（未手动设置过 → null）。
-  bool? groupExpandedOf(ProcessSegment segment, int turn, int? step) =>
-      _groupManual[groupKeyOf(segment, turn, step)];
-
   /// 写入段级手动状态（键由调用方从当前渲染计划带过来，与读取同源）。
   void setSegmentExpanded(String key, bool expanded) {
     _segmentManual[key] = expanded;
   }
 
-  /// 写入组级手动状态。
-  void setGroupExpanded(String key, bool expanded) {
-    _groupManual[key] = expanded;
-  }
-
-  /// 渲染前对齐本轮身份，必要时迁移手动状态。
+  /// 渲染前对齐本轮段身份，必要时迁移段级手动状态。
   ///
   /// 只读写本对象内的 map，不 setState、不依赖帧，可在 build 期间调用（幂等）。
   /// 只对 **live 视图**调用：历史分段视图的窗口与 live 不同，两个窗口各自同步会
   /// 互相误判（同一个 turn 的段在两个窗口里可能一段在、一段不在）。
   void sync(int turn, List<ProcessSegment> segments) {
-    var groupOrder = 0;
-    final next = <SegmentIdentitySnapshot>[];
-    for (final segment in segments) {
-      final segmentKey = segmentKeyOf(segment, turn);
-      final groups = <GroupIdentitySnapshot>[];
-      for (final group in segment.groups) {
-        groups.add(GroupIdentitySnapshot(
-          key: _groupKeyOfSegmentKey(segmentKey, group.step),
-          memberIds: {for (final row in group.rows) memberIdentityOf(row)},
-          order: groupOrder++,
-        ));
-      }
-      next.add(SegmentIdentitySnapshot(
-        key: segmentKey,
-        memberIds: {for (final row in segment.rows) memberIdentityOf(row)},
-        groups: groups,
-      ));
-    }
+    final next = <SegmentIdentitySnapshot>[
+      for (final segment in segments)
+        SegmentIdentitySnapshot(
+          key: segmentKeyOf(segment, turn),
+          memberIds: {for (final row in segment.rows) memberIdentityOf(row)},
+        ),
+    ];
     final previous = _snapshots[turn];
     if (previous != null) {
       final previousKeys = {for (final snapshot in previous) snapshot.key};
@@ -941,23 +900,15 @@ class ProcessFoldState {
           !previousKeys.containsAll(nextKeys)) {
         _migrateSegments(previous, next);
       }
-      // issue #123 v3：组键的 step 会单独迟到（段键不变），所以组迁移不能挂在
-      // 「段键集合变化」上——必须独立按组指纹（组键 → 成员令牌）判断。
-      if (!_sameGroupFingerprint(previous, next)) {
-        _migrateGroups(previous, next);
-      }
     }
     _snapshots[turn] = next;
   }
 
-  // ── 段迁移 ──────────────────────────────────────────────────────────
   void _migrateSegments(
     List<SegmentIdentitySnapshot> previous,
     List<SegmentIdentitySnapshot> next,
   ) {
     // 1) 计算「旧段 → 新段」的保留比例（旧段成员有多少仍在新段里）。
-    //    身份用 memberIds（callId / step），不用行 seq（工具行 seq 会被
-    //    tool/call 覆盖：result 先到 110 → call 到达后 100）。
     final candidates = <({int oldIndex, int newIndex, double ratio})>[];
     for (var oi = 0; oi < previous.length; oi++) {
       final old = previous[oi];
@@ -1001,106 +952,9 @@ class ProcessFoldState {
     SegmentIdentitySnapshot from,
     SegmentIdentitySnapshot to,
   ) {
-    // 只搬**段级**状态；组级状态统一由 [_migrateGroups] 按成员重叠处理
-    // （issue #123 v3：按 step 值搬组状态会跳过 null→<step>，且和组迁移两套规则打架）。
     final segmentState = _segmentManual.remove(from.key);
     if (segmentState != null) {
       _segmentManual[to.key] = segmentState;
-    }
-  }
-
-  // ── 组迁移 ──────────────────────────────────────────────────────────
-  bool _sameGroupFingerprint(
-    List<SegmentIdentitySnapshot> previous,
-    List<SegmentIdentitySnapshot> next,
-  ) {
-    final previousGroups = _flattenGroups(previous);
-    final nextGroups = _flattenGroups(next);
-    if (previousGroups.length != nextGroups.length) return false;
-    final nextByKey = {for (final group in nextGroups) group.key: group};
-    if (nextByKey.length != nextGroups.length) return false; // 键重复（异常）
-    for (final old in previousGroups) {
-      final now = nextByKey[old.key];
-      if (now == null) return false;
-      if (now.memberIds.length != old.memberIds.length) return false;
-      if (!now.memberIds.containsAll(old.memberIds)) return false;
-    }
-    return true;
-  }
-
-  static List<GroupIdentitySnapshot> _flattenGroups(
-    List<SegmentIdentitySnapshot> segments,
-  ) => [for (final segment in segments) ...segment.groups];
-
-  void _migrateGroups(
-    List<SegmentIdentitySnapshot> previous,
-    List<SegmentIdentitySnapshot> next,
-  ) {
-    final oldGroups = _flattenGroups(previous);
-    final newGroups = _flattenGroups(next);
-    if (oldGroups.isEmpty) return;
-    final nextKeys = {for (final group in newGroups) group.key};
-
-    // 1) 每个旧组选一个后继：成员重叠比例最高的新组。
-    //    - 同键组也参与（重叠足够时视作「同一组的延续」，不迁移）；
-    //    - 平手时优先同键，其次按视觉序号，保证结果确定。
-    final chosen = <GroupIdentitySnapshot, GroupIdentitySnapshot>{};
-    for (final old in oldGroups) {
-      if (old.memberIds.isEmpty) continue;
-      GroupIdentitySnapshot? best;
-      var bestRatio = 0.0;
-      for (final now in newGroups) {
-        if (now.memberIds.isEmpty) continue;
-        var kept = 0;
-        for (final id in old.memberIds) {
-          if (now.memberIds.contains(id)) kept += 1;
-        }
-        final ratio = kept / old.memberIds.length;
-        if (ratio < residualMatchRatio) continue;
-        if (best == null) {
-          best = now;
-          bestRatio = ratio;
-          continue;
-        }
-        final sameKey = now.key == old.key;
-        final bestSameKey = best.key == old.key;
-        if (ratio > bestRatio + 1e-9 ||
-            ((ratio - bestRatio).abs() <= 1e-9 &&
-                ((sameKey && !bestSameKey) ||
-                    (sameKey == bestSameKey && now.order < best.order)))) {
-          best = now;
-          bestRatio = ratio;
-        }
-      }
-      if (best != null) chosen[old] = best;
-    }
-
-    // 2) 合并：多个旧组指向同一新组。
-    //    新组已有显式状态 → 不覆盖；否则继承，多值冲突时收起(false)优先。
-    final contributions = <String, List<GroupIdentitySnapshot>>{};
-    chosen.forEach((old, now) {
-      if (now.key == old.key) return; // 同键延续：状态已在目标键上
-      contributions.putIfAbsent(now.key, () => []).add(old);
-    });
-    for (final entry in contributions.entries) {
-      if (_groupManual.containsKey(entry.key)) continue; // 不覆盖已有显式状态
-      bool? merged;
-      for (final old in entry.value) {
-        final state = _groupManual[old.key];
-        if (state == null) continue;
-        merged = merged == null ? state : (merged && state);
-      }
-      if (merged != null) _groupManual[entry.key] = merged;
-    }
-
-    // 3) 迁移一律从旧键删除（不保留副本，避免将来旧键复用时串组）；
-    //    旧键若已不存在于新集合（零交集/合并/裁剪）也一并删除。
-    for (final old in oldGroups) {
-      final now = chosen[old];
-      final moved = now != null && now.key != old.key;
-      if (moved || !nextKeys.contains(old.key)) {
-        _groupManual.remove(old.key);
-      }
     }
   }
 }

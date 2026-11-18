@@ -1,19 +1,11 @@
-// issue #123 审查 P2：过程段/组**手动折叠状态**的可持续身份迁移（纯策略单测）。
+// issue #123（方案 D）：数据层只剩**段级**折叠状态；组级折叠状态移到 widget 层。
 //
-// 背景：段键 = 轮号 + 开段插话边界 seq（首段 `head`）。partial 窗口（初始 REST
-// 只给最后 N 条）缺 `turn/start` / 开段插话时，边界不可知 → 键是 `head`；
-// 用户上翻 `before` 分页把真实边界补进来后，同一批过程行有了边界 → 键变 `<seq>`。
-// 成员行没变，手动状态必须跟着迁移，否则用户点过的展开/收起「失效」。
-//
-// 本文件直接测纯策略（不依赖 Flutter）：
-//   - partial → 边界补入：段/组状态一起迁移；
-//   - **成员身份**：工具行按 `callId`、reasoning 行按内核 `step`（不是行 seq——
-//     `tool/call` 会覆盖 `reportedSeq`，同一工具在不同快照里的 seq 会变）；
-//   - 更早的段被补进来（旧段键不变）：不迁移、不串；
-//   - 窗口裁剪合段：状态跟随仍存活的成员，旧键删除；
-//   - 真切段：1:1 贪心匹配，只有匹配到的那一部分继承，不复制状态；
-//   - 无成员重叠的新段：不继承任何旧状态（不按键字符串猜）；
-//   - sync 幂等：同一批段重复同步不会反复迁移。
+// 本文件覆盖：
+// 1. 段级身份迁移（partial → 边界补入；成员身份用 callId/step，不用行 seq）；
+// 2. `retainTurns` 剪枝；
+// 3. 组身份 `groupIdentityOf` 的**唯一性**（含 `1,2,1` / `null,2,null` 两种
+//    同段内同 step 重复的形态——reviewer-12 的阻断项）：方案 D 不要求组身份稳定，
+//    但要求唯一（重复 ValueKey 会让同 Column 兄弟在 debug 构建直接断言）。
 //
 // 精确重跑：
 //   cd dsh-mobile-app && flutter test --no-pub test/issue123_fold_state_migration_test.dart
@@ -22,7 +14,6 @@ import 'package:dsh_mobile_app/models.dart';
 import 'package:dsh_mobile_app/turn_process.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-/// 思考行段：`step` 为空 = 旧内核/老历史的退化（无 step）行。
 ProcessSegment _segment(
   List<int> rowSeqs, {
   int? boundarySeq,
@@ -40,20 +31,6 @@ ProcessSegment _segment(
   ]),
 );
 
-/// 工具行段：`(seq, callId)` 列表（seq 可随 `tool/call` 到达而变，callId 不变）。
-ProcessSegment _toolSegment(
-  List<(int, String)> rows, {
-  int? boundarySeq,
-  int? step,
-}) => ProcessSegment(
-  boundarySeq: boundarySeq,
-  rows: List.unmodifiable([
-    for (final (seq, callId) in rows)
-      ProcessRow.tool(seq: seq, step: step, callId: callId, toolName: 'shell'),
-  ]),
-);
-
-/// 工具行段（带每行自己的 step）：`(seq, callId, step)`。
 ProcessSegment _toolRowsSegment(
   List<(int, String, int?)> rows, {
   int? boundarySeq,
@@ -61,12 +38,7 @@ ProcessSegment _toolRowsSegment(
   boundarySeq: boundarySeq,
   rows: List.unmodifiable([
     for (final (seq, callId, step) in rows)
-      ProcessRow.tool(
-        seq: seq,
-        step: step,
-        callId: callId,
-        toolName: 'shell',
-      ),
+      ProcessRow.tool(seq: seq, step: step, callId: callId, toolName: 'shell'),
   ]),
 );
 
@@ -74,427 +46,189 @@ ChatEvent _ev(int seq, String type, Map<String, dynamic> data) =>
     ChatEvent(seq: seq, type: type, data: data, time: seq * 10);
 
 void main() {
-  group('#123 P2 段/组手动状态迁移', () {
-    test('partial 窗口补入开段边界：段与组的手动状态一起迁移', () {
-      final state = ProcessFoldState();
-      // 初始 partial 窗口：缺 turn/start、缺插话 → 首段键 head，组键 head:35。
-      final partial = [_segment([100, 101, 102], step: 35)];
+  group('#123 段级身份迁移（数据层保留）', () {
+    test('partial 窗口补入开段边界：段级手动状态迁移', () {
+      final state = SegmentFoldState();
+      final partial = [_segment([100, 101], step: 35)];
       state.sync(1, partial);
       expect(state.segmentExpandedOf(partial.single, 1), isNull);
-      expect(state.groupExpandedOf(partial.single, 1, 35), isNull);
       state.setSegmentExpanded(segmentKeyOf(partial.single, 1), false);
-      state.setGroupExpanded(groupKeyOf(partial.single, 1, 35), false);
       expect(segmentKeyOf(partial.single, 1), '1:head');
 
-      // before 补页补入插话 seq95：同一批行现在有开段边界 95。
-      final completed = [_segment([100, 101, 102], boundarySeq: 95, step: 35)];
+      final completed = [_segment([100, 101], step: 35, boundarySeq: 95)];
       state.sync(1, completed);
       expect(segmentKeyOf(completed.single, 1), '1:95');
-      expect(
-        state.segmentExpandedOf(completed.single, 1),
-        isFalse,
-        reason: '段级手动状态必须跟到新键',
-      );
-      expect(
-        state.groupExpandedOf(completed.single, 1, 35),
-        isFalse,
-        reason: '组级手动状态必须跟到新键',
-      );
-      // 旧键删除：将来若又出现 `head`（边界被裁剪），不得把这份状态读回来。
+      expect(state.segmentExpandedOf(completed.single, 1), isFalse,
+          reason: '段级手动状态必须跟到新键');
       expect(state.segmentManual.containsKey('1:head'), isFalse);
-      expect(state.groupManual.containsKey('1:head:35'), isFalse);
     });
 
-    test('补入更早的段（旧段键不变）：不迁移、不串到新段', () {
-      final state = ProcessFoldState();
-      final beforePage = [_segment([100, 101], boundarySeq: 95, step: 35)];
+    test('补入更早的段（旧段键不变）：不迁移、不串', () {
+      final state = SegmentFoldState();
+      final beforePage = [_segment([100, 101], step: 35, boundarySeq: 95)];
       state.sync(1, beforePage);
-      state.setGroupExpanded(groupKeyOf(beforePage.single, 1, 35), false);
+      state.setSegmentExpanded(segmentKeyOf(beforePage.single, 1), false);
 
-      // 补页把更早的 head 段（插话之前的过程行）也补进来：旧段键仍是 1:95。
       final afterPage = [
         _segment([10, 11], step: 10),
-        _segment([100, 101], boundarySeq: 95, step: 35),
+        _segment([100, 101], step: 35, boundarySeq: 95),
       ];
       state.sync(1, afterPage);
-      expect(state.groupExpandedOf(afterPage[1], 1, 35), isFalse,
+      expect(state.segmentExpandedOf(afterPage[1], 1), isFalse,
           reason: '旧段键不变，状态原地保留');
-      expect(
-        state.groupExpandedOf(afterPage[0], 1, 10),
-        isNull,
-        reason: '新补进来的更早段不得继承旧段的手动状态',
-      );
+      expect(state.segmentExpandedOf(afterPage[0], 1), isNull,
+          reason: '新补进来的更早段不得继承旧段状态');
     });
 
-    test('窗口裁剪删掉边界（合段）：状态跟随仍存活的成员', () {
-      final state = ProcessFoldState();
+    test('工具行 seq 被 call 覆盖（result 先到）也按 callId 迁移', () {
+      final state = SegmentFoldState();
+      final before = [_toolRowsSegment([(110, 'c1', 35)])];
+      state.sync(1, before);
+      state.setSegmentExpanded(segmentKeyOf(before.single, 1), false);
+
+      final after = [_toolRowsSegment([(100, 'c1', 35)], boundarySeq: 95)];
+      state.sync(1, after);
+      expect(state.segmentExpandedOf(after.single, 1), isFalse,
+          reason: '身份令牌按 callId，不看会变的 reportedSeq');
+    });
+
+    test('合段：状态跟随仍存活的成员，旧键删除', () {
+      final state = SegmentFoldState();
       final twoSegments = [
         _segment([10, 11], step: 10),
-        _segment([100, 101], boundarySeq: 95, step: 35),
+        _segment([100, 101], step: 35, boundarySeq: 95),
       ];
       state.sync(1, twoSegments);
-      state.setGroupExpanded(groupKeyOf(twoSegments[1], 1, 35), false);
+      state.setSegmentExpanded(segmentKeyOf(twoSegments[1], 1), false);
 
-      // 裁剪：边界 95 与 head 段一起被裁掉，只剩原 95 段的成员 → 合段成 head。
       final merged = [_segment([100, 101], step: 35)];
       state.sync(1, merged);
       expect(segmentKeyOf(merged.single, 1), '1:head');
-      expect(
-        state.groupExpandedOf(merged.single, 1, 35),
-        isFalse,
-        reason: '合段后同一批成员的手动状态必须跟随',
-      );
+      expect(state.segmentExpandedOf(merged.single, 1), isFalse);
       expect(state.segmentManual.containsKey('1:95'), isFalse);
     });
 
-    test('真切段：1:1 匹配只让匹配到的部分继承，不复制状态', () {
-      final state = ProcessFoldState();
-      final single = [_segment([100, 101, 102, 103], step: 35)];
-      state.sync(1, single);
-      state.setSegmentExpanded(segmentKeyOf(single.single, 1), false);
-
-      // 边界 101 补插进段内部（当前事件序不可达的防御性场景）：
-      // 前 2 行 → head，后 2 行 → 101。只有保留比例更高的那一部分继承。
-      final split = [
-        _segment([100], step: 35),
-        _segment([101, 102, 103], boundarySeq: 101, step: 35),
-      ];
-      state.sync(1, split);
-      expect(state.segmentExpandedOf(split[1], 1), isFalse,
-          reason: '保留比例 3/4 的部分继承手动状态');
-      expect(state.segmentExpandedOf(split[0], 1), isNull,
-          reason: '另一部分不复制状态（否则一个操作让两段同时收起）');
-      expect(state.segmentManual.containsKey('1:head'), isFalse);
-    });
-
-    test('无成员重叠的新段不继承旧状态（不按键字符串猜）', () {
-      final state = ProcessFoldState();
-      final old = [_segment([100, 101], boundarySeq: 95, step: 35)];
-      state.sync(1, old);
-      state.setSegmentExpanded(segmentKeyOf(old.single, 1), false);
-      state.setGroupExpanded(groupKeyOf(old.single, 1, 35), false);
-
-      // 全新一段（成员完全不同）恰好也以 head 为键：不得读到旧状态。
-      final fresh = [_segment([500, 501], step: 36)];
-      state.sync(1, fresh);
-      expect(state.segmentExpandedOf(fresh.single, 1), isNull);
-      expect(state.groupExpandedOf(fresh.single, 1, 36), isNull);
-    });
-
-    test('sync 幂等：同一批段重复同步不会反复迁移或丢状态', () {
-      final state = ProcessFoldState();
-      final partial = [_segment([100, 101], step: 35)];
-      state.sync(1, partial);
-      state.setGroupExpanded(groupKeyOf(partial.single, 1, 35), false);
-      final completed = [_segment([100, 101], boundarySeq: 95, step: 35)];
-      state.sync(1, completed);
-      final first = state.groupManual;
-      state.sync(1, completed);
-      state.sync(1, completed);
-      expect(state.groupManual, first);
-      expect(state.groupExpandedOf(completed.single, 1, 35), isFalse);
-    });
-
-    test('不同轮次互不影响；clear 清空全部状态与快照', () {
-      final state = ProcessFoldState();
-      final turn1 = [_segment([100], boundarySeq: 95, step: 35)];
-      final turn2 = [_segment([200], step: 7)];
-      state.sync(1, turn1);
-      state.sync(2, turn2);
-      state.setGroupExpanded(groupKeyOf(turn1.single, 1, 35), false);
-      state.setGroupExpanded(groupKeyOf(turn2.single, 2, 7), true);
-      expect(state.groupExpandedOf(turn1.single, 1, 35), isFalse);
-      expect(state.groupExpandedOf(turn2.single, 2, 7), isTrue);
-      state.clear();
-      expect(state.segmentManual, isEmpty);
-      expect(state.groupManual, isEmpty);
-      expect(state.groupExpandedOf(turn1.single, 1, 35), isNull);
-    });
-  });
-
-  // ── 成员身份：不能用行 seq（#123 复核 blocking） ─────────────────────────
-  //
-  // 实证：同一工具先见 `tool/result`（seq110）→ `reportedSeq=110`；补页补入
-  // `tool/call`（seq100）会**无条件覆盖**成 100（call 是权威 layout 位置）。
-  // `ProcessRow.seq` 直接取 `reportedSeq`，所以「同一行」在两个快照里的 seq 不同；
-  // 身份必须用 `callId`（工具）/ 内核 `step`（思考行）。
-  group('#123 成员身份：callId / step，而不是行 seq', () {
-    test('实证：result 先到 110、call 后补 100 → 同一工具的行 seq 会变', () {
-      final tracker = TurnProcessTracker()
-        ..observe(_ev(120, 'assistant/message', {
-          'turn': 1,
-          'step': 1,
-          'reasoning': '想一想',
-          'reasoningChars': 3,
-          'text': '',
-        }))
-        ..observe(_ev(110, 'tool/result', {
-          'turn': 1,
-          'step': 2,
-          'callId': 'c1',
-          'name': 'shell',
-          'text': 'ok',
-        }));
-      ProcessRow toolRow() =>
-          tracker.build().single.rows.firstWhere((row) => row.isTool);
-      expect(toolRow().seq, 110, reason: '前提：partial 窗口只有 result');
-      expect(memberIdentityOf(toolRow()), 'tool:c1');
-      tracker.observe(_ev(100, 'tool/call', {
-        'turn': 1,
-        'step': 2,
-        'callId': 'c1',
-        'name': 'shell',
-      }));
-      expect(toolRow().seq, 100, reason: 'call 到达后 reportedSeq 被覆盖（产品语义）');
-      expect(
-        memberIdentityOf(toolRow()),
-        'tool:c1',
-        reason: 'seq 变了，身份不变——迁移必须按 callId',
-      );
-    });
-
-    test('工具行 seq 从 110 变 100（callId 不变）→ 段与组状态都迁移', () {
-      final state = ProcessFoldState();
-      final before = [_toolSegment([(110, 'c1')], step: 24)];
-      state.sync(1, before);
-      state.setSegmentExpanded(segmentKeyOf(before.single, 1), false);
-      state.setGroupExpanded(groupKeyOf(before.single, 1, 24), false);
-
-      final after = [_toolSegment([(100, 'c1')], boundarySeq: 95, step: 24)];
-      state.sync(1, after);
-      expect(segmentKeyOf(after.single, 1), '1:95');
-      expect(state.segmentExpandedOf(after.single, 1), isFalse,
-          reason: '段级状态必须按 callId 迁移（不是按行 seq）');
-      expect(state.groupExpandedOf(after.single, 1, 24), isFalse,
-          reason: '组级状态必须按 callId 迁移');
-      expect(state.groupManual.containsKey('1:head:24'), isFalse);
-    });
-
-    test('整段工具行 seq 全变（保留比例按 seq 只有 1/4）→ 仍按 callId 匹配', () {
-      final state = ProcessFoldState();
-      final before = [
-        _toolSegment([(8, 'cA'), (9, 'cB')], step: 1),
-      ];
-      state.sync(1, before);
-      state.setGroupExpanded(groupKeyOf(before.single, 1, 1), false);
-
-      // 补页与边界同页到达：cA 8→4、cB 9→5，且新增同段第三行 cC 6。
-      final after = [
-        _toolSegment([(4, 'cA'), (5, 'cB'), (6, 'cC')], boundarySeq: 3, step: 1),
-      ];
-      state.sync(1, after);
-      expect(state.groupExpandedOf(after.single, 1, 1), isFalse,
-          reason: 'seq 交集只剩 0 行也必须按 callId 认出同一段');
-    });
-
-    test('思考行 seq 变（迟到 chunk 让落定行继承更小 seq）→ 按 step 迁移', () {
-      final state = ProcessFoldState();
-      final before = [_segment([110], step: 5)];
-      state.sync(1, before);
-      state.setGroupExpanded(groupKeyOf(before.single, 1, 5), false);
-
-      final after = [_segment([50], boundarySeq: 95, step: 5)];
-      state.sync(1, after);
-      expect(
-        state.groupExpandedOf(after.single, 1, 5),
-        isFalse,
-        reason: '同一 step 的思考行只看 step：seq 由 noteReasoningStart 取 min，会变',
-      );
-    });
-
-    test('混合段：工具行看 callId、思考行看 step，一起参与身份', () {
-      final state = ProcessFoldState();
-      final before = ProcessSegment(
-        rows: [
-          ProcessRow.tool(seq: 110, step: 24, callId: 'c1', toolName: 'shell'),
-          ProcessRow.reasoning(seq: 120, step: 25, reasoning: '想', reasoningChars: 1),
-        ],
-      );
-      state.sync(1, [before]);
-      state.setGroupExpanded(groupKeyOf(before, 1, 24), false);
-      state.setGroupExpanded(groupKeyOf(before, 1, 25), false);
-
-      // 补页：工具 seq 变 100，思考行 seq 变 60；两个身份都不变。
-      final after = ProcessSegment(
-        boundarySeq: 95,
-        rows: [
-          ProcessRow.tool(seq: 100, step: 24, callId: 'c1', toolName: 'shell'),
-          ProcessRow.reasoning(seq: 60, step: 25, reasoning: '想', reasoningChars: 1),
-        ],
-      );
-      state.sync(1, [after]);
-      expect(state.groupExpandedOf(after, 1, 24), isFalse);
-      expect(state.groupExpandedOf(after, 1, 25), isFalse);
-    });
-
-    test('缺 step 的思考行没有稳定 id：身份退回 seq（已知局限，明确记录）', () {
-      final state = ProcessFoldState();
-      final before = [_segment([110])];
-      state.sync(1, before);
-      state.setGroupExpanded(groupKeyOf(before.single, 1, null), false);
-
-      // seq 变（例如老宿主 null-step 历史行重放）→ 没有稳定身份，匹配不上。
-      final after = [_segment([100], boundarySeq: 95)];
-      state.sync(1, after);
-      expect(
-        state.groupExpandedOf(after.single, 1, null),
-        isNull,
-        reason: 'null-step 行只能按 seq 认：seq 变则视为新段（不会串段，但会丢状态）',
-      );
-      expect(state.groupManual, isEmpty, reason: '旧键必须被删除，不能留到将来误读');
-    });
-  });
-
-  // ── v3：组身份按成员重叠迁移（step 会迟到；段键可能不变） ─────────────
-  group('#123 v3 组迁移：成员重叠 + step 迟到 + 冲突规则', () {
-    test('段键不变、step null→35：组状态按 callId 重叠迁移', () {
-      final state = ProcessFoldState();
-      final before = [_toolRowsSegment([(110, 'c1', null)], boundarySeq: 95)];
-      state.sync(1, before);
-      state.setGroupExpanded(groupKeyOf(before.single, 1, null), false);
-
-      // 段键仍是 1:95；只有组键变 1:95:x → 1:95:35。
-      final after = [_toolRowsSegment([(100, 'c1', 35)], boundarySeq: 95)];
-      state.sync(1, after);
-      expect(state.groupExpandedOf(after.single, 1, 35), isFalse,
-          reason: '段键不变时也必须触发组迁移（旧实现只看段键集合）');
-      expect(state.groupManual.containsKey('1:95:x'), isFalse);
-    });
-
-    test('段键变化 + step null→35：组状态也必须迁移', () {
-      final state = ProcessFoldState();
-      final before = [_toolRowsSegment([(110, 'c1', null)])];
-      state.sync(1, before);
-      state.setGroupExpanded(groupKeyOf(before.single, 1, null), false);
-
-      final after = [_toolRowsSegment([(100, 'c1', 35)], boundarySeq: 95)];
-      state.sync(1, after);
-      expect(state.groupExpandedOf(after.single, 1, 35), isFalse);
-      expect(state.groupManual.containsKey('1:head:x'), isFalse);
-    });
-
-    test('切分（等比例）：同键那部分继续持有，其余碎片用默认（不复制）', () {
-      final state = ProcessFoldState();
-      final before = [
-        _toolRowsSegment([(110, 'c1', null), (120, 'c2', null)], boundarySeq: 95),
-      ];
-      state.sync(1, before);
-      state.setGroupExpanded(groupKeyOf(before.single, 1, null), false);
-
-      // c2 拿到 step35 → 同一段内裂成两个组：step35{c2} / null{c1}。
-      final after = [
-        _toolRowsSegment([(110, 'c1', null), (120, 'c2', 35)], boundarySeq: 95),
-      ];
-      state.sync(1, after);
-      expect(state.groupExpandedOf(after.single, 1, null), isFalse,
-          reason: '平手时同键（null 组）视为延续，继续持有状态');
-      expect(state.groupExpandedOf(after.single, 1, 35), isNull,
-          reason: '碎片不得复制状态（否则一次操作收起两处）');
-    });
-
-    test('切分（不等比例）：重叠最高的新组继承，旧键删除', () {
-      final state = ProcessFoldState();
-      final before = [
-        _toolRowsSegment(
-          [(100, 'c1', null), (110, 'c2', null), (120, 'c3', null)],
-          boundarySeq: 95,
-        ),
-      ];
-      state.sync(1, before);
-      state.setGroupExpanded(groupKeyOf(before.single, 1, null), false);
-
-      // c1/c2 拿到 step35（0.67），c3 仍无 step（0.33）。
-      final after = [
-        _toolRowsSegment(
-          [(100, 'c1', 35), (110, 'c2', 35), (120, 'c3', null)],
-          boundarySeq: 95,
-        ),
-      ];
-      state.sync(1, after);
-      expect(state.groupExpandedOf(after.single, 1, 35), isFalse,
-          reason: '重叠最高的新组继承');
-      expect(state.groupExpandedOf(after.single, 1, null), isNull,
-          reason: '碎片用默认值');
-      expect(state.groupManual.containsKey('1:95:x'), isFalse,
-          reason: '迁移走的状态从旧键删除（旧键虽仍在渲染，也不再持有）');
-    });
-
-    test('合并 + 新组已有显式状态：不覆盖，旧状态让位并删除', () {
-      final state = ProcessFoldState();
-      final before = [
-        _toolRowsSegment([(100, 'c1', null), (110, 'c2', 35)], boundarySeq: 95),
-      ];
-      state.sync(1, before);
-      state.setGroupExpanded(groupKeyOf(before.single, 1, null), false);
-      state.setGroupExpanded(groupKeyOf(before.single, 1, 35), true);
-
-      // c1 也拿到 step35 → 两组合并成 35{c1,c2}（新键 = 旧 35 组键）。
-      final after = [
-        _toolRowsSegment([(100, 'c1', 35), (110, 'c2', 35)], boundarySeq: 95),
-      ];
-      state.sync(1, after);
-      expect(state.groupExpandedOf(after.single, 1, 35), isTrue,
-          reason: '新组已有显式状态（展开）不得被旧 x 组的收起覆盖');
-      expect(state.groupManual.containsKey('1:95:x'), isFalse);
-    });
-
-    test('合并 + 新组无状态：继承；多旧组冲突时收起(false)优先', () {
-      final state = ProcessFoldState();
-      // 两段（head / 95）各自一组；补页裁剪后合成新段 head{c1,c2}。
-      final before = [
-        _toolRowsSegment([(100, 'c1', 1)], boundarySeq: null),
-        _toolRowsSegment([(110, 'c2', 1)], boundarySeq: 95),
-      ];
-      state.sync(1, before);
-      state.setGroupExpanded('1:head:1', false);
-      state.setGroupExpanded('1:95:1', true);
-
-      final after = [
-        _toolRowsSegment([(100, 'c1', 1), (110, 'c2', 1)]),
-      ];
-      state.sync(1, after);
-      expect(state.groupExpandedOf(after.single, 1, 1), isFalse,
-          reason: '合并后无显式状态 → 继承；冲突时收起优先（保守）');
-      expect(state.groupManual.containsKey('1:95:1'), isFalse);
-    });
-
-    test('零交集：不迁移，旧键删除（不串到新组）', () {
-      final state = ProcessFoldState();
-      final before = [_toolRowsSegment([(100, 'c9', null)], boundarySeq: 95)];
-      state.sync(1, before);
-      state.setGroupExpanded(groupKeyOf(before.single, 1, null), false);
-
-      final after = [_toolRowsSegment([(200, 'c1', 35)], boundarySeq: 95)];
-      state.sync(1, after);
-      expect(state.groupExpandedOf(after.single, 1, 35), isNull);
-      expect(state.groupManual, isEmpty, reason: '零交集 → 旧状态删除');
-    });
-
-    test('同键 + 成员增长（流式追加）：状态原地保留', () {
-      final state = ProcessFoldState();
-      final before = [_toolRowsSegment([(100, 'c1', 35)], boundarySeq: 95)];
-      state.sync(1, before);
-      state.setGroupExpanded(groupKeyOf(before.single, 1, 35), false);
-
-      final after = [
-        _toolRowsSegment([(100, 'c1', 35), (110, 'c2', 35)], boundarySeq: 95),
-      ];
-      state.sync(1, after);
-      expect(state.groupExpandedOf(after.single, 1, 35), isFalse);
-    });
-
     test('retainTurns：只剪不再渲染的轮次快照，不动手动状态', () {
-      final state = ProcessFoldState();
-      final turn1 = _toolRowsSegment([(100, 'c1', 35)], boundarySeq: 95);
-      final turn2 = _toolRowsSegment([(200, 'c2', 7)], boundarySeq: 96);
+      final state = SegmentFoldState();
+      final turn1 = _segment([100], step: 35, boundarySeq: 95);
+      final turn2 = _segment([200], step: 7, boundarySeq: 96);
       state.sync(1, [turn1]);
       state.sync(2, [turn2]);
-      state.setGroupExpanded('1:95:35', false);
+      state.setSegmentExpanded('1:95', false);
       expect(state.snapshotTurns, {1, 2});
       state.retainTurns({2});
-      expect(state.snapshotTurns, {2}, reason: '不再渲染的轮次快照被剪掉');
-      expect(state.groupExpandedOf(turn1, 1, 35), isFalse,
+      expect(state.snapshotTurns, {2});
+      expect(state.segmentExpandedOf(turn1, 1), isFalse,
           reason: '剪枝只剪快照，手动状态必须保留');
+    });
+  });
+
+  // ── 组身份（方案 D）：只要求唯一，不要求稳定 ─────────────────────────
+  group('#123 组身份唯一性（ValueKey 地基）', () {
+    test('实证：result→call 只改行 seq，不改 callId（身份因此稳定）', () {
+      final tracker = TurnProcessTracker()
+        ..observe(_ev(1, 'turn/start', {'turn': 1}))
+        ..observe(_ev(2, 'assistant/message', {
+          'turn': 1, 'step': 1, 'messageId': 'r1', 'text': '',
+          'reasoning': '想', 'reasoningChars': 1,
+        }))
+        ..observe(_ev(110, 'tool/result', {
+          'turn': 1, 'step': 2, 'callId': 'c1', 'name': 'shell', 'text': 'ok',
+        }));
+      final turn = tracker.build().single;
+      final group = segmentsOf(turn)
+          .expand((s) => s.groups)
+          .firstWhere((g) => g.rows.any((r) => r.isTool));
+      expect(group.rows.firstWhere((r) => r.isTool).seq, 110);
+      final identity = groupIdentityOf(group, 1);
+      expect(identity, '1#tool:c1');
+      tracker.observe(_ev(100, 'tool/call', {
+        'turn': 1, 'step': 2, 'callId': 'c1', 'name': 'shell',
+      }));
+      final after = tracker.build().single;
+      final groupAfter = segmentsOf(after)
+          .expand((s) => s.groups)
+          .firstWhere((g) => g.rows.any((r) => r.isTool));
+      expect(groupAfter.rows.firstWhere((r) => r.isTool).seq, 100,
+          reason: 'call 覆盖 reportedSeq（产品语义不变）');
+      expect(groupIdentityOf(groupAfter, 1), identity,
+          reason: '组身份按 callId：seq 变化不影响 identity');
+    });
+
+    test('同段内 step 重复 `1,2,1`：组身份仍然唯一', () {
+      // result 先到（call 不在窗口）→ step1 的行被排到 step2 之后。
+      final tracker = TurnProcessTracker()
+        ..observe(_ev(1, 'turn/start', {'turn': 1}))
+        ..observe(_ev(5, 'assistant/message', {
+          'turn': 1, 'step': 1, 'messageId': 'r1', 'text': '',
+          'reasoning': '第一步思考', 'reasoningChars': 2,
+        }))
+        ..observe(_ev(10, 'tool/call', {
+          'turn': 1, 'step': 2, 'callId': 'c2', 'name': 'shell',
+        }))
+        ..observe(_ev(11, 'tool/result', {
+          'turn': 1, 'step': 2, 'callId': 'c2', 'name': 'shell', 'text': 'ok',
+        }))
+        ..observe(_ev(30, 'tool/result', {
+          'turn': 1, 'step': 1, 'callId': 'cLate', 'name': 'shell', 'text': 'ok',
+        }));
+      final turn = tracker.build().single;
+      final segment = segmentsOf(turn).single;
+      expect([for (final g in segment.groups) g.step], [1, 2, 1],
+          reason: '同段内 step 真的会重复（reviewer-12 的阻断项）');
+      final identities = [
+        for (final g in segment.groups) groupIdentityOf(g, 1),
+      ];
+      expect(identities.toSet().length, identities.length,
+          reason: 'identity 唯一 → ValueKey 不会重复（否则 debug 断言崩）');
+      expect(identities, ['1#think-step:1', '1#tool:c2', '1#tool:cLate']);
+    });
+
+    test('同段内无 step 行交错 `null,2,null`：组身份仍然唯一', () {
+      final tracker = TurnProcessTracker()
+        ..observe(_ev(1, 'turn/start', {'turn': 1}))
+        ..observe(_ev(10, 'assistant/message', {
+          'turn': 1, 'messageId': 'r1', 'text': '',
+          'reasoning': '第一段', 'reasoningChars': 2,
+        }))
+        ..observe(_ev(20, 'tool/call', {
+          'turn': 1, 'step': 2, 'callId': 'c2', 'name': 'shell',
+        }))
+        ..observe(_ev(21, 'tool/result', {
+          'turn': 1, 'step': 2, 'callId': 'c2', 'name': 'shell', 'text': 'ok',
+        }))
+        ..observe(_ev(30, 'assistant/message', {
+          'turn': 1, 'messageId': 'r2', 'text': '',
+          'reasoning': '第二段', 'reasoningChars': 2,
+        }));
+      final turn = tracker.build().single;
+      final segment = segmentsOf(turn).single;
+      expect([for (final g in segment.groups) g.step], [null, 2, null]);
+      final identities = [
+        for (final g in segment.groups) groupIdentityOf(g, 1),
+      ];
+      expect(identities.toSet().length, identities.length);
+      expect(identities, ['1#think-seq:10', '1#tool:c2', '1#think-seq:30']);
+    });
+
+    test('step 迟到（null→35）不改变含工具组的 identity', () {
+      final before = _toolRowsSegment([(110, 'c1', null)]);
+      final after = _toolRowsSegment([(100, 'c1', 35)]);
+      expect(
+        groupIdentityOf(before.groups.single, 1),
+        groupIdentityOf(after.groups.single, 1),
+        reason: 'identity 按 callId，不看 step：补入 step 不重置组状态',
+      );
+    });
+
+    test('补页把更早工具插到组首 → identity 变化（方案 D 的可接受失败模式）', () {
+      final before = _toolRowsSegment([(110, 'c2', 2)]);
+      final after = _toolRowsSegment([(100, 'c1', 2), (110, 'c2', 2)]);
+      expect(
+        groupIdentityOf(after.groups.single, 1),
+        isNot(groupIdentityOf(before.groups.single, 1)),
+        reason: 'identity 变 → Flutter 销毁旧 State、回落默认（不串状态）',
+      );
     });
   });
 }

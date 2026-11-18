@@ -307,11 +307,22 @@ Finder get _groupHeaders => find.byWidgetPredicate(
 
 int _headerCount(WidgetTester tester) => _groupHeaders.evaluate().length;
 
+/// 点组抬头（方案 D 后 widget 含组内行，用抬头自己的 InkWell 定位点击区）。
+Future<void> _tapHeader(WidgetTester tester, int index) async {
+  await tester.tap(
+    find
+        .descendant(of: _groupHeaders.at(index), matching: find.byType(InkWell))
+        .first,
+  );
+  await tester.pump(const Duration(milliseconds: 120));
+}
+
 bool _headerExpanded(WidgetTester tester, int index) {
-  final widget = tester.widget(_groupHeaders.at(index));
-  // 内部组件，靠 dynamic 读 expanded（与 #122 widget 测试同一口径）。
+  // issue #123（方案 D）：展开状态在 `_ProcessGroupHeader` 的 State 上。
+  final state = tester.state(_groupHeaders.at(index));
+  // 内部组件，靠 dynamic 读 debugExpanded（与 #122 widget 测试同一口径）。
   // ignore: avoid_dynamic_calls
-  return (widget as dynamic).expanded as bool;
+  return (state as dynamic).debugExpanded as bool;
 }
 
 Rect _rectOf(WidgetTester tester, Finder finder) => tester.getRect(finder);
@@ -425,8 +436,7 @@ void main() {
     );
 
     // ── 2. 真实点击组抬头：手动收起 ───────────────────────────────────────
-    await tester.tap(_groupHeaders.at(targetIndex));
-    await tester.pump(const Duration(milliseconds: 120));
+    await _tapHeader(tester, targetIndex);
     await tester.pumpAndSettle();
     // ignore: avoid_print
     print('[123-P2] afterTap headers=${_headerCount(tester)} '
@@ -476,8 +486,7 @@ void main() {
     // ── 5. 行为身份校验：再点一次 → 展开，并出现 step35 的行标记 ──────────
     await tester.ensureVisible(_groupHeaders.at(targetAfter));
     await tester.pumpAndSettle();
-    await tester.tap(_groupHeaders.at(targetAfter));
-    await tester.pump(const Duration(milliseconds: 120));
+    await _tapHeader(tester, targetAfter);
     await tester.pumpAndSettle();
     expect(
       _headerExpanded(tester, targetAfter),
@@ -519,8 +528,7 @@ void main() {
     );
 
     // ── 2. 真实点击：手动收起 cC 的组 ──────────────────────────────────
-    await tester.tap(_groupHeaders.at(targetIndex));
-    await tester.pump(const Duration(milliseconds: 120));
+    await _tapHeader(tester, targetIndex);
     await tester.pumpAndSettle();
     expect(_headerExpanded(tester, targetIndex), isFalse);
     expect(find.textContaining('shell-C'), findsNothing,
@@ -581,8 +589,7 @@ void main() {
     final targetIndex = _headerIndexAboveMarker(tester, 'shell-C');
 
     // 真实点击：收起无 step 的工具组。
-    await tester.tap(_groupHeaders.at(targetIndex));
-    await tester.pump(const Duration(milliseconds: 120));
+    await _tapHeader(tester, targetIndex);
     await tester.pumpAndSettle();
     expect(_headerExpanded(tester, targetIndex), isFalse);
     expect(find.textContaining('shell-C'), findsNothing);
@@ -627,8 +634,7 @@ void main() {
     expect(_headerCount(tester), 2);
     expect(find.textContaining('shell-C'), findsOneWidget);
     final targetIndex = _headerIndexAboveMarker(tester, 'shell-C');
-    await tester.tap(_groupHeaders.at(targetIndex));
-    await tester.pump(const Duration(milliseconds: 120));
+    await _tapHeader(tester, targetIndex);
     await tester.pumpAndSettle();
     expect(find.textContaining('shell-C'), findsNothing);
 

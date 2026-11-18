@@ -426,10 +426,17 @@ class _ChatScreenState extends State<ChatScreen> {
   Map<int, TurnProcess> _processTurnMap = const {};
   int _processVersion = 0; // 观察到的进化版本
   int _processBuiltVersion = -1; // 已折叠的版本
-  // issue #122/#123：过程段/组的手动展开收起状态（键 = 稳定段键/组键）。
-  // #123：partial 窗口补入真实开段边界时段键会迟到变化，由 ProcessFoldState 按
-  // 成员行身份迁移，避免用户点过的状态「失效」。
-  final ProcessFoldState _processFold = ProcessFoldState();
+  // issue #123（方案 D）：**组级**折叠状态移到 `_ProcessGroupHeader` 的 `State`
+  // （对齐 DSH 本体 `useDisclosure(version)`：identity 同 → State 复用；identity 变 →
+  // 新 State 回落默认）。这里只保留一份**外部镜像**，用途仅两个：
+  // 1. 滚动导致列表项回收、State 被销毁后重建时恢复用户选择；
+  // 2. 计划层派生 `visibleToolCallIds` / provisional 放置（活动条去重需要）。
+  // 没有任何迁移/同步/指纹：identity 变化即视为新组（取档位默认）。
+  final Map<String, bool> _groupUserExpanded = {};
+
+  // **段级**手动折叠状态仍在数据层：段键由 durable 的开段插话 seq 决定，
+  // 只有 partial 窗口补入边界时的 `head → <seq>` 会变，由成员身份迁移处理。
+  final SegmentFoldState _segmentFold = SegmentFoldState();
   final Map<String, bool> _reasoningRowExpansions = {}; // 思考行手动展开（turn:seq）
   final Map<int, int> _processRowLimits = {}; // 分批展示：turn → 已展示行数
   // ── issue #53（ADR 0027 §3）：轮末产出物（两卡 + 按坐标预览） ─────────
@@ -1993,7 +2000,8 @@ class _ChatScreenState extends State<ChatScreen> {
         _processTurnMap = const {};
         _processVersion++;
         _processBuiltVersion = -1;
-        _processFold.clear();
+        _segmentFold.clear();
+        _groupUserExpanded.clear();
         _reasoningRowExpansions.clear();
         _processRowLimits.clear();
         _livePlanCache = null;
@@ -7493,7 +7501,7 @@ class _ChatScreenState extends State<ChatScreen> {
       // 真实开段边界时，按成员行身份把旧键的手动状态迁移到新键）。
       // 只在 live 视图同步：历史分段视图的窗口与 live 不同，两个窗口各自同步会
       // 互相误判「同一段」（同一个 turn 在两个窗口里可能段不同）。
-      if (!historyView) _processFold.sync(turn, segments);
+      if (!historyView) _segmentFold.sync(turn, segments);
       final liveNow = !process.ended;
       // issue #108：运行中插话强制段展开（简洁档也一样）；异常结束同样强制。
       final forcedLive = liveNow && process.hasInterjection;
@@ -7530,7 +7538,7 @@ class _ChatScreenState extends State<ChatScreen> {
         // 会让 si 整体移动，导致手动折叠状态失配或串段；边界 seq 只随 durable
         // 插话变化，已渲染段的键保持稳定（见 `segmentKeyOf`）。
         final key = segmentKeyOf(segment, turn);
-        final manual = _processFold.segmentExpandedOf(segment, turn);
+        final manual = _segmentFold.segmentExpandedOf(segment, turn);
         final occupied = manual ?? segmentExpandedByDefault;
         final groupStyle = liveNow ? policy.liveGroups : policy.completedGroups;
         final flat = groupStyle == LiveGroupMode.flat ||
@@ -7551,11 +7559,12 @@ class _ChatScreenState extends State<ChatScreen> {
                   LiveGroupMode.collapsed || LiveGroupMode.flat => false,
                 }
               : false; // 已完成详细：组抬头折叠
+          // issue #123（方案 D）：组展开状态的**权威**在 `_ProcessGroupHeader` 的
+          // State；计划层只为活动条去重/provisional 放置读外部镜像（用户点过才有值），
+          // 没有迁移/同步——identity 变即视为新组，取档位默认。
           groupExpandedFlags = [
             for (final group in segment.groups)
-              // issue #122：默认展开标志与组抬头点击必须用**同一个**组键公式，
-              // 统一走 groupKeyOf，避免两处独立拼接后漂移。
-              _processFold.groupExpandedOf(segment, turn, group.step) ??
+              _groupUserExpanded[groupIdentityOf(group, turn)] ??
                   defaultGroupExpanded,
           ];
         }
@@ -7660,7 +7669,7 @@ class _ChatScreenState extends State<ChatScreen> {
     // issue #123 v3：身份快照按轮累积（v3 每组多存成员令牌 ≈ O(rows)），必须收口，
     // 否则长会话/长窗口无界增长。只剪 live 视图，且只剪**快照**：
     // 不再渲染的轮次在不可见期间不会发生键变化，滚回窗口时重建快照即可。
-    if (!historyView) _processFold.retainTurns(anchoredTurns);
+    if (!historyView) _segmentFold.retainTurns(anchoredTurns);
 
     return _ProcessPlan(
       processVersion: _processVersion,
@@ -7740,7 +7749,7 @@ class _ChatScreenState extends State<ChatScreen> {
               ? null
               : () {
                   setState(() {
-                    _processFold.setSegmentExpanded(plan.intervalKey, true);
+                    _segmentFold.setSegmentExpanded(plan.intervalKey, true);
                     _invalidateProcessPlan();
                   });
                   _onContentLayoutChanged();
@@ -7766,17 +7775,9 @@ class _ChatScreenState extends State<ChatScreen> {
             (row) => plan.visibleRowSeqs.contains(row.seq),
           );
           if (!hasVisibleRow) continue;
-          // issue #122：组键 = 段稳定键 + step（与段内组默认展开标志同源）。
-          final groupKey = groupKeyOf(
-            plan.segment,
-            plan.process.turn,
-            group.step,
-          );
-          final manual = _processFold.groupExpandedOf(
-            plan.segment,
-            plan.process.turn,
-            group.step,
-          );
+          // issue #123（方案 D）：组折叠状态的**权威**是 `_ProcessGroupHeader` 的
+          // State；这里只算 identity（唯一）与档位默认值，并读外部镜像做计划派生。
+          final identity = groupIdentityOf(group, plan.process.turn);
           // issue #108 v4：运行中简洁/详细组默认展开、标准折叠；已完成统一折叠。
           final defaultGroupExpanded = liveNow
               ? switch (policy.liveGroups) {
@@ -7785,7 +7786,8 @@ class _ChatScreenState extends State<ChatScreen> {
                   LiveGroupMode.collapsed || LiveGroupMode.flat => false,
                 }
               : false;
-          final groupExpanded = manual ?? defaultGroupExpanded;
+          final effectiveExpanded =
+              _groupUserExpanded[identity] ?? defaultGroupExpanded;
           // issue #61（note 1791）：抬头只信真实运行态——组内还有未 settled 的工具行，
           // 且轮次尚未结束。此前「最后一段最后一组强制 running」的兜底会让已完成的
           // 工具一直挂着「正在调用工具…」，直到整轮结束（alpha.7 真机截图问题 4）。
@@ -7800,22 +7802,26 @@ class _ChatScreenState extends State<ChatScreen> {
           );
           // issue #74：组折叠态聚合该组全部工具结果图片（含被分批隐藏的行），
           // 展开后由各工具卡/内容区呈现，不重复挂 chip。
-          final groupImages = groupExpanded
+          final groupImages = effectiveExpanded
               ? const <Map<String, dynamic>>[]
               : _imagesForProcessRows(
                   group.rows,
                   historyView: plan.historyView,
                 );
+          // provisional 行：只有该组**当前会展开**时才在组内插入（否则沿用块尾兜底）。
+          final slotInThisGroup = slot != null && gi == slotGroupIndex;
+          if (slotInThisGroup && effectiveExpanded) slotPlaced = true;
           children.add(_ProcessGroupHeader(
-            // issue #122：该 key 只供测试观测「折叠状态按稳定组键存取」，
-            // 不参与产品逻辑；运行时行为与无 key 时一致。
-            key: ValueKey<String>('process-group:$groupKey'),
+            key: ValueKey<String>('process-group:$identity'),
+            identity: identity,
+            defaultExpanded: defaultGroupExpanded,
+            persistedExpanded: _groupUserExpanded[identity],
+            resetVersion: 0,
             text: processGroupHeader(
               group,
               running: groupRunning,
               showDetail: plan.liveProcessDetail,
             ),
-            expanded: groupExpanded,
             running: groupRunning,
             failureCount: groupFailures,
             reasoningOnly: reasoningOnly,
@@ -7823,53 +7829,58 @@ class _ChatScreenState extends State<ChatScreen> {
             onOpenImages: groupImages.isEmpty
                 ? null
                 : () => _openImagesGallery(groupImages),
-            onTap: () {
+            onUserToggle: (expanded) {
               setState(() {
-                _processFold.setGroupExpanded(groupKey, !groupExpanded);
+                _groupUserExpanded[identity] = expanded;
                 _invalidateProcessPlan();
               });
               _onContentLayoutChanged();
             },
-          ));
-          if (!groupExpanded) continue;
-          final groupRowWidgets = <Widget>[];
-          if (slot != null && gi == slotGroupIndex) {
-            var inserted = false;
-            for (final row in group.rows) {
-              if (!inserted && row.seq > slot.orderSeq) {
-                groupRowWidgets.add(_buildProvisionalReasoningRow(slot, autoExpanded: autoDetail));
-                inserted = true;
+            // 组内行**懒构建**：只有展开时才调用（与旧行为一致：折叠组不构建行）。
+            bodyBuilder: () {
+              final groupRowWidgets = <Widget>[];
+              if (slotInThisGroup) {
+                var inserted = false;
+                for (final row in group.rows) {
+                  if (!inserted && row.seq > slot.orderSeq) {
+                    groupRowWidgets.add(
+                      _buildProvisionalReasoningRow(slot, autoExpanded: autoDetail),
+                    );
+                    inserted = true;
+                  }
+                  if (!plan.visibleRowSeqs.contains(row.seq)) continue;
+                  groupRowWidgets.add(
+                    _buildProcessRow(
+                      process,
+                      row,
+                      historyView: plan.historyView,
+                      policy: policy,
+                    ),
+                  );
+                }
+                if (!inserted) {
+                  groupRowWidgets.add(
+                    _buildProvisionalReasoningRow(slot, autoExpanded: autoDetail),
+                  );
+                }
+              } else {
+                for (final row in group.rows) {
+                  if (!plan.visibleRowSeqs.contains(row.seq)) continue;
+                  groupRowWidgets.add(
+                    _buildProcessRow(
+                      process,
+                      row,
+                      historyView: plan.historyView,
+                      policy: policy,
+                    ),
+                  );
+                }
               }
-              if (!plan.visibleRowSeqs.contains(row.seq)) continue;
-              groupRowWidgets.add(
-                _buildProcessRow(
-                  process,
-                  row,
-                  historyView: plan.historyView,
-                  policy: policy,
-                ),
-              );
-            }
-            if (!inserted) {
-              groupRowWidgets.add(_buildProvisionalReasoningRow(slot, autoExpanded: autoDetail));
-            }
-            slotPlaced = true;
-          } else {
-            for (final row in group.rows) {
-              if (!plan.visibleRowSeqs.contains(row.seq)) continue;
-              groupRowWidgets.add(
-                _buildProcessRow(
-                  process,
-                  row,
-                  historyView: plan.historyView,
-                  policy: policy,
-                ),
-              );
-            }
-          }
-          // issue #76：A 导轨——仅展开组出现：左 6dp 处 2dp line，内容左移 14dp，
-          // 行间 1dp hairline（首末无）；组收起不留线/空白；不加组外框。
-          children.add(_buildGroupRail(groupRowWidgets));
+              // issue #76：A 导轨——仅展开组出现：左 6dp 处 2dp line，内容左移 14dp，
+              // 行间 1dp hairline（首末无）；组收起不留线/空白；不加组外框。
+              return _buildGroupRail(groupRowWidgets);
+            },
+          ));
         }
         if (slot != null && !slotPlaced) {
           children.add(_buildProvisionalReasoningRow(slot, autoExpanded: autoDetail));
@@ -7961,7 +7972,7 @@ class _ChatScreenState extends State<ChatScreen> {
             key: ValueKey<String>('collapse-process:${plan.intervalKey}'),
             onTap: () {
               setState(() {
-                _processFold.setSegmentExpanded(plan.intervalKey, false);
+                _segmentFold.setSegmentExpanded(plan.intervalKey, false);
                 _invalidateProcessPlan();
               });
               _onContentLayoutChanged();
@@ -11591,11 +11602,29 @@ class _FailureCountChip extends StatelessWidget {
 }
 
 /// 过程组抬头：运行中「正在调用工具…」，完成态「N 次工具调用」，不显示用时。
-class _ProcessGroupHeader extends StatelessWidget {
+/// issue #123（方案 D，对齐 DSH 本体 `useDisclosure(version)`）：
+/// **组折叠状态由组件自己的 State 持有**，不再走数据层 map + 迁移。
+///
+/// 配合调用方的 `ValueKey('process-group:<identity>')`：
+/// - identity 相同 → Flutter 复用同一个 State → 展开/收起状态保持；
+/// - identity 变化 → 销毁旧 State、创建新 State → 回落 `defaultExpanded`（失败模式
+///   是「回到默认」，不会串状态）；
+/// - `resetVersion` 变化 → 手动选择失效（DSH 的 version 语义；当前无该来源，恒 0）。
+class _ProcessGroupHeader extends StatefulWidget {
+  /// 组身份（唯一；见 `groupIdentityOf`）。
+  final String identity;
+
+  /// 档位/阶段决定的默认展开态（用户没手动操作过时用它）。
+  final bool defaultExpanded;
+
+  /// 外部镜像：滚动回收 State 后重建时用来恢复用户选择；null = 没手动操作过。
+  final bool? persistedExpanded;
+
+  /// 结构版本：变化即让手动选择失效（DSH `useDisclosure(version)` 的等价物）。
+  final int resetVersion;
+
   final String text;
-  final bool expanded;
   final bool running;
-  final VoidCallback onTap;
 
   /// issue #74：该组（含分批隐藏行）工具结果图片数；仅在组折叠时由调用方传入。
   final int imageCount;
@@ -11608,12 +11637,23 @@ class _ProcessGroupHeader extends StatelessWidget {
 
   /// issue #76：仅思考组（#75）用 psychology 品牌图标，其余工具组用 ink2 工具图标。
   final bool reasoningOnly;
+
+  /// 用户手动切换后通知调用方：镜像（计划派生 + 回收恢复）+ 计划失效。
+  final ValueChanged<bool> onUserToggle;
+
+  /// 组内行（**懒构建**：只有展开时才调用，折叠组不构建行）。
+  final Widget Function() bodyBuilder;
+
   const _ProcessGroupHeader({
     super.key,
+    required this.identity,
+    required this.defaultExpanded,
+    required this.resetVersion,
     required this.text,
-    required this.expanded,
     required this.running,
-    required this.onTap,
+    required this.onUserToggle,
+    required this.bodyBuilder,
+    this.persistedExpanded,
     this.imageCount = 0,
     this.onOpenImages,
     this.failureCount = 0,
@@ -11621,15 +11661,51 @@ class _ProcessGroupHeader extends StatelessWidget {
   });
 
   @override
+  State<_ProcessGroupHeader> createState() => _ProcessGroupHeaderState();
+}
+
+class _ProcessGroupHeaderState extends State<_ProcessGroupHeader> {
+  /// 用户手动选择（null = 没操作过）。DSH 的 `expandedVersion` 对应物：
+  /// 这里直接存展开态，`resetVersion` 变化时清空（回落默认）。
+  late bool? _userExpanded = widget.persistedExpanded;
+
+  /// 当前是否展开：没操作过 → 档位默认；操作过 → 用户选择。
+  bool get expanded => _userExpanded ?? widget.defaultExpanded;
+
+  /// 单测/诊断只读（测试通过 dynamic 读取）。
+  bool get debugExpanded => expanded;
+
+  @override
+  void didUpdateWidget(covariant _ProcessGroupHeader oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // DSH 语义：结构版本变了 → 手动选择失效，回落默认值。
+    if (oldWidget.resetVersion != widget.resetVersion) {
+      _userExpanded = null;
+    } else if (oldWidget.persistedExpanded != null &&
+        widget.persistedExpanded == null) {
+      // 外部镜像被清空（换会话/reset）→ 跟随清空，避免同 identity 的残留 State 串状态。
+      _userExpanded = null;
+    }
+  }
+
+  void _toggle() {
+    final next = !expanded;
+    setState(() => _userExpanded = next);
+    widget.onUserToggle(next);
+  }
+
+  @override
   Widget build(BuildContext context) {
     final ink = DshColors.ink(context);
     final ink2 = DshColors.ink2(context);
     final brand = DshColors.brand(context);
-    final hasMeta = imageCount > 0 || failureCount > 0;
+    final hasMeta = widget.imageCount > 0 || widget.failureCount > 0;
     final textScaler = MediaQuery.textScalerOf(context);
     final scale = textScaler.scale(13) / 13;
-    return InkWell(
-      onTap: onTap,
+    final header = InkWell(
+      // 组抬头点击区（测试定位用；identity 唯一，不会重复）。
+      key: ValueKey<String>('group-toggle:${widget.identity}'),
+      onTap: _toggle,
       borderRadius: BorderRadius.circular(8),
       child: ConstrainedBox(
         constraints: const BoxConstraints(minHeight: 48),
@@ -11638,7 +11714,7 @@ class _ProcessGroupHeader extends StatelessWidget {
             // issue #76：宽屏且未放大文字时徽标在右栏；窄屏/大字/实测装不下时
             // 徽标下移到文案左缘下一行，主行仍保留 chevron 与完整点击区。
             final narrow = constraints.maxWidth < 328 || scale > 1.2;
-            final icon = running
+            final icon = widget.running
                 ? SizedBox(
                     width: 16,
                     height: 16,
@@ -11648,14 +11724,14 @@ class _ProcessGroupHeader extends StatelessWidget {
                     ),
                   )
                 : Icon(
-                    reasoningOnly
+                    widget.reasoningOnly
                         ? Icons.psychology_outlined
                         : Icons.build_outlined,
                     size: 16,
-                    color: reasoningOnly ? brand : ink2,
+                    color: widget.reasoningOnly ? brand : ink2,
                   );
             final title = Text(
-              text,
+              widget.text,
               style: TextStyle(
                 fontSize: 13,
                 fontWeight: FontWeight.w600,
@@ -11670,9 +11746,9 @@ class _ProcessGroupHeader extends StatelessWidget {
               runSpacing: 4,
               crossAxisAlignment: WrapCrossAlignment.center,
               children: [
-                if (imageCount > 0 && onOpenImages != null)
-                  _ImageCountChip(count: imageCount, onOpen: onOpenImages!),
-                if (failureCount > 0) _FailureCountChip(count: failureCount),
+                if (widget.imageCount > 0 && widget.onOpenImages != null)
+                  _ImageCountChip(count: widget.imageCount, onOpen: widget.onOpenImages!),
+                if (widget.failureCount > 0) _FailureCountChip(count: widget.failureCount),
               ],
             );
             final chevron = Icon(
@@ -11715,6 +11791,14 @@ class _ProcessGroupHeader extends StatelessWidget {
           },
         ),
       ),
+    );
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        header,
+        if (expanded) widget.bodyBuilder(),
+      ],
     );
   }
 }

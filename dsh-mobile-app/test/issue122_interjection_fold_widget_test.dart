@@ -139,21 +139,30 @@ Finder get _summaryRows => find.byWidgetPredicate(
 Finder get _collapseRows => find.textContaining('收起过程');
 
 dynamic _headerAt(WidgetTester tester, int index) =>
-    tester.widget(_groupHeaders.at(index));
+    tester.state(_groupHeaders.at(index));
 
 /// issue #122：按稳定组键取组抬头——段收起后组抬头会消失，位置索引会偏移，
 /// 用 key 定位才不会串。键不存在时抛断言，便于直接看出是哪一段没了。
+/// 点组抬头（方案 D 后 `_ProcessGroupHeader` 含组内行，widget 中心可能落在行上；
+/// 用抬头自己的 InkWell 定位点击区）。
+Future<void> _tapHeader(WidgetTester tester, Finder header) async {
+  await tester.tap(
+    find.descendant(of: header, matching: find.byType(InkWell)).first,
+  );
+  await tester.pump(const Duration(milliseconds: 120));
+}
+
 _ProcessGroupHeaderProbe _headerByKey(WidgetTester tester, String key) {
   final finder = find.byKey(ValueKey<String>('process-group:$key'));
   expect(finder, findsOneWidget, reason: '组抬头 $key 应存在');
-  final w = tester.widget(finder);
-  return _ProcessGroupHeaderProbe(w);
+  // issue #123（方案 D）：展开状态在 `_ProcessGroupHeader` 的 State 上。
+  return _ProcessGroupHeaderProbe(tester.state(finder));
 }
 
 class _ProcessGroupHeaderProbe {
-  _ProcessGroupHeaderProbe(this._w);
-  final dynamic _w;
-  bool get expanded => _w.expanded as bool;
+  _ProcessGroupHeaderProbe(this._state);
+  final dynamic _state;
+  bool get expanded => _state.debugExpanded as bool;
 }
 
 Future<AppStore> _pumpChat(
@@ -206,8 +215,7 @@ void main() {
     expect(_groupHeaders, findsOneWidget);
     expect(_headerAt(tester, 0).expanded, isTrue, reason: '详细档运行中组默认展开');
 
-    await tester.tap(_groupHeaders.first);
-    await tester.pump(const Duration(milliseconds: 120));
+    await _tapHeader(tester, _groupHeaders.first);
     expect(_headerAt(tester, 0).expanded, isFalse, reason: '手动收起应生效');
 
     // 轮内插入真人对话，随后 agent 进入新 step。
@@ -226,16 +234,16 @@ void main() {
       isTrue,
       reason: '插话后新增段的组按档位默认展开，不得继承/串用旧组的折叠状态',
     );
-    // 直接锁渲染用的稳定键（旧位置索引键下这里会是 1:0:1 / 1:1:2）。
+    // 直接锁渲染用的 widget 身份（方案 D：identity 唯一 → ValueKey 复用 State）。
     expect(
-      find.byKey(const ValueKey<String>('process-group:1:head:1')),
+      find.byKey(const ValueKey<String>('process-group:1#tool:c1')),
       findsOneWidget,
-      reason: '轮首段组键 = turn:head:step',
+      reason: '轮首段组身份 = turn#tool:callId',
     );
     expect(
-      find.byKey(const ValueKey<String>('process-group:1:6:2')),
+      find.byKey(const ValueKey<String>('process-group:1#tool:c2')),
       findsOneWidget,
-      reason: '插话段组键 = turn:开段插话seq:step',
+      reason: '插话段组身份 = turn#tool:callId（不含段键）',
     );
     expect(tester.takeException(), isNull);
     await tester.pump(const Duration(milliseconds: 900));
@@ -243,33 +251,34 @@ void main() {
 
   testWidgets('T2 连续插话 + 多次切换：折叠状态始终跟随同一段', (tester) async {
     final store = await _pumpChat(tester, runningTurn(), suffix: 't2');
-    await tester.tap(_groupHeaders.first);
-    await tester.pump(const Duration(milliseconds: 120));
+    await _tapHeader(tester, _groupHeaders.first);
 
     // issue #122：全程用稳定组键定位，不用位置索引——段收起后组抬头消失，
     // 索引会偏移，用索引断言会把「键稳定」这件事测成「位置恰好没错」。
     await _inject(tester, store, _user(6, '插话1'));
     await _inject(tester, store, _call(7, step: 2, callId: 'c2'));
     await _inject(tester, store, _result(8, step: 2, callId: 'c2'));
-    expect(_headerByKey(tester, '1:head:1').expanded, isFalse,
+    expect(_headerByKey(tester, '1#tool:c1').expanded, isFalse,
         reason: 'head 段组保持开头那次手动收起');
     // 新段（边界6）在 live+详细档默认展开，不继承 head 的 manual 状态。
-    expect(_headerByKey(tester, '1:6:2').expanded, isTrue,
+    expect(_headerByKey(tester, '1#tool:c2').expanded, isTrue,
         reason: '新段组按档位默认展开，不串用 head 的 manual 状态');
 
     await _inject(tester, store, _user(9, '插话2'));
     await _inject(tester, store, _call(10, step: 3, callId: 'c3'));
     await _inject(tester, store, _result(11, step: 3, callId: 'c3'));
-    expect(_headerByKey(tester, '1:head:1').expanded, isFalse,
+    expect(_headerByKey(tester, '1#tool:c1').expanded, isFalse,
         reason: 'head 段组未被后续插话影响');
-    expect(_headerByKey(tester, '1:6:2').expanded, isTrue,
+    expect(_headerByKey(tester, '1#tool:c2').expanded, isTrue,
         reason: '边界6 段组保持用户展开状态');
-    expect(_headerByKey(tester, '1:9:3').expanded, isTrue,
+    expect(_headerByKey(tester, '1#tool:c3').expanded, isTrue,
         reason: '边界9 新段组默认展开');
 
     // 收起 head 段组，再插一次话，head 的状态仍跟随同一个稳定键。
-    await tester.tap(find.byKey(const ValueKey<String>('process-group:1:head:1')));
-    await tester.pump(const Duration(milliseconds: 120));
+    await _tapHeader(
+      tester,
+      find.byKey(const ValueKey<String>('process-group:1#tool:c1')),
+    );
     await _inject(tester, store, _user(13, '插话3'));
     await _inject(tester, store, _call(14, step: 4, callId: 'c4'));
     await _inject(tester, store, _result(15, step: 4, callId: 'c4'));
@@ -285,14 +294,14 @@ void main() {
     // 开头被手动收起后 `visibleRowSeqs` 为空，因此它的抬头按设计不出现——这不是
     // #122 的缺陷，断言要按「组抬头消失」写，而不是「还在但 expanded=false」。
     expect(
-      find.byKey(const ValueKey<String>('process-group:1:head:1')),
+      find.byKey(const ValueKey<String>('process-group:1#tool:c1')),
       findsNothing,
       reason: 'head 段组保持开头那次手动收起（issue #75：无可见行时不渲染抬头）',
     );
     // 其余三段各按默认展开，且**键未被前序插话影响**——这是本用例的核心。
-    expect(_headerByKey(tester, '1:6:2').expanded, isTrue);
-    expect(_headerByKey(tester, '1:9:3').expanded, isTrue);
-    expect(_headerByKey(tester, '1:13:4').expanded, isTrue,
+    expect(_headerByKey(tester, '1#tool:c2').expanded, isTrue);
+    expect(_headerByKey(tester, '1#tool:c3').expanded, isTrue);
+    expect(_headerByKey(tester, '1#tool:c4').expanded, isTrue,
         reason: '边界13 新段组默认展开');
     expect(tester.takeException(), isNull);
     await tester.pump(const Duration(milliseconds: 900));
@@ -306,8 +315,7 @@ void main() {
       suffix: 't3',
     );
     expect(_headerAt(tester, 0).expanded, isFalse, reason: '标准档运行中组默认折叠');
-    await tester.tap(_groupHeaders.first);
-    await tester.pump(const Duration(milliseconds: 120));
+    await _tapHeader(tester, _groupHeaders.first);
     expect(_headerAt(tester, 0).expanded, isTrue, reason: '手动展开应生效');
 
     await _inject(tester, store, _user(6, '插话'));
@@ -326,7 +334,10 @@ void main() {
     await _inject(tester, store, _result(8, step: 2, callId: 'c2'));
     expect(_groupHeaders, findsNWidgets(2));
 
-    await tester.tap(find.byKey(const ValueKey<String>('process-group:1:6:2')));
+    await _tapHeader(
+      tester,
+      find.byKey(const ValueKey<String>('process-group:1#tool:c2')),
+    );
     await tester.pump(const Duration(milliseconds: 120));
     expect(_headerAt(tester, 1).expanded, isFalse);
 
@@ -334,7 +345,7 @@ void main() {
     await _inject(tester, store, _call(9, step: 2, callId: 'c3'));
     await _inject(tester, store, _result(10, step: 2, callId: 'c3'));
     expect(
-      find.byKey(const ValueKey<String>('process-group:1:6:2')),
+      find.byKey(const ValueKey<String>('process-group:1#tool:c2')),
       findsOneWidget,
     );
     expect(_headerAt(tester, 1).expanded, isFalse, reason: '组内追加工具行不得改变组键/折叠状态');
@@ -354,11 +365,11 @@ void main() {
     await _pumpChat(tester, completedInterjectedTurn(), suffix: 't5-history');
     expect(_groupHeaders, findsNWidgets(2));
     expect(
-      find.byKey(const ValueKey<String>('process-group:1:head:1')),
+      find.byKey(const ValueKey<String>('process-group:1#tool:c1')),
       findsOneWidget,
     );
     expect(
-      find.byKey(const ValueKey<String>('process-group:1:6:2')),
+      find.byKey(const ValueKey<String>('process-group:1#tool:c2')),
       findsOneWidget,
     );
     expect(
@@ -370,7 +381,10 @@ void main() {
       find.byKey(const ValueKey<String>('collapse-process:1:6')),
       findsOneWidget,
     );
-    await tester.tap(find.byKey(const ValueKey<String>('process-group:1:6:2')));
+    await _tapHeader(
+      tester,
+      find.byKey(const ValueKey<String>('process-group:1#tool:c2')),
+    );
     await tester.pump(const Duration(milliseconds: 120));
     expect(_headerAt(tester, 1).expanded, isTrue, reason: '详细档已完成组默认折叠，点击后展开');
     expect(_headerAt(tester, 0).expanded, isFalse);
@@ -387,18 +401,21 @@ void main() {
     }
     expect(_groupHeaders, findsNWidgets(2));
     expect(
-      find.byKey(const ValueKey<String>('process-group:1:head:1')),
+      find.byKey(const ValueKey<String>('process-group:1#tool:c1')),
       findsOneWidget,
     );
     expect(
-      find.byKey(const ValueKey<String>('process-group:1:6:2')),
+      find.byKey(const ValueKey<String>('process-group:1#tool:c2')),
       findsOneWidget,
     );
     expect(
       find.byKey(const ValueKey<String>('collapse-process:1:6')),
       findsOneWidget,
     );
-    await tester.tap(find.byKey(const ValueKey<String>('process-group:1:6:2')));
+    await _tapHeader(
+      tester,
+      find.byKey(const ValueKey<String>('process-group:1#tool:c2')),
+    );
     await tester.pump(const Duration(milliseconds: 120));
     expect(_headerAt(tester, 1).expanded, isTrue);
     expect(_headerAt(tester, 0).expanded, isFalse);
@@ -471,11 +488,11 @@ void main() {
       reason: '段键必须是 turn:开段插话seq（旧实现是 turn:1）',
     );
     expect(
-      find.byKey(const ValueKey<String>('process-group:1:head:1')),
+      find.byKey(const ValueKey<String>('process-group:1#tool:c1')),
       findsOneWidget,
     );
     expect(
-      find.byKey(const ValueKey<String>('process-group:1:6:2')),
+      find.byKey(const ValueKey<String>('process-group:1#tool:c2')),
       findsOneWidget,
     );
 
@@ -495,11 +512,11 @@ void main() {
       reason: '迟到事件后第二段收起行仍用稳定键 turn:开段插话seq（旧实现是 turn:1）',
     );
     expect(
-      find.byKey(const ValueKey<String>('process-group:1:head:1')),
+      find.byKey(const ValueKey<String>('process-group:1#tool:c1')),
       findsOneWidget,
     );
     expect(
-      find.byKey(const ValueKey<String>('process-group:1:6:2')),
+      find.byKey(const ValueKey<String>('process-group:1#tool:c2')),
       findsOneWidget,
     );
     expect(tester.takeException(), isNull);

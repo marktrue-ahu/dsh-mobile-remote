@@ -9,8 +9,13 @@
 // - 开段插话边界 `boundarySeq` 只来自 durable 的真人 `user/message` seq，与行内容
 //   无关，上述场景都不变。轮首段用 `head` 哨兵（不随 partial 轮锚点变化）。
 //
-// 本文件对应验收第 7 条（单测直接断言键稳定性）；UI 行为回归见
+// 本文件对应验收第 7 条（单测直接断言键/身份稳定性）；UI 行为回归见
 // `issue122_interjection_fold_widget_test.dart`。
+//
+// issue #123（方案 D）后：**组折叠状态已移到 widget 层**（`ValueKey(identity)` 复用
+// State），组身份 = `groupIdentityOf`（工具行按首个 callId、思考行按 step/seq），
+// 不再有「段键:step」的组键，也不再有组级迁移/迁移键契约。本文件保留段键契约，
+// 并把原「组键」断言改为「组身份」断言（唯一性/跨补页稳定性）。
 import 'package:dsh_mobile_app/models.dart';
 import 'package:dsh_mobile_app/turn_process.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -69,7 +74,7 @@ void main() {
     expect(segmentKeyOf(segments[1], 1), '1:6');
   });
 
-  test('T7b 键契约：段键=轮号+开段边界；组键=段键+step（缺 step 用 x）', () {
+  test('T7b 契约：段键=轮号+开段边界；组身份=轮号+首工具 callId / 思考 step/seq', () {
     final tracker = trackerOf([
       ev(1, 'turn/start', {'turn': 1}),
       ev(2, 'user/message', {'text': '提示词', 'sourceKind': 'user'}),
@@ -79,7 +84,11 @@ void main() {
     final turn = buildOf(tracker);
     final segment = segAt(turn, 3);
     expect(segmentKeyOf(segment, 1), '1:head');
-    expect(groupKeyOf(segment, 1, segment.groups.single.step), '1:head:x');
+    expect(
+      groupIdentityOf(segment.groups.single, 1),
+      '1#tool:c1',
+      reason: '组身份按首个工具 callId（缺 step 也一样：identity 不看 step）',
+    );
 
     final explicit = ProcessSegment(
       rows: [
@@ -88,12 +97,20 @@ void main() {
       boundarySeq: 8,
     );
     expect(segmentKeyOf(explicit, 3), '3:8');
-    expect(groupKeyOf(explicit, 3, 2), '3:8:2');
-    expect(
-      groupKeyOf(explicit, 3, null),
-      '3:8:x',
-      reason: '缺 step 的组键必须与「step 恰好等于 x」不可能冲突的哨兵一致',
+    expect(groupIdentityOf(explicit.groups.single, 3), '3#tool:c9');
+    // 纯思考组（无工具）：有 step 用 step，缺 step 用 seq（旧内核退化行）。
+    final thinkingStep = ProcessSegment(
+      rows: [
+        ProcessRow.reasoning(seq: 9, step: 2, reasoning: '想', reasoningChars: 1),
+      ],
     );
+    expect(groupIdentityOf(thinkingStep.groups.single, 3), '3#think-step:2');
+    final thinkingNull = ProcessSegment(
+      rows: [
+        ProcessRow.reasoning(seq: 9, reasoning: '想', reasoningChars: 1),
+      ],
+    );
+    expect(groupIdentityOf(thinkingNull.groups.single, 3), '3#think-seq:9');
   });
 
   test('T7c 补页先加载后段（E）：后段 si 移动，稳定键不变', () {
@@ -143,8 +160,11 @@ void main() {
     ]);
     var turn = buildOf(tracker);
     expect(boundarySeqsOf(turn), [null, 6]);
-    final groupKeyBefore = groupKeyOf(segAt(turn, 7), 1, 2);
-    expect(groupKeyBefore, '1:6:2');
+    final identityBefore = groupIdentityOf(
+      segAt(turn, 7).groups.firstWhere((g) => g.rows.any((r) => r.seq == 7)),
+      1,
+    );
+    expect(identityBefore, '1#tool:c3');
     expect(segmentsOf(turn).indexWhere((s) => s.rows.any((r) => r.seq == 7)),
         1);
 
@@ -160,9 +180,12 @@ void main() {
       reason: '切更早的段会让后段 si 从 1 变 2（旧组键 1:2 会失配）',
     );
     expect(
-      groupKeyOf(segAt(turn, 7), 1, 2),
-      groupKeyBefore,
-      reason: '组键跟段边界走：后段的开段边界仍是 6，键必须不变',
+      groupIdentityOf(
+        segAt(turn, 7).groups.firstWhere((g) => g.rows.any((r) => r.seq == 7)),
+        1,
+      ),
+      identityBefore,
+      reason: '组身份由成员决定（不含段键）：更早段被切分不会改变它',
     );
   });
 
@@ -193,7 +216,7 @@ void main() {
       reason: 'reasoning 迟到会让段首行 seq 从 10 变 5——startSeq 不适合做键',
     );
     expect(segmentKeyOf(segAt(turn, 10), 1), '1:head');
-    expect(groupKeyOf(segAt(turn, 10), 1, 1), '1:head:1');
+    expect(groupIdentityOf(segAt(turn, 10).groups.single, 1), '1#tool:c1');
   });
 
   test('T7f 历史↔实时（H）：键一致；startSeq 因 reasoning 迟到不一致', () {
@@ -290,12 +313,13 @@ void main() {
         [for (var i = 0; i < segments.length; i++) segmentKeyOf(segments[i], 1)],
         ['1:head', '1:5', '1:9'],
       );
+      // 组身份跨段使用同一套规则（不含段键）：历史倒序/实时一致，且跨段唯一。
       expect(
         [
-          for (final step in [1, 2, 3])
-            groupKeyOf(segments[step - 1], 1, step),
+          for (var i = 0; i < segments.length; i++)
+            groupIdentityOf(segments[i].groups.single, 1),
         ],
-        ['1:head:1', '1:5:2', '1:9:3'],
+        ['1#tool:c1', '1#tool:c2', '1#tool:c3'],
       );
     }
   });

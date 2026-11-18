@@ -321,7 +321,9 @@ void main() {
     expect(_summaryRows, findsNothing);
     expect(_groupHeaders, findsOneWidget);
     expect(_rails, findsNothing, reason: '收起组不留导轨/空白');
-    await tester.tap(_groupHeaders);
+    await tester.tap(
+      find.descendant(of: _groupHeaders, matching: find.byType(InkWell)).first,
+    );
     await tester.pump(const Duration(milliseconds: 200));
     expect(_rails, findsOneWidget, reason: '展开组出现导轨');
     await tester.pump(const Duration(milliseconds: 900));
@@ -610,7 +612,11 @@ void main() {
         }
         if (_groupHeaders.evaluate().isNotEmpty) {
           final before = _rails.evaluate().length;
-          await tester.tap(_groupHeaders.first);
+          await tester.tap(
+      find
+          .descendant(of: _groupHeaders.first, matching: find.byType(InkWell))
+          .first,
+    );
           await tester.pump(const Duration(milliseconds: 200));
           final after = _rails.evaluate().length;
           expect(after, isNot(before),
