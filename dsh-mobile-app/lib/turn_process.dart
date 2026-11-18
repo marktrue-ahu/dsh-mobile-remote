@@ -783,7 +783,7 @@ class SegmentIdentitySnapshot {
 
   final String key;
 
-  /// 成员行身份令牌（见 [ProcessFoldState.memberIdentityOf]）。**不是行 seq**：
+  /// 成员行身份令牌（见 [memberIdentityOf]）。**不是行 seq**：
   /// 工具行的 `reportedSeq` 会被后到的 `tool/call` 覆盖（result 先到时
   /// 110 → call 到达后 100），用 seq 求交会让「同一行」看起来是两行。
   final Set<String> memberIds;
