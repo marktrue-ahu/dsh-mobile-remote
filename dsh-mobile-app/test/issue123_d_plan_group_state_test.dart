@@ -102,6 +102,7 @@ List<Map<String, dynamic>> _history() {
 
 class _Backend {
   _Backend(this.history, {required this.initialLimit});
+  /// 可变：用于测试「turn 数据被移除后，身份条目按存在性清理」。
   final List<Map<String, dynamic>> history;
   final int initialLimit;
 
@@ -182,6 +183,44 @@ Future<void> _tapHeader(WidgetTester tester, int index) async {
   await tester.pump(const Duration(milliseconds: 60));
 }
 
+/// 两个已完成/运行中的轮次，用于「存在性过滤」用例（按 turn 前缀区分 identity）。
+List<Map<String, dynamic>> _twoTurnHistory() {
+  final events = <Map<String, dynamic>>[];
+  var seq = 1;
+  void add(String type, Map<String, dynamic> data) => events.add({
+    'seq': seq++,
+    'type': type,
+    'data': data,
+    'time': 1000 + seq * 10,
+  });
+  for (final turn in [1, 2]) {
+    add('turn/start', {'turn': turn});
+    add('user/message', {
+      'messageId': 'u$turn',
+      'text': '第 $turn 轮',
+      'sourceKind': 'user',
+    });
+    add('tool/call', {
+      'turn': turn,
+      'step': 1,
+      'callId': 't$turn',
+      'name': 'shell-T$turn',
+      'arguments': 'echo $turn',
+    });
+    add('tool/result', {
+      'turn': turn,
+      'step': 1,
+      'callId': 't$turn',
+      'name': 'shell-T$turn',
+      'text': 'ok $turn',
+    });
+    if (turn == 1) {
+      add('turn/end', {'turn': turn, 'reason': {'kind': 'completed'}});
+    }
+  }
+  return events;
+}
+
 Future<AppStore> _mount(
   WidgetTester tester,
   _Backend backend, {
@@ -249,6 +288,92 @@ void main() {
     expect(_headerExpanded(tester, index), isFalse,
         reason: '没操作过 → 跟随标准档默认（折叠）');
   });
+  testWidgets('D3 不因普通工具事件重置（与废弃的保守失效方案的关键区别）', (tester) async {
+    final backend = _Backend(_history(), initialLimit: 50);
+    final store = await _mount(tester, backend);
+    final index = _headerIndexAboveMarker(tester, 'shell-C10');
+    await _tapHeader(tester, index);
+    expect(_headerExpanded(tester, index), isFalse, reason: '用户手动收起');
+    // 注入普通工具事件：新工具 call + result（会让该轮组集合增长）。
+    store.injectFrame({
+      'type': 'session/event',
+      'sessionId': _session,
+      'event': {
+        'seq': 9000,
+        'type': 'tool/call',
+        'data': {
+          'turn': 1,
+          'step': 14,
+          'callId': 'c14',
+          'name': 'shell-C14',
+          'arguments': 'echo c14',
+        },
+        'time': 90000,
+      },
+    });
+    await tester.pump();
+    store.injectFrame({
+      'type': 'session/event',
+      'sessionId': _session,
+      'event': {
+        'seq': 9001,
+        'type': 'tool/result',
+        'data': {
+          'turn': 1,
+          'step': 14,
+          'callId': 'c14',
+          'name': 'shell-C14',
+          'text': 'ok c14',
+        },
+        'time': 90010,
+      },
+    });
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 120));
+    expect(_headerExpanded(tester, index), isFalse,
+        reason: '普通工具事件只增删 identity 集合，不得重置已有用户选择');
+    // 收尾：泵掉事件注入产生的 800ms sessions debounce 计时器。
+    await tester.pump(const Duration(seconds: 1));
+  });
+
+  testWidgets('D4 存在性过滤：turn 数据被移除后其 identity 条目被清理', (tester) async {
+    final history = _twoTurnHistory();
+    final backend = _Backend(history, initialLimit: 50);
+    final store = await _mount(tester, backend);
+    // 两个轮次各做一次手动操作：turn1（已完成，默认折叠）→ 展开；
+    // turn2（运行中，详细档默认展开）→ 收起。identity 分别是 1#tool:t1 / 2#tool:t2。
+    // 两个过程块各一个组：文档顺序 [turn1, turn2]（turn1 已完成 → 默认折叠，
+    // 工具卡不渲染，不能用 marker 定位）。
+    await _tapHeader(tester, 0); // turn1：展开（用户选择 true）
+    await _tapHeader(tester, 1); // turn2：收起（用户选择 false）
+    final screen = tester.state(find.byType(ChatScreen));
+    // ignore: avoid_dynamic_calls
+    final keys = (screen as dynamic).debugGroupUserExpandedKeys as Set<String>;
+    expect(keys, containsAll(<String>['1#tool:t1', '2#tool:t2']));
+    // 后端历史移除 turn2（turn1 保留），触发 compaction 重同步（reset reload）。
+    history.removeWhere((e) => (e['data']?['turn'] as num?)?.toInt() == 2);
+    store.injectFrame({
+      'type': 'session/event',
+      'sessionId': _session,
+      'event': {
+        'seq': 9100,
+        'type': 'compaction/end',
+        'data': const <String, dynamic>{},
+        'time': 91000,
+      },
+    });
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump(const Duration(milliseconds: 400));
+    // ignore: avoid_dynamic_calls
+    final keysAfter = (screen as dynamic).debugGroupUserExpandedKeys as Set<String>;
+    expect(keysAfter, isNot(contains('2#tool:t2')),
+        reason: 'turn2 已不在当前数据里 → 按存在性过滤删除其条目');
+    expect(keysAfter, contains('1#tool:t1'),
+        reason: 'turn1 仍存在 → 其条目保留（证明不是整表清空）');
+    await tester.pump(const Duration(seconds: 1));
+  });
+
 }
 
 int _headerIndexAboveMarker(WidgetTester tester, String marker) {
