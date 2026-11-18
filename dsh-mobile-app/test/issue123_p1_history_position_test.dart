@@ -388,11 +388,15 @@ void main() {
     );
     expect(probe.rangeError, lessThanOrEqualTo(0.5), reason: '此刻位置必须合法');
 
-    // ── 2. 稳定：多帧不得自己漂走（意图 = reading） ─────────────────────
+    // ── 2. 稳定：12 帧内位置不得自己漂走（意图 = reading） ─────────────
+    //
+    // issue #123 复核（reviewer-11）：采样必须在**泵帧之前**。旧写法先泵完 12 帧
+    // 再采样、然后立刻比较，采样与比较之间没有任何帧/动作 → 差值恒为 0，这条断言
+    // 测不出任何漂移（自证式假绿）。
+    final before = probe.pixels;
     for (var i = 0; i < 12; i++) {
       await replay.pumpFrame(tag: 'stable$i');
     }
-    final before = probe.pixels;
     // ignore: avoid_print
     print('[123-P1] stable:${replay.recent(count: 3)}');
     expect(
@@ -400,10 +404,13 @@ void main() {
       isFalse,
       reason: '上翻到历史区后意图必须是 reading${replay.recent()}',
     );
+    // 12 帧之间的真实位移：不是回归用例（修复前也不该漂），而是防止将来
+    // `rangeClamp`/跟随校正引入「阅读态被悄悄推走」的守卫。
     expect(
       (probe.pixels - before).abs(),
       lessThanOrEqualTo(0.5),
-      reason: '稳定期位置不得漂移${replay.recent()}',
+      reason: '12 帧稳定期内位置不得漂移（采样 ${before.toStringAsFixed(1)}，'
+          '12 帧后 ${probe.pixels.toStringAsFixed(1)}）${replay.recent()}',
     );
 
     // ── 3. 注入 todo/write：新事件改变布局，但阅读位置必须保持 ───────────
