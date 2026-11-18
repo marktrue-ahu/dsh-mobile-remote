@@ -307,6 +307,15 @@
       "createdAt": "2026-11-17T21:56:18.603Z",
       "note": "dist-tags verified",
       "updatedAt": "2026-11-17T22:03:38.665Z"
+    },
+    {
+      "tag": "v3.2.4-rc.3",
+      "pluginVersion": "3.2.4-rc.3",
+      "carrierVersion": "3.2.4-rc.3-app",
+      "build": 56,
+      "integrity": "sha512-HYTvc9W66PXSujK/Ju6tE7e42gr9eH/DoOlordd33FOCitL40OBjxd1bZQgMSte/bdYLZnElschLi9bVYHWpPg==",
+      "status": "submitted",
+      "createdAt": "2026-11-18T03:16:36.708Z"
     }
   ]
 }
