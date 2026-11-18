@@ -9,6 +9,11 @@
 //     现在有了真实开段边界 → 段键变 `1:3`、组键变 `1:3:<step>` → 手动状态失配；
 //   - 期望：同一段/组的手动折叠状态跟着迁移，组保持收起；实际：回到档位默认（展开）。
 //
+// 第二个用例（#123 复核 blocking）：**工具行的身份不能用 seq**。
+// 同一工具先见 `tool/result`（seq110）→ `reportedSeq=110`；补页补入 `tool/call`
+// （seq100）会无条件覆盖成 100（call 是权威 layout 位置）。迁移若按行 seq 求交，
+// 同一行看起来是两行 → 段匹配失败 → 手动状态被删。身份必须是 durable 的 callId。
+//
 // 断言口径（不使用键字符串断言替代点击行为）：
 //   1. 点击前用**几何**（组抬头 ↔ 行标记的上下相邻）定位目标组抬头；
 //   2. 点击后该组的行标记消失（组真的收起了）；
@@ -78,6 +83,94 @@ List<Map<String, dynamic>> _history() {
   add('assistant/message', {
     'turn': 1,
     'step': 41,
+    'messageId': 'a1',
+    'text': '检查中……',
+  });
+  return events;
+}
+
+/// 工具行夹具（#123 复核 blocking）：初始窗口只有 result，没有 call。
+///
+/// seq1 turn/start / seq2 提示词 / seq3 插话 / seq4..6 三个 tool/call /
+/// seq7 result cC / seq8 result cA / seq9 result cB / seq10 思考行（把轮次带起来）/
+/// seq11 回答（过程块宿主）。
+/// 初始窗口 = 最后 5 条（seq7..11）：cA/cB/cC 都只有 result（seq 8/9/7），
+/// call 全在补页里。补页 seq1..6 一次带回**开段边界(3) + 三个 call** →
+/// cA 8→4、cB 9→5、cC 7→6，与边界变化发生在同一次 sync。
+List<Map<String, dynamic>> _toolHistory() {
+  final events = <Map<String, dynamic>>[];
+  var seq = 1;
+  void add(String type, Map<String, dynamic> data) => events.add({
+    'seq': seq++,
+    'type': type,
+    'data': data,
+    'time': 1000 + seq * 10,
+  });
+
+  add('turn/start', {'turn': 1});
+  add('user/message', {
+    'messageId': 'u1',
+    'text': '先看滚动问题',
+    'sourceKind': 'user',
+  });
+  add('user/message', {
+    'messageId': 'u2',
+    'text': '插一句：先别动底部',
+    'sourceKind': 'user',
+  });
+  add('tool/call', {
+    'turn': 1,
+    'step': 1,
+    'callId': 'cA',
+    'name': 'shell-A',
+    'arguments': 'echo A',
+  });
+  add('tool/call', {
+    'turn': 1,
+    'step': 1,
+    'callId': 'cB',
+    'name': 'shell-B',
+    'arguments': 'echo B',
+  });
+  add('tool/call', {
+    'turn': 1,
+    'step': 2,
+    'callId': 'cC',
+    'name': 'shell-C',
+    'arguments': 'echo C',
+  });
+  add('tool/result', {
+    'turn': 1,
+    'step': 2,
+    'callId': 'cC',
+    'name': 'shell-C',
+    'text': 'ok C',
+  });
+  add('tool/result', {
+    'turn': 1,
+    'step': 1,
+    'callId': 'cA',
+    'name': 'shell-A',
+    'text': 'ok A',
+  });
+  add('tool/result', {
+    'turn': 1,
+    'step': 1,
+    'callId': 'cB',
+    'name': 'shell-B',
+    'text': 'ok B',
+  });
+  add('assistant/message', {
+    'turn': 1,
+    'step': 3,
+    'messageId': 'r1',
+    'text': '',
+    'reasoning': '第 3 步：检查状态',
+    'reasoningChars': 9,
+  });
+  add('assistant/message', {
+    'turn': 1,
+    'step': 4,
     'messageId': 'a1',
     'text': '检查中……',
   });
@@ -179,6 +272,19 @@ int _headerIndexAboveMarker(WidgetTester tester, String marker) {
   return bestIndex;
 }
 
+/// 主滚动列表的真实 `minScrollExtent`（<0 = center 之前已有更早历史项）。
+double _minExtent(WidgetTester tester) => tester
+    .state<ScrollableState>(
+      find
+          .descendant(
+            of: find.byType(CustomScrollView),
+            matching: find.byType(Scrollable, skipOffstage: false),
+          )
+          .first,
+    )
+    .position
+    .minScrollExtent;
+
 /// 真实上翻手势（多步 pan；单事件位移在 SelectionArea + lazy 列表下会被吞掉）。
 Future<void> _dragUp(WidgetTester tester, double distance) async {
   final gesture = await tester.startGesture(
@@ -197,11 +303,16 @@ Future<void> _dragUp(WidgetTester tester, double distance) async {
   await tester.pump(const Duration(milliseconds: 400));
 }
 
-Future<AppStore> _mount(WidgetTester tester, _Backend backend) async {
+Future<AppStore> _mount(
+  WidgetTester tester,
+  _Backend backend, {
+  WorkStepDisplayMode mode = WorkStepDisplayMode.detailed,
+  String suffix = '',
+}) async {
   final store = AppStore()
     ..sessionId = _session
     ..sessions = [Session(id: _session, title: 'S', cwd: null, createdAt: 1)]
-    ..stepDisplayMode = WorkStepDisplayMode.detailed
+    ..stepDisplayMode = mode
     ..turnFoldTiming = TurnFoldTiming.afterAnswer;
   await tester.binding.setSurfaceSize(_surface);
   addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -214,7 +325,7 @@ Future<AppStore> _mount(WidgetTester tester, _Backend backend) async {
         builder: (context) => MediaQuery(
           data: const MediaQueryData(size: _surface),
           child: ChatScreen(
-            key: const ValueKey<String>('issue123-p2'),
+            key: ValueKey<String>('issue123-p2$suffix'),
             store: store,
             apiClient: backend.api,
             onTitleChanged: () {},
@@ -322,5 +433,72 @@ void main() {
     expect(tester.takeException(), isNull);
     // ignore: avoid_print
     print('[123-P2] PASS steps=$replay');
+  });
+
+  // #123 复核（blocking）：迁移身份必须是 durable 的 callId，不是行 seq。
+  //
+  // partial 窗口只有 `tool/result` → 工具行 seq 由 result 决定；补页把 `tool/call`
+  // 和开段边界**同页**带回来时，`reportedSeq` 被 call 覆盖（8/9/7 → 4/5/6）。
+  // 按 seq 求交只剩 1/4（只有思考行不变），低于阈值 → 段匹配失败 → 手动状态被删；
+  // 按 callId 求交是 4/4 → 状态保持。
+  testWidgets('P2b 工具行 seq 被 call 覆盖时，手动收起的组仍必须保持收起', (tester) async {
+    final backend = _Backend(_toolHistory(), initialLimit: 5);
+    await _mount(tester, backend, suffix: '-p2b');
+
+    // ── 1. 初始 partial 窗口：三组默认展开，工具卡可见 ──────────────────
+    expect(_headerCount(tester), 3, reason: '窗口内应有 step1/step2/step3 三组');
+    expect(find.textContaining('shell-A'), findsOneWidget);
+    expect(find.textContaining('shell-B'), findsOneWidget);
+    expect(find.textContaining('shell-C'), findsOneWidget);
+    final targetIndex = _headerIndexAboveMarker(tester, 'shell-C');
+    expect(
+      _headerExpanded(tester, targetIndex),
+      isTrue,
+      reason: '详细档运行中组默认展开（点击前的前提）',
+    );
+
+    // ── 2. 真实点击：手动收起 cC 的组 ──────────────────────────────────
+    await tester.tap(_groupHeaders.at(targetIndex));
+    await tester.pump(const Duration(milliseconds: 120));
+    await tester.pumpAndSettle();
+    expect(_headerExpanded(tester, targetIndex), isFalse);
+    expect(find.textContaining('shell-C'), findsNothing,
+        reason: '组收起后组内工具卡不应渲染');
+    expect(find.textContaining('shell-A'), findsOneWidget,
+        reason: '其它组仍是默认展开（对照）');
+
+    // ── 3. 真实上翻：同一页补回三个 call + 开段边界 ────────────────────
+    // 空 older sliver 自带 10dp 顶部内边距（min≈-10），所以用「上翻前后 min 变负很多」
+    // 作为「真的补进了更早历史」的判据。
+    final minBefore = _minExtent(tester);
+    await _dragUp(tester, 540);
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump(const Duration(milliseconds: 400));
+    // ignore: avoid_print
+    print('[123-P2b] afterPaging headers=${_headerCount(tester)} '
+        'min=${_minExtent(tester)} '
+        'A=${find.textContaining('shell-A').evaluate().length} '
+        'B=${find.textContaining('shell-B').evaluate().length} '
+        'C=${find.textContaining('shell-C').evaluate().length}');
+    expect(
+      _minExtent(tester),
+      lessThan(minBefore - 20),
+      reason: '前提：这次上翻真的把更早历史补进了 center 之前'
+          '（min $minBefore → ${_minExtent(tester)}）',
+    );
+
+    // ── 4. 手动状态必须保持：cC 的组仍然收起，其它组仍展开 ────────────
+    expect(_headerCount(tester), 3,
+        reason: '补页后仍是同一段的三组（段键从 head 变成边界，组数不变）');
+    expect(find.textContaining('shell-A'), findsOneWidget,
+        reason: '其它组按默认展开，说明过程块仍在正常渲染');
+    expect(find.textContaining('shell-B'), findsOneWidget);
+    expect(
+      find.textContaining('shell-C'),
+      findsNothing,
+      reason: '补入开段边界 + call 覆盖 seq 后，同一组的手动收起状态必须保持'
+          '（按 seq 求交会匹配失败 → 弹回默认展开）',
+    );
+    expect(tester.takeException(), isNull);
   });
 }

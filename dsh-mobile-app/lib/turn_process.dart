@@ -759,19 +759,53 @@ String groupKeyOf(ProcessSegment segment, int turn, int? step) =>
 String _groupKeyOfSegmentKey(String segmentKey, int? step) =>
     '$segmentKey:${step ?? 'x'}';
 
-/// 一轮过程的段身份快照：稳定键 + 成员行 durable seq + 段内 step 集合。
+/// 一轮过程的段身份快照：稳定键 + 成员行**身份令牌** + 段内 step 集合。
 ///
 /// issue #123：只用于**成员身份比对**，不参与渲染判断。
 class SegmentIdentitySnapshot {
   const SegmentIdentitySnapshot({
     required this.key,
-    required this.rowSeqs,
+    required this.memberIds,
     required this.steps,
   });
 
   final String key;
-  final Set<int> rowSeqs;
+
+  /// 成员行身份令牌（见 [ProcessFoldState.memberIdentityOf]）。**不是行 seq**：
+  /// 工具行的 `reportedSeq` 会被后到的 `tool/call` 覆盖（result 先到时
+  /// 110 → call 到达后 100），用 seq 求交会让「同一行」看起来是两行。
+  final Set<String> memberIds;
   final Set<int?> steps;
+}
+
+/// 过程行的**可迁移身份令牌**（issue #123）。
+///
+/// 为什么不能用行 `seq`（`ProcessRow.seq`）：
+/// - 工具行的 `seq` 取自 `_tools[callId].reportedSeq`，而 `tool/call` 会**无条件**
+///   覆盖它（`turn_process.dart` 的 tool/call 分支；call 才是权威 layout 位置）。
+///   result 先到 → `reportedSeq=110`；补页把 call 补进来 → 变成 100。同一工具在
+///   两次快照里的 seq 不同，seq 求交会得到零交集，迁移被误判成「新段」。
+/// - reasoning 行的 `seq` 在迟到 chunk / 重复 message 下也可能变
+///   （`noteReasoningStart` 取 min，落定行继承它）。
+///
+/// 因此用各组行**真正稳定**的量：
+/// - 工具行 → `tool:<callId>`：`_tools` 本来就按 callId 索引，这是系统里的 durable 标识；
+/// - 有 step 的 reasoning 行 → `think-step:<step>`：同一 (turn, step) 在 `build()` 里
+///   只保留一条思考行，step 是内核稳定步号（seq 变了身份也不变）；
+/// - 缺 step 的 reasoning 行 → `think-seq:<seq>`：这类是旧内核/老历史的退化行，
+///   没有任何稳定 id，只能退回 seq（同一 tracker 内行创建后 seq 固定；跨重载不保证，
+///   但迁移只在同一 tracker 的相邻两次渲染之间比对）。
+String memberIdentityOf(ProcessRow row) {
+  if (row.isTool) {
+    final callId = row.callId;
+    // `ProcessRow.tool` 的 callId 必填，但类型是 String?：退化时用 seq 兜底，
+    // 保证每行总有身份（宁可退化为 seq，也不要让整段失去身份）。
+    return callId == null || callId.isEmpty
+        ? 'tool-seq:${row.seq}'
+        : 'tool:$callId';
+  }
+  final step = row.step;
+  return step == null ? 'think-seq:${row.seq}' : 'think-step:$step';
 }
 
 /// issue #123：过程段/过程组**手动折叠状态**的唯一容器 + 可持续身份迁移。
@@ -787,7 +821,9 @@ class SegmentIdentitySnapshot {
 /// 成员行没变，手动状态必须跟着迁移；否则用户点过的展开/收起会「失效」（#122 的
 /// 修复在 partial 窗口这条路径上漏掉了这一种变化）。
 ///
-/// 迁移判据是**成员行身份**（行 durable seq 集合），不是键字符串：
+/// 迁移判据是**成员行身份令牌**（见 [memberIdentityOf]：工具行按 callId、
+/// reasoning 行按内核 step），不是键字符串、也不是行 seq（工具行 seq 会被
+/// 后到的 `tool/call` 覆盖）：
 /// 1. 每次渲染前 [sync] 记录本轮的段身份快照；
 /// 2. 键集合变化时，用「旧段成员在新段里的保留比例」做 1:1 贪心匹配
 ///    （阈值 [residualMatchRatio]），把旧段键的手动状态写进新段键；
@@ -854,7 +890,7 @@ class ProcessFoldState {
       for (final segment in segments)
         SegmentIdentitySnapshot(
           key: segmentKeyOf(segment, turn),
-          rowSeqs: {for (final row in segment.rows) row.seq},
+          memberIds: {for (final row in segment.rows) memberIdentityOf(row)},
           steps: {for (final group in segment.groups) group.step},
         ),
     ];
@@ -875,19 +911,21 @@ class ProcessFoldState {
     List<SegmentIdentitySnapshot> next,
   ) {
     // 1) 计算「旧段 → 新段」的保留比例（旧段成员有多少仍在新段里）。
+    //    身份用 memberIds（callId / step），不用行 seq：工具行的 seq 会被后到的
+    //    tool/call 覆盖（result 先到 110 → call 到达后 100），seq 求交会零交集。
     final candidates = <({int oldIndex, int newIndex, double ratio})>[];
     for (var oi = 0; oi < previous.length; oi++) {
       final old = previous[oi];
-      if (old.rowSeqs.isEmpty) continue;
+      if (old.memberIds.isEmpty) continue;
       for (var ni = 0; ni < next.length; ni++) {
         final now = next[ni];
         if (now.key == old.key) continue; // 键未变：不需要迁移
-        if (now.rowSeqs.isEmpty) continue;
+        if (now.memberIds.isEmpty) continue;
         var kept = 0;
-        for (final seq in old.rowSeqs) {
-          if (now.rowSeqs.contains(seq)) kept += 1;
+        for (final id in old.memberIds) {
+          if (now.memberIds.contains(id)) kept += 1;
         }
-        final ratio = kept / old.rowSeqs.length;
+        final ratio = kept / old.memberIds.length;
         if (ratio >= residualMatchRatio) {
           candidates.add((oldIndex: oi, newIndex: ni, ratio: ratio));
         }
