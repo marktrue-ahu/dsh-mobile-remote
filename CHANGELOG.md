@@ -1,5 +1,47 @@
 # Changelog
 
+## v3.2.4-rc.4（build 57，issues #118 #122 #123）— 滚动位置修正、组折叠重做
+
+> 插件 `3.2.4-rc.4` / App `3.2.4+57` / 载体 `3.2.4-rc.4-app`。RC 候选：插件发布到 npm `rc` dist-tag，`latest` 保持 `3.2.3-rc.1` 不动（只有 stable 可前进）。
+
+### 历史阅读位置不再被新事件抢回（#118）
+
+上翻加载过更早历史后（`paged` 会话），滚动位置可以为负——这是**合法的历史阅读位置**。此前 `_clampOverscrollAfterShrink` 只看 `maxScrollExtent` 不看 `minScrollExtent`，把任何负像素都当作越界并 `jumpTo(0)`，导致新事件到达时用户正在读的历史被拉回。
+
+- 判据改为真实的 `[minScrollExtent, maxScrollExtent]` 区间（`rangeError`）
+- 越界校正改走 `ScrollFollowCoordinator` 的 `requestRangeClamp` 入口，目标是把当前位置夹回合法区间（**不是**回到底部），拖拽中/世代失效作废
+- `atTopAlignment` 的 `pixels <= 0.5` 同样是错误假设，改为 `atLiveWindow = pixels >= -0.5`（「没有停在更早历史里」）
+
+### 过程组折叠状态重做（#122、#123）
+
+原先组折叠状态维护在数据层（`key → bool` 表，键是 `段键:step`）。为让不稳定的键在重建后仍能命中，长出了多层身份迁移逻辑，三轮实现均被判不可交付——根因是 `groups` 按 step **连续**聚合，`1,2,1` 会产生两个同键的组，键本身不唯一。
+
+改为与 DSH 本体同构的做法（`useDisclosure(version)` + `retainAccountKeys`）：
+
+- **展开态由 widget `State` 持有**，用 `ValueKey(identity)` 让 Flutter 的 reconciliation 决定复用还是新建
+- **数据层只保留「用户选择缓存」**：写入是赋值，清理是**只按存在性过滤**（`removeWhere((key) => !existing.contains(key))`），不做任何身份匹配、快照、指纹或迁移
+- **组身份**：`$turn#tool:<首个工具 callId>` → `#think-step:<step>` → `#think-seq:<seq>`。只保证唯一，不保证稳定；identity 变化即回落默认
+- 组内行懒构建（折叠时不构建）
+- 段级折叠仍用数据层迁移（`boundarySeq` 是 durable 的，保留）
+
+**与 DSH 的唯一实质差异**：DSH 的组键是 `workspaceId`（内核 durable、不复用）；本仓库用 `callId` 派生，理论上可能被不同逻辑组复用，极端情况下会误继承折叠选择。该风险已接受，不为此增加校验或迁移（见 ADR 0034）。
+
+### 决策记录
+
+ADR 0034 重写：组折叠状态归属 widget 层 + 按存在性过滤的用户选择缓存。记录了 v1–v3 三轮失败史与放弃保守失效方案的量化理由（50 次工具调用会产生 100 次失效，含参数 chunk 可达数千次）。
+
+### 验证
+
+- 本机门禁 5 项全绿：`flutter analyze` 0 error/0 warning、`flutter test` **1604 通过 / 1 skip**、timeline-contract 179/0、account-usage 15/0、Kotlin `UsagePanelModelTest` BUILD SUCCESSFUL
+- `node --test`：1220 例 1199 通过 / 17 skip / **4 失败**。四项经独立双 worktree 对照确认为本机 root 环境所致（`chmod 0500` 在 root 下失效 ×2、`smoke.mjs` 要求 uid>0、`ANDROID_HOME` 存在时发现真 aapt），与基线完全同集合，非本次引入
+- 变异反证：去掉存在性过滤 → 空历史用例变红；恢复旧 `_items.isNotEmpty` 守卫 → 同用例变红；换成「结构变化清空」→ 「不因普通工具事件重置」用例变红
+
+### 未验证
+
+- 真机未验证：以上均为 widget/单测 + 真实代码路径回放
+- identity 复用导致的误继承：已声明的风险，未构造真实可达用例
+- 无法证明不存在所有未来异步竞态（当前 `_items.clear()` 唯一在同步重建块内）
+
 ## v3.2.4-rc.3（build 56，issues #118）— 修复折叠变短后的大段空白
 
 > 插件 `3.2.4-rc.3` / App `3.2.4+56` / 载体 `3.2.4-rc.3-app`。RC 候选：插件发布到 npm `rc` dist-tag，`latest` 保持 `3.2.3-rc.1` 不动（只有 stable 可前进）。
