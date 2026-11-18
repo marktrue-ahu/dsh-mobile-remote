@@ -1231,8 +1231,21 @@ class _ChatScreenState extends State<ChatScreen> {
       final actualMax = _scrollCtrl.hasClients
           ? _scrollCtrl.position.maxScrollExtent
           : double.infinity;
-      final shortEnough =
-          !paged && actualMax <= 1.0 && contentExtent < viewport.size.height - 80;
+      // issue #118（第三种情况）：`paged` 只用于**历史浏览中**的短内容判定。
+      // 原条件 `!paged` 会让「上翻加载过更早历史」的会话**永久**失去底部占位：
+      // 本轮过程段在 `turn/end` 折叠后内容矮于一屏时，内容停在顶部、下方留大片
+      // 空白（真机会话 59aaa367，详细档，940+ 事件、47 次工具调用）。
+      // 放宽为「已回到顶部对齐（pixels <= 0.5）」时同样启用：
+      //   - 用户在历史区**中间**停留时 pixels > 0，仍走原有的「不补占位」路径，
+      //     避免 issue #76 的「占位与位置修正互相拉扯」（provisional 行被推出）；
+      //   - 已经顶对齐说明用户不在历史浏览位置，此时补占位只是把短内容贴到
+      //     输入框上方，不会把任何行推出视口。
+      final atTopAlignment = !_scrollCtrl.hasClients
+          ? true
+          : _scrollCtrl.position.pixels <= 0.5;
+      final shortEnough = (!paged || atTopAlignment) &&
+          actualMax <= 1.0 &&
+          contentExtent < viewport.size.height - 80;
       // issue #89：占位与内容之和不得超过视口（否则会制造可滚动空白 + 回底按钮）；
       // 视口高度变化（活动条显隐/键盘）必须立即按新高度收敛，不能沿用旧占位。
       final overflowBlank =
