@@ -23,9 +23,12 @@
 
 ## 决定
 
-### 1. 组折叠状态归属 widget 层，不做数据层迁移
+### 1. 组折叠状态归属 widget 层，不做数据层身份迁移
 
 `_ProcessGroupHeader` 从 `StatelessWidget` 改为 `StatefulWidget`，由组件自身持有展开状态；调用方只提供**身份键**与**默认值**：
+
+> 「不做数据层迁移」的准确含义是：不做**身份映射**（match / classify / migrate / 指纹）。
+> 数据层仍保留一份「用户选择缓存」，理由与边界见 §8——它不参与任何映射计算。
 
 ```dart
 _ProcessGroupHeader(
@@ -73,9 +76,9 @@ export function useDisclosure(version = 0) {
 
 `ProcessRow` 已暴露 `callId` 字段（`turn_process.dart:324`），无需额外改造数据层。
 
-### 4. `resetVersion` 语义：档位世代
+### 4. `resetVersion` 保留接口，**恒为 0**
 
-除 `identity` 外，widget 还需要一个 `resetVersion`：
+widget 的状态机保留一个 `resetVersion` 形参（对应 DSH 的 `version`）：
 
 ```dart
 class _ProcessGroupHeaderState extends State<_ProcessGroupHeader> {
@@ -86,17 +89,18 @@ class _ProcessGroupHeaderState extends State<_ProcessGroupHeader> {
 }
 ```
 
-`resetVersion` 在**展示档位切换**时递增。效果：
+但**当前没有任何来源推进它**，实现中恒传 `0`（`chat_screen.dart:7819`）。实际效果：
 
 | 用户状态 | 档位切换后 |
 |---|---|
 | 从未手动操作过（`null`） | 跟随新档位的 `defaultExpanded` |
-| 操作过，且在同一档位世代内 | 保持用户选择 |
-| 操作过，但档位已切换（世代变了） | 回落到新档位的 `defaultExpanded` |
+| 手动操作过 | **保持用户选择**（不因档位切换而回落） |
 
-这与 DSH 的 `useDisclosure(version)`（`use-disclosure.ts:11-17`）同构：那里 `version` 由「seat 被 Turn 隐藏」推进，这里由档位切换推进。
+**这是有意的**：用户的显式操作优先级高于档位默认值。用户既然手动展开/收起过某个组，就不应因切换展示档位而被覆盖——否则用户会感到「我的选择被系统改掉了」。
 
-**不用 `resetVersion` 的后果**：「用户操作过」的标记会永久压住新档位的默认值，切换档位时该组不跟随。
+保留 `resetVersion` 接口而非直接删掉，是为了将来若出现「必须让手动状态失效」的确定场景（例如某个开关要求重置全部折叠态）时有明确落点，而不必临时改造状态机。
+
+**与 DSH 的差异**：DSH 的 `useDisclosure(version)` 中 `version` 由「seat 被 Turn 隐藏」推进，属于「组件即将被销毁前主动作废旧状态」；本仓库当前没有等价需求，故不推进。
 
 ### 5. 段级折叠保留数据层迁移
 
@@ -119,7 +123,32 @@ class _ProcessGroupHeaderState extends State<_ProcessGroupHeader> {
 
 **这是 `StatefulWidget` 生命周期的自然行为，不做额外处理。** 不为此引入「段收起时暂存组状态」的机制——那等于在数据层重建一份组状态。
 
-### 8. 接受「identity 变化时状态回落默认」
+### 8. 保留一份「用户选择缓存」，但它**不是**身份映射
+
+数据层保留 `Map<String, bool> _groupUserExpanded`（identity → 用户显式选择）。这是本 ADR 允许的唯一数据层组状态，因为两个需求无法只靠 widget `State` 满足：
+
+**理由 1：列表回收会销毁 `State`**
+
+对话列表懒构建并回收离屏项（无 `cacheExtent` / `keepAlive` 配置）。用户收起某组后向下滚动几屏，该组 widget 被回收 → `State` 销毁 → 滚回来时新建 `State` → 回到档位默认。这是 `StatefulWidget` 生命周期的必然结果，不是实现缺陷。
+
+**理由 2：计划层计算早于 widget 构建**
+
+`visibleToolCallIds`（`chat_screen.dart:7460`）在渲染前、由数据层派生出「哪些工具行的组当前可见」，供活动条去重（`:5801-5831`，`issue84` 覆盖）。数据层计算时 widget 尚不存在，拿不到 `State`。
+
+**它与被否决的迁移的本质区别**：
+
+| | v1–v3 迁移 | 本缓存的 |
+|---|---|---|
+| 计算旧→新身份映射 | 是（match / classify / migrate） | **否** |
+| 快照、指纹、触发条件 | 是 | **否** |
+| identity 变化时 | 尝试迁移，出错即串状态 | **直接视为新组，取档位默认** |
+| 代码量 | 300+ 行 | 数个读写点 |
+
+**它只是缓存，不是映射。** 最坏情况是「identity 变了导致缓存未命中 → 回落默认」，不会串到别的组。
+
+**护栏**：这张表只能有 `identity → bool` 的读写，**不得**引入快照、指纹、匹配或迁移。若将来有需求要以这张表为基础做迁移，说明本 ADR 的前提被推翻，应先回到 §「未采纳的替代方案」重新论证。
+
+### 9. 接受「identity 变化时状态回落默认」
 
 组身份在某些场景（例如补页把更早的 `tool/call` 插到组首）会变化。此时状态回落到 `defaultExpanded`。
 
