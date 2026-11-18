@@ -1,5 +1,35 @@
 # Changelog
 
+## v3.2.4-rc.3（build 56，issues #118）— 修复折叠变短后的大段空白
+
+> 插件 `3.2.4-rc.3` / App `3.2.4+56` / 载体 `3.2.4-rc.3-app`。RC 候选：插件发布到 npm `rc` dist-tag，`latest` 保持 `3.2.3-rc.1` 不动（只有 stable 可前进）。
+
+### 修复内容下方大段空白（#118）
+
+`rc.2` 只包含了该 issue 的第一部分修复（SSE 事件改布局后跟随）。本版补齐第二部分：
+
+- **现象**（真机截图 + 测试稳定复现 3 次）：长会话上翻加载过更早历史后，本轮 `turn/end` 自动折叠把过程段大幅压短，内容下方出现大段空白，右下角回底按钮可见。
+- **根因**：`_scheduleLiveBottomGapMeasure` 的 `shortEnough = !paged && …` 对 `paged` 会话**永久停用** #77 短内容底部占位。用户上翻过历史后 `paged = true`，此后再也不会补占位；折叠把 live 内容从 1018dp 压到 100dp 时，`maxScrollExtent` 变成 0 而 `pixels` 仍停在旧值 `-40`，内容顶被推到视口上方，下方留 526dp 空白。
+- **修复**：新增 `_clampOverscrollAfterShrink()`，挂在所有改变布局的事件出口之后。只在「不可滚动（`max ≈ 0`）且 `pixels` 越界为负」这一确定异常态把位置拉回 `0`。
+- **不启用 paged 底部占位**：按维护者决定避开 issue #76 的「占位与位置修正互相拉扯」；可滚动时的越界仍交给 `BallisticScrollActivity` 自行回弹，不抢用户位置。
+- **实测**：修复前 `tailResidual=+526` / `pixels=-40`；修复后 `tailResidual=0` / `pixels=0`。
+
+### 决策记录
+
+- ADR 0032 代理面板独立化、ADR 0033 测试夹具按通道推导（文档，不影响产物）。
+
+### 验证
+
+- 本机门禁 6 项全绿：`flutter analyze` 0 error/0 warning、`flutter test` **1559 全绿**、timeline-contract 179/0、account-usage 15/0、`node --test` 1220 例 1199 通过（4 项为本机 root 环境既有失败）、Kotlin `UsagePanelModelTest` BUILD SUCCESSFUL；
+- 新增 `issue118_detailed_mode_blank_test.dart`（13 例）覆盖复现场景；
+- 变异反证：注释掉 `_clampOverscrollAfterShrink()` 调用 → 1 例变红，还原后复绿。
+
+### 真机验收进度
+
+- `#116` / `#119` 已在 `rc.2` 真机验收通过（#119 的 8 项验收中「子代理会话内 todo/write 回放」未单独覆盖）；
+- `#118` 第一部分的真机表现待本版合并后一并观察；
+- `#120` 的四个归属/时序场景在 `rc.2` 上均正常，(a) 假设未复现；仍需 `[120-debug]` 日志原文才能坐实历史现象。
+
 ## v3.2.4-rc.2（build 55，issues #116 #118 #119 #120）— 宿主错误透传、时间线清理与滚动跟随补全
 
 > 插件 `3.2.4-rc.2` / App `3.2.4+55` / 载体 `3.2.4-rc.2-app`。RC 候选：插件发布到 npm `rc` dist-tag，`latest` 保持 `3.2.3-rc.1` 不动（只有 stable 可前进）。本版是首个相对 `alpha.21` / `rc.1` 带**实质功能修复**的 RC。
