@@ -59,11 +59,16 @@ enum FollowIntent {
 
 /// 校正原因。合并时按「越显式越优先」选择，预算取较大者。
 enum CorrectionReason {
-  /// 新事件 / 同一过程条目内部增高 / 展开收起 / 异步详情 / 活动条显隐等布局版本变化。
-  contentLayout,
-
   /// 内部再收敛（例如一次 jump 后 lazy extent 修正）；由 owner 预算驱动，外部一般不用。
   settle,
+
+  /// 布局变短后的**越界夹回**（issue #123）：`pixels` 落到 `[minExtent, maxExtent]`
+  /// 之外。语义是机械修正而不是「跟随最新」——目标 = 当前 pixels 夹回合法区间，
+  /// **不是** `maxExtent`（详见 [ScrollFollowCoordinator.requestRangeClamp]）。
+  rangeClamp,
+
+  /// 新事件 / 同一过程条目内部增高 / 展开收起 / 异步详情 / 活动条显隐等布局版本变化。
+  contentLayout,
 
   /// 点击「回到底部」按钮。
   explicitBackToBottom,
@@ -74,9 +79,10 @@ enum CorrectionReason {
 
 int _reasonRank(CorrectionReason reason) => switch (reason) {
   CorrectionReason.settle => 1,
-  CorrectionReason.contentLayout => 2,
-  CorrectionReason.explicitBackToBottom => 3,
-  CorrectionReason.forcedPosition => 4,
+  CorrectionReason.rangeClamp => 2,
+  CorrectionReason.contentLayout => 3,
+  CorrectionReason.explicitBackToBottom => 4,
+  CorrectionReason.forcedPosition => 5,
 };
 
 /// 一次待执行的校正决策（适配器拿到后执行 jumpTo，再回报 [ScrollFollowCoordinator.noteCorrectionApplied]）。
@@ -295,6 +301,25 @@ class ScrollFollowCoordinator {
     _book(reason, budget ?? defaultBudget);
   }
 
+  /// issue #123：布局变短后的**越界夹回**请求（`pixels` 落到 `[minExtent, maxExtent]` 外）。
+  ///
+  /// 与跟随校正共用同一决策 seam 与守卫，但语义不是「跟随最新」而是**机械修正**：
+  /// - 目标 = 当前 `pixels` 夹回合法区间后的位置，**永远不是 `maxExtent`**；
+  /// - 因此阅读态不阻止：合法阅读位置（含 center 之前的负区间）根本不会发起请求，
+  ///   真越界时夹回也不改变用户在看哪段内容；若这里也按阅读态拒绝，越界位置会
+  ///   一直留着（#118 的「内容被推到视口上方」正是这样产生的）；
+  /// - 拖拽中一律作废（用户手势优先），世代失效由 [takeCorrection] 复核后作废。
+  ///
+  /// 为什么不能直接 `jumpTo`：`#123` P1 的原始实现只看 `max` 就 `jumpTo(0)`，
+  /// 把 center 布局的合法负区间当成越界——用户正在读的历史被抢回 center。
+  void requestRangeClamp({ScrollGeometry? geometry, int budget = 2}) {
+    if (_disposed) return;
+    if (geometry != null) _updateDisplay(geometry);
+    if (_dragging) return;
+    if (geometry != null && geometry.rangeError <= convergeTolerance) return;
+    _book(CorrectionReason.rangeClamp, budget);
+  }
+
   void _book(CorrectionReason reason, int budget) {
     final current = _pending;
     if (current == null) {
@@ -326,8 +351,12 @@ class ScrollFollowCoordinator {
   // ── 执行（适配器在帧后调用） ───────────────────────────────────────
   /// 取一次可执行的校正。
   ///
-  /// 返回 null 表示本帧不动作：无待执行、拖拽中（用户优先）、阅读态（除非强制定位）、
+  /// 返回 null 表示本帧不动作：无待执行、拖拽中（用户优先）、阅读态（跟随校正）、
   /// 世代失效、或已收敛。执行时逐项重查，防止「安排时有效、执行时已失效」。
+  ///
+  /// issue #123：`rangeClamp` 的目标是「当前 pixels 夹回合法区间」而不是末端，
+  /// 它不改变用户在看哪段内容，所以不受阅读态拦截（合法阅读位置不会被请求）；
+  /// 真越界时必须夹回，否则位置会一直留在 `[min, max]` 之外。
   ScrollCorrection? takeCorrection(ScrollGeometry geometry) {
     _updateDisplay(geometry);
     _frameBooked = false;
@@ -344,10 +373,27 @@ class ScrollFollowCoordinator {
       _pending = null;
       return null;
     }
-    if (_intent != FollowIntent.followLatest) {
+    final rangeClamp = pending.reason == CorrectionReason.rangeClamp;
+    if (!rangeClamp && _intent != FollowIntent.followLatest) {
       _cancelledByIntentCount += 1;
       _pending = null;
       return null;
+    }
+    if (rangeClamp) {
+      if (geometry.rangeError <= convergeTolerance) {
+        _pending = null; // 已回到合法区间：无需动作
+        return null;
+      }
+      return ScrollCorrection(
+        targetPixels: geometry.pixels.clamp(
+          geometry.minExtent,
+          geometry.maxExtent,
+        ),
+        reason: pending.reason,
+        attempt: pending.attempt,
+        budget: pending.budget,
+        generation: pending.generation,
+      );
     }
     if (_isConverged(geometry)) {
       _pending = null;

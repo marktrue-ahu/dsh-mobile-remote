@@ -750,7 +750,196 @@ String segmentKeyOf(ProcessSegment segment, int turn) =>
 /// 组键与段键同源：两个构造点（默认展开标志 / 组抬头点击）必须都走这里，
 /// 否则用户点击写入的键与渲染读取的键会漂移（issue #122 审查要点）。
 String groupKeyOf(ProcessSegment segment, int turn, int? step) =>
-    '${segmentKeyOf(segment, turn)}:${step ?? 'x'}';
+    _groupKeyOfSegmentKey(segmentKeyOf(segment, turn), step);
+
+/// 组键的唯一拼接实现：段键 + step（缺 step 用 `x`）。
+///
+/// 供 [groupKeyOf] 与 [ProcessFoldState] 的状态迁移共用——两处独立拼接会让
+/// 「迁移写入的键」和「渲染读取的键」漂移（与 #122 的组键同源要求一致）。
+String _groupKeyOfSegmentKey(String segmentKey, int? step) =>
+    '$segmentKey:${step ?? 'x'}';
+
+/// 一轮过程的段身份快照：稳定键 + 成员行 durable seq + 段内 step 集合。
+///
+/// issue #123：只用于**成员身份比对**，不参与渲染判断。
+class SegmentIdentitySnapshot {
+  const SegmentIdentitySnapshot({
+    required this.key,
+    required this.rowSeqs,
+    required this.steps,
+  });
+
+  final String key;
+  final Set<int> rowSeqs;
+  final Set<int?> steps;
+}
+
+/// issue #123：过程段/过程组**手动折叠状态**的唯一容器 + 可持续身份迁移。
+///
+/// 键仍是 [segmentKeyOf] / [groupKeyOf]（轮号 + durable 开段边界 + step）。但段键
+/// 在一种真实路径下会**迟到变化**：
+///
+/// - partial 窗口（初始 REST 只给最后 N 条，缺 `turn/start` / 开段插话）时开段边界
+///   不可知 → 段键是 `head`；
+/// - 用户上翻 `before` 分页把真实边界补进来 → 同一批过程行现在有边界 → 段键变
+///   `<seq>`（组键随之从 `..:head:<step>` 变 `..:<seq>:<step>`）。
+///
+/// 成员行没变，手动状态必须跟着迁移；否则用户点过的展开/收起会「失效」（#122 的
+/// 修复在 partial 窗口这条路径上漏掉了这一种变化）。
+///
+/// 迁移判据是**成员行身份**（行 durable seq 集合），不是键字符串：
+/// 1. 每次渲染前 [sync] 记录本轮的段身份快照；
+/// 2. 键集合变化时，用「旧段成员在新段里的保留比例」做 1:1 贪心匹配
+///    （阈值 [residualMatchRatio]），把旧段键的手动状态写进新段键；
+///    段内 `step` 未变时，组级手动状态一起迁移；
+/// 3. 迁移后删除旧键，避免将来复用同一个键（例如再次回到 `head`）时把别人的
+///    状态读回来。
+///
+/// 冲突策略（真切段/合段）：
+/// - **切段**（补插进已渲染段内部的边界，当前事件序不可达）：按保留比例从高到低
+///   1:1 匹配，只有被匹配的那一部分继承手动状态，其余部分用档位默认值——不复制状态，
+///   避免「一个操作让两段同时收起」；比例低于阈值视为新段（不猜）。
+/// - **合段**（窗口裁剪删掉边界，原两段并成一段）：合并后的段继承保留比例最高的
+///   旧段状态，另一个旧段的状态随旧键删除。
+/// - **补入更早的段**（有新的段出现在前面）：旧段键与成员都不变，走原来的键查找，
+///   不触发迁移；新段用档位默认值。
+class ProcessFoldState {
+  ProcessFoldState({this.residualMatchRatio = 0.5});
+
+  /// 「旧段成员在新段里的保留比例」达到该值才认为仍是同一段。
+  final double residualMatchRatio;
+
+  final Map<String, bool> _segmentManual = {};
+  final Map<String, bool> _groupManual = {};
+  final Map<int, List<SegmentIdentitySnapshot>> _snapshots = {};
+
+  /// 诊断/单测只读：段级手动状态（键 = `segmentKeyOf`）。
+  Map<String, bool> get segmentManual => Map.unmodifiable(_segmentManual);
+
+  /// 诊断/单测只读：组级手动状态（键 = `groupKeyOf`）。
+  Map<String, bool> get groupManual => Map.unmodifiable(_groupManual);
+
+  /// 会话重载/换会话：手动状态与快照一起清空。
+  void clear() {
+    _segmentManual.clear();
+    _groupManual.clear();
+    _snapshots.clear();
+  }
+
+  /// 段级手动状态（未手动设置过 → null，由调用方用档位默认值）。
+  bool? segmentExpandedOf(ProcessSegment segment, int turn) =>
+      _segmentManual[segmentKeyOf(segment, turn)];
+
+  /// 组级手动状态（未手动设置过 → null）。
+  bool? groupExpandedOf(ProcessSegment segment, int turn, int? step) =>
+      _groupManual[groupKeyOf(segment, turn, step)];
+
+  /// 写入段级手动状态（键由调用方从当前渲染计划带过来，与读取同源）。
+  void setSegmentExpanded(String key, bool expanded) {
+    _segmentManual[key] = expanded;
+  }
+
+  /// 写入组级手动状态。
+  void setGroupExpanded(String key, bool expanded) {
+    _groupManual[key] = expanded;
+  }
+
+  /// 渲染前对齐本轮段身份，必要时迁移手动状态。
+  ///
+  /// 只读写本对象内的 map，不 setState、不依赖帧，可在 build 期间调用（幂等）。
+  /// 只对 **live 视图**调用：历史分段视图的窗口与 live 不同，两个窗口各自同步会
+  /// 互相误判成员全等（同一个 turn 的段在两个窗口里可能一段在、一段不在）。
+  void sync(int turn, List<ProcessSegment> segments) {
+    final next = <SegmentIdentitySnapshot>[
+      for (final segment in segments)
+        SegmentIdentitySnapshot(
+          key: segmentKeyOf(segment, turn),
+          rowSeqs: {for (final row in segment.rows) row.seq},
+          steps: {for (final group in segment.groups) group.step},
+        ),
+    ];
+    final previous = _snapshots[turn];
+    if (previous != null) {
+      final previousKeys = {for (final snapshot in previous) snapshot.key};
+      final nextKeys = {for (final snapshot in next) snapshot.key};
+      if (previousKeys.length != nextKeys.length ||
+          !previousKeys.containsAll(nextKeys)) {
+        _migrate(previous, next);
+      }
+    }
+    _snapshots[turn] = next;
+  }
+
+  void _migrate(
+    List<SegmentIdentitySnapshot> previous,
+    List<SegmentIdentitySnapshot> next,
+  ) {
+    // 1) 计算「旧段 → 新段」的保留比例（旧段成员有多少仍在新段里）。
+    final candidates = <({int oldIndex, int newIndex, double ratio})>[];
+    for (var oi = 0; oi < previous.length; oi++) {
+      final old = previous[oi];
+      if (old.rowSeqs.isEmpty) continue;
+      for (var ni = 0; ni < next.length; ni++) {
+        final now = next[ni];
+        if (now.key == old.key) continue; // 键未变：不需要迁移
+        if (now.rowSeqs.isEmpty) continue;
+        var kept = 0;
+        for (final seq in old.rowSeqs) {
+          if (now.rowSeqs.contains(seq)) kept += 1;
+        }
+        final ratio = kept / old.rowSeqs.length;
+        if (ratio >= residualMatchRatio) {
+          candidates.add((oldIndex: oi, newIndex: ni, ratio: ratio));
+        }
+      }
+    }
+    // 2) 1:1 贪心匹配（保留比例从高到低）。
+    candidates.sort((a, b) => b.ratio.compareTo(a.ratio));
+    final usedOld = <int>{};
+    final usedNew = <int>{};
+    for (final candidate in candidates) {
+      if (usedOld.contains(candidate.oldIndex)) continue;
+      if (usedNew.contains(candidate.newIndex)) continue;
+      usedOld.add(candidate.oldIndex);
+      usedNew.add(candidate.newIndex);
+      _migrateSegment(previous[candidate.oldIndex], next[candidate.newIndex]);
+    }
+    // 3) 没有匹配上的旧键：状态随旧键删除（原段已被裁剪/合段吃掉），
+    //    避免将来复用同一个键时把别人的状态读回来。
+    for (var oi = 0; oi < previous.length; oi++) {
+      if (usedOld.contains(oi)) continue;
+      final old = previous[oi];
+      if (next.any((now) => now.key == old.key)) continue; // 键仍存在：保留
+      _dropSegment(old);
+    }
+  }
+
+  void _migrateSegment(
+    SegmentIdentitySnapshot from,
+    SegmentIdentitySnapshot to,
+  ) {
+    final segmentState = _segmentManual.remove(from.key);
+    if (segmentState != null) {
+      _segmentManual[to.key] = segmentState;
+    }
+    for (final step in from.steps) {
+      if (!to.steps.contains(step)) continue; // 该组在这一段里不存在了
+      final oldGroupKey = _groupKeyOfSegmentKey(from.key, step);
+      final newGroupKey = _groupKeyOfSegmentKey(to.key, step);
+      final groupState = _groupManual.remove(oldGroupKey);
+      if (groupState != null) {
+        _groupManual[newGroupKey] = groupState;
+      }
+    }
+  }
+
+  void _dropSegment(SegmentIdentitySnapshot snapshot) {
+    _segmentManual.remove(snapshot.key);
+    for (final step in snapshot.steps) {
+      _groupManual.remove(_groupKeyOfSegmentKey(snapshot.key, step));
+    }
+  }
+}
 
 const int processBatchSize = 50;
 

@@ -25,6 +25,19 @@
 //    用户回滑停在离底 40px（阅读态）⇒ 内容顶对齐、下方大段空白、回底按钮常显。
 //    典型几何：`gap=0`、`max=0`、`dist=40`、`intent=reading`、`showJump=true`。
 //
+// ⚠️ 2026-11-18（#123 审查）修正：上面「用户回滑停在离底 40px」的判读是**错的**。
+//    ChatView 是 `CustomScrollView(center: ...)`，center 之前是 `_olderItems`；
+//    加载过更早历史后 `pixels=-40` 落在合法区间 `[min=-1518, max=0]` 内，
+//    是**合法的历史阅读位置**，不是「越界 40px」。因此：
+//    - `_clampOverscrollAfterShrink` 不再 `jumpTo(0)`（#123 P1：那会抢走阅读位置），
+//      只在真正越界时请求 owner 夹回；
+//    - `atTopAlignment` 不再是 `pixels <= 0.5`（那会把历史区当顶对齐），
+//      改为「没有停在更早历史里（pixels >= -0.5）」；
+//    - 尝试M 的判据随之改为「位置合法 + 位置保持 + 历史区不补占位」，
+//      不再把 `pixels>=0` 当成功判据（旧判据与错误实现一起绿，是 #123 指出的测试缺陷）。
+//      正常路径（回到 live 起点后短内容补占位）由
+//      `issue123_p1_history_position_test.dart` 的 P1b 覆盖。
+//
 // 本文件只做**回放测量**，不改产品代码、不复制生产滚动算法：
 // - `intent` / `showJumpToLatest` / `gap` / `jumps` 取 ChatScreen 只读诊断；
 // - `tailResidual` 取真实 live SliverList 的**最后投影子项** RenderObject，
@@ -38,7 +51,8 @@
 // - 基线/A–J、对照1/2：断言**期望行为**（真实末端贴合设计底边、跟随态无回底按钮）；
 //   绿 = 未复现（当前实际结果）。
 // - 尝试D：记录一个方向相反的已知缺口（展开任务面板让视口变矮 90px 后不跟随）；
-// - 尝试M：**复现用例**，断言截图现象本身（正 tailResidual + 回底按钮可见）。
+// - 尝试M：内容因折叠变短后的回归用例——位置合法、历史阅读位置保持、历史区不补占位
+//   （#123 审查修正了原判据：`pixels>=0` 不是成功条件）。
 //
 // 精确重跑：
 //   cd dsh-mobile-app && flutter test --no-pub test/issue118_detailed_mode_blank_test.dart
@@ -1135,13 +1149,18 @@ void main() {
     }
   });
 
-  // ── 尝试M：`paged` 状态下短内容 —— 代码里 #77 的底部占位对 paged 永久停用 ──
+  // ── 尝试M：`paged` 状态下短内容 + 折叠变短后的位置保持（#118 + #123 修正） ──
   //
-  // `_scheduleLiveBottomGapMeasure` 的 `shortEnough` 条件是 `!paged && actualMax<=1`；
-  // `paged = _olderItems.isNotEmpty`（用户上翻加载过更早历史后为真）。因此「运行中
-  // 长轮次 + 用户上翻过 + 本轮结束自动折叠 → 内容矮于视口」时，内容会**顶对齐**、
-  // 下方留大段空白，阅读态下回底按钮常显——与截图形态一致。这里用真实分页窗口回放。
-  testWidgets('尝试M：上翻分页（paged）后本轮结束自动折叠 → 短内容空白是否持续',
+  // `_scheduleLiveBottomGapMeasure` 的 `shortEnough` 曾要求 `!paged && actualMax<=1`
+  // （`paged = _olderItems.isNotEmpty`，用户上翻加载过更早历史后为真）。当时把
+  // 「折叠后 pixels=-40」判成「越界 40px」，于是用 `_clampOverscrollAfterShrink`
+  // 把 pixels 拉回 0（#123 审查：那是**合法的历史阅读位置**，拉回=抢走用户位置）。
+  //
+  // 现在本用例锁的是**修正后的契约**：paged 会话里用户上翻到更早历史后，
+  // 本轮 `turn/end` 折叠让内容变矮，位置必须保持合法且不被抢走；历史区不补占位。
+  // 「回到 live 起点后短内容补占位」的正常路径见
+  // `issue123_p1_history_position_test.dart` 的 P1b。
+  testWidgets('尝试M：paged 会话折叠变短后，用户的历史阅读位置必须保持',
       (tester) async {
     try {
       // 3 个已完成轮次（每轮 1 次工具）+ 第 4 轮运行中 104 行过程。
@@ -1210,6 +1229,11 @@ void main() {
       replay.record('dragUp');
       // ignore: avoid_print
       print('[118] dragUp:${replay.recent(count: 2)}');
+      // #123：折叠前记录位置——折叠是「布局变短」，不得改变历史阅读位置。
+      final pxBeforeFold = probe.pixels;
+      expect(pxBeforeFold, lessThan(-0.5),
+          reason: '前提：上翻后用户停在更早历史里（负 pixels 合法）'
+              '${replay.recent()}');
       // 本轮结束：标准档自动折叠过程段 → 内容大幅变矮。
       replay.inject('turn/end', {
         'turn': 4,
@@ -1237,27 +1261,26 @@ void main() {
           'showJump=${probe.showJumpToLatest} gap=${probe.liveBottomGap} '
           'dist=${probe.distanceToEnd} max=${probe.maxExtent} '
           'reading=${!probe.intentFollow}');
-      // 验收判定（issue #118 修复后）：内容因折叠变短后不得留下大段空白。
+      // 验收判定（#118 修复 + #123 审查修正）：
       //
-      // 修复前实测（保留在本文件顶部注释）：tail=+526、px=-40、max=0、按钮可见。
-      // 修复方式不是启用 paged 底部占位（会重现 issue #76 的拉扯），而是把越界的
-      // pixels 拉回 [0, max]：`_clampOverscrollAfterShrink`。
       // 判据不是 tailResidual（内容少于一屏时它天然为正——那是「内容之后的空间」，
-      // 不是异常空白），而是 **pixels 是否越界**：
-
-      // 修复前实测 px=-40：内容顶被推到视口上方 40px，用户看到内容中段、下方大段空白。
-      // 修复后 px=0：内容顶对齐视口顶，剩余空间在内容之后，属正常短内容布局。
+      // 不是异常空白），也不是 `pixels>=0`（center 布局下负 pixels 是**合法的
+      // 历史阅读位置**：#123 审查实测 min=-7190/max=0/px≈-870），而是：
+      //   1. 位置在真实 `[minScrollExtent, maxScrollExtent]` 内（rangeError==0）；
+      //   2. 折叠（布局变短）**不得改变**用户的历史阅读位置；
+      //   3. 用户仍停在更早历史里时**不补**底部占位（否则等于把历史区当顶对齐）。
       expect(probe.maxExtent, lessThan(1),
           reason: '前提：折叠后内容确实不可滚动（max≈0）${replay.recent()}');
-      expect(probe.pixels, greaterThanOrEqualTo(-0.5),
-          reason: '修复后像素不得越界为负（内容顶不该被推到视口上方）'
+      expect(probe.rangeError, lessThanOrEqualTo(0.5),
+          reason: '折叠后位置必须仍在真实合法区间内（负区间合法）'
               '${replay.recent()}');
-      // issue #118 第三种情况（真机会话 59aaa367 截图）：paged 会话内容矮于一屏时，
-      // 底部占位原先被 `!paged` 永久停用 → 内容停顶部、下方大片空白。
-      // 现在放宽为「已回到顶部对齐时也补占位」，因此 gap 必须 > 0。
-      expect(probe.liveBottomGap, greaterThan(0),
-          reason: 'paged 会话在顶部对齐且内容矮于视口时，必须补底部占位'
-              '（否则内容停顶部、下方留大片空白）${replay.recent()}');
+      expect(probe.pixels, closeTo(pxBeforeFold, 1.0),
+          reason: '内容变短不得抢走用户正在读的历史位置'
+              '（折叠前 px=$pxBeforeFold，折叠后 px=${probe.pixels}）'
+              '${replay.recent()}');
+      expect(probe.liveBottomGap, 0,
+          reason: '用户停在更早历史里时不得补底部占位'
+              '（#123：pixels<0 是合法历史位，不是「顶对齐」）${replay.recent()}');
       expect(tail, isNotNull, reason: '应能取到投影末端${replay.recent()}');
       // 回底按钮仍可见是 issue #114 定的产品行为（阅读态恒显入口），不是缺陷；
       // 但它必须真的能回到「内容底部」，而不是跳进空白区。

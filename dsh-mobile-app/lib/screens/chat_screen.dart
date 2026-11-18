@@ -426,8 +426,10 @@ class _ChatScreenState extends State<ChatScreen> {
   Map<int, TurnProcess> _processTurnMap = const {};
   int _processVersion = 0; // 观察到的进化版本
   int _processBuiltVersion = -1; // 已折叠的版本
-  final Map<String, bool> _turnExpansions = {}; // 过程段手动展开/收起（稳定段键：turn:开段插话边界，首段 head）
-  final Map<String, bool> _groupExpansions = {}; // 过程组手动展开（段稳定键:step）
+  // issue #122/#123：过程段/组的手动展开收起状态（键 = 稳定段键/组键）。
+  // #123：partial 窗口补入真实开段边界时段键会迟到变化，由 ProcessFoldState 按
+  // 成员行身份迁移，避免用户点过的状态「失效」。
+  final ProcessFoldState _processFold = ProcessFoldState();
   final Map<String, bool> _reasoningRowExpansions = {}; // 思考行手动展开（turn:seq）
   final Map<int, int> _processRowLimits = {}; // 分批展示：turn → 已展示行数
   // ── issue #53（ADR 0027 §3）：轮末产出物（两卡 + 按坐标预览） ─────────
@@ -1235,15 +1237,21 @@ class _ChatScreenState extends State<ChatScreen> {
       // 原条件 `!paged` 会让「上翻加载过更早历史」的会话**永久**失去底部占位：
       // 本轮过程段在 `turn/end` 折叠后内容矮于一屏时，内容停在顶部、下方留大片
       // 空白（真机会话 59aaa367，详细档，940+ 事件、47 次工具调用）。
-      // 放宽为「已回到顶部对齐（pixels <= 0.5）」时同样启用：
-      //   - 用户在历史区**中间**停留时 pixels > 0，仍走原有的「不补占位」路径，
-      //     避免 issue #76 的「占位与位置修正互相拉扯」（provisional 行被推出）；
-      //   - 已经顶对齐说明用户不在历史浏览位置，此时补占位只是把短内容贴到
-      //     输入框上方，不会把任何行推出视口。
-      final atTopAlignment = !_scrollCtrl.hasClients
+      // 放宽为「已回到 live 视口起点」时同样启用。
+      //
+      // issue #123：判据**不能**是 `pixels <= 0.5` —— center 之前是 `_olderItems`，
+      // 上翻加载过更早历史后 `pixels<0` 是**合法的历史阅读位置**（实测
+      // `min=-1518, max=0, pixels=-990`），把它当成「顶对齐」等于假装用户不在历史区：
+      //   - 与 #123 P1 是同一个错误假设（「负 pixels = 越界」）；
+      //   - 用户停在历史区时补占位，会把 live 内容整体下推，改变 extent 与越界判定。
+      // 现在用 `pixels >= -0.5` 表达「当前没有停在更早历史里」：
+      //   - 历史区（pixels < -0.5）走原有的「不补占位」路径，保持 issue #76 契约；
+      //   - 回到 live 起点/之后（且 `shortEnough` 要求 max<=1，此时 pixels 至多几像素）
+      //     才补占位，把短内容贴到输入框上方（#118 第三种表现）。
+      final atLiveWindow = !_scrollCtrl.hasClients
           ? true
-          : _scrollCtrl.position.pixels <= 0.5;
-      final shortEnough = (!paged || atTopAlignment) &&
+          : _scrollCtrl.position.pixels >= -0.5;
+      final shortEnough = (!paged || atLiveWindow) &&
           actualMax <= 1.0 &&
           contentExtent < viewport.size.height - 80;
       // issue #89：占位与内容之和不得超过视口（否则会制造可滚动空白 + 回底按钮）；
@@ -1985,8 +1993,7 @@ class _ChatScreenState extends State<ChatScreen> {
         _processTurnMap = const {};
         _processVersion++;
         _processBuiltVersion = -1;
-        _turnExpansions.clear();
-        _groupExpansions.clear();
+        _processFold.clear();
         _reasoningRowExpansions.clear();
         _processRowLimits.clear();
         _livePlanCache = null;
@@ -2826,7 +2833,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _clampOverscrollAfterShrink();
   }
 
-  /// issue #118：内容因**布局变化**变短后，把越界的滚动位置拉回合法范围。
+  /// issue #118 / #123：内容因**布局变化**变短后，把**真正越界**的滚动位置夹回合法范围。
   ///
   /// 复现（详细档 + paged 会话，实测 `tailResidual=+526`、`max=0`、`px=-40`）：
   /// 用户上翻加载过更早历史后 `paged=true`，#77 短内容底部占位被
@@ -2834,24 +2841,36 @@ class _ChatScreenState extends State<ChatScreen> {
   /// live 内容从 1018dp 压到 100dp，`maxScrollExtent` 变成 0，而 `pixels`
   /// 仍停在旧值 → 内容顶边被推到视口上方、下方留出大段空白，且阅读态恒显回底按钮。
   ///
-  /// 这里**不启用底部占位**（维护者决定，避免重现 issue #76 的「占位与位置修正
-  /// 互相拉扯」），只把**越界**的 pixels 拉回 `[0, max]`。内容变短是布局变化导致、
-  /// 不是用户滚动，因此不违反「不抢用户位置」：用户看到的仍是同一段内容。
+  /// ⚠️ #123 P1（审查发现）：第一版实现只看 `maxScrollExtent`：
+  /// `if (max > 0.5 || pixels >= -0.5) return; jumpTo(0);`
+  /// 漏掉了「center 之前是 `_olderItems`」这个事实——加载过更早历史后
+  /// `pixels` 为负是**合法阅读位置**（实测 `min=-1518, max=0, pixels=-990`）。
+  /// 于是一条新事件（例如 `todo/write`）就把用户正在读的历史抢回 center，
+  /// 而 `intent` 仍是 reading。
+  ///
+  /// 现在的判据与执行方式：
+  /// - 判据用真实 `[minScrollExtent, maxScrollExtent]` 的越界量（[ScrollGeometry.rangeError]），
+  ///   负区间合法，只有真正越界才动作；
+  /// - 校正是**请求 owner**（[ScrollFollowCoordinator.requestRangeClamp]）而不是直接
+  ///   `jumpTo`：拖拽中/世代失效一律作废，目标永远是最接近当前 pixels 的合法位置
+  ///   （不是末端，也不是 center）。
+  /// - 不启用底部占位（维护者决定，避免重现 issue #76 的「占位与位置修正互相拉扯」）。
   void _clampOverscrollAfterShrink() {
     if (!mounted || _inHistory) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      if (!_scrollCtrl.hasClients) return;
+      if (_inHistory || !_scrollCtrl.hasClients) return;
       final position = _scrollCtrl.position;
       if (!position.hasContentDimensions) return;
-      final max = position.maxScrollExtent;
-      final pixels = position.pixels;
-      // 只在「不可滚动 + 越界」这一确定异常态纠正；可滚动时的越界由
-      // BallisticScrollActivity 自行回弹，不在这里抢。
-      if (max > 0.5 || pixels >= -0.5) return;
-      _runProgrammaticScroll(() {
-        _scrollCtrl.jumpTo(0);
-      });
+      final geometry = _geometryOfPosition(position);
+      // 只在**真正越界**时请求 owner 夹回；center 之前的负区间是合法历史阅读位置。
+      if (geometry.rangeError <= 0.5) return;
+      AppLog.instance.log(
+        'Chat: 越界夹回(请求) pixels=${geometry.pixels.toStringAsFixed(0)} '
+        'min=${geometry.minExtent.toStringAsFixed(0)} '
+        'max=${geometry.maxExtent.toStringAsFixed(0)}(#123)',
+      );
+      _scrollFollow.requestRangeClamp(geometry: geometry);
       _syncScrollFollowDisplay();
     });
   }
@@ -7470,6 +7489,11 @@ class _ChatScreenState extends State<ChatScreen> {
       if (start == null) continue; // 历史截断：没有 turn/start，不构造过程块
       anchoredTurns.add(turn);
       final segments = segmentsOf(process);
+      // issue #123：读手动折叠状态前先让 owner 对齐本轮段身份（partial 窗口补入
+      // 真实开段边界时，按成员行身份把旧键的手动状态迁移到新键）。
+      // 只在 live 视图同步：历史分段视图的窗口与 live 不同，两个窗口各自同步会
+      // 互相误判「同一段」（同一个 turn 在两个窗口里可能段不同）。
+      if (!historyView) _processFold.sync(turn, segments);
       final liveNow = !process.ended;
       // issue #108：运行中插话强制段展开（简洁档也一样）；异常结束同样强制。
       final forcedLive = liveNow && process.hasInterjection;
@@ -7506,7 +7530,7 @@ class _ChatScreenState extends State<ChatScreen> {
         // 会让 si 整体移动，导致手动折叠状态失配或串段；边界 seq 只随 durable
         // 插话变化，已渲染段的键保持稳定（见 `segmentKeyOf`）。
         final key = segmentKeyOf(segment, turn);
-        final manual = _turnExpansions[key];
+        final manual = _processFold.segmentExpandedOf(segment, turn);
         final occupied = manual ?? segmentExpandedByDefault;
         final groupStyle = liveNow ? policy.liveGroups : policy.completedGroups;
         final flat = groupStyle == LiveGroupMode.flat ||
@@ -7531,7 +7555,7 @@ class _ChatScreenState extends State<ChatScreen> {
             for (final group in segment.groups)
               // issue #122：默认展开标志与组抬头点击必须用**同一个**组键公式，
               // 统一走 groupKeyOf，避免两处独立拼接后漂移。
-              _groupExpansions[groupKeyOf(segment, turn, group.step)] ??
+              _processFold.groupExpandedOf(segment, turn, group.step) ??
                   defaultGroupExpanded,
           ];
         }
@@ -7711,7 +7735,7 @@ class _ChatScreenState extends State<ChatScreen> {
               ? null
               : () {
                   setState(() {
-                    _turnExpansions[plan.intervalKey] = true;
+                    _processFold.setSegmentExpanded(plan.intervalKey, true);
                     _invalidateProcessPlan();
                   });
                   _onContentLayoutChanged();
@@ -7743,7 +7767,11 @@ class _ChatScreenState extends State<ChatScreen> {
             plan.process.turn,
             group.step,
           );
-          final manual = _groupExpansions[groupKey];
+          final manual = _processFold.groupExpandedOf(
+            plan.segment,
+            plan.process.turn,
+            group.step,
+          );
           // issue #108 v4：运行中简洁/详细组默认展开、标准折叠；已完成统一折叠。
           final defaultGroupExpanded = liveNow
               ? switch (policy.liveGroups) {
@@ -7792,7 +7820,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 : () => _openImagesGallery(groupImages),
             onTap: () {
               setState(() {
-                _groupExpansions[groupKey] = !groupExpanded;
+                _processFold.setGroupExpanded(groupKey, !groupExpanded);
                 _invalidateProcessPlan();
               });
               _onContentLayoutChanged();
@@ -7928,7 +7956,7 @@ class _ChatScreenState extends State<ChatScreen> {
             key: ValueKey<String>('collapse-process:${plan.intervalKey}'),
             onTap: () {
               setState(() {
-                _turnExpansions[plan.intervalKey] = false;
+                _processFold.setSegmentExpanded(plan.intervalKey, false);
                 _invalidateProcessPlan();
               });
               _onContentLayoutChanged();
@@ -13020,7 +13048,7 @@ class _ProcessBlockPlan {
   final bool grouping;
 
   /// issue #122：过程段的**稳定**折叠键（`segmentKeyOf`：轮号 + 开段插话边界
-  /// seq，轮首段为 `head`）。`_turnExpansions` 与段收起行 key 都用它。
+  /// seq，轮首段为 `head`）。`ProcessFoldState` 与段收起行 key 都用它。
   ///
   /// 名称沿用 intervalKey：它标识「两条插话之间的 interval」，改后语义反而更准。
   /// 不要换回 `turn:段索引`——补页/裁剪会让索引移动，折叠状态会串段。

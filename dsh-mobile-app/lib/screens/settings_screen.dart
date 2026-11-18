@@ -833,11 +833,27 @@ class _SettingsScreenState extends State<SettingsScreen> {
         tx.resultOk != false &&
         !_hostReleaseReady(store) &&
         title.startsWith('插件更新完成，等待');
+    // issue #123（#116 回归）：失败卡的**主行**必须是映射后的可执行原因，
+    // 不是后端写进日志的英文输出。原实现优先取 `_progressLine`，于是
+    // `nextAction=restart-host` 的「请先重启 DSH」被日志整行盖掉；快速拒绝时
+    // 首次轮询就是 failed，`_lastProgressPhase` 为空还会跳过 toast → 用户不点详情
+    // 完全不知道要重启。
+    //
+    // 现在：失败 → 动作指引优先；日志降为**次级行**（详情面板里仍有完整日志）。
+    final failureLine = failureReason;
     final detailLine = awaitingDetail
         ? '正在导入/校验 App 载体，就绪后即可检查 App 更新…'
-        : (_progressLine.isNotEmpty
-              ? _progressLine
-              : (failureReason ?? progress.stageText));
+        : (failureLine ??
+              (_progressLine.isNotEmpty
+                  ? _progressLine
+                  : progress.stageText));
+    // 次级行：只在失败时把最新一行日志放到主行下方（同一次读取、不额外请求）。
+    final secondaryLine = !awaitingDetail &&
+            failureLine != null &&
+            _progressLine.isNotEmpty &&
+            _progressLine != failureLine
+        ? _progressLine
+        : null;
 
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
@@ -924,6 +940,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
               color: progress.failed ? danger : ink3,
             ),
           ),
+          if (secondaryLine != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              // 日志是次级信息：比主行更小更淡，且排在主行**下方**；完整日志
+              // 仍在「详情 ▸」里（不在这里透传更多宿主原文）。
+              child: Text(
+                secondaryLine,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 10, color: ink3),
+              ),
+            ),
           if (targetVersion.isNotEmpty)
             Padding(
               padding: const EdgeInsets.only(top: 4),
