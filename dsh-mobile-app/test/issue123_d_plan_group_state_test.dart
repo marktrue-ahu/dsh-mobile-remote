@@ -20,6 +20,7 @@
 // 精确重跑：
 //   cd dsh-mobile-app && flutter test --no-pub test/issue123_d_plan_group_state_test.dart
 
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:dsh_mobile_app/api.dart';
@@ -106,6 +107,9 @@ class _Backend {
   final List<Map<String, dynamic>> history;
   final int initialLimit;
 
+  /// 非空时，下一次 `/api/history` 请求会等待该 Completer（模拟慢响应）。
+  Completer<void>? historyGate;
+
   late final Api api = Api(client: MockClient(_handle))
     ..baseUrl = 'http://issue123-dplan.test'
     ..path = '/m'
@@ -123,6 +127,11 @@ class _Backend {
     Map<String, dynamic> body;
     final path = request.url.path;
     if (path == '/m/api/history') {
+      final gate = historyGate;
+      if (gate != null) {
+        historyGate = null; // 只挂起下一次请求
+        await gate.future;
+      }
       final params = request.url.queryParameters;
       final limit = int.tryParse(params['limit'] ?? '') ?? 50;
       if (params.containsKey('before')) {
@@ -291,10 +300,16 @@ void main() {
   testWidgets('D3 不因普通工具事件重置（与废弃的保守失效方案的关键区别）', (tester) async {
     final backend = _Backend(_history(), initialLimit: 50);
     final store = await _mount(tester, backend);
-    final index = _headerIndexAboveMarker(tester, 'shell-C10');
-    await _tapHeader(tester, index);
-    expect(_headerExpanded(tester, index), isFalse, reason: '用户手动收起');
-    // 注入普通工具事件：新工具 call + result（会让该轮组集合增长）。
+    // 按 identity 定位（不用注入前的 index——结构变化后 index 可能指错组）。
+    const target = '1#tool:c10';
+    expect(_headerByIdentity(target), findsOneWidget);
+    expect(_headerExpandedByIdentity(tester, target), isTrue);
+    await _tapHeaderByIdentity(tester, target);
+    expect(_headerExpandedByIdentity(tester, target), isFalse,
+        reason: '用户手动收起');
+    expect(_cachedIdentities(tester), contains(target));
+
+    // 注入普通工具事件：新工具 call + result（该轮组集合增长）。
     store.injectFrame({
       'type': 'session/event',
       'sessionId': _session,
@@ -330,12 +345,21 @@ void main() {
     });
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 120));
-    expect(_headerExpanded(tester, index), isFalse,
+
+    // 断言注入的事件**确实进入了过程计划**（不只断言 UI 状态）：
+    // 新工具组以 identity `1#tool:c14` 出现，且其工具卡已渲染。
+    expect(_headerByIdentity('1#tool:c14'), findsOneWidget,
+        reason: '注入的 tool/call+tool/result 必须真的生成过程组');
+    expect(find.textContaining('shell-C14'), findsOneWidget,
+        reason: '注入的工具卡必须进入渲染计划');
+    // 目标组仍保持用户收起（identity 仍在 → 不被过滤、不被重置）。
+    expect(_headerExpandedByIdentity(tester, target), isFalse,
         reason: '普通工具事件只增删 identity 集合，不得重置已有用户选择');
+    expect(_cachedIdentities(tester), contains(target),
+        reason: '目标组的用户选择仍在缓存（新组未被用户操作，不应入缓存）');
     // 收尾：泵掉事件注入产生的 800ms sessions debounce 计时器。
     await tester.pump(const Duration(seconds: 1));
   });
-
   testWidgets('D4 存在性过滤：turn 数据被移除后其 identity 条目被清理', (tester) async {
     final history = _twoTurnHistory();
     final backend = _Backend(history, initialLimit: 50);
@@ -374,6 +398,118 @@ void main() {
     await tester.pump(const Duration(seconds: 1));
   });
 
+  testWidgets('D5 真实空历史 → 空帧 → 同 identity 再现 → 回落默认（不继承）', (tester) async {
+    final history = _history();
+    final backend = _Backend(history, initialLimit: 50);
+    final store = await _mount(tester, backend);
+    const target = '1#tool:c10';
+    await _tapHeaderByIdentity(tester, target);
+    expect(_headerExpandedByIdentity(tester, target), isFalse);
+    expect(_cachedIdentities(tester), contains(target));
+
+    // 后端历史变为**空**：compaction 重同步 → 空帧。
+    history.clear();
+    _injectCompaction(tester, store, 9200);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(_headerCount(tester), 0, reason: '空历史 → 空帧（组全部消失）');
+    expect(_cachedIdentities(tester), isEmpty,
+        reason: '空计划下 existing 为空 → 存在性过滤清空缓存');
+
+    // 历史恢复为原内容（同一 identity 再次出现）→ 新 State 回落默认。
+    history.addAll(_history());
+    _injectCompaction(tester, store, 9300);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(_headerByIdentity(target), findsOneWidget, reason: '同 identity 再现');
+    expect(_headerExpandedByIdentity(tester, target), isTrue,
+        reason: '旧缓存已清、旧 State 已卸载 → 回落默认（详细档展开），不继承旧收起');
+    expect(_cachedIdentities(tester), isNot(contains(target)),
+        reason: '再现后用户尚未操作 → 缓存里不应有该条目');
+  });
+
+  testWidgets('D6 慢历史响应：请求等待期旧选择必须保留（不得提前清空）', (tester) async {
+    final history = _history();
+    final backend = _Backend(history, initialLimit: 50);
+    final store = await _mount(tester, backend);
+    const target = '1#tool:c10';
+    await _tapHeaderByIdentity(tester, target);
+    expect(_headerExpandedByIdentity(tester, target), isFalse);
+
+    // 挂起下一次 history 响应，触发 compaction 重同步。
+    final gate = Completer<void>();
+    backend.historyGate = gate;
+    _injectCompaction(tester, store, 9400);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 200));
+
+    // 请求仍在等待：旧列表/旧选择必须保留（_load 在 await 之后才 clear）。
+    expect(_cachedIdentities(tester), contains(target),
+        reason: '请求未回时不得清空用户选择');
+    expect(_headerByIdentity(target), findsOneWidget,
+        reason: '请求未回时旧列表仍在（clear 发生在 await 之后）');
+    expect(_headerExpandedByIdentity(tester, target), isFalse);
+
+    // 响应返回 → 重载完成，identity 不变 → 选择保留。
+    gate.complete();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(_cachedIdentities(tester), contains(target),
+        reason: '重载后 identity 仍存在 → 保留用户选择');
+    expect(_headerExpandedByIdentity(tester, target), isFalse);
+    await tester.pump(const Duration(seconds: 1));
+  });
+
+}
+
+/// 按 identity 找组抬头（方案 D 的 ValueKey 就是 identity）。
+Finder _headerByIdentity(String identity) =>
+    find.byKey(ValueKey<String>('process-group:$identity'));
+
+bool _headerExpandedByIdentity(WidgetTester tester, String identity) {
+  final state = tester.state(_headerByIdentity(identity));
+  // ignore: avoid_dynamic_calls
+  return (state as dynamic).debugExpanded as bool;
+}
+
+Future<void> _tapHeaderByIdentity(WidgetTester tester, String identity) async {
+  await tester.tap(
+    find
+        .descendant(of: _headerByIdentity(identity), matching: find.byType(InkWell))
+        .first,
+  );
+  await tester.pump(const Duration(milliseconds: 120));
+  await tester.pump(const Duration(milliseconds: 60));
+}
+
+/// 触发一次 compaction 重同步（`_load(reset: true)`）。
+void _injectCompaction(WidgetTester tester, dynamic store, int seq) {
+  // ignore: avoid_dynamic_calls
+  (store as dynamic).injectFrame({
+    'type': 'session/event',
+    'sessionId': _session,
+    'event': {
+      'seq': seq,
+      'type': 'compaction/end',
+      'data': const <String, dynamic>{},
+      'time': seq * 10,
+    },
+  });
+}
+
+Set<String> _cachedIdentities(WidgetTester tester) {
+  final screen = tester.state(find.byType(ChatScreen));
+  // ignore: avoid_dynamic_calls
+  return (screen as dynamic).debugGroupUserExpandedKeys as Set<String>;
 }
 
 int _headerIndexAboveMarker(WidgetTester tester, String marker) {
