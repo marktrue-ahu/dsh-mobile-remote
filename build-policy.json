@@ -325,8 +325,10 @@
       "carrierVersion": "3.2.4-rc.4-app",
       "build": 57,
       "integrity": "sha512-iNaJ+/FiOekzPCOHD3RFo8mcsZs/JQdJqtwmZyf+GqpENHg14Gz3g9kik0Xn6EbK3WA+cQAVss1aWMbW67Q5gQ==",
-      "status": "submitted",
-      "createdAt": "2026-11-18T16:29:35.749Z"
+      "status": "published",
+      "createdAt": "2026-11-18T16:29:35.749Z",
+      "note": "dist-tags verified",
+      "updatedAt": "2026-11-18T16:38:08.971Z"
     }
   ]
 }
