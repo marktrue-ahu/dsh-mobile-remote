@@ -37,6 +37,9 @@ class _Backend {
   final List<Map<String, dynamic>> jobs;
   final List<Map<String, dynamic>> kills = [];
 
+  /// 前 N 次 GET /api/jobs 返回 500（模拟首次加载失败，验证重试恢复）。
+  int failJobsTimes = 0;
+
   late final Api api = Api(client: MockClient(_handle))
     ..baseUrl = 'http://issue128.test'
     ..path = '/m'
@@ -56,6 +59,14 @@ class _Backend {
     if (path == '/m/api/history') {
       body = {'ok': true, 'events': history, 'hasMore': false};
     } else if (path == '/m/api/jobs' && request.method == 'GET') {
+      if (failJobsTimes > 0) {
+        failJobsTimes--;
+        return http.Response(
+          jsonEncode({'ok': false, 'error': 'jobs-unavailable'}),
+          500,
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        );
+      }
       body = {'ok': true, 'jobs': jobs};
     } else if (path == '/m/api/jobs/kill' && request.method == 'POST') {
       final decoded = jsonDecode(request.body) as Map<String, dynamic>;
@@ -423,6 +434,36 @@ void main() {
 
       expect(find.text('暂无任务'), findsOneWidget);
       expect(find.textContaining('后台任务进行中'), findsNothing);
+      expect(tester.takeException(), isNull);
+      await _finish(tester);
+    });
+
+    testWidgets('首次加载失败 → 重试成功：任务可见且可取消（P2 回归）', (tester) async {
+      final backend = _Backend(
+        _shortHistory(),
+        jobs: [_job('j1', 'running', label: '后台任务 A')],
+      )..failJobsTimes = 1;
+      await _mount(tester, backend: backend);
+      await _openJobsSheet(tester);
+
+      expect(find.textContaining('加载失败：'), findsOneWidget);
+      expect(find.text('后台任务 A'), findsNothing);
+
+      await tester.tap(find.text('重试'));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.textContaining('加载失败：'),
+        findsNothing,
+        reason: '重试开始必须清掉旧错误，否则成功后仍停在错误页',
+      );
+      expect(find.text('后台任务 A'), findsOneWidget);
+      expect(find.text('取消'), findsOneWidget);
+
+      await tester.tap(find.text('取消'));
+      await tester.pumpAndSettle();
+      expect(backend.kills, hasLength(1));
+      expect(backend.kills.single['jobId'], 'j1', reason: '恢复后取消入口必须真的可用');
       expect(tester.takeException(), isNull);
       await _finish(tester);
     });

@@ -146,7 +146,13 @@ class _JobsTabState extends State<_JobsTab> {
   Future<void> _load() async {
     // v2.7.2 review：弹层可下滑关闭,异步回调后必须防 setState-after-dispose
     if (!mounted) return;
-    setState(() => _jobs = null);
+    // issue #128 review(P2)：重试开始即清旧错误。此前 `_error` 从不清除——首次失败后
+    // 点「重试」即使成功，仍会停在错误页，任务看不到也取消不了；移除聊天页卡片后
+    // 本页签是唯一后台任务入口，必须能恢复。
+    setState(() {
+      _jobs = null;
+      _error = null;
+    });
     try {
       final list = await (widget.apiClient ?? api).jobs(widget.sessionId);
       if (!mounted) return;
