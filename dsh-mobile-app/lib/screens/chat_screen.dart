@@ -252,6 +252,72 @@ typedef GitBrowserControllerFactory = GitBrowserController Function(
   GitReadApi api,
 );
 
+/// issue #129：首次打开会话的失败态（消息区整页三态之一）。
+///
+/// [retryable] = false 表示 dead-end：会话不存在/已删除或缺少会话标识——重试同一个
+/// 请求不会成功，界面只保留「返回会话列表」。[reason] 是给用户看的原因文案。
+class InitialLoadFailure {
+  final String reason;
+  final bool retryable;
+  final bool missingSession;
+
+  const InitialLoadFailure({
+    required this.reason,
+    required this.retryable,
+    this.missingSession = false,
+  });
+}
+
+/// issue #129：把 `/history` 首次加载异常归类成失败态。
+///
+/// 契约（GitLab #129）：
+/// - 404 / `session-not-found` / `not-found`、或调用方明确缺少会话标识 → dead-end，不可重试；
+/// - 超时、网络错误、503 及其它暂时性错误 → 可重试。
+InitialLoadFailure initialLoadFailureFor(
+  Object? error, {
+  bool missingSession = false,
+}) {
+  if (missingSession) {
+    return InitialLoadFailure(
+      reason: L10n.t('缺少会话标识，无法加载会话', 'No session selected — unable to load'),
+      retryable: false,
+      missingSession: true,
+    );
+  }
+  if (error is ApiException) {
+    if (error.status == 404 ||
+        error.code == 'session-not-found' ||
+        error.code == 'not-found') {
+      return InitialLoadFailure(
+        reason: L10n.t('会话不存在或已被删除', 'Session not found or deleted'),
+        retryable: false,
+      );
+    }
+    if (error.status == 503) {
+      return InitialLoadFailure(
+        reason: L10n.t(
+          '服务暂时不可用（503），请稍后重试',
+          'Service temporarily unavailable (503) — try again later',
+        ),
+        retryable: true,
+      );
+    }
+  }
+  if (error is TimeoutException) {
+    return InitialLoadFailure(
+      reason: L10n.t(
+        '请求超时，请检查网络后重试',
+        'Request timed out — check your connection and retry',
+      ),
+      retryable: true,
+    );
+  }
+  return InitialLoadFailure(
+    reason: '${L10n.t('连接失败：', 'Connection failed: ')}$error',
+    retryable: true,
+  );
+}
+
 class _ConversationActionRail extends StatefulWidget {
   final List<String> initialOrder;
   final ValueChanged<List<String>> onOrderChanged;
@@ -493,6 +559,14 @@ class _ChatScreenState extends State<ChatScreen> {
   int? _lastAssistantSeq;
   DateTime? _lastResyncAt; // 兜底补拉节流（10s）
   int _loadGeneration = 0; // 丢弃跨越 reset/会话切换的旧 history 响应
+
+  // ── issue #129：首次打开会话的消息区三态（loading / empty / failed） ──
+  //
+  // 只在「从未成功加载过且时间线无内容」时启用：reset 重同步、SSE 先到、已有内容
+  // 一律不进三态（避免整页闪动）。`_everLoaded` 默认 false，首帧即显示 loading，
+  // 不依赖任何延时计时器。
+  bool _everLoaded = false;
+  InitialLoadFailure? _initialLoadFailure;
   // v2.7.2 review(M1)：本页绑定的会话（initState 时捕获）——事件按它过滤，叠层页面互不污染
   String? _mySessionId;
   // issue #94/#95：Markdown 本地图片 loader；缓存/并发/会话隔离由本页 LRU 负责。
@@ -1056,7 +1130,13 @@ class _ChatScreenState extends State<ChatScreen> {
     _scrollFollow = ScrollFollowCoordinator(
       ensureFrame: _ensureScrollFollowFrame,
     );
-    _load();
+    // issue #129：缺少会话标识时明确进入失败态（dead-end），而不是空白/静默返回。
+    // 其余情况首帧即 loading（`_everLoaded` 默认 false）。
+    if ((_mySessionId ?? '').isEmpty) {
+      _initialLoadFailure = initialLoadFailureFor(null, missingSession: true);
+    } else {
+      _load();
+    }
     // v2.7：恢复该会话上次未发送的输入草稿
     final sid = _mySessionId;
     if (sid != null) {
@@ -1913,7 +1993,18 @@ class _ChatScreenState extends State<ChatScreen> {
   /// （保留历史请求期间 SSE 已入列的新条目）。
   Future<void> _load({bool reset = false}) async {
     final id = _mySessionId ?? widget.store.sessionId;
-    if (id == null) return;
+    if (id == null || id.isEmpty) {
+      // issue #129：缺会话标识是明确的失败（dead-end），不再静默返回空白。
+      if (!_everLoaded && mounted) {
+        setState(() {
+          _initialLoadFailure = initialLoadFailureFor(
+            null,
+            missingSession: true,
+          );
+        });
+      }
+      return;
+    }
     final generation = ++_loadGeneration;
     AppLog.instance.log(reset ? 'Chat: 重同步会话（按新表面重载）$id' : 'Chat: 打开会话 $id');
     try {
@@ -1930,6 +2021,10 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
       setState(() {
+        // issue #129：首次加载成功后退出 loading/failed；此后即使时间线为空也走
+        // empty 态（由 `_initialStateView` 判定），reset 重同步不再触发整页三态。
+        _everLoaded = true;
+        _initialLoadFailure = null;
         // 打开/重同步会话时以本次响应为准（赋值，而非 |=）：避免上一条会话的「仅部分历史」
         // 横幅残留到正常会话。后续增量分页（after/before）仍用 |=：任一页降级即持续提示。
         _historyDegraded = page.degraded;
@@ -2083,6 +2178,10 @@ class _ChatScreenState extends State<ChatScreen> {
         forced: true,
         reason: CorrectionReason.forcedPosition,
       );
+      // issue #129：三态（loading/empty/failed）→ 内容态的切换帧里滚动视图可能尚未挂载，
+      // owner 会因 `!hasClients` 取消上面的强制定位。内容挂载后的帧后再强制一次，
+      // 保证长会话首屏真正落底；ADR 0035 的顶对齐/高度规则不变。
+      _requestInitialFollowAfterMount();
       _refreshUsage();
       widget.store.refreshSessionConfig();
       if (!reset) _scheduleAutoFillFirstScreen();
@@ -2100,24 +2199,91 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
       AppLog.instance.log('Chat: 历史加载失败 $id → $e');
-      if (mounted) {
-        if (_items.isNotEmpty || _olderItems.isNotEmpty) {
-          showToast(
-            context,
-            L10n.t(
-              '连接不可用，已保留当前时间线；稍后可重试详情',
-              'Connection unavailable; cached timeline kept, retry details later',
-            ),
-          );
-        } else {
-          showToast(
-            context,
-            '${L10n.t('该会话暂不可用：', 'This session is unavailable: ')}$e',
-          );
-          Navigator.of(context).pop();
-        }
+      if (!mounted) return;
+      if (_hasTimelineContent) {
+        // issue #129：已有内容（含 SSE 先到）时不进整页失败态——保留时间线，只 toast。
+        showToast(
+          context,
+          L10n.t(
+            '连接不可用，已保留当前时间线；稍后可重试详情',
+            'Connection unavailable; cached timeline kept, retry details later',
+          ),
+        );
+      } else if (_everLoaded) {
+        // 成功加载过的空会话在重同步时失败：保留空态，只提示，不把空会话伪装成错误页。
+        showToast(
+          context,
+          '${L10n.t('刷新会话失败：', 'Failed to refresh session: ')}$e',
+        );
+      } else {
+        // 首次加载、且时间线无任何内容：进入明确失败态（不自动 pop）。
+        setState(() {
+          _initialLoadFailure = initialLoadFailureFor(e);
+        });
       }
     }
+  }
+
+  /// issue #129：时间线是否已有内容（历史/SSE/发件乐观条目）。有内容时永不显示整页三态，
+  /// 避免“已能看到对话却闪成加载页”。
+  bool get _hasTimelineContent =>
+      _items.isNotEmpty || _olderItems.isNotEmpty || _histItems.isNotEmpty;
+
+  /// issue #129：首次加载成功、内容挂载后的帧后强制跟随一次。
+  ///
+  /// 三态组件替换了 `CustomScrollView`：成功 setState 与滚动视图挂载之间隔着一帧，
+  /// 此时 `_ensureScrollFollowFrame` 会因 `!hasClients` 取消强制定位。这里等内容态
+  /// 真正布局后再请求一次；若仍无 clients（例如空态没有滚动视图），静默结束。
+  void _requestInitialFollowAfterMount() {
+    if (!mounted || _inHistory || !_hasTimelineContent) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _inHistory) return;
+      if (!_scrollCtrl.hasClients) {
+        // 极端情况下内容态还要再一帧才挂载 clients：只补一次，避免无界自激。
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted || _inHistory) return;
+          _requestScrollFollow(
+            forced: true,
+            reason: CorrectionReason.forcedPosition,
+          );
+        });
+        WidgetsBinding.instance.ensureVisualUpdate();
+        return;
+      }
+      _requestScrollFollow(
+        forced: true,
+        reason: CorrectionReason.forcedPosition,
+      );
+    });
+    WidgetsBinding.instance.ensureVisualUpdate();
+  }
+
+  /// issue #129：失败态「重试」——回到 loading 再走一次首次加载。
+  Future<void> _retryInitialLoad() async {
+    if (!mounted) return;
+    setState(() => _initialLoadFailure = null);
+    await _load();
+  }
+
+  /// issue #129：消息区整页三态。返回 null 表示走正常消息流。
+  ///
+  /// 规则：
+  /// - 已有任意内容 → 正常消息流（SSE 先到/乐观消息/重同步都不遮内容）；
+  /// - 从未成功加载 → loading（重试中同样）或 failed；
+  /// - 成功加载且时间线为空 → empty（明确提示，而不是无限空白）；
+  /// - 历史浏览视图 `_inHistory` 永远是正常分支。
+  Widget? _initialStateView() {
+    if (_inHistory || _hasTimelineContent) return null;
+    if (!_everLoaded) {
+      final failure = _initialLoadFailure;
+      if (failure == null) return const _InitialLoadingView();
+      return _InitialLoadFailedView(
+        failure: failure,
+        onRetry: _retryInitialLoad,
+        onBack: () => Navigator.of(context).maybePop(),
+      );
+    }
+    return const _EmptySessionView();
   }
 
   // ── 无限上翻（微信式） ──
@@ -5861,6 +6027,9 @@ class _ChatScreenState extends State<ChatScreen> {
     // 只在取值变化时 setState，因此会收敛，不会自激。
     WidgetsBinding.instance.addPostFrameCallback((_) => _updateActiveTurn());
 
+    // issue #129：首次打开的三态整页替换消息区（不塞 sliver，避免 extent/owner 回归）。
+    final initialView = _initialStateView();
+
     return Scaffold(
       backgroundColor: Theme.of(context).scaffoldBackgroundColor,
       appBar: AppBar(
@@ -5963,56 +6132,58 @@ class _ChatScreenState extends State<ChatScreen> {
               // 消息流：live 视图（普通列表，最新在底部）或历史分段浏览；
               // 上翻时右下角浮出"回到底部"圆钮（位于输入框正上方，不在消息流内）
               Expanded(
-                child: Stack(
-                  children: [
-                    Positioned.fill(
-                      child: _inHistory
-                          ? _buildHistoryView()
-                          : _buildLiveView(),
-                    ),
-                    // issue #24：轮次导航刻度轨。放在消息流之上、右下角圆钮之下；
-                    // 只占右侧约 28px，空白区域不吸收命中，消息流照常滚动。
-                    if (!_inHistory && showTurnRail)
-                      // issue #80：轨道宽 28 + 右侧 8dp gutter；gutter 不命中（Align 只
-                      // 命中真实子节点）。底部预留 62dp，保证轨道下界与「回到底部」圆钮
-                      // 至少 12dp 避让；轨道自身仍受 420dp 轨框 + 可用高度约束。
-                      Positioned(
-                        top: 0,
-                        left: 0,
-                        right: 0,
-                        bottom: turnRailBottomReserve,
-                        child: Align(
-                          alignment: Alignment.centerRight,
-                          child: Padding(
-                            padding: const EdgeInsets.only(
-                              right: turnRailRightGutter,
-                            ),
-                            child: TurnNavigatorRail(
-                              anchors: turnAnchors,
-                              unloadedTurns: unloadedTurns,
-                              activeTurn: _activeTurn,
-                              busyTurn: _busyTurn,
-                              width: turnRailWidth,
-                              maxHeight: 420,
-                              onNavigate: (anchor) =>
-                                  unawaited(_navigateToTurn(anchor)),
+                child:
+                    initialView ??
+                    Stack(
+                      children: [
+                        Positioned.fill(
+                          child: _inHistory
+                              ? _buildHistoryView()
+                              : _buildLiveView(),
+                        ),
+                        // issue #24：轮次导航刻度轨。放在消息流之上、右下角圆钮之下；
+                        // 只占右侧约 28px，空白区域不吸收命中，消息流照常滚动。
+                        if (!_inHistory && showTurnRail)
+                          // issue #80：轨道宽 28 + 右侧 8dp gutter；gutter 不命中（Align 只
+                          // 命中真实子节点）。底部预留 62dp，保证轨道下界与「回到底部」圆钮
+                          // 至少 12dp 避让；轨道自身仍受 420dp 轨框 + 可用高度约束。
+                          Positioned(
+                            top: 0,
+                            left: 0,
+                            right: 0,
+                            bottom: turnRailBottomReserve,
+                            child: Align(
+                              alignment: Alignment.centerRight,
+                              child: Padding(
+                                padding: const EdgeInsets.only(
+                                  right: turnRailRightGutter,
+                                ),
+                                child: TurnNavigatorRail(
+                                  anchors: turnAnchors,
+                                  unloadedTurns: unloadedTurns,
+                                  activeTurn: _activeTurn,
+                                  busyTurn: _busyTurn,
+                                  width: turnRailWidth,
+                                  maxHeight: 420,
+                                  onNavigate: (anchor) =>
+                                      unawaited(_navigateToTurn(anchor)),
+                                ),
+                              ),
                             ),
                           ),
-                        ),
-                      ),
-                    if (!_inHistory)
-                      // issue #81：圆钮移入右侧 action gutter（right 0，38dp），正文右
-                      // padding 相应取 38，避免 320+大字时遮挡尾段；动画/点击/语义不变。
-                      Positioned(
-                        bottom: 12,
-                        right: 0,
-                        child: _JumpToLatestButton(
-                          visible: _showJumpToLatest,
-                          onTap: _jumpToLatest,
-                        ),
-                      ),
-                  ],
-                ),
+                        if (!_inHistory)
+                          // issue #81：圆钮移入右侧 action gutter（right 0，38dp），正文右
+                          // padding 相应取 38，避免 320+大字时遮挡尾段；动画/点击/语义不变。
+                          Positioned(
+                            bottom: 12,
+                            right: 0,
+                            child: _JumpToLatestButton(
+                              visible: _showJumpToLatest,
+                              onTap: _jumpToLatest,
+                            ),
+                          ),
+                      ],
+                    ),
               ),
               // issue #97 P2：composer 上方的底部控件统一成可测量的一组，
               // 菜单可用高度需扣除它们，避免 320×640 + 键盘时 Column 溢出。
@@ -12565,6 +12736,176 @@ class _JobCardState extends State<_JobCard> {
                 ),
               ),
             ),
+        ],
+      ),
+    );
+  }
+}
+
+/// issue #129：三态（loading / empty / failed）共用的居中容器。
+///
+/// 放在 `CustomScrollView` **外面**、整页替换消息区（不塞 sliver，避免 extent/owner
+/// 回归）；自身可滚，保证 320dp + 1.5x 大字号下不溢出；不影响 ADR 0035 的顶对齐规则。
+class _CenteredStateBody extends StatelessWidget {
+  final Widget child;
+  const _CenteredStateBody({super.key, required this.child});
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final minHeight =
+            constraints.maxHeight.isFinite && constraints.maxHeight > 48
+            ? constraints.maxHeight - 48
+            : 0.0;
+        return SingleChildScrollView(
+          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
+          child: ConstrainedBox(
+            constraints: BoxConstraints(minHeight: minHeight),
+            child: Center(child: child),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// issue #129：首次打开会话的 loading 态——首帧即显示（`_everLoaded` 默认 false），
+/// 20×20 spinner（strokeWidth 2）+「正在加载会话…」，不等待任何延时计时器。
+class _InitialLoadingView extends StatelessWidget {
+  const _InitialLoadingView();
+
+  @override
+  Widget build(BuildContext context) {
+    final ink3 = DshColors.ink3(context);
+    return _CenteredStateBody(
+      key: const ValueKey<String>('chat-initial-loading'),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(
+            width: 20,
+            height: 20,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          const SizedBox(height: 12),
+          Text(
+            L10n.t('正在加载会话…', 'Loading session…'),
+            key: const ValueKey<String>('chat-initial-loading-text'),
+            style: TextStyle(fontSize: 13.5, color: ink3),
+            textAlign: TextAlign.center,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// issue #129：成功加载且时间线为空——明确「还没有消息」与下一步，而不是无限空白。
+class _EmptySessionView extends StatelessWidget {
+  const _EmptySessionView();
+
+  @override
+  Widget build(BuildContext context) {
+    final ink2 = DshColors.ink2(context);
+    final ink3 = DshColors.ink3(context);
+    return _CenteredStateBody(
+      key: const ValueKey<String>('chat-session-empty'),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.chat_bubble_outline, size: 36, color: ink3),
+          const SizedBox(height: 12),
+          Text(
+            L10n.t('这个会话还没有消息', 'No messages in this session yet'),
+            key: const ValueKey<String>('chat-session-empty-title'),
+            style: TextStyle(
+              fontSize: 15.5,
+              fontWeight: FontWeight.w600,
+              color: ink2,
+            ),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 6),
+          Text(
+            L10n.t(
+              '在下方输入框发送第一条消息',
+              'Send the first message from the input box below',
+            ),
+            style: TextStyle(fontSize: 13, color: ink3),
+            textAlign: TextAlign.center,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// issue #129：首次加载失败——图标 + 标题 + 原因 +（可重试时）重试 + 返回会话列表。
+///
+/// 不自动 pop；404 / `session-not-found` / 缺 sessionId 是 dead-end（`retryable=false`），
+/// 只保留「返回会话列表」。
+class _InitialLoadFailedView extends StatelessWidget {
+  final InitialLoadFailure failure;
+  final VoidCallback onRetry;
+  final VoidCallback onBack;
+  const _InitialLoadFailedView({
+    required this.failure,
+    required this.onRetry,
+    required this.onBack,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final ink2 = DshColors.ink2(context);
+    final ink3 = DshColors.ink3(context);
+    return _CenteredStateBody(
+      key: const ValueKey<String>('chat-initial-failed'),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            failure.missingSession
+                ? Icons.search_off_outlined
+                : Icons.cloud_off_outlined,
+            size: 36,
+            color: ink3,
+          ),
+          const SizedBox(height: 12),
+          Text(
+            L10n.t('会话加载失败', 'Failed to load session'),
+            key: const ValueKey<String>('chat-initial-failed-title'),
+            style: TextStyle(
+              fontSize: 15.5,
+              fontWeight: FontWeight.w600,
+              color: ink2,
+            ),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 6),
+          Text(
+            failure.reason,
+            key: const ValueKey<String>('chat-initial-failed-reason'),
+            style: TextStyle(fontSize: 13, color: ink3),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 16),
+          Wrap(
+            alignment: WrapAlignment.center,
+            spacing: 12,
+            runSpacing: 8,
+            children: [
+              if (failure.retryable)
+                FilledButton(
+                  onPressed: onRetry,
+                  child: Text(L10n.t('重试', 'Retry')),
+                ),
+              OutlinedButton(
+                onPressed: onBack,
+                child: Text(L10n.t('返回会话列表', 'Back to sessions')),
+              ),
+            ],
+          ),
         ],
       ),
     );
