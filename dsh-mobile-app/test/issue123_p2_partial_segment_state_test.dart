@@ -401,6 +401,7 @@ Future<AppStore> _mount(
             store: store,
             apiClient: backend.api,
             onTitleChanged: () {},
+            autoFillFirstScreen: false,
           ),
         ),
       ),
@@ -420,8 +421,10 @@ void main() {
     // ── 1. 初始 partial 窗口：只有 steps 32..40 的组，且目标组可用几何定位 ──
     final initialHeaders = _headerCount(tester);
     // ignore: avoid_print
-    print('[123-P2] mount headers=$initialHeaders '
-        'marker=${find.textContaining(_marker).evaluate().length}');
+    print(
+      '[123-P2] mount headers=$initialHeaders '
+      'marker=${find.textContaining(_marker).evaluate().length}',
+    );
     expect(
       initialHeaders,
       greaterThanOrEqualTo(9),
@@ -439,19 +442,13 @@ void main() {
     await _tapHeader(tester, targetIndex);
     await tester.pumpAndSettle();
     // ignore: avoid_print
-    print('[123-P2] afterTap headers=${_headerCount(tester)} '
-        'marker=${find.textContaining(_marker).evaluate().length} '
-        'expanded=${_headerExpanded(tester, targetIndex)}');
-    expect(
-      _headerExpanded(tester, targetIndex),
-      isFalse,
-      reason: '点击组抬头应手动收起',
+    print(
+      '[123-P2] afterTap headers=${_headerCount(tester)} '
+      'marker=${find.textContaining(_marker).evaluate().length} '
+      'expanded=${_headerExpanded(tester, targetIndex)}',
     );
-    expect(
-      find.textContaining(_marker),
-      findsNothing,
-      reason: '组收起后组内行不应再渲染',
-    );
+    expect(_headerExpanded(tester, targetIndex), isFalse, reason: '点击组抬头应手动收起');
+    expect(find.textContaining(_marker), findsNothing, reason: '组收起后组内行不应再渲染');
     replay.add('手动收起 step$_targetStep');
 
     // ── 3. 真实上翻：before 分页把 turn/start 与插话边界补进来 ────────────
@@ -459,8 +456,10 @@ void main() {
       await _dragUp(tester, 540);
     }
     // ignore: avoid_print
-    print('[123-P2] afterPaging headers=${_headerCount(tester)} '
-        'marker=${find.textContaining(_marker).evaluate().length}');
+    print(
+      '[123-P2] afterPaging headers=${_headerCount(tester)} '
+      'marker=${find.textContaining(_marker).evaluate().length}',
+    );
     expect(
       _headerCount(tester),
       greaterThan(initialHeaders),
@@ -473,7 +472,8 @@ void main() {
     expect(
       _headerExpanded(tester, targetAfter),
       isFalse,
-      reason: '补入开段边界后，同一组的手动收起状态必须保持'
+      reason:
+          '补入开段边界后，同一组的手动收起状态必须保持'
           '（旧实现按 head 键写入、按边界键读取 → 弹回默认展开）',
     );
     expect(
@@ -531,10 +531,16 @@ void main() {
     await _tapHeader(tester, targetIndex);
     await tester.pumpAndSettle();
     expect(_headerExpanded(tester, targetIndex), isFalse);
-    expect(find.textContaining('shell-C'), findsNothing,
-        reason: '组收起后组内工具卡不应渲染');
-    expect(find.textContaining('shell-A'), findsOneWidget,
-        reason: '其它组仍是默认展开（对照）');
+    expect(
+      find.textContaining('shell-C'),
+      findsNothing,
+      reason: '组收起后组内工具卡不应渲染',
+    );
+    expect(
+      find.textContaining('shell-A'),
+      findsOneWidget,
+      reason: '其它组仍是默认展开（对照）',
+    );
 
     // ── 3. 真实上翻：同一页补回三个 call + 开段边界 ────────────────────
     // 空 older sliver 自带 10dp 顶部内边距（min≈-10），所以用「上翻前后 min 变负很多」
@@ -544,28 +550,34 @@ void main() {
     await tester.pump(const Duration(milliseconds: 400));
     await tester.pump(const Duration(milliseconds: 400));
     // ignore: avoid_print
-    print('[123-P2b] afterPaging headers=${_headerCount(tester)} '
-        'min=${_minExtent(tester)} '
-        'A=${find.textContaining('shell-A').evaluate().length} '
-        'B=${find.textContaining('shell-B').evaluate().length} '
-        'C=${find.textContaining('shell-C').evaluate().length}');
+    print(
+      '[123-P2b] afterPaging headers=${_headerCount(tester)} '
+      'min=${_minExtent(tester)} '
+      'A=${find.textContaining('shell-A').evaluate().length} '
+      'B=${find.textContaining('shell-B').evaluate().length} '
+      'C=${find.textContaining('shell-C').evaluate().length}',
+    );
     expect(
       _minExtent(tester),
       lessThan(minBefore - 20),
-      reason: '前提：这次上翻真的把更早历史补进了 center 之前'
+      reason:
+          '前提：这次上翻真的把更早历史补进了 center 之前'
           '（min $minBefore → ${_minExtent(tester)}）',
     );
 
     // ── 4. 手动状态必须保持：cC 的组仍然收起，其它组仍展开 ────────────
-    expect(_headerCount(tester), 3,
-        reason: '补页后仍是同一段的三组（段键从 head 变成边界，组数不变）');
-    expect(find.textContaining('shell-A'), findsOneWidget,
-        reason: '其它组按默认展开，说明过程块仍在正常渲染');
+    expect(_headerCount(tester), 3, reason: '补页后仍是同一段的三组（段键从 head 变成边界，组数不变）');
+    expect(
+      find.textContaining('shell-A'),
+      findsOneWidget,
+      reason: '其它组按默认展开，说明过程块仍在正常渲染',
+    );
     expect(find.textContaining('shell-B'), findsOneWidget);
     expect(
       find.textContaining('shell-C'),
       findsNothing,
-      reason: '补入开段边界 + call 覆盖 seq 后，同一组的手动收起状态必须保持'
+      reason:
+          '补入开段边界 + call 覆盖 seq 后，同一组的手动收起状态必须保持'
           '（按 seq 求交会匹配失败 → 弹回默认展开）',
     );
     expect(tester.takeException(), isNull);
@@ -575,8 +587,7 @@ void main() {
   //
   // 组键从 `1:head:x` 变 `1:head:35`，但**段键集合没变**；旧实现只在段键集合
   // 变化时调用迁移 → 这条路径完全没覆盖（reviewer-11 实证：期望 false，实际 null）。
-  testWidgets('P2c 段键不变、只有 step 迟到（null→35）：手动收起的组仍必须保持收起',
-      (tester) async {
+  testWidgets('P2c 段键不变、只有 step 迟到（null→35）：手动收起的组仍必须保持收起', (tester) async {
     final backend = _Backend(
       _noStepHistory(withInterjection: false),
       initialLimit: 3,
@@ -600,19 +611,28 @@ void main() {
     await tester.pump(const Duration(milliseconds: 400));
     await tester.pump(const Duration(milliseconds: 400));
     // ignore: avoid_print
-    print('[123-P2c] afterPaging headers=${_headerCount(tester)} '
-        'min=${_minExtent(tester)} '
-        'C=${find.textContaining('shell-C').evaluate().length} '
-        'think=${find.textContaining('想一下：检查状态').evaluate().length}');
-    expect(_minExtent(tester), lessThan(minBefore - 20),
-        reason: '前提：这次上翻真的补进了更早历史');
+    print(
+      '[123-P2c] afterPaging headers=${_headerCount(tester)} '
+      'min=${_minExtent(tester)} '
+      'C=${find.textContaining('shell-C').evaluate().length} '
+      'think=${find.textContaining('想一下：检查状态').evaluate().length}',
+    );
+    expect(
+      _minExtent(tester),
+      lessThan(minBefore - 20),
+      reason: '前提：这次上翻真的补进了更早历史',
+    );
     expect(_headerCount(tester), 2, reason: '仅 step 迟到，组数不变');
-    expect(find.textContaining('想一下：检查状态'), findsOneWidget,
-        reason: '对照：另一组仍按档位默认展开');
+    expect(
+      find.textContaining('想一下：检查状态'),
+      findsOneWidget,
+      reason: '对照：另一组仍按档位默认展开',
+    );
     expect(
       find.textContaining('shell-C'),
       findsNothing,
-      reason: 'step 从 null 变 35 后，同一组的手动收起状态必须保持'
+      reason:
+          'step 从 null 变 35 后，同一组的手动收起状态必须保持'
           '（段键没变，旧实现不触发迁移 → 弹回默认展开）',
     );
     expect(tester.takeException(), isNull);
@@ -623,8 +643,7 @@ void main() {
   // 补页同页带回插话边界 + call(step35)：段键 `1:head`→`1:3`，组键
   // `1:head:x`→`1:3:35`。旧 `_migrateSegment` 按 step 值搬组状态，
   // `to.steps.contains(null)` 为 false → 组状态丢失。
-  testWidgets('P2d 段键变化 + step 迟到（null→35）：手动收起的组仍必须保持收起',
-      (tester) async {
+  testWidgets('P2d 段键变化 + step 迟到（null→35）：手动收起的组仍必须保持收起', (tester) async {
     final backend = _Backend(
       _noStepHistory(withInterjection: true),
       initialLimit: 3,
@@ -644,15 +663,23 @@ void main() {
     await tester.pump(const Duration(milliseconds: 400));
     await tester.pump(const Duration(milliseconds: 400));
     // ignore: avoid_print
-    print('[123-P2d] afterPaging headers=${_headerCount(tester)} '
-        'min=${_minExtent(tester)} '
-        'C=${find.textContaining('shell-C').evaluate().length} '
-        'think=${find.textContaining('想一下：检查状态').evaluate().length}');
-    expect(_minExtent(tester), lessThan(minBefore - 20),
-        reason: '前提：这次上翻真的补进了更早历史');
+    print(
+      '[123-P2d] afterPaging headers=${_headerCount(tester)} '
+      'min=${_minExtent(tester)} '
+      'C=${find.textContaining('shell-C').evaluate().length} '
+      'think=${find.textContaining('想一下：检查状态').evaluate().length}',
+    );
+    expect(
+      _minExtent(tester),
+      lessThan(minBefore - 20),
+      reason: '前提：这次上翻真的补进了更早历史',
+    );
     expect(_headerCount(tester), 2);
-    expect(find.textContaining('想一下：检查状态'), findsOneWidget,
-        reason: '对照：step1 思考组按默认展开');
+    expect(
+      find.textContaining('想一下：检查状态'),
+      findsOneWidget,
+      reason: '对照：step1 思考组按默认展开',
+    );
     expect(
       find.textContaining('shell-C'),
       findsNothing,

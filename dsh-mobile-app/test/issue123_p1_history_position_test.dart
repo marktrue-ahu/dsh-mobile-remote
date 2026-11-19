@@ -206,12 +206,8 @@ class _Probe {
     return 0;
   }
 
-  /// owner 派生的底部占位高度（#77/#118：短内容时把消息列表推到底部）。
-  double get liveBottomGap {
-    final state = tester.state(find.byType(ChatScreen));
-    // ignore: avoid_dynamic_calls
-    return (state as dynamic).debugLiveBottomGap as double;
-  }
+  /// ADR 0035：底部占位已删除；保留 0 读数用于旧日志/断言可读失败信息。
+  double get liveBottomGap => 0.0;
 
   bool get intentFollow {
     final state = tester.state(find.byType(ChatScreen));
@@ -264,12 +260,7 @@ class _Replay {
     store.injectFrame({
       'type': 'session/event',
       'sessionId': _session,
-      'event': {
-        'seq': _seq++,
-        'type': type,
-        'data': data,
-        'time': _seq * 10,
-      },
+      'event': {'seq': _seq++, 'type': type, 'data': data, 'time': _seq * 10},
     });
   }
 
@@ -346,6 +337,7 @@ Future<AppStore> _mount(
             store: store,
             apiClient: backend.api,
             onTitleChanged: () {},
+            autoFillFirstScreen: false,
           ),
         ),
       ),
@@ -357,9 +349,7 @@ Future<AppStore> _mount(
 }
 
 void main() {
-  testWidgets('P1 上翻加载历史后停在 pixels<0：注入 todo/write 不得抢走阅读位置', (
-    tester,
-  ) async {
+  testWidgets('P1 上翻加载历史后停在 pixels<0：注入 todo/write 不得抢走阅读位置', (tester) async {
     final backend = _Backend(_history(), initialLimit: 50);
     final store = await _mount(tester, backend);
     final probe = _Probe(tester);
@@ -410,7 +400,8 @@ void main() {
     expect(
       (probe.pixels - before).abs(),
       lessThanOrEqualTo(0.5),
-      reason: '12 帧稳定期内位置不得漂移（采样 ${before.toStringAsFixed(1)}，'
+      reason:
+          '12 帧稳定期内位置不得漂移（采样 ${before.toStringAsFixed(1)}，'
           '12 帧后 ${probe.pixels.toStringAsFixed(1)}）${replay.recent()}',
     );
 
@@ -439,7 +430,8 @@ void main() {
     expect(
       (probe.pixels - before).abs(),
       lessThanOrEqualTo(1.0),
-      reason: '用户正在读的历史位置必须保持（注入前 px=${before.toStringAsFixed(1)}，'
+      reason:
+          '用户正在读的历史位置必须保持（注入前 px=${before.toStringAsFixed(1)}，'
           '注入后 px=${probe.pixels.toStringAsFixed(1)}）${replay.recent()}',
     );
 
@@ -456,7 +448,8 @@ void main() {
     expect(
       (probe.pixels - before).abs(),
       lessThanOrEqualTo(1.0),
-      reason: 'session/jobs 布局变化同样不得抢走历史阅读位置'
+      reason:
+          'session/jobs 布局变化同样不得抢走历史阅读位置'
           '（注入前 px=${before.toStringAsFixed(1)}，注入后 px=${probe.pixels.toStringAsFixed(1)}）'
           '${replay.recent()}',
     );
@@ -489,10 +482,16 @@ void main() {
       await replay.dragUp(540);
     }
     replay.record('paged');
-    expect(probe.minExtent, lessThan(-100),
-        reason: '前提：上翻必须真的补进更早历史${replay.recent()}');
-    expect(probe.pixels, lessThan(-100),
-        reason: '前提：用户此刻停在更早历史里${replay.recent()}');
+    expect(
+      probe.minExtent,
+      lessThan(-100),
+      reason: '前提：上翻必须真的补进更早历史${replay.recent()}',
+    );
+    expect(
+      probe.pixels,
+      lessThan(-100),
+      reason: '前提：用户此刻停在更早历史里${replay.recent()}',
+    );
     expect(
       probe.liveBottomGap,
       0,
@@ -503,7 +502,9 @@ void main() {
     await replay.dragDown(1400);
     replay.record('backToLiveTop');
     // ignore: avoid_print
-    print('[123-P1b] back:${replay.recent(count: 3)} gap=${probe.liveBottomGap}');
+    print(
+      '[123-P1b] back:${replay.recent(count: 3)} gap=${probe.liveBottomGap}',
+    );
     expect(
       probe.pixels,
       greaterThanOrEqualTo(-0.5),
@@ -528,20 +529,24 @@ void main() {
       await replay.pumpFrame(tag: 'todo$i');
     }
     // ignore: avoid_print
-    print('[123-P1b] final:${replay.recent(count: 6)} '
-        'gap=${probe.liveBottomGap}');
-    expect(probe.maxExtent, lessThan(1),
-        reason: '前提：折叠后内容应已矮于一屏${replay.recent()}');
+    print(
+      '[123-P1b] final:${replay.recent(count: 6)} '
+      'gap=${probe.liveBottomGap}',
+    );
+    expect(
+      probe.maxExtent,
+      lessThan(1),
+      reason: '前提：折叠后内容应已矮于一屏${replay.recent()}',
+    );
     expect(
       probe.liveBottomGap,
-      greaterThan(0),
-      reason: 'paged 会话回到 live 起点且内容矮于一屏时，必须恢复底部占位'
-          '（否则内容停顶部、下方大片空白）${replay.recent()}',
+      0,
+      reason: 'ADR 0035：短内容顶对齐，不再补底部占位${replay.recent()}',
     );
     expect(
       probe.pixels,
       greaterThanOrEqualTo(-0.5),
-      reason: '补占位时位置必须仍在 live 区间${replay.recent()}',
+      reason: '折叠变短后位置必须仍在 live 区间${replay.recent()}',
     );
     expect(probe.rangeError, lessThanOrEqualTo(0.5), reason: '位置必须合法');
     await _finish(tester, store);
