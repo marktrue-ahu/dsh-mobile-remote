@@ -8371,7 +8371,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _loadChangedSummary(String sessionId, int turn) async {
     final generation = _tailLoadGeneration;
-    final stillCurrent = () =>
+    bool stillCurrent() =>
         mounted && generation == _tailLoadGeneration && sessionId == _tailSessionId;
     try {
       for (var attempt = 0; attempt < 2; attempt += 1) {
