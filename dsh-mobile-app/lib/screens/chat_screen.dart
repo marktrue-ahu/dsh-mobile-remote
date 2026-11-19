@@ -2323,11 +2323,13 @@ class _ChatScreenState extends State<ChatScreen> {
   /// 手动入口绕过失败门禁（只允许它重试），但和自动入口共用 [prependOlderPage]，
   /// 由 `_loadingMore` 去重——不会双发。
   Future<void> _loadMoreInfinite({bool manual = false}) async {
-    if (_loadingMore) return;
+    // issue #130：服务端已声明到顶时，顶部状态行就是反馈；不再发一次必然返回空页的
+    // 请求（短会话/到顶后都不产生多余请求）。轮次跨页跳转走 `_loadOlderForTurnJump`，
+    // 不受此守卫影响。
+    if (_loadingMore || !_historyHasMore) return;
     // issue #130：失败后 80px 自动触发不再连续重发，只允许点状态行重试。
     if (_olderLoadFailed && !manual) return;
-    // 到顶的说明统一由顶部状态行承载（exhausted / degraded），这里不再弹重复 toast；
-    // 是否还有更早历史仍以服务端 `hasMore`/空页为准（由 `_prependOlderPage` 收口）。
+    // 到顶的说明统一由顶部状态行承载（exhausted / degraded），这里不再弹重复 toast。
     await _prependOlderPage(limit: _histPageSize);
   }
 
