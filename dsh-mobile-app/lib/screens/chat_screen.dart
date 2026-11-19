@@ -1268,8 +1268,11 @@ class _ChatScreenState extends State<ChatScreen> {
       final atLiveWindow = !_scrollCtrl.hasClients
           ? true
           : _scrollCtrl.position.pixels >= -0.5;
+      // task-35：有隐藏行（分批未渲染）时不得按短内容补占位——渲染高度不含隐藏行，
+      // 会把「内容装不下一屏」误判成短内容，占位反而把内容整体下推、制造空白。
       final shortEnough = (!paged || atLiveWindow) &&
           actualMax <= 1.0 &&
+          !_livePlanHasHiddenRows &&
           contentExtent < viewport.size.height - 80;
       // issue #89：占位与内容之和不得超过视口（否则会制造可滚动空白 + 回底按钮）；
       // 视口高度变化（活动条显隐/键盘）必须立即按新高度收敛，不能沿用旧占位。
@@ -1298,6 +1301,26 @@ class _ChatScreenState extends State<ChatScreen> {
       // 违反「位置移动来自用户动作才恢复/保持跟随」；内容/布局变化由事件入口
       // (`_handleEvent` / `_onContentLayoutChanged` / 活动条显隐) 显式请求。
     });
+  }
+
+  /// task-35（真机 59aaa367）：live 计划里是否有**被分批隐藏**的过程行。
+  ///
+  /// `contentExtent` 只含已渲染行（`liveSliver.geometry.scrollExtent`），被
+  /// `batchProcessRows` 隐藏的行不在其中。若只看渲染高度，「7 个折叠组 ~700dp < 视口」
+  /// 会被误判为短内容 → 补 `_liveBottomGap` → 占位把内容整体下推（真机：出现
+  /// 「显示更多（还有 N 行）」的同时下方留出空白）。
+  ///
+  /// 判据是**任一可见轮次存在隐藏行**（计划里 `hiddenTotalInTurn > 0`）；隐藏行说明
+  /// 内容客观上一屏装不下，不能按「短内容」处理。
+  bool get _livePlanHasHiddenRows {
+    final plan = _livePlanCache;
+    if (plan == null) return false;
+    for (final plans in plan.hostsBySeq.values) {
+      for (final block in plans) {
+        if (block.hiddenTotalInTurn > 0) return true;
+      }
+    }
+    return false;
   }
 
   /// 一键回到最新消息：显式进入跟随，由 owner 做有界收敛。
