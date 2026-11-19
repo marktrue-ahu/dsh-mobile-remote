@@ -280,6 +280,8 @@
 
 **规范化正文（`text`）**：`assistant/message` 的详情响应额外附 `data.text`，由服务端用**与事件摘要同一个 `blocksToText`** 提取（只拼 `type == "text"` 的块，跳过 `reasoning` 与内部块），因此与摘要下发的 `text` 同源同规则。客户端必须直接采用该字段作为正文，**不得自行递归拼接 `message.content`**——那会把 `reasoning` 块并进正文，使思维链在折叠块之外重复出现（issue #1 需求变更记录）。`tool/result` 等其它类型的详情仍以原始事件载荷为准；原始 `message` 块原样保留。
 
+**长用户消息与完整思考（issue #126 / ADR 0035）**：`user/message` 的详情响应额外附 `data.text`（同一 `blocksToText`，`imagePlaceholder:false`），客户端在摘要 2000 字截断时用它补齐长用户消息。`assistant/message` 的详情响应额外附 `data.reasoning`（完整思维链，与摘要同一 `reasoningText` 口径）；摘要的 `reasoning` 在 20000 字处截断时，客户端在用户首次展开思考行时用它补齐。两者都受单事件详情 8 MiB 上限约束；客户端渲染前仍按 20000 字上限裁剪并明确提示。
+
 ### 3.6 GET /m/api/events（SSE）
 `Content-Type: text/event-stream`。帧格式（`data:` 单行 JSON）：
 

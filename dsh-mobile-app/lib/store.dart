@@ -227,6 +227,7 @@ class AppStore extends ChangeNotifier {
   /// issue #86：Git 分支图选中上限（全局偏好，5/10/不限；默认 5）。
   GitGraphBranchLimit gitGraphBranchLimit = GitGraphBranchLimit.fallback;
   TurnFoldTiming turnFoldTiming = TurnFoldTiming.afterAnswer;
+
   /// 思维链折叠手动状态（会话 -> 消息key -> 手动展开值；滚动/重进/重启持久，null=跟随设置默认）
   Map<String, Map<String, bool>> reasoningOverrides = {};
   String language = 'zh'; // zh | en（v2.7：界面语言，持久化）
@@ -1503,6 +1504,9 @@ class AppStore extends ChangeNotifier {
   StreamSubscription<Map<String, dynamic>>? _sub;
   int _retry = 0;
   Timer? _retryTimer;
+  // SSE 503（服务端 too-many-connections）：单独退避，避免 bootstrap 成功后
+  // 又把 retry 清零、每 2s 重连一次形成风暴。
+  bool _sseBusy = false;
   bool _connecting = false;
 
   static const _kSession = 'dsh_mr_session';
@@ -2647,6 +2651,7 @@ class AppStore extends ChangeNotifier {
       _onFrame,
       onError: (e) {
         AppLog.instance.log('SSE: error $e');
+        if ('$e'.contains('SSE HTTP 503')) _sseBusy = true;
         // 超时 = 黑洞地址（路由不可达，如手机关了组网 VPN）→ 立即轮换候选地址，
         // 不再白等 3×15 秒的重试循环（连接被拒/中断等瞬时错误仍走正常退避）
         if (e is TimeoutException && api.rotateBaseUrl()) {
@@ -2714,6 +2719,7 @@ class AppStore extends ChangeNotifier {
   void injectFrame(Map<String, dynamic> frame) => _onFrame(frame);
 
   void _onFrame(Map<String, dynamic> frame) {
+    _sseBusy = false;
     _retry = 0;
     final type = frame['type'];
     if (type == 'hello') {
@@ -2884,15 +2890,18 @@ class AppStore extends ChangeNotifier {
             data: {'rpcId': request.rpcId, 'sessionId': request.sessionId},
           ),
         );
-        onAttentionEvent?.call(AttentionEvent(
-          kind: AttentionKind.question,
-          source: api.notificationScope,
-          sessionId: request.sessionId,
-          identity: request.rpcId,
-          at: DateTime.now(),
-          summary:
-              request.questions.isEmpty ? null : request.questions.first.question,
-        ));
+        onAttentionEvent?.call(
+          AttentionEvent(
+            kind: AttentionKind.question,
+            source: api.notificationScope,
+            sessionId: request.sessionId,
+            identity: request.rpcId,
+            at: DateTime.now(),
+            summary: request.questions.isEmpty
+                ? null
+                : request.questions.first.question,
+          ),
+        );
         AppLog.instance.log(
           '通知：问询帧到达 rpc=${request.rpcId} session=${request.sessionId}（已交给本地通知）',
         );
@@ -2941,17 +2950,19 @@ class AppStore extends ChangeNotifier {
             data: {'rpcId': request.rpcId, 'sessionId': request.sessionId},
           ),
         );
-        onAttentionEvent?.call(AttentionEvent(
-          kind: AttentionKind.approval,
-          source: api.notificationScope,
-          sessionId: request.sessionId,
-          identity: request.approvalId.isEmpty
-              ? request.rpcId
-              : request.approvalId,
-          at: DateTime.now(),
-          toolName: request.toolName,
-          summary: request.reason,
-        ));
+        onAttentionEvent?.call(
+          AttentionEvent(
+            kind: AttentionKind.approval,
+            source: api.notificationScope,
+            sessionId: request.sessionId,
+            identity: request.approvalId.isEmpty
+                ? request.rpcId
+                : request.approvalId,
+            at: DateTime.now(),
+            toolName: request.toolName,
+            summary: request.reason,
+          ),
+        );
         AppLog.instance.log(
           '通知：审批帧到达 rpc=${request.rpcId} approvalId=${request.approvalId} '
           'session=${request.sessionId} tool=${request.toolName}（已交给本地通知）',
@@ -3062,6 +3073,12 @@ class AppStore extends ChangeNotifier {
           data: ce.data,
           sessionId: fsid as String?,
           detailAvailable: ce.detailAvailable,
+          // issue #126：实时摘要的 call/result 结构化数据与正文长度提示也必须原样
+          // 带给时间线；否则同一事件在 live 与 reload 后呈现不同（工具卡缺退出码/
+          // 命中数徽标，assistant 缺“查看全文”入口）。
+          detailTextChars: ce.detailTextChars,
+          callSummary: ce.callSummary,
+          resultSummary: ce.resultSummary,
           // issue #52/#53：实时摘要的 time 与 turn/end 的 tail 必须原样带给时间线，
           // 否则 live 轮次页脚没有用时、轮末卡片要等重进会话才出现。
           time: ce.time,
@@ -3132,6 +3149,13 @@ class AppStore extends ChangeNotifier {
     _connecting = false;
     _retryTimer?.cancel();
     _setConnState('offline');
+    if (_sseBusy) {
+      // 服务端连接满：5s/10s 退避，不再每 2s 探测。
+      final delay = Duration(seconds: _retry >= 6 ? 10 : 5);
+      _retry = _retry >= 6 ? 6 : _retry + 1;
+      _retryTimer = Timer(delay, connect);
+      return;
+    }
     if (_retry >= 3) {
       _retryTimer = Timer(const Duration(seconds: 2), () async {
         final epoch = _agentStatusEpoch;

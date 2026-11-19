@@ -1,10 +1,9 @@
-// issue #80：轮次导航 Gutter 36。
+// issue #80：轮次导航 Gutter。
 //
-// 规格（note 2264）：
-// - 轨道宽 28dp + 右侧 8dp gutter；轨道隐藏时 padding 恢复 16dp（#81 起圆钮可见时
-//   取 38dp：轨道可见必然伴随圆钮可见，见 issue81 的 action gutter 矩阵）；
+// ADR 0035 修订：轨道宽 28dp + 右侧 8dp gutter；正文右 padding 恒定 38dp，
+// 轨道/圆钮 overlay，显隐不再改变正文宽度（旧 36/16 分档退役）。
 // - 390/320 都不自动缩轨；轨道仅真实轨框范围命中，gutter 右侧 8dp 留白不命中；
-// - 显隐与 padding 同帧；右下「回到底部」圆钮与轨道下界至少 12dp 避让；
+// - 右下「回到底部」圆钮与轨道下界至少 12dp 避让；
 // - 保留点按/长按扫掠/高亮/未加载刻度/轨内自动滚动（导航行为不改）。
 
 import 'dart:convert';
@@ -109,14 +108,16 @@ Future<AppStore> _pumpChat(
   store.sessions = [
     Session(id: sessionId, title: 'S', cwd: null, createdAt: 1),
   ];
-  await tester.pumpWidget(MaterialApp(
-    home: ChatScreen(
-      key: ValueKey('issue80-$keySuffix'),
-      store: store,
-      apiClient: backend.api,
-      onTitleChanged: () {},
+  await tester.pumpWidget(
+    MaterialApp(
+      home: ChatScreen(
+        key: ValueKey('issue80-$keySuffix'),
+        store: store,
+        apiClient: backend.api,
+        onTitleChanged: () {},
+      ),
     ),
-  ));
+  );
   await tester.pump(const Duration(milliseconds: 350));
   return store;
 }
@@ -133,32 +134,40 @@ double _screenWidth(WidgetTester tester) =>
 Finder get _rail => find.byType(TurnNavigatorRail);
 
 ScrollPosition _pos(WidgetTester tester) => tester
-    .state<ScrollableState>(find.descendant(
-      of: find.byType(CustomScrollView),
-      matching: find.byType(Scrollable),
-    ))
+    .state<ScrollableState>(
+      find
+          .descendant(
+            of: find.byType(CustomScrollView),
+            matching: find.byType(Scrollable),
+          )
+          .first,
+    )
     .position;
 
-/// 消息列表第一条 live SliverPadding 的右 padding（与轨道显隐同帧）。
+/// 消息列表第一条 live SliverPadding 的右 padding（ADR 0035 恒定 38）。
 Finder get _jumpButton => find.byWidgetPredicate(
-      (w) => w.runtimeType.toString() == '_JumpToLatestButton',
-    );
+  (w) => w.runtimeType.toString() == '_JumpToLatestButton',
+);
 
 bool _jumpVisible(WidgetTester tester) {
   final finder = _jumpButton;
   if (finder.evaluate().isEmpty) return false;
-  final animated =
-      find.descendant(of: finder, matching: find.byType(AnimatedOpacity));
+  final animated = find.descendant(
+    of: finder,
+    matching: find.byType(AnimatedOpacity),
+  );
   if (animated.evaluate().isEmpty) return false;
   return tester.widget<AnimatedOpacity>(animated.first).opacity > 0.5;
 }
 
 double _liveRightPadding(WidgetTester tester) {
   final paddings = tester
-      .widgetList<SliverPadding>(find.descendant(
-        of: find.byType(CustomScrollView),
-        matching: find.byType(SliverPadding),
-      ))
+      .widgetList<SliverPadding>(
+        find.descendant(
+          of: find.byType(CustomScrollView),
+          matching: find.byType(SliverPadding),
+        ),
+      )
       .toList();
   return paddings.first.padding.resolve(TextDirection.ltr).right;
 }
@@ -169,7 +178,8 @@ double? _visibleUserTextRight(WidgetTester tester) {
   for (final element in find.textContaining('这是一条足够长的用户消息').evaluate()) {
     final rect = tester.getRect(find.byWidget(element.widget));
     if (rect.top >= 0 && rect.bottom <= 900 && rect.left >= 0) {
-      if (rect.right <= screenW && rect.right > screenW - 120) return rect.right;
+      if (rect.right <= screenW && rect.right > screenW - 120)
+        return rect.right;
     }
   }
   return null;
@@ -193,22 +203,31 @@ void main() {
     final textRight = _visibleUserTextRight(tester);
     expect(textRight, isNotNull, reason: '需要可见的长用户气泡');
     // 气泡右缘 = 屏宽-38，文本再内缩 12（气泡内边距）。
-    expect(textRight!, closeTo(390 - 38 - 12, 2),
-        reason: '正文不进入 gutter（右缘 $textRight）');
+    expect(
+      textRight!,
+      closeTo(390 - 38 - 12, 2),
+      reason: '正文不进入 gutter（右缘 $textRight）',
+    );
 
     // gutter 右侧 8dp 留白不命中：点它不触发导航（滚动位置不变）。
     final before = _pos(tester).pixels;
     await tester.tapAt(Offset(390 - 4, railRect.center.dy));
     await tester.pump(const Duration(milliseconds: 200));
-    expect(_pos(tester).pixels, closeTo(before, 1),
-        reason: 'gutter 留白不命中轨道、不触发导航');
+    expect(
+      _pos(tester).pixels,
+      closeTo(before, 1),
+      reason: 'gutter 留白不命中轨道、不触发导航',
+    );
 
     // 真实轨道仍可点按跳转（导航行为保留）：点轨道上的刻度会移动阅读位置。
     await tester.tapAt(Offset(railRect.center.dx, railRect.bottom - 8));
     await tester.pump(const Duration(milliseconds: 400));
     await tester.pumpAndSettle();
-    expect(_pos(tester).pixels, isNot(closeTo(before, 1)),
-        reason: '轨道点按仍能跳转（末个刻度 → 最新轮）');
+    expect(
+      _pos(tester).pixels,
+      isNot(closeTo(before, 1)),
+      reason: '轨道点按仍能跳转（末个刻度 → 最新轮）',
+    );
     expect(tester.takeException(), isNull);
     await tester.pump(const Duration(milliseconds: 900));
   });
@@ -228,8 +247,11 @@ void main() {
 
     final textRight = _visibleUserTextRight(tester);
     expect(textRight, isNotNull);
-    expect(textRight!, closeTo(320 - 38 - 12, 2),
-        reason: '320 正文右缘应为 270（屏宽-16-38-12）');
+    expect(
+      textRight!,
+      closeTo(320 - 38 - 12, 2),
+      reason: '320 正文右缘应为 270（屏宽-16-38-12）',
+    );
 
     final before = _pos(tester).pixels;
     await tester.tapAt(Offset(320 - 4, railRect.center.dy));
@@ -239,7 +261,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 900));
   });
 
-  testWidgets('底部跟随：既无轨道也无圆钮 → padding 16', (tester) async {
+  testWidgets('底部跟随：既无轨道也无圆钮 → padding 恒定 38', (tester) async {
     tester.view.physicalSize = const Size(390, 844);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
@@ -247,7 +269,7 @@ void main() {
     // 停在真正的底部（follow）：轨道只在离开底部时出现；圆钮在 follow+真正到底时隐藏。
     expect(_rail, findsNothing, reason: '在底部时轨道隐藏');
     expect(_jumpVisible(tester), isFalse, reason: 'follow + 真正到底 → 圆钮隐藏');
-    expect(_liveRightPadding(tester), 16, reason: '既无轨道也无圆钮 → 默认 16dp');
+    expect(_liveRightPadding(tester), 38, reason: 'ADR 0035：恒定 38dp');
     await tester.pump(const Duration(milliseconds: 900));
   });
 
@@ -261,22 +283,25 @@ void main() {
     expect(_rail, findsNothing, reason: '<2 轮不渲染轨道');
     // #114 P2 产品行为变更：阅读态始终显示「回到底部」圆钮（不再只按 160px 几何隐藏）。
     // 因此这里 padding 取圆钮 gutter 38，而不是旧断言的无 gutter 16。
-    expect(_liveRightPadding(tester), 38,
-        reason: '轨道隐藏，但阅读态回底圆钮可见 → gutter 38');
+    expect(
+      _liveRightPadding(tester),
+      38,
+      reason: '轨道隐藏，但阅读态回底圆钮可见 → gutter 38',
+    );
     final textRight = _visibleUserTextRight(tester);
     expect(textRight, isNotNull);
     expect(textRight!, closeTo(390 - 38 - 12, 2));
     await tester.pump(const Duration(milliseconds: 900));
   });
 
-  testWidgets('显隐与 padding 同帧：离开底部出现轨道/圆钮→38；回底后一帧内恢复→16', (tester) async {
+  testWidgets('显隐不改 padding：轨道/圆钮出现或消失都恒定 38', (tester) async {
     tester.view.physicalSize = const Size(390, 844);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
     await _pumpChat(tester, _TurnBackend());
     // 留在底部：无轨道 + 16dp。
     expect(_rail, findsNothing);
-    expect(_liveRightPadding(tester), 16);
+    expect(_liveRightPadding(tester), 38);
 
     await _scrollUp(tester);
     expect(_rail, findsOneWidget);
@@ -287,7 +312,7 @@ void main() {
     await tester.tap(_jumpButton, warnIfMissed: false);
     await tester.pump(const Duration(milliseconds: 400));
     expect(_rail, findsNothing, reason: '回底后轨道隐藏');
-    expect(_liveRightPadding(tester), 16, reason: 'padding 与轨道同帧恢复 16dp');
+    expect(_liveRightPadding(tester), 38, reason: 'padding 不随轨道显隐变化');
     await tester.pump(const Duration(milliseconds: 900));
   });
 
@@ -301,8 +326,11 @@ void main() {
     expect(_jumpButton, findsOneWidget);
     final railRect = tester.getRect(_rail);
     final buttonRect = tester.getRect(_jumpButton);
-    expect(buttonRect.top - railRect.bottom, greaterThanOrEqualTo(12),
-        reason: '轨道下界 ${railRect.bottom} 与圆钮 top ${buttonRect.top} 至少 12dp');
+    expect(
+      buttonRect.top - railRect.bottom,
+      greaterThanOrEqualTo(12),
+      reason: '轨道下界 ${railRect.bottom} 与圆钮 top ${buttonRect.top} 至少 12dp',
+    );
     await tester.pump(const Duration(milliseconds: 900));
   });
 
@@ -319,12 +347,11 @@ void main() {
     final before = _pos(tester).pixels;
     await tester.tapAt(Offset(railRect.center.dx, railRect.top - 10));
     await tester.pump(const Duration(milliseconds: 200));
-    expect(_pos(tester).pixels, closeTo(before, 1),
-        reason: '只有真实轨框范围响应点按');
+    expect(_pos(tester).pixels, closeTo(before, 1), reason: '只有真实轨框范围响应点按');
     await tester.pump(const Duration(milliseconds: 900));
   });
 
-  testWidgets('切换会话：新会话轮次不足时轨道隐藏、padding 恢复', (tester) async {
+  testWidgets('切换会话：新会话轮次不足时轨道隐藏，padding 仍恒定', (tester) async {
     tester.view.physicalSize = const Size(390, 844);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
@@ -340,7 +367,7 @@ void main() {
       keySuffix: 'single',
     );
     expect(_rail, findsNothing);
-    expect(_liveRightPadding(tester), 16);
+    expect(_liveRightPadding(tester), 38);
     await tester.pump(const Duration(milliseconds: 900));
   });
 

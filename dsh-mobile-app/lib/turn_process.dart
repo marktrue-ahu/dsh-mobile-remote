@@ -75,7 +75,8 @@ class LiveReasoningBuffer {
     for (final entry in _entries.values) {
       if (best == null ||
           entry.turn > best.turn ||
-          (entry.turn == best.turn && _stepRank(entry.step) > _stepRank(best.step))) {
+          (entry.turn == best.turn &&
+              _stepRank(entry.step) > _stepRank(best.step))) {
         best = entry;
       }
     }
@@ -165,7 +166,8 @@ class LiveReasoningBuffer {
     var maxClosed = _closedMaxStep[turn];
     for (final entry in _entries.values.toList()) {
       if (entry.turn != turn) continue;
-      final close = settledStep == null ||
+      final close =
+          settledStep == null ||
           entry.step == null ||
           entry.step! <= settledStep;
       if (!close) continue;
@@ -183,7 +185,9 @@ class LiveReasoningBuffer {
     }
     if (maxClosed != null) {
       final prev = _closedMaxStep[turn];
-      _closedMaxStep[turn] = prev == null || maxClosed > prev ? maxClosed : prev;
+      _closedMaxStep[turn] = prev == null || maxClosed > prev
+          ? maxClosed
+          : prev;
     }
     return changed;
   }
@@ -285,11 +289,7 @@ class LiveProcessCounters {
 }
 
 class _LiveEntry {
-  _LiveEntry({
-    required this.turn,
-    required this.step,
-    required this.firstSeq,
-  });
+  _LiveEntry({required this.turn, required this.step, required this.firstSeq});
 
   final int turn;
   final int? step;
@@ -301,12 +301,12 @@ class _LiveEntry {
   void write(String delta) => _buffer.write(delta);
 
   LiveReasoning snapshot() => LiveReasoning(
-        turn: turn,
-        step: step,
-        text: _buffer.toString(),
-        chars: chars,
-        firstSeq: firstSeq,
-      );
+    turn: turn,
+    step: step,
+    text: _buffer.toString(),
+    chars: chars,
+    firstSeq: firstSeq,
+  );
 }
 
 /// 过程行种类：思维链与工具调用。
@@ -330,16 +330,22 @@ class ProcessRow {
   final String reasoning;
   final int reasoningChars;
 
+  /// 思考行对应的 durable 事件 seq / 详情指针（供“展开时加载完整思考”）。
+  final int? detailSeq;
+  final bool detailAvailable;
+
   const ProcessRow.reasoning({
     required this.seq,
     this.step,
     required this.reasoning,
     required this.reasoningChars,
-  })  : kind = ProcessRowKind.reasoning,
-        callId = null,
-        toolName = null,
-        status = 'complete',
-        isError = false;
+    this.detailSeq,
+    this.detailAvailable = false,
+  }) : kind = ProcessRowKind.reasoning,
+       callId = null,
+       toolName = null,
+       status = 'complete',
+       isError = false;
 
   const ProcessRow.tool({
     required this.seq,
@@ -348,9 +354,11 @@ class ProcessRow {
     this.toolName,
     this.status = 'running',
     this.isError = false,
-  })  : kind = ProcessRowKind.tool,
-        reasoning = '',
-        reasoningChars = 0;
+    this.detailSeq,
+    this.detailAvailable = false,
+  }) : kind = ProcessRowKind.tool,
+       reasoning = '',
+       reasoningChars = 0;
 
   bool get isTool => kind == ProcessRowKind.tool;
   bool get isReasoning => kind == ProcessRowKind.reasoning;
@@ -377,8 +385,7 @@ class ProcessGroup {
 
   int get toolCount => rows.where((r) => r.isTool).length;
   int get reasoningCount => rows.where((r) => r.isReasoning).length;
-  int get reasoningChars =>
-      rows.fold(0, (sum, r) => sum + r.reasoningChars);
+  int get reasoningChars => rows.fold(0, (sum, r) => sum + r.reasoningChars);
 
   /// 组内还有正在跑的工具调用。
   bool get running => rows.any((r) => r.running);
@@ -435,21 +442,19 @@ class TurnProcess {
   int get rowCount => groups.fold(0, (sum, g) => sum + g.rows.length);
 
   /// 过程行按 seq 展开（组顺序 + 组内顺序），供分段与分批使用。
-  List<ProcessRow> get rows => [
-        for (final group in groups) ...group.rows,
-      ];
+  List<ProcessRow> get rows => [for (final group in groups) ...group.rows];
 
   /// 轮内有插话：本轮边界内出现了真人 user 消息（含远端）。
   ///
   /// issue #79：插话只让该轮在「回答后」档**默认展开**（可手动折叠）；
   /// 运行中/异常结束才是硬强制展开，「下次有新消息」档仍按新消息自动收起。
   bool get hasInterjection => humanUserSeqs.any(
-        (seq) => seq > startSeq && (endSeq == null || seq < endSeq!),
-      );
+    (seq) => seq > startSeq && (endSeq == null || seq < endSeq!),
+  );
 
   /// 异常结束（aborted/interrupted/error）：强制展开且不显示用时。
-  bool get abnormalEnd => const {'aborted', 'interrupted', 'error'}
-      .contains(endReasonKind);
+  bool get abnormalEnd =>
+      const {'aborted', 'interrupted', 'error'}.contains(endReasonKind);
 
   /// 强制展开（不看策略）：轮次未结束、异常结束。
   ///
@@ -530,11 +535,11 @@ class TurnFoldPolicy {
   /// 运行中过程组（v4）：简洁隐藏（手动展开段后默认展开）、标准折叠、
   /// 详细展开、完全展开平铺。
   LiveGroupMode get liveGroups => switch (mode) {
-        WorkStepDisplayMode.concise => LiveGroupMode.hidden,
-        WorkStepDisplayMode.standard => LiveGroupMode.collapsed,
-        WorkStepDisplayMode.detailed => LiveGroupMode.expanded,
-        WorkStepDisplayMode.expanded => LiveGroupMode.flat,
-      };
+    WorkStepDisplayMode.concise => LiveGroupMode.hidden,
+    WorkStepDisplayMode.standard => LiveGroupMode.collapsed,
+    WorkStepDisplayMode.detailed => LiveGroupMode.expanded,
+    WorkStepDisplayMode.expanded => LiveGroupMode.flat,
+  };
 
   /// 运行中详情是否自动展开：仅完全展开的**当前轮**；完成/历史不自动。
   bool get liveDetailsAutoExpanded => mode == WorkStepDisplayMode.expanded;
@@ -544,12 +549,11 @@ class TurnFoldPolicy {
 
   /// 已完成过程组：详细显示折叠抬头；完全展开平铺；简洁/标准不显示。
   CompletedGroupMode get completedGroups => switch (mode) {
-        WorkStepDisplayMode.concise ||
-        WorkStepDisplayMode.standard =>
-          CompletedGroupMode.hidden,
-        WorkStepDisplayMode.detailed => CompletedGroupMode.collapsed,
-        WorkStepDisplayMode.expanded => CompletedGroupMode.flat,
-      };
+    WorkStepDisplayMode.concise ||
+    WorkStepDisplayMode.standard => CompletedGroupMode.hidden,
+    WorkStepDisplayMode.detailed => CompletedGroupMode.collapsed,
+    WorkStepDisplayMode.expanded => CompletedGroupMode.flat,
+  };
 
   /// 详细/完全展开的思考行折叠预览；简洁/标准不显示预览。
   bool get settledReasoningPreview =>
@@ -561,12 +565,11 @@ class TurnFoldPolicy {
 
   /// 兼容旧判定：已完成是否按组（详细 collapsed；其余 none/flat）。
   StepGrouping get stepGrouping => switch (mode) {
-        WorkStepDisplayMode.concise ||
-        WorkStepDisplayMode.standard =>
-          StepGrouping.none,
-        WorkStepDisplayMode.detailed => StepGrouping.collapsed,
-        WorkStepDisplayMode.expanded => StepGrouping.none,
-      };
+    WorkStepDisplayMode.concise ||
+    WorkStepDisplayMode.standard => StepGrouping.none,
+    WorkStepDisplayMode.detailed => StepGrouping.collapsed,
+    WorkStepDisplayMode.expanded => StepGrouping.none,
+  };
 
   /// 旧兼容：已完成组是否以抬头呈现。
   bool get groupsCollapsedByDefault => mode == WorkStepDisplayMode.detailed;
@@ -652,7 +655,8 @@ class ProcessSegment {
   bool get isEmpty => rows.isEmpty;
   int get startSeq => rows.first.seq;
   int get toolCount => rows.where((row) => row.isTool).length;
-  int get reasoningChars => rows.fold(0, (sum, row) => sum + row.reasoningChars);
+  int get reasoningChars =>
+      rows.fold(0, (sum, row) => sum + row.reasoningChars);
 
   /// 段内过程组：按 step 连续聚合（缺 step 退化为一段一组）。
   List<ProcessGroup> get groups {
@@ -663,7 +667,9 @@ class ProcessSegment {
     var started = false;
     void flush() {
       if (current.isEmpty) return;
-      groups.add(ProcessGroup(step: currentStep, rows: List.unmodifiable(current)));
+      groups.add(
+        ProcessGroup(step: currentStep, rows: List.unmodifiable(current)),
+      );
     }
 
     for (final row in rows) {
@@ -680,18 +686,48 @@ class ProcessSegment {
     return List.unmodifiable(groups);
   }
 
+  /// 段内是否还有未 settled 的工具行。
+  bool get running => rows.any((row) => row.running);
+
+  /// 段内最近一个仍在运行的工具名（没有则 null；用于段摘要/组抬头状态）。
+  String? get runningToolName {
+    for (var i = rows.length - 1; i >= 0; i--) {
+      final row = rows[i];
+      if (!row.isTool || !row.running) continue;
+      final name = row.toolName;
+      if (name != null && name.isNotEmpty) return name;
+    }
+    return null;
+  }
+
   /// 段折叠摘要（整段收起时替代过程块的一行）。
+  ///
+  /// issue #126/ADR 0035：活动条删除后，简洁档的运行状态由这里承载——运行中优先
+  /// 显示“思考中…”或“进行中 · 当前工具”，完成态才退回思考字数/组数。
   String get summary {
     final parts = <String>[];
-    if (reasoningChars > 0) {
-      parts.add(L10n.t('思考 $reasoningChars 字', '$reasoningChars chars of thinking'));
+    if (running) {
+      final name = runningToolName;
+      parts.add(
+        name == null
+            ? L10n.t('思考中…', 'Thinking…')
+            : L10n.t('进行中 · $name', 'Running · $name'),
+      );
+    } else if (reasoningChars > 0) {
+      parts.add(
+        L10n.t('思考 $reasoningChars 字', '$reasoningChars chars of thinking'),
+      );
     }
-    parts.add(toolCount == 0
-        ? L10n.t('${groups.length} 个过程组', '${groups.length} process groups')
-        : L10n.t(
-            '${groups.length} 组 · $toolCount 次工具调用',
-            '${groups.length} groups · $toolCount tool calls',
-          ));
+    if (!running || toolCount > 0) {
+      parts.add(
+        toolCount == 0
+            ? L10n.t('${groups.length} 个过程组', '${groups.length} process groups')
+            : L10n.t(
+                '${groups.length} 组 · $toolCount 次工具调用',
+                '${groups.length} groups · $toolCount tool calls',
+              ),
+      );
+    }
     return parts.join(' · ');
   }
 }
@@ -712,16 +748,19 @@ List<ProcessSegment> segmentsOf(TurnProcess turn) {
   int? openingBoundary;
   void flush() {
     if (current.isNotEmpty) {
-      out.add(ProcessSegment(
-        rows: List.unmodifiable(current),
-        boundarySeq: openingBoundary,
-      ));
+      out.add(
+        ProcessSegment(
+          rows: List.unmodifiable(current),
+          boundarySeq: openingBoundary,
+        ),
+      );
       current = <ProcessRow>[];
     }
   }
 
   for (final row in rows) {
-    while (boundaryIndex < boundaries.length && row.seq > boundaries[boundaryIndex]) {
+    while (boundaryIndex < boundaries.length &&
+        row.seq > boundaries[boundaryIndex]) {
       flush();
       openingBoundary = boundaries[boundaryIndex];
       boundaryIndex++;
@@ -776,10 +815,7 @@ String groupIdentityOf(ProcessGroup group, int turn) {
 /// issue #123：只用于**段级**手动折叠状态的成员身份比对，不参与渲染判断。
 /// （组级折叠状态已按方案 D 移到 widget 层，不再有组级迁移。）
 class SegmentIdentitySnapshot {
-  const SegmentIdentitySnapshot({
-    required this.key,
-    required this.memberIds,
-  });
+  const SegmentIdentitySnapshot({required this.key, required this.memberIds});
 
   final String key;
 
@@ -959,38 +995,6 @@ class SegmentFoldState {
   }
 }
 
-const int processBatchSize = 50;
-
-/// 单轮过程行分批窗口：展开后超过 [limit] 行时只呈现前 [limit] 行。
-class ProcessBatchWindow {
-  final List<ProcessRow> visible;
-  final int hidden;
-  final int total;
-
-  const ProcessBatchWindow({
-    required this.visible,
-    required this.hidden,
-    required this.total,
-  });
-}
-
-/// 按轮次过程顺序（组顺序 + 组内 seq 顺序）切出前 [limit] 行。
-ProcessBatchWindow batchProcessRows(List<ProcessRow> rows, int limit) {
-  final effective = limit < 0 ? 0 : limit;
-  if (rows.length <= effective) {
-    return ProcessBatchWindow(
-      visible: List<ProcessRow>.unmodifiable(rows),
-      hidden: 0,
-      total: rows.length,
-    );
-  }
-  return ProcessBatchWindow(
-    visible: List<ProcessRow>.unmodifiable(rows.sublist(0, effective)),
-    hidden: rows.length - effective,
-    total: rows.length,
-  );
-}
-
 /// 过程组抬头文案：运行中「正在调用工具…」，完成态「N 次工具调用」。
 /// **不显示用时**（ADR 0027 §2 的有意简化）。
 ///
@@ -1028,19 +1032,14 @@ String processGroupHeader(
       }
     }
     // issue #108：标准档组抬头折叠，必须仍表达该 step 的组数/状态。
+    // ADR 0035：活动条删除后，没有工具运行的组由这里承载“思考中…”。
     if (group.toolCount > 0) {
       return L10n.t(
         '${group.toolCount} 次工具调用 · 进行中',
         '${group.toolCount} tool calls · running',
       );
     }
-    if (group.reasoningChars > 0) {
-      return L10n.t(
-        '思考 ${group.reasoningChars} 字 · 进行中',
-        '${group.reasoningChars} chars of thinking · running',
-      );
-    }
-    return L10n.t('正在调用工具…', 'Calling tool…');
+    return L10n.t('思考中…', 'Thinking…');
   }
   // issue #75：只有思考、没有工具调用的组不能显示「0 次工具调用」——
   // 那是没有信息量的幽灵抬头，也不符合「组抬头说明该组做了什么」的语义。
@@ -1077,7 +1076,10 @@ String turnFooterText(TurnProcess turn) {
 String formatTurnDuration(int milliseconds) {
   final seconds = milliseconds / 1000;
   if (seconds < 60) {
-    return L10n.t('${seconds.toStringAsFixed(1)} 秒', '${seconds.toStringAsFixed(1)}s');
+    return L10n.t(
+      '${seconds.toStringAsFixed(1)} 秒',
+      '${seconds.toStringAsFixed(1)}s',
+    );
   }
   final total = seconds.round();
   if (total < 3600) {
@@ -1224,8 +1226,7 @@ class TurnProcessTracker {
           t.endReasonKind = reason['kind'] as String;
         }
         if (time != null) {
-          t.endedAtMs =
-              t.endedAtMs == null ? time : _max(t.endedAtMs!, time);
+          t.endedAtMs = t.endedAtMs == null ? time : _max(t.endedAtMs!, time);
         }
         return;
       case 'user/message':
@@ -1259,15 +1260,18 @@ class TurnProcessTracker {
           // 历史回放没有 chunk → 无记录 → 行 seq = message seq（外观逐字节不变）。
           final startSeq = _takeReasoningStart(owner, step);
           final rowSeq = startSeq == null ? seq : _min(startSeq, seq);
-          _turn(owner).rows.add(_MutableRow(
-            seq: rowSeq,
-            eventSeq: seq,
-            order: _order++,
-            step: step,
-            kind: ProcessRowKind.reasoning,
-            reasoning: reasoning,
-            reasoningChars: chars,
-          ));
+          _turn(owner).rows.add(
+            _MutableRow(
+              seq: rowSeq,
+              eventSeq: seq,
+              order: _order++,
+              step: step,
+              kind: ProcessRowKind.reasoning,
+              reasoning: reasoning,
+              reasoningChars: chars,
+              detailAvailable: event.detailAvailable,
+            ),
+          );
         }
         return;
       case 'tool/call':
@@ -1324,7 +1328,8 @@ class TurnProcessTracker {
   /// 事件 seq → 轮次（事件自带 turn 字段的那些）。
   final Map<int, int> _itemTurn = {};
 
-  _MutableTurn _turn(int turn) => _turns.putIfAbsent(turn, () => _MutableTurn(turn));
+  _MutableTurn _turn(int turn) =>
+      _turns.putIfAbsent(turn, () => _MutableTurn(turn));
 
   _MutableToolRow _tool(String callId) =>
       _tools.putIfAbsent(callId, () => _MutableToolRow(callId));
@@ -1460,22 +1465,26 @@ class TurnProcessTracker {
             step: row.step,
             reasoning: row.reasoning,
             reasoningChars: row.reasoningChars,
+            detailSeq: row.eventSeq,
+            detailAvailable: row.detailAvailable,
           ),
       ];
       for (final tool in _tools.values.where((t) => !t.surfaceReplay)) {
         if (tool.turn != t.turn) continue;
         final seq = tool.reportedSeq;
         if (seq == null) continue;
-        rows.add(ProcessRow.tool(
-          seq: seq,
-          step: tool.step,
-          callId: tool.callId,
-          toolName: tool.name,
-          status: tool.settled
-              ? (tool.isError ? 'failed' : 'success')
-              : 'running',
-          isError: tool.isError,
-        ));
+        rows.add(
+          ProcessRow.tool(
+            seq: seq,
+            step: tool.step,
+            callId: tool.callId,
+            toolName: tool.name,
+            status: tool.settled
+                ? (tool.isError ? 'failed' : 'success')
+                : 'running',
+            isError: tool.isError,
+          ),
+        );
       }
       rows.sort((a, b) {
         final bySeq = a.seq.compareTo(b.seq);
@@ -1498,18 +1507,20 @@ class TurnProcessTracker {
               (t.endSeq == null || seq < t.endSeq!))
             seq,
       ]..sort();
-      result.add(TurnProcess(
-        turn: t.turn,
-        startSeq: anchor,
-        partial: t.startSeq == null,
-        endSeq: t.endSeq,
-        ended: t.ended,
-        endReasonKind: t.endReasonKind,
-        startedAtMs: t.startedAtMs,
-        endedAtMs: t.endedAtMs,
-        groups: _groupRows(rows),
-        humanUserSeqs: human,
-      ));
+      result.add(
+        TurnProcess(
+          turn: t.turn,
+          startSeq: anchor,
+          partial: t.startSeq == null,
+          endSeq: t.endSeq,
+          ended: t.ended,
+          endReasonKind: t.endReasonKind,
+          startedAtMs: t.startedAtMs,
+          endedAtMs: t.endedAtMs,
+          groups: _groupRows(rows),
+          humanUserSeqs: human,
+        ),
+      );
     }
     // issue #92：compaction 会重新落盘旧 turn 的 tool/result（seq 变新、turn/step 保留），
     // 但加载窗口里没有该 turn 的 turn/start / turn/end。旧逻辑不生成 TurnProcess →
@@ -1534,29 +1545,33 @@ class TurnProcessTracker {
         if (tool.turn != turn) continue;
         final seq = tool.reportedSeq;
         if (seq == null) continue;
-        rows.add(ProcessRow.tool(
-          seq: seq,
-          step: tool.step,
-          callId: tool.callId,
-          toolName: tool.name,
-          status: tool.settled
-              ? (tool.isError ? 'failed' : 'success')
-              : 'running',
-          isError: tool.isError,
-        ));
+        rows.add(
+          ProcessRow.tool(
+            seq: seq,
+            step: tool.step,
+            callId: tool.callId,
+            toolName: tool.name,
+            status: tool.settled
+                ? (tool.isError ? 'failed' : 'success')
+                : 'running',
+            isError: tool.isError,
+          ),
+        );
       }
       if (rows.isEmpty) continue;
       rows.sort((a, b) => a.seq.compareTo(b.seq));
       _orphanAnchors[turn] = rows.first.seq;
-      result.add(TurnProcess(
-        turn: turn,
-        startSeq: rows.first.seq,
-        partial: true,
-        ended: true,
-        endReasonKind: 'completed',
-        groups: _groupRows(rows),
-        humanUserSeqs: const [],
-      ));
+      result.add(
+        TurnProcess(
+          turn: turn,
+          startSeq: rows.first.seq,
+          partial: true,
+          ended: true,
+          endReasonKind: 'completed',
+          groups: _groupRows(rows),
+          humanUserSeqs: const [],
+        ),
+      );
     }
     return result;
   }
@@ -1569,7 +1584,9 @@ class TurnProcessTracker {
     var started = false;
     void flush() {
       if (current.isEmpty) return;
-      groups.add(ProcessGroup(step: currentStep, rows: List.unmodifiable(current)));
+      groups.add(
+        ProcessGroup(step: currentStep, rows: List.unmodifiable(current)),
+      );
     }
 
     for (final row in rows) {
@@ -1593,8 +1610,7 @@ class TurnProcessTracker {
   static int _max(int a, int b) => a >= b ? a : b;
 
   static String? _callIdOf(Map<String, dynamic> data) {
-    final id =
-        (data['callId'] ?? data['toolCallId'] ?? data['id'])?.toString();
+    final id = (data['callId'] ?? data['toolCallId'] ?? data['id'])?.toString();
     return id != null && id.isNotEmpty ? id : null;
   }
 
@@ -1633,6 +1649,7 @@ class _MutableRow {
     required this.kind,
     this.reasoning = '',
     this.reasoningChars = 0,
+    this.detailAvailable = false,
   }) : eventSeq = eventSeq ?? seq;
 
   /// 渲染排序键（issue #70：落定 reasoning 行可能继承首个 delta seq）。
@@ -1645,6 +1662,7 @@ class _MutableRow {
   final ProcessRowKind kind;
   final String reasoning;
   final int reasoningChars;
+  final bool detailAvailable;
 }
 
 class _MutableToolRow {
