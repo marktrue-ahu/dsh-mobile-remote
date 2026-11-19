@@ -24,6 +24,13 @@ DSH 本体的做法是：折叠态单行；展开态固定上限（过程组 bod
 - 保留 `_clampOverscrollAfterShrink`（内容变短后的范围夹回）与 `ScrollFollowCoordinator` 的意图/校正语义。短内容首次打开时意图仍是 `followLatest`；内容一旦超过一屏，由 owner 校正到底部，不因顶对齐把用户误判为阅读态。
 - 本决策只约束 live 视图；历史分段视图（`_inHistory`）保持现状。
 
+### 1b. 首屏补拉最新轮
+
+- 初始 `/history` 仍取 50 条；若最新一轮是 **partial**（窗口缺 `turn/start`）且服务端声明还有更早历史，自动补拉 `_histPageSize`（30 条/页），最多 5 页，直到最新轮不再是 partial、没有更早历史，或用户已上翻进入阅读态。
+- **不按视口高度补拉**：按高度补会为前几轮历史白拉，且容易在首屏后造成跳动；补到最新轮 `turn/start` 即停，保证过程块来源完整。
+- 达到 5 页上限仍 partial 时保留既有 partial 轮次 fallback 与顶对齐，不无限拉取。
+- 测试可用 `ChatScreen.autoFillFirstScreen=false` 关闭该行为，专门验证“初次 50 条部分轮次”的兼容路径。
+
 ### 2. 折叠行固定单行，展开正文固定上限
 
 - 过程行/工具行/思考行折叠态固定单行：`24dp × textScaler`，超长省略，状态 chip 不换行。
@@ -84,6 +91,7 @@ DSH 本体的做法是：折叠态单行；展开态固定上限（过程组 bod
 - 数据对齐：SSE 转发补齐 `callSummary`/`resultSummary`/`detailTextChars`；`/event-detail` 为 `user/message` 补 canonical `text`、为 `assistant/message` 补完整 `reasoning`；仅有图片的 assistant 不再整条跳过；长用户消息/思考在“查看全文/首次展开”时按需加载。
 - 四档：完全展开不再自动展开详情；工具状态只由过程行/组抬头承载；思考状态按 §4 落到摘要/组抬头/provisional 行。
 - 过程块宿主：live 轮的过程块优先锚定在 `_items`（center 之后），不跟随早期事件跑到 `_olderItems`；否则补页后 live 侧只剩零高度行，center 边界会出现大块空白（#126 真机 `min=-1673/max=0/extent=44`）。
+- 首屏补拉（方案 2）：初始 50 条后若最新轮 partial，自动补 30 条/页、最多 5 页直到 `turn/start` 已加载；不按视口高度补拉，用户上翻即停。
 - 测试：因行为退役，删除 `batch_hidden_bottom_gap_test`、`issue84_visible_tool_dedupe_test`、`issue77_live_scroll_test`、`issue89_scroll_overscroll_test`、`issue118_detailed_mode_blank_test`、`issue118_subagent_follow_blank_test`；新增 `issue126_visible_content_parity_test`。当前 `flutter test` 1723 通过 / 1 skip，`flutter analyze` 0 error/warning，`timeline-contract-check` 181 PASS，`account-usage-check` 15 PASS，Kotlin `UsagePanelModelTest` PASS。
 - 门禁遗留：`node --test test/*.mjs` 在 `release-pairing` 的“APK 内部版本实读”上失败（`aapt`/`aapt2` exit 1）；已在干净 HEAD 同环境复跑并得到同样失败，属**基线环境红灯**，与本 ADR 改动无关。交付时按 AGENT-RULES 的基线例外流程登记。
 - 真机实测（2026-11-20，会话 256144d7，134→192 项）：live 底部已收敛到 `max=566.7 extent=1218 blank=6.0`，大空白消失；但历史侧 `SliverList` 在只构建 1 个子项时会把 `max` 估到 38090、`extent` 估到 38742，随后才修正。说明“过程块仍是单个 Column 子项”会让懒估算放大；后续需把过程块/组拆成 sliver 子项（本轮未做）。
