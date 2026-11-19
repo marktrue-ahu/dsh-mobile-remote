@@ -180,6 +180,39 @@ void main() {
         reason: '定位后该轮应进入已构建范围');
   });
 
+  // task-38（对齐上游 9793976 的意图）：定位只保证「目标与视口相交」，正文变窄后
+  // 估算落点可能让目标停在阅读线下方 → 用户点第 N 轮、高亮却停在 N-1。这里锁死
+  // 「点第 N 轮 → 高亮第 N 轮」（真实点击刻度 + 断言刻度轨 activeTurn）。
+  testWidgets('点第 N 轮刻度后，高亮必须落在第 N 轮（不能滞后一轮）', (tester) async {
+    final backend = _TurnBackend(turns: 6);
+    final store = AppStore()..sessionId = 'session-turns';
+    await _pumpChat(tester, backend: backend, store: store);
+
+    await _scrollUp(tester, by: 1200);
+    expect(find.byType(TurnNavigatorRail), findsOneWidget);
+
+    for (final target in [3, 5, 2]) {
+      await tester.tap(
+        find.byKey(ValueKey<String>('turn-tick-$target')),
+        warnIfMissed: false,
+      );
+      await tester.pumpAndSettle();
+      final rail = tester.widget<TurnNavigatorRail>(
+        find.byType(TurnNavigatorRail),
+      );
+      expect(
+        rail.activeTurn,
+        target,
+        reason: '点第 $target 轮后高亮必须落在第 $target 轮（activeTurn=${rail.activeTurn}）',
+      );
+      expect(
+        find.text('第 $target 轮的问题'),
+        findsOneWidget,
+        reason: '第 $target 轮的内容应在已构建范围内',
+      );
+    }
+  });
+
   testWidgets('刻度轨不是滚动死区：沿轨扫掠出预览并落到所指轮次', (tester) async {
     final backend = _TurnBackend(turns: 6);
     final store = AppStore()..sessionId = 'session-turns';
