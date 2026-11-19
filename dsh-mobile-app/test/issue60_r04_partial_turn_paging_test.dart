@@ -19,7 +19,12 @@ class _PagedBackend {
   _PagedBackend() {
     // 115 条事件：turn/start(1) → user(2) → 55 组 tool/call+result(3..112) →
     // assistant(113) → presented(114) → turn/end(115)。初次 limit=50 缺 start。
-    events.add({'seq': 1, 'type': 'turn/start', 'time': 1000, 'data': {'turn': 1}});
+    events.add({
+      'seq': 1,
+      'type': 'turn/start',
+      'time': 1000,
+      'data': {'turn': 1},
+    });
     events.add({
       'seq': 2,
       'type': 'user/message',
@@ -32,13 +37,26 @@ class _PagedBackend {
         'seq': seq++,
         'type': 'tool/call',
         'time': 1200 + i * 10,
-        'data': {'turn': 1, 'step': 1, 'callId': 'c$i', 'name': 'bash', 'arguments': '{"command":"echo x"}'},
+        'data': {
+          'turn': 1,
+          'step': 1,
+          'callId': 'c$i',
+          'name': 'bash',
+          'arguments': '{"command":"echo x"}',
+        },
       });
       events.add({
         'seq': seq++,
         'type': 'tool/result',
         'time': 1201 + i * 10,
-        'data': {'turn': 1, 'step': 1, 'callId': 'c$i', 'name': 'bash', 'text': 'x', 'isError': false},
+        'data': {
+          'turn': 1,
+          'step': 1,
+          'callId': 'c$i',
+          'name': 'bash',
+          'text': 'x',
+          'isError': false,
+        },
       });
     }
     events.add({
@@ -99,7 +117,8 @@ class _PagedBackend {
       if (after != null) {
         return _json({'ok': true, 'events': <Object>[], 'hasMore': false});
       }
-      final limit = int.tryParse(request.url.queryParameters['limit'] ?? '') ?? 50;
+      final limit =
+          int.tryParse(request.url.queryParameters['limit'] ?? '') ?? 50;
       lastLimit = limit;
       final start = events.length > limit ? events.length - limit : 0;
       final page = events.sublist(start);
@@ -141,6 +160,7 @@ void main() {
           store: store,
           apiClient: backend.api,
           onTitleChanged: () {},
+          autoFillFirstScreen: false,
         ),
       ),
     );
