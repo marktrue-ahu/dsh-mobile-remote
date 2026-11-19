@@ -128,11 +128,7 @@ class _HistoryBackend {
     pending.complete(
       hasMore
           ? _pageResponse(_pendingCursor!, _pendingLimit, hasMore: true)
-          : _json({
-              'ok': true,
-              'events': <Object>[],
-              'hasMore': false,
-            }),
+          : _json({'ok': true, 'events': <Object>[], 'hasMore': false}),
     );
   }
 
@@ -170,9 +166,7 @@ class _HistoryBackend {
   });
 
   http.Response _pageResponse(int before, int limit, {required bool hasMore}) {
-    final preceding = history
-        .where((e) => (e['seq'] as int) < before)
-        .toList();
+    final preceding = history.where((e) => (e['seq'] as int) < before).toList();
     return _json({
       'ok': true,
       'events': preceding.length > limit
@@ -274,11 +268,7 @@ class _Probe {
 
   /// 状态行当前高度（必须恰好在视口内/已构建）。
   double statusRowHeight() {
-    expect(
-      statusRow,
-      findsOneWidget,
-      reason: '状态行应已构建（视觉顶部）：${geometry()}',
-    );
+    expect(statusRow, findsOneWidget, reason: '状态行应已构建（视觉顶部）：${geometry()}');
     return tester.getSize(statusRow).height;
   }
 }
@@ -383,19 +373,21 @@ void main() {
         noMore: noMore,
       );
       expect(f(loaded: false), isNull);
-      expect(f(loading: true, failed: true, hasMore: false, noMore: true),
-          OlderHistoryStatus.loading);
-      expect(f(failed: true, hasMore: false, noMore: true),
-          OlderHistoryStatus.failed);
+      expect(
+        f(loading: true, failed: true, hasMore: false, noMore: true),
+        OlderHistoryStatus.loading,
+      );
+      expect(
+        f(failed: true, hasMore: false, noMore: true),
+        OlderHistoryStatus.failed,
+      );
       expect(f(hasMore: true), OlderHistoryStatus.idle);
       expect(f(hasMore: false), OlderHistoryStatus.exhausted);
       expect(f(hasMore: true, noMore: true), OlderHistoryStatus.exhausted);
     });
   });
 
-  testWidgets('loading 只 pump 触发帧即出现；快速上翻不重复请求；到顶后不再请求', (
-    tester,
-  ) async {
+  testWidgets('loading 只 pump 触发帧即出现；快速上翻不重复请求；到顶后不再请求', (tester) async {
     final backend = _HistoryBackend(_history());
     final store = await _mount(tester, backend);
     final probe = _Probe(tester);
@@ -572,9 +564,7 @@ void main() {
     await _finish(tester, store);
   });
 
-  testWidgets('成功 prepend 后阅读位置与触点不跳（状态行等高、内容插入不推动视口）', (
-    tester,
-  ) async {
+  testWidgets('成功 prepend 后阅读位置与触点不跳（状态行等高、内容插入不推动视口）', (tester) async {
     final backend = _HistoryBackend(_history());
     final store = await _mount(tester, backend);
     final probe = _Probe(tester);
@@ -596,11 +586,7 @@ void main() {
     expect(backend.beforeCalls, 2, reason: backend.beforeCursors.join(','));
     expect(find.text(_loadingLabel), findsOneWidget);
     final message = find.text('第 13 轮回答');
-    expect(
-      message,
-      findsOneWidget,
-      reason: '夹具前提：第一页补回了第 13 轮（seq 51..80）',
-    );
+    expect(message, findsOneWidget, reason: '夹具前提：第一页补回了第 13 轮（seq 51..80）');
     final topBefore = tester.getTopLeft(message).dy;
     final pixelsBefore = probe.pixels;
     final minBefore = probe.minExtent;
@@ -618,11 +604,7 @@ void main() {
       reason: '补页不得改变阅读位置（center 锚点不重排已构建子项）',
     );
     // 触点/滚动偏移必须严格不跳（center 锚点不重排已构建子项）。
-    expect(
-      probe.pixels,
-      pixelsBefore,
-      reason: '补页不得改变滚动偏移（触点位置）',
-    );
+    expect(probe.pixels, pixelsBefore, reason: '补页不得改变滚动偏移（触点位置）');
     // 消息屏幕位置允许既有的 SliverList 懒估算修正（ADR 0035 实施记录：历史侧
     // 只构建少量子项时估算值会随后修正），但不得出现整页级跳动。
     final contentShift = (topAfter - topBefore).abs();
@@ -675,10 +657,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 400));
     expect(probe.status, OlderHistoryStatus.exhausted);
     expect(
-      find.descendant(
-        of: probe.statusRow,
-        matching: find.text(_degradedLabel),
-      ),
+      find.descendant(of: probe.statusRow, matching: find.text(_degradedLabel)),
       findsOneWidget,
       reason: '降级会话到顶时状态行应显示“更早历史不可恢复”',
     );
