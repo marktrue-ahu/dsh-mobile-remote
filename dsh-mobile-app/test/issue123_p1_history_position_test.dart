@@ -41,7 +41,7 @@ const Size _surface = Size(390, 844);
 // 20 个已完成短轮次（每轮 4 事件）+ 第 21 轮 52 个 step（每条 step 1 条思考行），
 // 共 52 个过程行——初始 REST 只返回最后 50 条事件（真实服务端窗口），
 // 更早事件由用户上翻的 `before` 分页取回。
-List<Map<String, dynamic>> _history() {
+List<Map<String, dynamic>> _history({int steps = 52}) {
   final events = <Map<String, dynamic>>[];
   var seq = 1;
   void add(String type, Map<String, dynamic> data) => events.add({
@@ -69,14 +69,15 @@ List<Map<String, dynamic>> _history() {
       'reason': {'kind': 'completed'},
     });
   }
-  // 第 21 轮：运行中（无 turn/end），52 个 step，每个 step 一条思考行 + 一次工具调用。
+  // 第 21 轮：运行中（无 turn/end），`steps` 个 step，每个 step 一条思考行 + 一次工具调用。
+  // steps=52 → 104 行，触发分批（隐藏 54 行）；steps=20 → 40 行，不触发分批。
   add('turn/start', {'turn': 21});
   add('user/message', {
     'messageId': 'u21',
     'text': '帮我排查滚动问题',
     'sourceKind': 'user',
   });
-  for (var step = 1; step <= 52; step++) {
+  for (var step = 1; step <= steps; step++) {
     add('assistant/message', {
       'turn': 21,
       'step': step,
@@ -476,7 +477,9 @@ void main() {
   // 底部占位（#77/#118 第三种表现）照常生效——否则「短内容停在顶部、下方大片空白」
   // 会以「把负像素一律当顶对齐」之外的另一种方式回归。
   testWidgets('P1b paged 会话回到 live 起点后，短内容底部占位仍必须生效', (tester) async {
-    final backend = _Backend(_history(), initialLimit: 50);
+    // task-35 后：有隐藏行时不补占位，所以本用例改用「无分批」的夹具（40 行），
+    // 单独锁 atLiveWindow 路径（paged + 真正短内容 → 补占位）。
+    final backend = _Backend(_history(steps: 20), initialLimit: 50);
     final store = await _mount(tester, backend);
     final probe = _Probe(tester);
     final replay = _Replay(tester, store, probe);
