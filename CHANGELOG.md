@@ -1,5 +1,36 @@
 # Changelog
 
+## v3.2.4-rc.5（build 58，真机 59aaa367）— 分批隐藏行导致的底部空白修复
+
+> 插件 `3.2.4-rc.5` / App `3.2.4+58` / 载体 `3.2.4-rc.5-app`。RC 候选：插件发布到 npm `rc` dist-tag，`latest` 保持 `3.2.3-rc.1` 不动（只有 stable 可前进）。
+
+### 分批隐藏行不再被误判为短内容（真机 59aaa367）
+
+真机（`3.2.4-rc.4`）会话 `59aaa367`：子代理大量工具调用 → 过程行超过分批上限 50 → 出现「显示更多（还有 86 行）」，同时聊天记录被整体下推、下方留出空白。
+
+- **根因**：`_scheduleLiveBottomGapMeasure` 用 `liveSliver.geometry.scrollExtent` 测内容高度，该值**只含已渲染行**，不含被 `batchProcessRows` 隐藏的行。详细档里已完成的 7 个折叠组约 700dp < 视口 844dp → 判定「短内容」→ 补 `_liveBottomGap` → 占位把内容整体下推；而实际还有 86 行没渲染，内容客观上一屏装不下。
+- **修复**：`shortEnough` 增加 `!_livePlanHasHiddenRows`——live 计划里任一可见轮次存在隐藏行时不补底部占位。判据从 `_livePlanCache.hostsBySeq` 读 `_ProcessBlockPlan.hiddenTotalInTurn`（任一可见轮次，不是只看当前滚动的那个），计划缓存与判定同帧、无额外扫描。
+- **分批策略不变**：未改 `batchProcessRows`、未取消分批（维护者确认的方案 A）。
+
+### 测试（先红后绿）
+
+- 新增 `batch_hidden_bottom_gap_test.dart`（真机形态：详细档已完成轮 + 5 step × 20 工具 = 100 行 > 50 + 跟随态）：
+  - 主用例：修复前 `gap=184`、内容被整体下推（内容顶 240 vs 视口顶 56）→ 红；修复后 `gap=0`、内容贴视口顶 → 绿；
+  - 对照组：无隐藏行的短会话（2 次工具调用）仍必须补占位、贴底（`tailResidual≈0`）。
+- `issue123_p1_history_position_test.dart` 的 P1b 夹具改为 `steps: 20`（40 行、不触发分批）：该用例锁的是 `atLiveWindow` 路径（paged + 真正短内容 → 补占位），原 52-step 夹具本身带隐藏行、按新契约不应补占位。**只调夹具，断言不变**；P1a 仍用 52（分批 + 历史位置保持）。
+- 既有分批/滚动套件全绿：`issue118_*`、`issue52/70/74/75/76/84`、`turn_process`、`issue77/89`。
+- 变异反证：去掉 `!_livePlanHasHiddenRows` → 主用例变红（`gap=184`），还原后复绿。
+
+### 验证
+
+- 本机门禁 6 项：`flutter analyze` 0 error / 0 warning（24 info，与基线同）、`flutter test` **1606 通过 / 1 skip**、`node --test` 1220 例 1199 通过 / 17 skip / **4 失败**、timeline-contract 179 PASS / 0 FAIL、account-usage 15 通过 / 0 失败、Kotlin `UsagePanelModelTest` BUILD SUCCESSFUL（`--rerun-tasks`，178 tasks executed）
+- node 4 项失败为本机 root 环境既有问题（`chmod 0500` 在 root 下失效 ×2、`host-canary-smoke` 要求 uid>0、`ANDROID_HOME` 下 aapt 存在却执行失败）；已与 `v3.2.4-rc.4`（`b088e49`）同环境对照，**失败集合逐条相同、总数相同**（1220/1199/4/17），无新增项
+
+### 未验证
+
+- 真机未复验：以上为 widget 测试 + 真实代码路径回放；落版本后需在真机（同类长会话）确认「显示更多」出现时下方空白消失。
+
+
 ## v3.2.4-rc.4（build 57，issues #118 #122 #123）— 滚动位置修正、组折叠重做
 
 > 插件 `3.2.4-rc.4` / App `3.2.4+57` / 载体 `3.2.4-rc.4-app`。RC 候选：插件发布到 npm `rc` dist-tag，`latest` 保持 `3.2.3-rc.1` 不动（只有 stable 可前进）。
