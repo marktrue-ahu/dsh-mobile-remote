@@ -70,6 +70,7 @@ class TeamStatus {
   final bool modelSelected;
   final bool pending;
   final bool locked;
+  final bool lockedKnown;
   final bool canToggle;
   final String? unavailableReason;
   final String leadTitle;
@@ -90,6 +91,7 @@ class TeamStatus {
     required this.modelSelected,
     required this.pending,
     required this.locked,
+    required this.lockedKnown,
     required this.canToggle,
     required this.unavailableReason,
     required this.leadTitle,
@@ -112,6 +114,7 @@ class TeamStatus {
     modelSelected: false,
     pending: false,
     locked: false,
+    lockedKnown: false,
     canToggle: false,
     unavailableReason: 'team-unavailable',
     leadTitle: '',
@@ -136,6 +139,8 @@ class TeamStatus {
       modelSelected: j['modelSelected'] != false,
       pending: j['pending'] == true,
       locked: j['locked'] == true,
+      // 旧宿主没有该字段：不擅自断言“锁已知”；新宿主显式下发。
+      lockedKnown: j['lockedKnown'] == true,
       canToggle: j['canToggle'] == true,
       unavailableReason: j['unavailableReason'] as String?,
       leadTitle: (lead['title'] ?? '').toString(),

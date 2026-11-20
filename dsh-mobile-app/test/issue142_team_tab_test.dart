@@ -40,6 +40,7 @@ Map<String, dynamic> _team({
   bool modeKnown = true,
   bool pending = false,
   bool locked = false,
+  bool lockedKnown = true,
   bool canToggle = true,
   String? reason,
   List<Map<String, dynamic>> members = const [],
@@ -55,6 +56,7 @@ Map<String, dynamic> _team({
   'modelSelected': modelSelected,
   'pending': pending,
   'locked': locked,
+  'lockedKnown': lockedKnown,
   'canToggle': canToggle,
   'unavailableReason': reason,
   'lead': {'id': _root, 'title': '主会话', 'status': 'idle'},
@@ -374,6 +376,18 @@ void main() {
       isTrue,
       reason: '旧 GET 不得覆盖 save 后状态',
     );
+  });
+
+  testWidgets('锁状态未知（旧/休眠）：原因可见且开关禁用，不伪称未锁', (tester) async {
+    final backend = _Backend(
+      _team(lockedKnown: false, canToggle: false, reason: 'team-lock-unknown'),
+    );
+    await _mountTeam(tester, backend);
+    expect(find.byKey(const ValueKey('agent-team-reason')), findsOneWidget);
+    expect(find.textContaining('未提供团队锁状态'), findsOneWidget);
+    await tester.tap(find.byType(Switch));
+    await tester.pumpAndSettle();
+    expect(backend.postCalls, 0);
   });
 
   testWidgets('320dp / 深色 / 1.5x：团队页不溢出', (tester) async {

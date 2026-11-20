@@ -689,7 +689,7 @@
 { "ok": true, "team": {
   "sessionId": "…", "supported": true, "root": true, "agentLive": true,
   "enabled": false, "modeKnown": true, "modelSelected": true,
-  "pending": false, "locked": false, "canToggle": true, "unavailableReason": null,
+  "pending": false, "locked": false, "lockedKnown": true, "canToggle": true, "unavailableReason": null,
   "lead": { "id": "…", "title": "…", "status": "inactive" },
   "members": [ { "id": "…", "name": "reviewer", "title": "…", "kind": "child",
                  "status": "running", "depth": 1, "parentSessionId": "…" } ],
@@ -702,7 +702,8 @@
 - `enabled/modeKnown/tasks`：只认 live Session + `agentTeams.isEnabled/listTasks` 的权威 projection。休眠会话没有可投影的 Session 对象，**不手工折叠** `team/mode`/`team/task` 事件（fork 继承事件可能把父会话状态误当本会话）→ `modeKnown:false`、`enabled:false`、`tasksAvailable:false`，由客户端显式降级。
 - `supported`：宿主是否提供 `agentTeams.isEnabled/setEnabled`；旧宿主为 `false`，客户端隐藏/禁用写操作并显示降级提示，**不伪造**成员或任务。
 - `root`：`origin !== "subagent"`；子代理会话不可修改团队设置（POST 返回 `409 team-root-required`）。
-- `canToggle/unavailableReason`：固定优先级 `team-unavailable` → `team-root-required` → `team-session-offline` → `team-model-unselected` → `team-locked` → `team-pending`。`modelSelected` 取会话待生效模型（provider+model 均有值）。
+- `canToggle/unavailableReason`：固定优先级 `team-unavailable` → `team-root-required` → `team-lock-unknown` → `team-locked` → `team-session-offline` → `team-model-unselected` → `team-pending`。`modelSelected` 取会话待生效模型（provider+model 均有值）。
+- `lockedKnown/locked`：锁的权威事实源是 `header.locked`（宿主显式提供时）；否则 live agent 表示本进程持有该会话 writer（单写者，可判定未锁）。休眠会话没有 writer 可判定 → `lockedKnown:false`（客户端禁用开关并显示“当前电脑端未提供团队锁状态”），**不伪称未锁**。
 - `members[].status`：活 agent `running`/`inactive`；diagnostic 行为三枚举 `unsupported/corrupt/unavailable`。
 - `tasks` 只给计数（#143 任务板单独定义）；`tasksAvailable:false` 表示宿主无团队任务投影/当前会话未激活，不伪造。
 
@@ -712,7 +713,7 @@
 响应: { "ok": true, "team": { …同上… } }
 ```
 - 映射内核 `agentTeams/setEnabled(rootAgent, enabled)`；成功后返回最新状态（不乐观翻转）。
-- 失败稳定码：`400 bad-request`（缺 sessionId / enabled 非布尔）、`404 session-not-found`、`409 team-root-required`、`409 team-session-offline`（未激活，需先发消息）、`409 team-model-unselected`（先选模型）、`409 team-pending`（上一次切换在途）、`409 team-locked`（宿主锁；当前版本保留）、`500 team-save-failed`（固定文案，不泄漏原始异常）、`503 team-unavailable`（旧宿主）。
+- 失败稳定码：`400 bad-request`（缺 sessionId / enabled 非布尔）、`404 session-not-found`、`409 team-root-required`、`409 team-session-offline`（未激活，需先发消息）、`409 team-model-unselected`（先选模型）、`409 team-pending`（上一次切换在途）、`409 team-locked`（`header.locked` 或保存时 writer 被占用/lease 失效；POST 二次校验，不只信 GET/客户端）、`500 team-save-failed`（固定文案，不泄漏原始异常）、`503 team-unavailable`（旧宿主）。GET 的 `team-lock-unknown` 只用于状态呈现；休眠会话 POST 仍返回 `team-session-offline`。
 - 不改变 `/send`、`/stop`、审批/问询语义。
 
 **GET `/m/api/goal?sessionId=…`** — 当前目标（无目标返回 `{ "goal": null }`）

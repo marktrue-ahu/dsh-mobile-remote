@@ -603,14 +603,20 @@ class _TeamTabState extends State<_TeamTab> {
         'This desktop does not support agent teamwork; related actions are hidden',
       );
     }
-    if (!status.agentLive) {
-      return L10n.t('未连接电脑端', 'Not connected to the desktop');
+    if (!status.lockedKnown) {
+      return L10n.t(
+        '当前电脑端未提供团队锁状态',
+        'This desktop does not provide the team lock state',
+      );
     }
     if (status.locked) {
       return L10n.t(
         '当前会话已锁定，无法修改团队协作',
         'This session is locked; agent teamwork cannot be changed',
       );
+    }
+    if (!status.agentLive) {
+      return L10n.t('未连接电脑端', 'Not connected to the desktop');
     }
     if (status.pending) {
       return L10n.t('正在应用团队设置，请稍候', 'Applying team settings, please wait');

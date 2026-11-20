@@ -1577,7 +1577,7 @@ test("issue #142 复审 P2：休眠 fork 不手折父会话 team 事件，权威
 		assert.equal(body.team.enabled, false, "不得把父会话 team/mode 当本会话状态");
 		assert.equal(body.team.tasksAvailable, false, "不得手折 team/task");
 		assert.deepEqual(body.team.tasks, { total: 0, completed: 0, inProgress: 0, pending: 0 });
-		assert.equal(body.team.unavailableReason, "team-session-offline");
+		assert.equal(body.team.unavailableReason, "team-lock-unknown");
 	} finally {
 		harness.clean();
 	}
@@ -1654,6 +1654,45 @@ test("issue #142 复审 P2：未知版本/其他 teamId 事件不参与权威任
 		assert.equal(body.team.enabled, true);
 		assert.deepEqual(body.team.tasks, { total: 1, completed: 1, inProgress: 0, pending: 0 },
 			"只使用权威 listTasks，不折叠未知版本/其他 teamId 的事件");
+	} finally {
+		harness.clean();
+	}
+});
+
+test("issue #142 复审 P2：GET locked=true 呈现锁定且禁用；POST 二次校验拒绝", async () => {
+	const { harness } = teamHarness({ rootHeader: { locked: true } });
+	try {
+		const get = await call(harness.route, "/m/api/team?sessionId=root-team");
+		assert.equal(get.status, 200);
+		assert.equal(get.body.team.lockedKnown, true);
+		assert.equal(get.body.team.locked, true);
+		assert.equal(get.body.team.canToggle, false);
+		assert.equal(get.body.team.unavailableReason, "team-locked");
+		const post = await call(harness.route, "/m/api/team", {
+			method: "POST",
+			body: { sessionId: "root-team", enabled: false },
+		});
+		assert.equal(post.status, 409);
+		assert.equal(post.body.error, "team-locked");
+	} finally {
+		harness.clean();
+	}
+});
+
+test("issue #142 复审 P2：POST 保存时 writer 被占用（SessionAlreadyOwnedError）→ team-locked", async () => {
+	const { harness } = teamHarness();
+	harness.provide("agentTeams", {
+		isEnabled: () => false,
+		async setEnabled() { throw Object.assign(new Error("session is already owned"), { name: "SessionAlreadyOwnedError" }); },
+		listTasks: () => [],
+	});
+	try {
+		const post = await call(harness.route, "/m/api/team", {
+			method: "POST",
+			body: { sessionId: "root-team", enabled: true },
+		});
+		assert.equal(post.status, 409);
+		assert.equal(post.body.error, "team-locked");
 	} finally {
 		harness.clean();
 	}
