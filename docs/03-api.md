@@ -1460,3 +1460,33 @@ POST 请求体：`{"sessionId","repositoryId","tips":[...],"limit"?,"snapshotId"
 - **图库增强（issue #69）**：附图全屏查看器、多图分页、尺寸/名称/mediaType 元数据、保存/分享、失败重试；仍使用既有 `images[]` 元数据与 `/m/api/attachment`，服务端契约不变。
 - **实时思维链（issue #70）**：`assistant/chunk` 的 reasoning delta 仅由 App 生成 provisional 过程行并在落定后去重；无新字段/端点。
 - **diff 视图收尾（issue #71）**：整块横向滚动、固定行号列、大 diff 懒构建；`/changes/diff` 契约不变。
+
+### 6.25 GET /m/api/plugin-inventory（当前宿主插件清单/健康，v3.3，issue #145）
+
+只读：返回当前连接宿主的已安装 bundle 清单。事实来自宿主 `pluginManager.listBundles()`（版本/来源/启停/错误）与 `pluginInventory.list()`（运行期 fiber 相位）；App 不自行推断启用/健康/兼容。
+
+```json
+{
+  "ok": true,
+  "supported": true,
+  "reason": "",
+  "host": { "id": "<宿主稳定身份>", "pluginVersion": "3.3.0" },
+  "plugins": [{
+    "id": "@scope/pkg", "name": "@scope/pkg", "title": { "zh": "显示名", "en": "Display" },
+    "description": null, "packageName": "@scope/pkg", "version": "1.2.3",
+    "source": { "kind": "builtin|local|git|registry|unknown", "label": "内置|本地|Git|配置渠道|未知" },
+    "enabled": true, "current": true,
+    "health": { "state": "ok|disabled|failed", "reasonCode": "incompatible-version|runtime-start-failed|…" },
+    "compatibility": { "ok": false, "requirements": "engines.dsh: >=0.3.0" },
+    "updateAvailable": null,
+    "management": { "readOnly": true }
+  }]
+}
+```
+
+- **旧宿主/缺能力**：HTTP 200 + `supported:false`、`reason:"host-plugin-manager-unavailable"`、`plugins:[]`；旧插件没有该路由时 App 按 404 降级。**不伪造空清单**。
+- **失败**：`503 plugin-inventory-unavailable`（不返回内部异常原文/路径）。
+- 运行期项失败（`fiberPhase:"failed"`）计入 `health.state:"failed"`、`reasonCode:"runtime-start-failed"`；不返回 `diagnostic` 原文。
+- `compatibility.ok=false` 时 `requirements` 提供宿主报告的未满足条件（≤4 项）。
+- `current=true` 表示该 bundle 是当前手机连接所依赖的插件；不提供任何安装/升级/卸载/启停/重启字段或方法。
+- `updateAvailable` 固定 `null`：更新候选检查属于 #146/#147，本端点不触网检查 registry。

@@ -33,6 +33,7 @@ import '../updater.dart';
 import '../version_alignment.dart';
 import 'sheets.dart';
 import 'providers_screen.dart';
+import 'plugin_inventory_screen.dart';
 import 'usage_screen.dart';
 
 /// issue #116：宿主拒绝后的稳定动作 → 可执行文案（未知动作返回空串，由调用方回退到 reason 文案）。
@@ -2597,6 +2598,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
             trailing: DshSwitch(
               value: widget.store.showHiddenFiles,
               onChanged: (v) => widget.store.setShowHiddenFiles(v),
+            ),
+          ),
+        ]),
+        _card(L10n.t('插件', 'Plugins'), [
+          _row(
+            leading: const Icon(Icons.extension_outlined),
+            title: L10n.t('插件管理', 'Plugins'),
+            sub: L10n.t(
+              '当前电脑的插件清单、版本与健康（只读）',
+              'Installed plugins, versions and health on this computer (read-only)',
+            ),
+            trailing: Text(
+              L10n.t('查看 ▸', 'View ▸'),
+              style: TextStyle(fontSize: 12, color: brand),
+            ),
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (_) => PluginInventoryScreen(store: widget.store),
+              ),
             ),
           ),
         ]),
