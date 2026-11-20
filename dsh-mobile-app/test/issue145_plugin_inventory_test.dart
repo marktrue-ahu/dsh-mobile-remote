@@ -3,6 +3,7 @@
 // 覆盖：清单/版本/来源/启停/健康/兼容；无写入口；旧宿主降级；空/加载/失败/重试；
 // 320 / 深色 / 1.5x；Semantics 行播报。
 import 'package:dsh_mobile_app/api.dart';
+import 'package:dsh_mobile_app/l10n.dart';
 import 'package:dsh_mobile_app/plugin_inventory.dart';
 import 'package:dsh_mobile_app/screens/plugin_inventory_screen.dart';
 import 'package:dsh_mobile_app/store.dart';
@@ -37,6 +38,7 @@ PluginInfo plugin(
 
 PluginInventory supported(List<PluginInfo> plugins) => PluginInventory(
   supported: true,
+  complete: true,
   host: const PluginInventoryHost(
     id: 'host-1234567890',
     pluginVersion: '3.3.0',
@@ -137,7 +139,7 @@ void main() {
             reasonCode: 'incompatible-version',
           ),
           compatibility: const PluginCompatibility(
-            ok: false,
+            state: 'incompatible',
             requirements: 'engines.dsh: >=0.3.0',
           ),
         ),
@@ -220,6 +222,99 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('未读取到插件'), findsOneWidget);
     expect(find.text('重试'), findsOneWidget);
+  });
+
+  testWidgets('运行态/兼容未知不冒充健康：starting/unknown 有明确文字', (tester) async {
+    await pumpScreen(
+      tester,
+      loader: () async => supported([
+        plugin('dsh-starting', health: const PluginHealth(state: 'starting')),
+        plugin('dsh-unknown', health: const PluginHealth(state: 'unknown')),
+        plugin(
+          'dsh-compat-unknown',
+          health: const PluginHealth(state: 'ok'),
+          compatibility: const PluginCompatibility(),
+        ),
+      ]),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('启动中'), findsOneWidget);
+    expect(find.text('未知'), findsWidgets);
+    expect(find.text('运行中'), findsOneWidget);
+    // 兼容未知只在详情里显示“未知”，行状态不冒充“兼容”。
+    await tester.tap(find.text('dsh-compat-unknown'));
+    await tester.pumpAndSettle();
+    expect(find.text('未知（宿主未提供判定）'), findsOneWidget);
+  });
+
+  test('来源标签按 L10n 本地化：真实端点形状 + English 模式不显示中文', () async {
+    L10n.lang = 'en';
+    addTearDown(() => L10n.lang = 'zh');
+    final api = Api(
+      client: MockClient(
+        (_) async => http.Response(
+          '{"ok":true,"supported":true,"complete":true,"plugins":['
+          '{"name":"dsh-builtin","packageName":"dsh-builtin","version":"1.0.0","source":{"kind":"builtin","label":"内置"},"health":{"state":"ok"},"compatibility":{"state":"unknown","ok":null}},'
+          '{"name":"dsh-entry","packageName":"dsh-entry","version":"","source":{"kind":"entry","label":"配置条目"},"health":{"state":"unknown"},"compatibility":{"state":"unknown","ok":null}}'
+          ']}',
+          200,
+          headers: {'content-type': 'application/json'},
+        ),
+      ),
+    )..baseUrl = 'http://127.0.0.1:1';
+    final inventory = await api.pluginInventory();
+    expect(inventory.plugins[0].source.displayLabel, 'Built-in');
+    expect(inventory.plugins[1].source.displayLabel, 'Configured entry');
+    expect(inventory.plugins[0].source.displayLabel, isNot(contains('内置')));
+    // 未知 kind 才回退服务端 label。
+    final unknown = PluginSource.fromJson({
+      'kind': 'future-kind',
+      'label': '未来来源',
+    });
+    expect(unknown.displayLabel, '未来来源');
+  });
+
+  testWidgets('清单不完整：部分数据仍显示，并有明确降级提示', (tester) async {
+    await pumpScreen(
+      tester,
+      loader: () async => PluginInventory(
+        supported: false,
+        complete: false,
+        degraded: true,
+        plugins: [
+          plugin(
+            'dsh-standalone',
+            health: const PluginHealth(state: 'unknown'),
+          ),
+        ],
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.textContaining('清单不完整'), findsOneWidget);
+    expect(find.text('dsh-standalone'), findsOneWidget);
+  });
+
+  testWidgets('旧宿主降级后刷新失败：错误与重试结果可见，不只显示旧“不支持”', (tester) async {
+    var calls = 0;
+    await pumpScreen(
+      tester,
+      loader: () async {
+        calls += 1;
+        if (calls == 1) {
+          return const PluginInventory(
+            supported: false,
+            reason: 'host-plugin-manager-unavailable',
+          );
+        }
+        throw Exception('offline');
+      },
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('当前电脑端不支持手机端插件管理'), findsOneWidget);
+    await tester.tap(find.byType(OutlinedButton));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('重新检测失败'), findsOneWidget);
+    expect(find.text('重新检测'), findsOneWidget);
   });
 
   testWidgets('320 / 深色 / 1.5x：不溢出，版本与状态仍可读', (tester) async {

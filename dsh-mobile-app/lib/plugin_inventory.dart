@@ -17,13 +17,14 @@ class PluginSource {
   }
 
   String get displayLabel {
-    if (label.isNotEmpty) return label;
+    // 已知 kind 一律本地化：后端 label 是中文兜底，不能在 English 模式直接透传。
     return switch (kind) {
       'builtin' => L10n.t('内置', 'Built-in'),
       'local' => L10n.t('本地', 'Local'),
       'git' => 'Git',
       'registry' => L10n.t('配置渠道', 'Configured source'),
-      _ => L10n.t('未知', 'Unknown'),
+      'entry' => L10n.t('配置条目', 'Configured entry'),
+      _ => label.isNotEmpty ? label : L10n.t('未知', 'Unknown'),
     };
   }
 }
@@ -44,11 +45,14 @@ class PluginHealth {
   bool get isOk => state == 'ok';
   bool get isFailed => state == 'failed';
   bool get isDisabled => state == 'disabled';
+  bool get isStarting => state == 'starting';
+  bool get isUnknown => state == 'unknown';
 
   String get label => switch (state) {
     'ok' => L10n.t('运行中', 'Running'),
     'disabled' => L10n.t('已停用', 'Disabled'),
     'failed' => L10n.t('异常', 'Error'),
+    'starting' => L10n.t('启动中', 'Starting'),
     _ => L10n.t('未知', 'Unknown'),
   };
 
@@ -61,6 +65,10 @@ class PluginHealth {
         return L10n.t('与当前 DSH 版本不兼容', 'Incompatible with this DSH version');
       case 'runtime-start-failed':
         return L10n.t('运行期启动失败', 'Failed to start');
+      case 'runtime-starting':
+        return L10n.t('宿主正在启动该插件', 'The host is starting this plugin');
+      case 'runtime-unknown':
+        return L10n.t('宿主未提供运行态', 'The host did not report runtime state');
       case 'unsupported-platform':
         return L10n.t('当前平台不支持', 'Unsupported platform');
       case 'operation-error':
@@ -74,17 +82,30 @@ class PluginHealth {
 }
 
 class PluginCompatibility {
-  final bool ok;
+  /// `ok` / `incompatible` / `unknown`（宿主未给出可判定的兼容事实）。
+  final String state;
   final String requirements;
-  const PluginCompatibility({this.ok = true, this.requirements = ''});
+  const PluginCompatibility({this.state = 'unknown', this.requirements = ''});
 
   factory PluginCompatibility.fromJson(Object? json) {
     if (json is! Map) return const PluginCompatibility();
+    final raw = json['state'];
+    final state = raw is String && raw.isNotEmpty
+        ? raw
+        : json['ok'] == true
+        ? 'ok'
+        : json['ok'] == false
+        ? 'incompatible'
+        : 'unknown';
     return PluginCompatibility(
-      ok: json['ok'] != false,
+      state: state,
       requirements: (json['requirements'] as String?)?.trim() ?? '',
     );
   }
+
+  bool get ok => state == 'ok';
+  bool get isIncompatible => state == 'incompatible';
+  bool get isUnknown => state == 'unknown';
 }
 
 class PluginInfo {
@@ -141,7 +162,7 @@ class PluginInfo {
     return name.isNotEmpty ? name : packageName;
   }
 
-  bool get needsAttention => health.isFailed || !compatibility.ok;
+  bool get needsAttention => health.isFailed || compatibility.isIncompatible;
 }
 
 class PluginInventoryHost {
@@ -162,12 +183,20 @@ class PluginInventoryHost {
 
 class PluginInventory {
   final bool supported;
+
+  /// 宿主两侧（bundle 清单 + 运行期 plugin entries）都成功读取才为 true。
+  final bool complete;
+
+  /// 部分数据可用，但清单可能缺少独立 plugin entry（不能宣称完整）。
+  final bool degraded;
   final String reason;
   final PluginInventoryHost host;
   final List<PluginInfo> plugins;
 
   const PluginInventory({
     this.supported = false,
+    this.complete = false,
+    this.degraded = false,
     this.reason = '',
     this.host = const PluginInventoryHost(),
     this.plugins = const [],
@@ -179,8 +208,13 @@ class PluginInventory {
     for (final row in (json['plugins'] as List? ?? const [])) {
       plugins.add(PluginInfo.fromJson(row));
     }
+    final supported = json['supported'] == true;
     return PluginInventory(
-      supported: json['supported'] == true,
+      supported: supported,
+      complete: json.containsKey('complete')
+          ? json['complete'] == true
+          : supported,
+      degraded: json['degraded'] == true,
       reason: (json['reason'] as String?)?.trim() ?? '',
       host: PluginInventoryHost.fromJson(json['host']),
       plugins: plugins,
@@ -189,6 +223,8 @@ class PluginInventory {
 
   factory PluginInventory.unsupported(String reason) =>
       PluginInventory(supported: false, reason: reason);
+
+  bool get isPartial => degraded || (supported && !complete);
 
   int get runningCount =>
       plugins.where((p) => p.enabled && p.health.isOk).length;

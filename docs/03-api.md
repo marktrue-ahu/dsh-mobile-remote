@@ -1469,24 +1469,27 @@ POST 请求体：`{"sessionId","repositoryId","tips":[...],"limit"?,"snapshotId"
 {
   "ok": true,
   "supported": true,
+  "complete": true,
+  "degraded": false,
   "reason": "",
   "host": { "id": "<宿主稳定身份>", "pluginVersion": "3.3.0" },
   "plugins": [{
     "id": "@scope/pkg", "name": "@scope/pkg", "title": { "zh": "显示名", "en": "Display" },
     "description": null, "packageName": "@scope/pkg", "version": "1.2.3",
-    "source": { "kind": "builtin|local|git|registry|unknown", "label": "内置|本地|Git|配置渠道|未知" },
-    "enabled": true, "current": true,
-    "health": { "state": "ok|disabled|failed", "reasonCode": "incompatible-version|runtime-start-failed|…" },
-    "compatibility": { "ok": false, "requirements": "engines.dsh: >=0.3.0" },
+    "source": { "kind": "builtin|local|git|registry|entry|unknown", "label": "内置|本地|Git|配置渠道|配置条目|未知" },
+    "enabled": true, "current": true, "independent": false,
+    "health": { "state": "ok|starting|disabled|failed|unknown", "reasonCode": "runtime-starting|runtime-unknown|runtime-start-failed|…" },
+    "compatibility": { "ok": null, "state": "ok|incompatible|unknown", "requirements": "engines.dsh: >=0.3.0" },
     "updateAvailable": null,
     "management": { "readOnly": true }
   }]
 }
 ```
 
-- **旧宿主/缺能力**：HTTP 200 + `supported:false`、`reason:"host-plugin-manager-unavailable"`、`plugins:[]`；旧插件没有该路由时 App 按 404 降级。**不伪造空清单**。
-- **失败**：`503 plugin-inventory-unavailable`（不返回内部异常原文/路径）。
-- 运行期项失败（`fiberPhase:"failed"`）计入 `health.state:"failed"`、`reasonCode:"runtime-start-failed"`；不返回 `diagnostic` 原文。
-- `compatibility.ok=false` 时 `requirements` 提供宿主报告的未满足条件（≤4 项）。
-- `current=true` 表示该 bundle 是当前手机连接所依赖的插件；不提供任何安装/升级/卸载/启停/重启字段或方法。
+- **清单完整性**：`supported=true` 仅当宿主 `pluginManager.listBundles()` 与 `pluginInventory.list()` **两侧都成功**；`complete` 同义。任一侧不可得时 `supported=false`、`degraded=true`、`reason` 为 `runtime-inventory-unavailable` 或 `host-plugin-manager-unavailable`，仍可返回另一侧的部分行，但**不冒充完整清单**。旧插件没有该路由时 App 按 404 整页降级。
+- **bundle 与独立 plugin entry**：bundle 行来自 profile/安装的 bundle 包清单；独立配置/非 bundle-owned 的 plugin entry 来自运行期 snapshot，按 `entryId`（并以 `moduleName` 兜底）去重后合并，`independent=true`、`source.kind="entry"`、无版本。
+- **健康事实**：`enabled` 只是配置事实；`ok` 仅在**所有 bundle rows 都匹配且 fiberPhase 全为 active**（或独立 entry active）时给出。缺失运行期服务/抛错/空 entries/无匹配（`runtime-unknown`）、`pending|loading|unloading`（`starting`）、`failed`（`failed`）都不得冒充健康。不返回 `diagnostic` 原文。
+- **兼容事实**：只有宿主明确报告 `incompatible-version` 才是 `state:"incompatible"`（`ok:false`，`requirements` ≤4 项）；其余无判定信息一律 `state:"unknown"`、`ok:null`，不得 `ok:true`。
+- **来源本地化**：服务端 `label` 是中文兜底；App 对已知 `kind` 按当前语言映射，未知 kind 才回退 `label`。
+- `current=true` 表示该插件是当前手机连接所依赖的插件；不提供任何安装/升级/卸载/启停/重启字段或方法。
 - `updateAvailable` 固定 `null`：更新候选检查属于 #146/#147，本端点不触网检查 registry。

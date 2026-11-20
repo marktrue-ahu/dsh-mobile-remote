@@ -87,7 +87,7 @@ test("已安装清单：版本/来源/启停/健康/兼容与当前连接标记�
 			this.calls.push("listBundles");
 			return [
 				bundle("@marktrue/dsh-mobile-remote", {
-					version: "3.3.0", official: true, availability: "installation", rows: [{ rowId: "mobile-remote", moduleName: "@marktrue/dsh-mobile-remote" }],
+					version: "3.3.0", official: true, availability: "installation", rows: [{ rowId: "mobile-remote", moduleName: "@marktrue/dsh-mobile-remote", entryId: "entry-mobile" }],
 					meta: { title: { zh: "移动端", en: "Mobile Remote" } },
 				}),
 				bundle("dsh-extra", { version: "2.0.0", source: "github:foo/bar#0123456789012345678901234567890123456789", enabled: false }),
@@ -97,7 +97,10 @@ test("已安装清单：版本/来源/启停/健康/兼容与当前连接标记�
 		async updateBundle() { throw new Error("read-only endpoint must not call updateBundle"); },
 	};
 	const pluginInventory = {
-		async list() { return { managementAvailable: true, entries: [{ entryId: "entry-bad", moduleName: "dsh-bad", enabled: true, fiberPhase: "failed", diagnostic: "/home/secret path" }] }; },
+		async list() { return { managementAvailable: true, entries: [
+			{ entryId: "entry-mobile", moduleName: "@marktrue/dsh-mobile-remote", enabled: true, fiberPhase: "active" },
+			{ entryId: "entry-bad", moduleName: "dsh-bad", enabled: true, fiberPhase: "failed", diagnostic: "/home/secret path" },
+		] }; },
 	};
 	const h = createHarness({ pluginManager, pluginInventory });
 	try {
@@ -111,6 +114,7 @@ test("已安装清单：版本/来源/启停/健康/兼容与当前连接标记�
 		assert.equal(mobile.current, true);
 		assert.equal(mobile.enabled, true);
 		assert.equal(mobile.health.state, "ok");
+		assert.equal(mobile.compatibility.state, "unknown");
 		assert.deepEqual(mobile.source, { kind: "builtin", label: "内置" });
 		const extra = body.plugins.find((p) => p.packageName === "dsh-extra");
 		assert.equal(extra.enabled, false);
@@ -120,6 +124,7 @@ test("已安装清单：版本/来源/启停/健康/兼容与当前连接标记�
 		assert.equal(bad.health.state, "failed");
 		assert.equal(bad.health.reasonCode, "incompatible-version");
 		assert.equal(bad.compatibility.ok, false);
+		assert.equal(bad.compatibility.state, "incompatible");
 		assert.match(bad.compatibility.requirements, /engines\.dsh/);
 		// 只读：没有任何写能力/写动作字段；诊断原文（含本机路径）不外泄。
 		for (const p of body.plugins) {
@@ -160,5 +165,170 @@ test("方法约束与 HEAD：写方法 405，HEAD 无 body", async () => {
 		const head = await call(h.route, "/m/api/plugin-inventory", "HEAD");
 		assert.equal(head.status, 200);
 		assert.equal(head.body, "");
+	} finally { h.clean(); }
+});
+
+const enabledBundle = (name, entryIds) => bundle(name, {
+	rows: entryIds.map((entryId, index) => ({ rowId: `${name}-${index}`, moduleName: name, ...(entryId ? { entryId } : {}) })),
+});
+
+test("健康事实：缺 pluginInventory 服务/抛错/空 entries/无匹配 → unknown，不得冒充 ok", async () => {
+	const cases = [
+		{ name: "缺服务", inventory: undefined, expect: "unknown" },
+		{ name: "服务抛错", inventory: { async list() { throw new Error("boom"); } }, expect: "unknown" },
+		{ name: "空 entries", inventory: { async list() { return { entries: [] }; } }, expect: "unknown" },
+		{ name: "rows 无匹配", inventory: { async list() { return { entries: [{ entryId: "other", fiberPhase: "active" }] }; } }, expect: "unknown" },
+	];
+	for (const item of cases) {
+		const h = createHarness({
+			pluginManager: { async listBundles() { return [enabledBundle("dsh-a", ["entry-a"])]; } },
+			pluginInventory: item.inventory,
+		});
+		try {
+			const { status, body } = await call(h.route);
+			assert.equal(status, 200, item.name);
+			assert.equal(body.plugins[0].health.state, item.expect, item.name);
+			assert.notEqual(body.plugins[0].health.state, "ok", item.name);
+		} finally { h.clean(); }
+	}
+});
+
+test("健康事实：pending/loading/unloading → starting；fiberPhase=null → unknown", async () => {
+	const phases = ["pending", "loading", "unloading"];
+	for (const phase of phases) {
+		const h = createHarness({
+			pluginManager: { async listBundles() { return [enabledBundle(`dsh-${phase}`, [`entry-${phase}`])]; } },
+			pluginInventory: { async list() { return { entries: [{ entryId: `entry-${phase}`, fiberPhase: phase }] }; } },
+		});
+		try {
+			const { body } = await call(h.route);
+			assert.equal(body.plugins[0].health.state, "starting", phase);
+		} finally { h.clean(); }
+	}
+
+	const h = createHarness({
+		pluginManager: { async listBundles() { return [enabledBundle("dsh-null", ["entry-null"])]; } },
+		pluginInventory: { async list() { return { entries: [{ entryId: "entry-null", fiberPhase: null }] }; } },
+	});
+	try {
+		const { body } = await call(h.route);
+		assert.equal(body.plugins[0].health.state, "unknown");
+	} finally { h.clean(); }
+});
+
+test("兼容性：无宿主 incompatibility 证据 → unknown；incompatible-version → 明确 false", async () => {
+	const h = createHarness({
+		pluginManager: {
+			async listBundles() {
+				return [
+					enabledBundle("dsh-ok", ["entry-ok"]),
+					enabledBundle("dsh-old", ["entry-old"]),
+				];
+			},
+		},
+		pluginInventory: { async list() { return { entries: [{ entryId: "entry-ok", fiberPhase: "active" }, { entryId: "entry-old", fiberPhase: "active" }] }; } },
+	});
+	try {
+		const { body } = await call(h.route);
+		assert.equal(body.plugins[0].compatibility.state, "unknown");
+		assert.equal(body.plugins[0].compatibility.ok, null);
+	} finally { h.clean(); }
+
+	const h2 = createHarness({
+		pluginManager: {
+			async listBundles() {
+				return [bundle("dsh-bad", {
+					errors: undefined,
+					error: { code: "incompatible-version", incompatible: [{ name: "dsh-bad", version: "0.1.0", runtimeVersion: "0.2.2", requirements: { "engines.dsh": ">=0.3.0" } }] },
+					enabled: true,
+				})];
+			},
+		},
+	});
+	try {
+		const { body } = await call(h2.route);
+		assert.equal(body.plugins[0].compatibility.state, "incompatible");
+		assert.equal(body.plugins[0].compatibility.ok, false);
+		assert.match(body.plugins[0].compatibility.requirements, /engines\.dsh/);
+	} finally { h2.clean(); }
+});
+
+test("完整清单：合并独立 plugin entry；与 bundle 重叠按 entryId/moduleName 去重", async () => {
+	const h = createHarness({
+		pluginManager: {
+			async listBundles() {
+				return [
+					enabledBundle("dsh-bundle", ["entry-shared"]),
+					bundle("dsh-empty-bundle", { rows: [] }),
+				];
+			},
+		},
+		pluginInventory: {
+			async list() {
+				return { entries: [
+					{ entryId: "entry-shared", moduleName: "dsh-bundle", enabled: true, fiberPhase: "active" },
+					{ entryId: "entry-standalone", moduleName: "dsh-standalone", enabled: true, fiberPhase: "active" },
+					{ entryId: "entry-failed", moduleName: "dsh-independent-failed", enabled: true, fiberPhase: "failed", diagnostic: "/home/x" },
+				] };
+			},
+		},
+	});
+	try {
+		const { body } = await call(h.route);
+		assert.equal(body.supported, true);
+		assert.equal(body.complete, true);
+		assert.equal(body.plugins.length, 4);
+		const standalone = body.plugins.find((p) => p.packageName === "dsh-standalone");
+		assert.equal(standalone.independent, true);
+		assert.deepEqual(standalone.source, { kind: "entry", label: "配置条目" });
+		assert.equal(standalone.version, "");
+		assert.equal(standalone.health.state, "ok");
+		assert.equal(body.plugins.filter((p) => p.packageName === "dsh-bundle").length, 1, "共享 entry 不得重复");
+		const failedEntry = body.plugins.find((p) => p.packageName === "dsh-independent-failed");
+		assert.equal(failedEntry.health.state, "failed");
+		assert.equal(failedEntry.compatibility.state, "unknown");
+		assert.equal(JSON.stringify(body).includes("/home/x"), false);
+	} finally { h.clean(); }
+});
+
+test("完整清单：任一侧不可得 → supported=false/degraded，不冒充完整", async () => {
+	const bundlesOnly = createHarness({
+		pluginManager: { async listBundles() { return [enabledBundle("dsh-b", ["entry-b"])]; } },
+		pluginInventory: { async list() { throw new Error("runtime boom"); } },
+	});
+	try {
+		const { status, body } = await call(bundlesOnly.route);
+		assert.equal(status, 200);
+		assert.equal(body.supported, false);
+		assert.equal(body.complete, false);
+		assert.equal(body.degraded, true);
+		assert.equal(body.reason, "runtime-inventory-unavailable");
+		assert.equal(body.plugins.length, 1, "bundle 行仍可作为部分数据");
+		assert.equal(body.plugins[0].health.state, "unknown");
+	} finally { bundlesOnly.clean(); }
+
+	const entriesOnly = createHarness({
+		pluginInventory: { async list() { return { entries: [{ entryId: "entry-only", moduleName: "dsh-only", enabled: true, fiberPhase: "active" }] }; } },
+	});
+	try {
+		const { body } = await call(entriesOnly.route);
+		assert.equal(body.supported, false);
+		assert.equal(body.reason, "host-plugin-manager-unavailable");
+		assert.equal(body.plugins.length, 1);
+		assert.equal(body.plugins[0].packageName, "dsh-only");
+	} finally { entriesOnly.clean(); }
+});
+
+test("完整清单：两侧都成功但为空 → supported=true（合法空清单，不是降级）", async () => {
+	const h = createHarness({
+		pluginManager: { async listBundles() { return []; } },
+		pluginInventory: { async list() { return { entries: [] }; } },
+	});
+	try {
+		const { body } = await call(h.route);
+		assert.equal(body.supported, true);
+		assert.equal(body.complete, true);
+		assert.equal(body.degraded, false);
+		assert.deepEqual(body.plugins, []);
 	} finally { h.clean(); }
 });

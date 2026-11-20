@@ -100,20 +100,35 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
         onRetry: _refresh,
       );
     }
-    if (!inventory.supported) {
-      return _UnsupportedState(onRetry: _refresh);
+    if (!inventory.supported && inventory.plugins.isEmpty) {
+      return _UnsupportedState(
+        onRetry: _refresh,
+        error: _error,
+        loading: _loading,
+      );
     }
     return _buildList(context, inventory);
   }
 
   Widget _buildList(BuildContext context, PluginInventory inventory) {
     final plugins = inventory.plugins;
+    final partial = inventory.isPartial;
     return RefreshIndicator(
       onRefresh: _refresh,
       child: ListView(
         padding: const EdgeInsets.fromLTRB(16, 14, 16, 24),
         children: [
           _HostContextCard(store: widget.store, host: inventory.host),
+          if (partial)
+            _InlineNotice(
+              icon: Icons.info_outline,
+              text: L10n.t(
+                '清单不完整：宿主运行态或独立插件列表不可用，以下可能缺少条目。',
+                'Incomplete list: the host runtime or standalone plugins are unavailable; some entries may be missing.',
+              ),
+              actionLabel: L10n.t('重试', 'Retry'),
+              onAction: _refresh,
+            ),
           if (_error != null)
             _InlineNotice(
               icon: Icons.warning_amber_outlined,
@@ -304,21 +319,24 @@ class _PluginRow extends StatelessWidget {
       : 'v${plugin.version}';
 
   String _statusLabel() {
-    if (!plugin.compatibility.ok) return L10n.t('不兼容', 'Incompatible');
+    if (plugin.compatibility.isIncompatible) {
+      return L10n.t('不兼容', 'Incompatible');
+    }
     return plugin.health.label;
   }
 
   Color _statusColor(BuildContext context) {
     final ink3 = DshColors.ink3(context);
-    if (!plugin.compatibility.ok || plugin.health.isFailed) {
+    if (plugin.compatibility.isIncompatible || plugin.health.isFailed) {
       return DshColors.danger(context);
     }
     if (plugin.health.isOk) return DshColors.ok(context);
+    if (plugin.health.isStarting) return DshColors.warn(context);
     return ink3;
   }
 
   String? _reasonLine() {
-    if (!plugin.compatibility.ok) {
+    if (plugin.compatibility.isIncompatible) {
       final req = plugin.compatibility.requirements;
       return req.isEmpty
           ? L10n.t('与当前 DSH 版本不兼容', 'Incompatible with this DSH version')
@@ -370,10 +388,12 @@ class _PluginRow extends StatelessWidget {
         L10n.t('兼容性', 'Compatibility'),
         plugin.compatibility.ok
             ? L10n.t('兼容', 'Compatible')
-            : L10n.t(
+            : plugin.compatibility.isIncompatible
+            ? L10n.t(
                 '不兼容${plugin.compatibility.requirements.isEmpty ? '' : '（${plugin.compatibility.requirements}）'}',
                 'Incompatible${plugin.compatibility.requirements.isEmpty ? '' : ' (${plugin.compatibility.requirements})'}',
-              ),
+              )
+            : L10n.t('未知（宿主未提供判定）', 'Unknown (not reported by the host)'),
       ),
       if (plugin.current)
         fact(L10n.t('当前连接', 'Current connection'), L10n.t('是', 'Yes')),
@@ -694,7 +714,13 @@ class _FailureState extends StatelessWidget {
 
 class _UnsupportedState extends StatelessWidget {
   final VoidCallback onRetry;
-  const _UnsupportedState({required this.onRetry});
+  final String? error;
+  final bool loading;
+  const _UnsupportedState({
+    required this.onRetry,
+    this.error,
+    this.loading = false,
+  });
   @override
   Widget build(BuildContext context) => Center(
     child: Padding(
@@ -729,10 +755,24 @@ class _UnsupportedState extends StatelessWidget {
               color: DshColors.ink3(context),
             ),
           ),
+          if (error != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              L10n.t('重新检测失败：$error', 'Check failed: $error'),
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 12, color: DshColors.danger(context)),
+            ),
+          ],
           const SizedBox(height: 10),
           OutlinedButton(
-            onPressed: onRetry,
-            child: Text(L10n.t('重新检测', 'Check again')),
+            onPressed: loading ? null : onRetry,
+            child: loading
+                ? const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : Text(L10n.t('重新检测', 'Check again')),
           ),
         ],
       ),
