@@ -69,7 +69,9 @@ class _Backend {
     }
     if (request.url.path == '/m/api/files') {
       fileRequests.add(path);
-      final bytes = contents[path];
+      // GitLab #16：新调用传会话 cwd 相对路径；夹具内容仍按 /work 绝对路径存储。
+      final resolved = path.startsWith('/') ? path : '/work/$path';
+      final bytes = contents[resolved];
       if (bytes == null) return http.Response('not found', 404);
       return http.Response.bytes(bytes, 200);
     }
@@ -295,7 +297,7 @@ void main() {
 
     expect(c.stage, BrowseStage.preview);
     expect(b.fileRequests.length, before + 1);
-    expect(b.fileRequests.last, '/work/README.md');
+    expect(b.fileRequests.last, 'README.md');
   });
 
   test('文件不存在时给出原因且不崩', () async {

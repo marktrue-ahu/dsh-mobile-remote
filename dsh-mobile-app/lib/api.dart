@@ -901,14 +901,21 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
   );
 
   /// `/api/files?path=` 的前缀读取入口（保留既有签名/语义）。
+  ///
+  /// [sessionId] 非空时服务端按该会话 cwd 校验相对路径（GitLab #16）；旧调用
+  /// 仍可省略，服务端按已注册工作区做兼容收紧。
   Future<DownloadPrefix> downloadFilePrefix(
     String remotePath,
     int maxBytes, {
+    String? sessionId,
     Duration connectTimeout = const Duration(seconds: 15),
     Duration idleTimeout = const Duration(seconds: 30),
     http.Client? downloadClient,
   }) => _downloadPrefixFrom(
-    _uri('/api/files?path=${Uri.encodeQueryComponent(remotePath)}'),
+    _uri(
+      '/api/files?path=${Uri.encodeQueryComponent(remotePath)}'
+      '${sessionId == null || sessionId.isEmpty ? '' : '&sessionId=${Uri.encodeQueryComponent(sessionId)}'}',
+    ),
     maxBytes,
     connectTimeout: connectTimeout,
     idleTimeout: idleTimeout,

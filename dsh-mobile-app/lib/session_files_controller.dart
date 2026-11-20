@@ -270,12 +270,23 @@ class SessionFilesController extends ChangeNotifier {
   /// 打开文件预览。
   Future<void> openFile(String name) async {
     final path = joinBrowsePath(currentPath, name, sep);
+    final relative = relativePathWithinRoot(root, path);
+    if (relative == null) {
+      stage = BrowseStage.error;
+      errorReason = '无法打开文件：路径不在会话工作目录内';
+      notifyListeners();
+      return;
+    }
     stage = BrowseStage.loading;
     // 先发布 previewPath：加载态也要能显示 in-content 返回按钮与历史入口。
     previewPath = path;
     notifyListeners();
     try {
-      final prefix = await _api.downloadFilePrefix(path, kPreviewByteLimit);
+      final prefix = await _api.downloadFilePrefix(
+        relative,
+        kPreviewByteLimit,
+        sessionId: sessionId,
+      );
       final bytes = prefix.bytes;
       final encoding = detectPreviewEncoding(bytes);
       if (encoding == PreviewEncoding.gb18030) {
