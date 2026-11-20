@@ -2015,6 +2015,11 @@ class _ChatScreenState extends State<ChatScreen> {
       AppLog.instance.log(
         'Chat: 历史加载成功 ${events.length} 条${reset ? '（重同步）' : ''}',
       );
+      // issue #129 review(P2)：初始打开时先捕获请求期间的 live 缓冲。durable 回放
+      // （tail:true）可能因快照里的 assistant/message/turn/end 清掉它们；若快照并未
+      // 包含同一段文本，下面必须恢复，否则已显示的流式正文会凭空消失。
+      final liveDraftBefore = _draft;
+      final liveStreamingBefore = _streaming;
       // v3.1.6（app-audit ②）：守卫之后才写降级标记——过期响应（会话切换/重同步重叠）此前
       // 也会改写横幅状态：`_historyDegraded` 是赋值语义，过期页能把已置位的提示抹回 false。
       if (!mounted || generation != _loadGeneration || id != _mySessionId) {
@@ -2103,11 +2108,17 @@ class _ChatScreenState extends State<ChatScreen> {
         _transientFrameKeys.clear();
         _debugPreviewCache.clear(); // 重建后 rawData 全变，旧预览缓存无意义
         // issue #70：按新表面重建 = 重新进入会话，流式思考缓冲与 provisional 展开态一并失效。
-        _liveReasoning.clear();
-        _liveReasoningRevision.value++;
-        _provisionalExpansions.clear();
-        _draft = '';
-        _streaming = false;
+        // issue #129 review(P2)：**初始打开**（reset=false）时，请求期间 SSE 可能已经送来
+        // live-chunk/reasoning（只进 `_draft`/`_liveReasoning`，尚无持久行）——不能无条件
+        // 清掉，否则成功返回空页/失败时会把已显示的流式正文整页消失。reset/compaction
+        // 仍按“重新进入会话”的既有语义清空。
+        if (reset) {
+          _liveReasoning.clear();
+          _liveReasoningRevision.value++;
+          _provisionalExpansions.clear();
+          _draft = '';
+          _streaming = false;
+        }
         // v3.1.4（issue #12 姊妹需求）：任务清单按**时间正序**折叠一次（最新覆盖、turn/start 清空），
         // 与内核投影一致——历史事件在下面按倒序入列渲染，顺序敏感的状态必须单独折叠。
         var foldedTodos = <Map<String, dynamic>>[];
@@ -2121,10 +2132,20 @@ class _ChatScreenState extends State<ChatScreen> {
           }
         }
         _todos = foldedTodos;
-        // 最新在前（渲染时倒序，最新位于列表底部）
+        // 最新在前（渲染时倒序，最新位于列表底部）。
+        // issue #129 review(P2)：`tail:true` 保持既有语义（历史 chunk 仍参与工具名兜底等）；
+        // 初始打开时若 durable 回放误清了请求期间保留的流式草稿，由下方
+        // `_reconcileLiveBuffersWithHistory` 按“durable 是否已包含流式文本”恢复/去重。
         for (final ev in events.reversed) {
           if (ev.seq != null && ev.seq! > fetchedLast) continue;
           _appendEvent(ev, history: true, tail: true);
+        }
+        if (!reset) {
+          _reconcileLiveBuffersWithHistory(
+            events,
+            draftBefore: liveDraftBefore,
+            streamingBefore: liveStreamingBefore,
+          );
         }
         // v3.1.4（issue #13）：跟踪字段按**时间正序**重算——历史是倒序入列的，
         // 沿用循环里的赋值会得到"最旧一条"，导致轮次兜底误判。
@@ -2238,6 +2259,64 @@ class _ChatScreenState extends State<ChatScreen> {
       _draft.isNotEmpty ||
       _streaming ||
       (_liveReasoning.current?.text.isNotEmpty ?? false);
+
+  /// issue #129 review(P2)：初始 history 重建后，用 durable 快照对保留的 live 缓冲去重。
+  ///
+  /// 初始打开期间 SSE 可能已送来 `assistant/live-chunk`（→ `_draft`）或 reasoning delta
+  /// （→ `_liveReasoning`），它们没有持久行，重放历史不会重新生成。这里只在**durable
+  /// 快照已经包含同一段内容**时丢弃 live 副本，避免：
+  /// - 空页/失败把流式正文清掉（保留）；
+  /// - 最终 assistant/message 已落库却又多显示一条草稿/思考（去重）。
+  ///
+  /// 按文本包含判断而不是 turn/step 水位：快照里可能有同 turn 更早 step 的 assistant/message
+  /// （step 不单调），按水位会误关仍在流的 provisional。
+  void _reconcileLiveBuffersWithHistory(
+    List<ChatEvent> events, {
+    required String draftBefore,
+    required bool streamingBefore,
+  }) {
+    final reasoning = _liveReasoning.current;
+    final draft = draftBefore.trim();
+    var draftSettled = draft.isEmpty;
+    var reasoningSettled = false;
+    for (final ev in events) {
+      if (ev.type == 'turn/end') {
+        final turn = (ev.data?['turn'] as num?)?.toInt();
+        if (reasoning != null && turn == reasoning.turn) {
+          reasoningSettled = true;
+          // 同一轮的 turn/end 也是当前草稿的终结水位（流式已结束）。
+          if (!draftSettled) draftSettled = true;
+        }
+        continue;
+      }
+      if (ev.type != 'assistant/message') continue;
+      final body = (ev.data?['text'] as String? ?? '').trim();
+      final durableReasoning = (ev.data?['reasoning'] as String? ?? '').trim();
+      if (!draftSettled && body.contains(draft)) draftSettled = true;
+      if (reasoning != null &&
+          durableReasoning.isNotEmpty &&
+          durableReasoning.contains(reasoning.text.trim())) {
+        reasoningSettled = true;
+      }
+    }
+    if (draftSettled) {
+      _draft = '';
+      _streaming = false;
+    } else if (_draft.isEmpty && draft.isNotEmpty) {
+      // 回放被快照里**无关**的 assistant/message/turn/end 清掉了草稿：快照没有包含
+      // 同一段文本 → 恢复请求期间的 live 缓冲（避免流式正文凭空消失）。
+      _draft = draftBefore;
+      _streaming = streamingBefore;
+    } else if (_draft.isEmpty && _streaming != streamingBefore) {
+      _streaming = streamingBefore;
+    }
+    if (reasoningSettled && reasoning != null) {
+      _liveReasoning.clear();
+      _liveReasoningRevision.value++;
+      _provisionalExpansions.clear();
+      _invalidateProcessPlan();
+    }
+  }
 
   /// issue #129：首次加载成功、内容挂载后的帧后强制跟随一次。
   ///

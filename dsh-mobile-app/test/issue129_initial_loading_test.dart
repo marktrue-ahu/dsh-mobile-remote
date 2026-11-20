@@ -317,6 +317,11 @@ void main() {
       final resetCompleter = Completer<http.Response>();
       var calls = 0;
       final backend = _Backend((request) {
+        final query = request.url.queryParameters;
+        // catchup（after）与分页（before）不属于 reset：直接给空页，避免和 reset completer 混用。
+        if (query.containsKey('after') || query.containsKey('before')) {
+          return Future.value(_page(const []));
+        }
         calls++;
         if (calls == 1) {
           return Future.value(
@@ -357,6 +362,24 @@ void main() {
         find.text('重同步前的用户消息'),
         findsOneWidget,
         reason: '重同步期间保留旧时间线，避免整页闪动',
+      );
+
+      // 区分“无游标的 reset 请求”与 catchup：reset 必须真的发出第二次整页请求。
+      final plainRequests = backend.historyRequests
+          .where(
+            (request) =>
+                !request.url.queryParameters.containsKey('after') &&
+                !request.url.queryParameters.containsKey('before'),
+          )
+          .toList();
+      expect(
+        plainRequests,
+        hasLength(2),
+        reason: '初始打开 1 次 + turn/end 触发的 reset 1 次（均无 after/before）',
+      );
+      expect(
+        plainRequests.every((r) => r.url.queryParameters['limit'] == '50'),
+        isTrue,
       );
 
       resetCompleter.complete(
@@ -490,8 +513,88 @@ void main() {
       expect(find.byKey(_failedKey), findsNothing);
       expect(find.textContaining('流式正文即时可见'), findsWidgets);
 
+      // review P2 复现：history 成功返回**空页**时，请求期间的流式正文不能被清掉。
+      // 保留草稿时会渲染流式光标（持续动画），不能用 pumpAndSettle；用固定帧推进。
       completer.complete(_page(const []));
+      await tester.pump(const Duration(milliseconds: 350));
+      for (var i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(find.byKey(_loadingKey), findsNothing);
+      expect(
+        find.byKey(_emptyKey),
+        findsNothing,
+        reason: '已有流式正文时不得切回“这个会话还没有消息”',
+      );
+      expect(
+        find.textContaining('流式正文即时可见'),
+        findsWidgets,
+        reason: '空页成功不得清掉请求期间保留的 live 草稿',
+      );
+
+      // 之后继续来 chunk 仍要更新同一段草稿。
+      store.injectFrame({
+        'type': 'session/event',
+        'sessionId': _session,
+        'event': _ev('assistant/live-chunk', 2, {
+          'turn': 1,
+          'step': 1,
+          'text': '，继续流式更新',
+        }),
+      });
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(find.textContaining('继续流式更新'), findsWidgets);
+      expect(tester.takeException(), isNull);
+      await tester.pump(const Duration(seconds: 1));
+
+      // 初始 history 请求必须是无 after/before 的整页请求（区分 catchup / reset）。
+      final first = backend.historyRequests.first.url.queryParameters;
+      expect(first.containsKey('after'), isFalse);
+      expect(first.containsKey('before'), isFalse);
+    });
+    testWidgets('durable 最终消息已包含流式文本：去重，不重复显示', (tester) async {
+      final completer = Completer<http.Response>();
+      final backend = _Backend((_) => completer.future);
+      final store = await _pumpChat(tester, backend: backend);
+
+      store.injectFrame({
+        'type': 'session/event',
+        'sessionId': _session,
+        'event': _ev('assistant/live-chunk', 1, {
+          'turn': 1,
+          'step': 1,
+          'text': '完整回复正文',
+        }),
+      });
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(find.textContaining('完整回复正文'), findsWidgets);
+
+      completer.complete(
+        _page([
+          _ev('turn/start', 1, {'turn': 1}),
+          _ev('user/message', 2, {
+            'messageId': 'u1',
+            'text': '开始任务',
+            'sourceKind': 'user',
+          }),
+          _ev('assistant/message', 3, {
+            'turn': 1,
+            'step': 1,
+            'messageId': 'a1',
+            'text': '完整回复正文',
+          }),
+        ]),
+      );
       await _settle(tester);
+
+      expect(
+        find.textContaining('完整回复正文'),
+        findsOneWidget,
+        reason: 'durable 消息已包含同一段文本时，live 草稿必须去重而不是重复显示',
+      );
+      expect(find.byKey(_emptyKey), findsNothing);
       expect(tester.takeException(), isNull);
     });
     testWidgets('成功加载有内容的会话：退出三态并渲染正文', (tester) async {
