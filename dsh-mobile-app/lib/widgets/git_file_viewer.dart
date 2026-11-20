@@ -934,9 +934,10 @@ class _GitFileViewerState extends State<GitFileViewer>
     return widest;
   }
 
-  /// 切换自动换行：记录当前顶部行 → 重建 → 帧末恢复该行并清掉横向偏移。
+  /// 切换自动换行：记录视口顶部锚点（源行 + 行内字符/偏移）→ 重建 →
+  /// 帧末恢复同一行内位置。单行超长内容不能只记行号，否则会跳回行首。
   void _toggleWrap() {
-    final anchor = _firstVisibleSourceLine() ?? 0;
+    final anchor = _captureSourceAnchor();
     final token = ++_wrapToggleToken;
     final turningOn = !_wrap;
     if (turningOn) {
@@ -952,12 +953,12 @@ class _GitFileViewerState extends State<GitFileViewer>
         _flingCtrl.stop();
         _hScroll.jumpTo(0);
       }
-      _restoreSourceTopLine(anchor);
+      _restoreSourceAnchor(anchor);
     });
   }
 
-  /// 当前内容列表里第一个可见行的下标；找不到（未布局）返回 null。
-  int? _firstVisibleSourceLine() {
+  /// 当前内容列表里第一个可见行及其在列表坐标系的行顶；找不到返回 null。
+  ({int index, double rowTop})? _firstVisibleSourceRow() {
     final root = context.findRenderObject();
     if (root == null) return null;
     RenderSliverList? sliver;
@@ -983,7 +984,7 @@ class _GitFileViewerState extends State<GitFileViewer>
         if (index != null &&
             layoutOffset != null &&
             layoutOffset + child.size.height > scrollOffset) {
-          return index;
+          return (index: index, rowTop: layoutOffset);
         }
       }
       child = list.childAfter(child);
@@ -991,26 +992,115 @@ class _GitFileViewerState extends State<GitFileViewer>
     return null;
   }
 
-  /// 把 [anchor] 行恢复到列表顶部（换行开/关的行高不同，按实测行高累计）。
-  void _restoreSourceTopLine(int index) {
-    if (!_vScroll.hasClients) return;
-    final width = _lastContentWidth;
-    if (width <= 0) return;
-    final textWidth = math.max(
-      0.0,
-      width - _sourceGutterWidth(context) - _kSourceGutterGap,
-    );
-    final lineCount = _sourceLines.length;
-    if (lineCount == 0) return;
-    final anchor = math.min(math.max(0, index), lineCount - 1);
-    var offset = _kSourceListVerticalPadding.toDouble();
-    if (_wrap) {
-      offset += _wrappedHeightUpTo(anchor, textWidth);
-    } else {
-      offset += _unwrappedHeightUpTo(anchor);
+  /// 记录视口顶部的行内锚点。
+  ///
+  /// - 换行开：按折行布局取「顶部可见字符」及其在视觉行内的像素偏移；
+  /// - 换行关：按共享横向偏移取视口左缘的字符，供重新开启时定位到同一段。
+  _WrapAnchor _captureSourceAnchor() {
+    final row = _firstVisibleSourceRow();
+    if (row == null || _sourceLines.isEmpty) {
+      return const _WrapAnchor(lineIndex: 0, charOffset: 0);
     }
-    final position = _vScroll.position;
-    _vScroll.jumpTo(offset.clamp(0.0, position.maxScrollExtent).toDouble());
+    final lineIndex = math.min(row.index, _sourceLines.length - 1);
+    final text = _sourceLines[lineIndex];
+    if (text.isEmpty) {
+      return _WrapAnchor(lineIndex: lineIndex, charOffset: 0);
+    }
+    final painter = _sourceLinePainter(
+      text,
+      wrapped: _wrap,
+      textWidth: _sourceTextWidth(),
+    );
+    try {
+      if (!_wrap) {
+        final horizontal = _hScroll.value.clamp(0.0, painter.width).toDouble();
+        final position = painter.getPositionForOffset(Offset(horizontal, 0));
+        return _WrapAnchor(lineIndex: lineIndex, charOffset: position.offset);
+      }
+      final scrollOffset = _vScroll.hasClients ? _vScroll.offset : 0.0;
+      // 行顶可能在视口上方（或顶部 padding 内），夹到段落范围内。
+      final dy = (scrollOffset - row.rowTop)
+          .clamp(0.0, painter.height)
+          .toDouble();
+      final position = painter.getPositionForOffset(Offset(0, dy));
+      final caret = painter.getOffsetForCaret(position, Rect.zero);
+      return _WrapAnchor(
+        lineIndex: lineIndex,
+        charOffset: position.offset,
+        intraLineOffset: math.max(0.0, dy - caret.dy),
+      );
+    } finally {
+      painter.dispose();
+    }
+  }
+
+  /// 恢复 [_WrapAnchor]：换行关按字符换算横向偏移，换行开按字符的视觉行 +
+  /// 行内偏移恢复纵向位置；行号列始终固定。
+  void _restoreSourceAnchor(_WrapAnchor anchor) {
+    if (!_vScroll.hasClients || _sourceLines.isEmpty) return;
+    final lineIndex = math.min(
+      math.max(0, anchor.lineIndex),
+      _sourceLines.length - 1,
+    );
+    final text = _sourceLines[lineIndex];
+    final textWidth = _sourceTextWidth();
+    final painter = _sourceLinePainter(
+      text,
+      wrapped: _wrap,
+      textWidth: textWidth,
+    );
+    try {
+      final charOffset = text.isEmpty
+          ? 0
+          : math.min(math.max(0, anchor.charOffset), text.length);
+      var offset = _kSourceListVerticalPadding.toDouble();
+      if (_wrap) {
+        final caret = painter.getOffsetForCaret(
+          TextPosition(offset: charOffset),
+          Rect.zero,
+        );
+        offset += _wrappedHeightUpTo(lineIndex, textWidth);
+        offset += caret.dy;
+        // 保留切换前在视觉行内的像素位置，避免每次切换向上漂移一行。
+        offset += anchor.intraLineOffset.clamp(0.0, painter.height);
+      } else {
+        offset += _unwrappedHeightUpTo(lineIndex);
+        final caret = painter.getOffsetForCaret(
+          TextPosition(offset: charOffset),
+          Rect.zero,
+        );
+        // 关闭换行后行内纵向位置无法直接映射：把同一字符放到视图左缘，
+        // 保持横向阅读位置，绝不跳回行首。
+        _hScroll.jumpTo(caret.dx);
+      }
+      final position = _vScroll.position;
+      _vScroll.jumpTo(offset.clamp(0.0, position.maxScrollExtent).toDouble());
+    } finally {
+      painter.dispose();
+    }
+  }
+
+  /// 内容正文视口宽（总宽 − 固定行号列 − 间距），换行开/关一致。
+  double _sourceTextWidth() {
+    final width = _lastContentWidth;
+    if (width <= 0) return 0;
+    return math.max(0.0, width - _sourceGutterWidth(context) - _kSourceGutterGap);
+  }
+
+  /// 按当前换行状态构造与渲染同源的段落，供行内字符/像素映射使用。
+  TextPainter _sourceLinePainter(
+    String text, {
+    required bool wrapped,
+    required double textWidth,
+  }) {
+    final painter = TextPainter(
+      text: TextSpan(text: text, style: _sourceTextStyle(context)),
+      textDirection: Directionality.of(context),
+      textScaler: MediaQuery.textScalerOf(context),
+      locale: Localizations.maybeLocaleOf(context),
+    );
+    painter.layout(maxWidth: wrapped ? textWidth : double.infinity);
+    return painter;
   }
 
   /// 换行态下 [0, endExclusive) 行的累计高度；按内容/宽度增量缓存，只算到锚点。
@@ -1595,6 +1685,26 @@ class _DiffRow {
 
   /// 折叠按钮行是否已展开（展开后该段不再有按钮行）。
   final bool expanded;
+}
+
+/// 换行切换时的视口锚点：源行 + 行内字符偏移 + 视觉行内像素偏移。
+///
+/// 只记行号在单行超长内容上会跳回行首；[charOffset] 让关闭换行时能换算到
+/// 横向滚动位置，再开启时又能从折行布局中找回同一段文字。
+class _WrapAnchor {
+  const _WrapAnchor({
+    required this.lineIndex,
+    required this.charOffset,
+    this.intraLineOffset = 0,
+  });
+
+  final int lineIndex;
+
+  /// 源行内的 UTF-16 字符偏移（顶部/左缘可见的第一个字符）。
+  final int charOffset;
+
+  /// 换行态下视口顶部相对该视觉行顶部的像素偏移；关闭换行态为 0。
+  final double intraLineOffset;
 }
 
 /// diff 预览整块横向滚动共享的偏移（issue #71 / Q19 方案 B）。

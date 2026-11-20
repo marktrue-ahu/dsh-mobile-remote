@@ -4,6 +4,7 @@
 // Markdown 渲染/diff/二进制隐藏、320/深色/1.5× 工具栏折叠，以及轮末预览、
 // 会话文件预览两个 content 入口（Git 浏览器当前只有 diff，做负例回归）。
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:ui' show Tristate;
 
 import 'package:dsh_mobile_app/api.dart';
@@ -78,6 +79,71 @@ Text _lineText(
 
 double _left(WidgetTester tester, Key key) =>
     tester.getTopLeft(find.byKey(key)).dx;
+
+/// 组件同源段落：测试里复算行内字符与像素的映射（Ahem 字体与组件一致）。
+TextPainter _sourcePainter(
+  WidgetTester tester,
+  String text, {
+  GitFileViewerKeys keys = _viewerKeys,
+  double? maxWidth,
+}) {
+  final element = tester.element(find.byKey(keys.sourceLineText(0)));
+  final style = DefaultTextStyle.of(element).style
+      .merge(const TextStyle(fontFamily: 'monospace', fontSize: 12));
+  return TextPainter(
+    text: TextSpan(text: text, style: style),
+    textDirection: TextDirection.ltr,
+    textScaler: MediaQuery.textScalerOf(element),
+    locale: Localizations.maybeLocaleOf(element),
+  )..layout(maxWidth: maxWidth ?? double.infinity);
+}
+
+double _textViewportWidth(
+  WidgetTester tester, [
+  GitFileViewerKeys keys = _viewerKeys,
+]) =>
+    tester.getSize(find.byKey(keys.sourceList)).width -
+    tester.getSize(find.byKey(keys.sourceLineNumber(0))).width -
+    10;
+
+/// 换行态下视口顶部对应的行内字符偏移。
+int _wrappedTopChar(
+  WidgetTester tester,
+  String text, [
+  GitFileViewerKeys keys = _viewerKeys,
+]) {
+  final painter = _sourcePainter(
+    tester,
+    text,
+    keys: keys,
+    maxWidth: _textViewportWidth(tester, keys),
+  );
+  try {
+    final listTop = tester.getTopLeft(find.byKey(keys.sourceList)).dy;
+    final textTop = tester.getTopLeft(find.byKey(keys.sourceLineText(0))).dy;
+    final dy = math.max(0.0, listTop - textTop);
+    return painter.getPositionForOffset(Offset(0, dy)).offset;
+  } finally {
+    painter.dispose();
+  }
+}
+
+/// 关闭换行态下视口左缘对应的行内字符偏移。
+int _unwrappedLeftChar(
+  WidgetTester tester,
+  String text, {
+  required double horizontalOffset,
+  GitFileViewerKeys keys = _viewerKeys,
+}) {
+  final painter = _sourcePainter(tester, text, keys: keys);
+  try {
+    return painter
+        .getPositionForOffset(Offset(math.max(0.0, horizontalOffset), 0))
+        .offset;
+  } finally {
+    painter.dispose();
+  }
+}
 
 /// 列表中第一个可见行（按行正文的实际全局矩形判断，忽略 ListView 预构建的缓存行）。
 int _firstVisibleLine(
@@ -185,6 +251,104 @@ void main() {
       _left(tester, _viewerKeys.sourceLineText(0)),
       lessThan(textLeft - 60),
     );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('single multi-screen line keeps intra-line position on→off→on', (
+    tester,
+  ) async {
+    // 单行 6000 字符：1.0× Ahem 下折成几十个视觉行，纵向跨多屏。
+    final line = List<String>.filled(6000, 'x').join();
+    await _pump(
+      tester,
+      GitFileViewer(
+        mode: GitFileViewerMode.content,
+        path: 'one-line.json',
+        content: line,
+      ),
+    );
+    final baseLeft = _left(tester, _viewerKeys.sourceLineText(0));
+
+    // 折行态滚到长行中段，记录视口顶部字符。
+    await tester.drag(
+      find.byKey(_viewerKeys.sourceList),
+      const Offset(0, -500),
+    );
+    await tester.pumpAndSettle();
+    final before = _wrappedTopChar(tester, line);
+    expect(before, greaterThan(100));
+
+    // 关闭换行：同一字符应出现在视口左缘（不是行首）。
+    await tester.tap(find.byKey(_viewerKeys.wrapToggle));
+    await tester.pumpAndSettle();
+    final offOffset = baseLeft - _left(tester, _viewerKeys.sourceLineText(0));
+    expect(offOffset, greaterThan(50));
+    final offChar = _unwrappedLeftChar(
+      tester,
+      line,
+      horizontalOffset: offOffset,
+    );
+    expect(offChar, greaterThan(100));
+    expect((offChar - before).abs(), lessThan(130));
+
+    // 再开启：视觉行位置回到原处，不能跳回长行开头。
+    await tester.tap(find.byKey(_viewerKeys.wrapToggle));
+    await tester.pumpAndSettle();
+    final after = _wrappedTopChar(tester, line);
+    expect(after, greaterThan(100));
+    expect((after - before).abs(), lessThan(130));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('single multi-screen line keeps intra-line position off→on→off', (
+    tester,
+  ) async {
+    final line = List<String>.filled(6000, 'y').join();
+    await _pump(
+      tester,
+      GitFileViewer(
+        mode: GitFileViewerMode.content,
+        path: 'one-line.json',
+        content: line,
+      ),
+    );
+
+    // 先在折行态关闭，把正文横向拖到长行中段。
+    await tester.tap(find.byKey(_viewerKeys.wrapToggle));
+    await tester.pumpAndSettle();
+    final baseLeft = _left(tester, _viewerKeys.sourceLineText(0));
+    await tester.drag(
+      find.byKey(_viewerKeys.sourceScrollSurface),
+      const Offset(-4000, 0),
+    );
+    await tester.pumpAndSettle();
+    final offOffset = baseLeft - _left(tester, _viewerKeys.sourceLineText(0));
+    expect(offOffset, greaterThan(1000));
+    final offChar = _unwrappedLeftChar(
+      tester,
+      line,
+      horizontalOffset: offOffset,
+    );
+    expect(offChar, greaterThan(10));
+
+    // 开启后应定位到该字符所在的折行段，而不是长行开头。
+    await tester.tap(find.byKey(_viewerKeys.wrapToggle));
+    await tester.pumpAndSettle();
+    final onTop = _wrappedTopChar(tester, line);
+    expect(onTop, greaterThan(10));
+    expect((onTop - offChar).abs(), lessThan(130));
+
+    // 再关闭：横向位置仍落在同一段，不能回零。
+    await tester.tap(find.byKey(_viewerKeys.wrapToggle));
+    await tester.pumpAndSettle();
+    final offOffset2 = baseLeft - _left(tester, _viewerKeys.sourceLineText(0));
+    expect(offOffset2, greaterThan(50));
+    final offChar2 = _unwrappedLeftChar(
+      tester,
+      line,
+      horizontalOffset: offOffset2,
+    );
+    expect((offChar2 - offChar).abs(), lessThan(130));
     expect(tester.takeException(), isNull);
   });
 
