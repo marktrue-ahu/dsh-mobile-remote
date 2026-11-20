@@ -2224,10 +2224,20 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  /// issue #129：时间线是否已有内容（历史/SSE/发件乐观条目）。有内容时永不显示整页三态，
-  /// 避免“已能看到对话却闪成加载页”。
+  /// issue #129：时间线是否已有**实时可见**内容。有内容时永不显示整页三态，避免
+  /// “已能看到对话/流式正文却闪成加载页”。
+  ///
+  /// 除已入列的条目外，必须覆盖尚未落成持久行的实时投影（review P2）：
+  /// - `assistant/live-chunk` 正文只累加 `_draft`/`_streaming`，**不添加 item**；
+  /// - reasoning delta 只进 `_liveReasoning`（活动条/provisional 行同源），也可能还没有 item。
+  /// 只看 3 个 item 列表会把“正在流式输出”误判成 loading/empty/failed 并整页遮住。
   bool get _hasTimelineContent =>
-      _items.isNotEmpty || _olderItems.isNotEmpty || _histItems.isNotEmpty;
+      _items.isNotEmpty ||
+      _olderItems.isNotEmpty ||
+      _histItems.isNotEmpty ||
+      _draft.isNotEmpty ||
+      _streaming ||
+      (_liveReasoning.current?.text.isNotEmpty ?? false);
 
   /// issue #129：首次加载成功、内容挂载后的帧后强制跟随一次。
   ///
@@ -2283,6 +2293,9 @@ class _ChatScreenState extends State<ChatScreen> {
         onBack: () => Navigator.of(context).maybePop(),
       );
     }
+    // review P2：`degraded=true && events.isEmpty` 只说明**当前表面**没有可恢复消息，
+    // 不等于新会话；用专门文案，避免“这个会话还没有消息/发送第一条消息”误导用户。
+    if (_historyDegraded) return const _DegradedEmptySessionView();
     return const _EmptySessionView();
   }
 
@@ -12831,6 +12844,49 @@ class _EmptySessionView extends StatelessWidget {
             L10n.t(
               '在下方输入框发送第一条消息',
               'Send the first message from the input box below',
+            ),
+            style: TextStyle(fontSize: 13, color: ink3),
+            textAlign: TextAlign.center,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// issue #129（review P2）：降级会话（`degraded=true`）且当前表面无事件。
+///
+/// 这不是“新会话”：历史只恢复了部分表面，不能承诺“还没有消息”，也不应引导用户
+/// 把空表面当成完整对话。文案明确“没有可恢复的消息”，并指向电脑端查看完整会话。
+class _DegradedEmptySessionView extends StatelessWidget {
+  const _DegradedEmptySessionView();
+
+  @override
+  Widget build(BuildContext context) {
+    final ink2 = DshColors.ink2(context);
+    final ink3 = DshColors.ink3(context);
+    return _CenteredStateBody(
+      key: const ValueKey<String>('chat-session-empty-degraded'),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.history_toggle_off, size: 36, color: ink3),
+          const SizedBox(height: 12),
+          Text(
+            L10n.t('当前没有可恢复的消息', 'No recoverable messages right now'),
+            key: const ValueKey<String>('chat-session-empty-degraded-title'),
+            style: TextStyle(
+              fontSize: 15.5,
+              fontWeight: FontWeight.w600,
+              color: ink2,
+            ),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 6),
+          Text(
+            L10n.t(
+              '仅恢复了部分历史，可在电脑端查看完整会话',
+              'Only partial history was recovered — open the desktop app to view the full session',
             ),
             style: TextStyle(fontSize: 13, color: ink3),
             textAlign: TextAlign.center,

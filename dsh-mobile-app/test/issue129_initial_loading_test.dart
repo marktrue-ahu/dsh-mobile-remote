@@ -31,6 +31,7 @@ const _session = 'session-129';
 const _loadingKey = ValueKey<String>('chat-initial-loading');
 const _emptyKey = ValueKey<String>('chat-session-empty');
 const _failedKey = ValueKey<String>('chat-initial-failed');
+const _degradedEmptyKey = ValueKey<String>('chat-session-empty-degraded');
 
 http.Response _json(Map<String, dynamic> body, [int status = 200]) =>
     http.Response(
@@ -281,6 +282,107 @@ void main() {
     });
   });
 
+  group('#129 empty：降级（degraded）与 reset 重同步', () {
+    testWidgets('degraded=true + 空 events：用降级空态，不冒充“新会话”', (tester) async {
+      final backend = _Backend(
+        (_) async => _json({
+          'ok': true,
+          'events': <Object>[],
+          'hasMore': false,
+          'degraded': true,
+        }),
+      );
+      await _pumpChat(tester, backend: backend);
+      await _settle(tester);
+
+      expect(find.byKey(_degradedEmptyKey), findsOneWidget);
+      expect(find.text('当前没有可恢复的消息'), findsOneWidget);
+      expect(find.text('仅恢复了部分历史，可在电脑端查看完整会话'), findsOneWidget);
+      expect(
+        find.byKey(_emptyKey),
+        findsNothing,
+        reason: '降级空表面不能使用“这个会话还没有消息/发送第一条消息”的普通空态',
+      );
+      expect(find.text('这个会话还没有消息'), findsNothing);
+      expect(find.text('在下方输入框发送第一条消息'), findsNothing);
+      expect(
+        find.textContaining('当前仅能恢复部分历史'),
+        findsOneWidget,
+        reason: '既有降级横幅仍在',
+      );
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('reset:true 重同步：不进入 loading，保留时间线直到新内容到达', (tester) async {
+      final resetCompleter = Completer<http.Response>();
+      var calls = 0;
+      final backend = _Backend((request) {
+        calls++;
+        if (calls == 1) {
+          return Future.value(
+            _page([
+              _ev('turn/start', 1, {'turn': 1}),
+              _ev('user/message', 2, {
+                'messageId': 'u1',
+                'text': '重同步前的用户消息',
+                'sourceKind': 'user',
+              }),
+            ]),
+          );
+        }
+        return resetCompleter.future;
+      });
+      final store = await _pumpChat(tester, backend: backend);
+      await _settle(tester);
+      expect(find.text('重同步前的用户消息'), findsOneWidget);
+
+      // turn/end 触发 #13 的兜底补拉 → _load(reset:true)
+      store.injectFrame({
+        'type': 'session/event',
+        'sessionId': _session,
+        'event': _ev('turn/end', 3, {
+          'turn': 1,
+          'reason': {'kind': 'completed'},
+        }),
+      });
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+
+      expect(
+        find.byKey(_loadingKey),
+        findsNothing,
+        reason: 'reset 重同步不得把已有时间线整页换成 loading',
+      );
+      expect(
+        find.text('重同步前的用户消息'),
+        findsOneWidget,
+        reason: '重同步期间保留旧时间线，避免整页闪动',
+      );
+
+      resetCompleter.complete(
+        _page([
+          _ev('turn/start', 1, {'turn': 1}),
+          _ev('user/message', 2, {
+            'messageId': 'u1',
+            'text': '重同步前的用户消息',
+            'sourceKind': 'user',
+          }),
+          _ev('assistant/message', 4, {
+            'turn': 1,
+            'step': 1,
+            'messageId': 'a1',
+            'text': '重同步后的回复',
+          }),
+        ]),
+      );
+      await _settle(tester);
+      expect(find.byKey(_loadingKey), findsNothing);
+      expect(find.byKey(_failedKey), findsNothing);
+      expect(find.textContaining('重同步后的回复'), findsWidgets);
+      expect(tester.takeException(), isNull);
+    });
+  });
+
   group('#129 failed：可重试 / dead-end', () {
     testWidgets('503 可重试：点重试进入 loading，成功后内容出现', (tester) async {
       final retryCompleter = Completer<http.Response>();
@@ -359,6 +461,39 @@ void main() {
   });
 
   group('#129 成功后切换与内容', () {
+    testWidgets('/history 挂起时首个 SSE 是 live-chunk：流式正文即时可见，不显示 loading', (
+      tester,
+    ) async {
+      final completer = Completer<http.Response>();
+      final backend = _Backend((_) => completer.future);
+      final store = await _pumpChat(tester, backend: backend);
+      expect(find.byKey(_loadingKey), findsOneWidget);
+
+      store.injectFrame({
+        'type': 'session/event',
+        'sessionId': _session,
+        'event': _ev('assistant/live-chunk', 1, {
+          'turn': 1,
+          'step': 1,
+          'text': '流式正文即时可见',
+        }),
+      });
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+
+      expect(
+        find.byKey(_loadingKey),
+        findsNothing,
+        reason: 'live-chunk 只有 _draft、没有 item，也必须算“已有实时内容”',
+      );
+      expect(find.byKey(_emptyKey), findsNothing);
+      expect(find.byKey(_failedKey), findsNothing);
+      expect(find.textContaining('流式正文即时可见'), findsWidgets);
+
+      completer.complete(_page(const []));
+      await _settle(tester);
+      expect(tester.takeException(), isNull);
+    });
     testWidgets('成功加载有内容的会话：退出三态并渲染正文', (tester) async {
       final backend = _Backend((_) async => _page(_oneMessage('加载完成')));
       await _pumpChat(tester, backend: backend);
@@ -370,6 +505,36 @@ void main() {
       expect(find.textContaining('加载完成'), findsWidgets);
       expect(find.text('开始任务'), findsOneWidget);
       expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('空态后收到 live-chunk：空态消失、流式正文出现', (tester) async {
+      final backend = _Backend((_) async => _page(const []));
+      final store = await _pumpChat(tester, backend: backend);
+      await _settle(tester);
+      expect(find.byKey(_emptyKey), findsOneWidget);
+
+      store.injectFrame({
+        'type': 'session/event',
+        'sessionId': _session,
+        'event': _ev('assistant/live-chunk', 1, {
+          'turn': 1,
+          'step': 1,
+          'text': '空态后的流式正文',
+        }),
+      });
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+
+      expect(
+        find.byKey(_emptyKey),
+        findsNothing,
+        reason: '流式正文是可恢复内容，不能被“还没有消息”空态遮住',
+      );
+      expect(find.textContaining('空态后的流式正文'), findsWidgets);
+      expect(find.byKey(_failedKey), findsNothing);
+      expect(tester.takeException(), isNull);
+      // 注入帧的 800ms 会话列表去抖 Timer 必须推进结束，避免 pending timer。
+      await tester.pump(const Duration(seconds: 1));
     });
 
     testWidgets('SSE 先到：即使 /history 仍挂起也不显示 loading', (tester) async {
@@ -409,7 +574,12 @@ void main() {
     testWidgets('长会话：首屏加载后停在底部（内容挂载后帧后强制定位）', (tester) async {
       final backend = _Backend((_) async => _page(_longHistory()));
       await _pumpChat(tester, backend: backend);
-      await _settle(tester);
+      // review P2：不用 pumpAndSettle 掩盖三态切换——固定推进帧，让 loading→内容态、
+      // 帧后强制定位与动画都真实发生。
+      for (var i = 0; i < 12; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(find.byKey(_loadingKey), findsNothing);
 
       final probe = _Probe(tester);
       final position = probe.position;
