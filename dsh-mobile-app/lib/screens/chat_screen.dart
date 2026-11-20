@@ -1876,6 +1876,20 @@ class _ChatScreenState extends State<ChatScreen> {
     return out;
   }
 
+  /// 内容索引 → 消息条目（「更早」按钮 / 加载条不是消息，返回 null）。
+  _MsgItem? _itemAtContentIndex(int index) {
+    if (index < 0) return null;
+    if (index < _olderItems.length) {
+      return _olderItems[_olderItems.length - 1 - index];
+    }
+    final base = _olderItems.length + (_olderButtonVisible ? 1 : 0);
+    final local = index - base;
+    if (local < 0) return null;
+    final i = _items.length - 1 - local;
+    if (i >= 0 && i < _items.length) return _items[i];
+    return null;
+  }
+
   /// 内容索引 → 该子项的**稳定尺寸缓存 key**（`seq` 优先，工具卡用 `latestSeq`）。
   ///
   /// 「更早」按钮 / 加载条 / 草稿不是消息，返回 null（它们不参与尺寸缓存）。
@@ -2111,6 +2125,18 @@ class _ChatScreenState extends State<ChatScreen> {
         showToast(context, _messageNotFoundText);
         return;
       }
+      // 普通时间线隐藏的调试事件（team/message/* 等）没有可见行：直接明确失败，
+      // 不把用户丢到一个零高度锚点上（设计：目标不可定位必须有提示）。
+      final targetItem = _itemAtContentIndex(index);
+      final mode = widget.store.timelineDebug
+          ? TimelineMode.debug
+          : TimelineMode.ordinary;
+      if (targetItem != null &&
+          targetItem.kind == _MsgKind.event &&
+          !timelineTypeVisibleIn(mode, targetItem.eventType ?? '')) {
+        showToast(context, _messageNotFoundText);
+        return;
+      }
       // 让目标行拿到临时 key（已构建时立即可见；未构建时定位循环会在落点后重试）。
       setState(() {});
       await WidgetsBinding.instance.endOfFrame;
@@ -2131,7 +2157,15 @@ class _ChatScreenState extends State<ChatScreen> {
             _scrollCtrl.hasClients ? _scrollCtrl.position.viewportDimension : 0,
         isTargetLoaded: () => _contentIndexOfSeq(seq) >= 0,
         isTargetBuilt: () => _messageJumpKey.currentContext != null,
-        isTargetInView: () => _turnKeyInViewport(_messageJumpKey),
+        isTargetInView: () {
+          // 零高度（被普通模式隐藏的事件）不算“看得见”，避免成功跳到不可见锚点。
+          final box =
+              _messageJumpKey.currentContext?.findRenderObject() as RenderBox?;
+          if (box == null || !box.hasSize || box.size.height <= 0) {
+            return false;
+          }
+          return _turnKeyInViewport(_messageJumpKey);
+        },
         reveal: () => _revealTurnKey(_messageJumpKey),
         measure: _measureTurnBoundaries,
         measureBuilt: _measureBuiltChildren,

@@ -56,16 +56,17 @@ List<Map<String, dynamic>> _history() {
 }
 
 class _Backend {
+  _Backend({List<Map<String, dynamic>>? events})
+    : events = events ?? _history();
+
+  final List<Map<String, dynamic>> events;
+
   late final Api api =
       Api(
           client: MockClient((request) async {
             final path = request.url.path;
             if (path == '/m/api/history') {
-              return _json({
-                'ok': true,
-                'events': _history(),
-                'hasMore': false,
-              });
+              return _json({'ok': true, 'events': events, 'hasMore': false});
             }
             if (path == '/m/api/event-detail') {
               return _json({'ok': true, 'event': null});
@@ -201,6 +202,37 @@ void main() {
     expect(sawHighlight, isTrue, reason: '定位成功后应出现 1.2s 高亮');
     expect(tester.takeException(), isNull);
     expect(store.sessionId, _session, reason: '跳转不改变当前会话');
+  });
+
+  testWidgets('隐藏的团队事件行：不跳零高度锚点，明确 toast', (tester) async {
+    final hiddenTeam = {
+      'seq': 41,
+      'type': 'team/message/queued',
+      'data': {
+        'messageId': 'tm-hidden',
+        'senderName': '发布协调员',
+        'targetId': 'session-b',
+        'text': '这条团队消息只出现在索引，不在普通时间线渲染。',
+      },
+      'time': 3000,
+    };
+    final backend = _Backend(events: [..._history(), hiddenTeam]);
+    await _pumpChat(tester, backend);
+    await _openMessagesTab(tester);
+
+    final row = find.byKey(const ValueKey<String>('message-index-row:41'));
+    expect(row, findsOneWidget);
+    await tester.tap(row);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+
+    expect(
+      find.text('未找到该消息（可能已被压缩或替换）'),
+      findsOneWidget,
+      reason: '普通时间线不可见的事件不能静默跳到零高度锚点',
+    );
+    expect(find.byType(AgentPanelScreen), findsNothing);
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('目标不存在：明确 toast，不静默、不改变会话', (tester) async {
