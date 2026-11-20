@@ -1,5 +1,82 @@
 # Changelog
 
+## v3.2.4-rc.6（build 59，issues #124 #126 #128 #129 #130 #131 #132 #135）— 对话页高度模型重做、加载态与 SSE 修复
+
+> 插件 `3.2.4-rc.6` / App `3.2.4+59` / 载体 `3.2.4-rc.6-app`。RC 候选：插件发布到 npm `rc` dist-tag，`latest` 保持 `3.2.3-rc.1` 不动（只有 stable 可前进）。
+
+### 中文
+
+#### 新增与体验改进
+
+- **首次打开会话三态加载（#129）**：聊天页首次加载明确区分 loading / empty / failed；失败可重试，实时流式内容到达后不再误判为空态。
+- **上翻历史加载状态行（#130）**：上翻历史时在顶部以固定高度状态行展示 loading / 已加载 / 空 / 失败四态，失败可重试，不挤压聊天内容。
+- **长用户消息查看全文（#132）**：超过 2000 字符的用户消息把「查看全文」入口移入气泡内；按需加载详情并显式区分已加载 / 失败，不再伪造成功。
+- **子代理运行指示（#124）**：主会话列表聚合递归子代理运行状态，子代理未结束时主会话持续显示运行中；断链或切换宿主会清空旧宿主计数，避免假运行状态。
+- **环境诊断中文化（#135）**：诊断页的指标、服务、端点与状态值按白名单中文化，不再出现重复或裸露英文 key；新增 SSE 指标 `mobileOldestAgeMs` / `mobileOldestIdleMs` / `mobileStalled` / `mobileEvicted` / `mobileRejected` 也有中文名。
+
+#### 修复
+
+- **对话页高度模型重做（ADR 0035，#126/#103/#114）**：短内容顶对齐，删除 `_liveBottomGap` 底部占位及其反馈环；折叠行固定 24dp，过程组 body 上限 `min(400dp, 50% 窗口)`，工具/思考/用户消息正文上限 320dp，图片单张 320dp、网格上限 `min(400dp, 50%)`；删除活动条与自动详情，思考状态落到段摘要/组抬头/provisional 行；gutter 恒定 38dp。修复分批隐藏行场景下内容被推离顶部、上下方大段空白和滚动越界等真机问题。
+- **首屏补拉最新轮（#126）**：初始 50 条若截断最新一轮（缺 `turn/start`），自动补拉 30 条/页、最多 5 页，直到拿到最新轮起止或用户上翻；不按视口高度补拉，避免首屏跳动。
+- **移除聊天页后台任务内联卡（#128）**：后台任务不再在聊天页占一张卡，也不再因卡片显隐触发视口跳变；取消入口统一到「会话工具 → 任务」页签，运行中可取消、停止中不可重复取消；任务面板重试会清除旧错误。
+- **SSE 连接泄漏与 503（#131）**：App 端每次 SSE 使用独立 `http.Client`，在取消/超时/错误/503/正常结束路径显式关闭，503 使用 5s/10s 退避；宿主端满额时不再直接 503，按「stalled 优先 → 同 clientId → 同 clientIp → 最旧」驱逐 1 条满龄（≥60s）连接，无候选才返回 503 + `Retry-After: 5`；诊断新增连接年龄/空闲/stalled/驱逐/拒绝指标。
+- **原生 SSE 版本与生命周期（#131）**：悬浮球原生 SSE 上报 `x-mobile-app-version` 与持久化 `x-mobile-client-id`，同一服务实例只启动一条 SSE 线程；连接建立、读取、异常与 onDestroy 均保证 `disconnect` 并清理 `sseConn`。
+- **导航回归测试**：补「点第 N 轮刻度后高亮必须落在第 N 轮」用例，锁定既有阅读线对齐行为。
+
+#### 验证
+
+- Flutter analyze：0 error / 0 warning（26 info，与 develop 基线同类）
+- Flutter test：**1640 通过 / 1 skip**
+- Node 套件：1239 例，1218 通过 / 17 skip / **4 失败**——4 项均为本机 root 环境既有问题（`chmod 0500` 在 root 下失效 ×2、`host-canary-smoke` source identity、`ANDROID_HOME` 下 aapt 存在却执行失败）；已与 rc.5 基线（`1e8658a`）同环境对照，失败集合逐条相同
+- timeline-contract：181 PASS / 0 FAIL
+- account-usage：15 通过 / 0 失败
+- Kotlin `UsagePanelModelTest`：BUILD SUCCESSFUL（27 用例，`--rerun-tasks` 强制重跑）
+- 受影响测试：Flutter 29 个改动测试文件 323 通过；Node `issue131-sse-connections` / `sse-connections` / `session-list-running-indicator` 56 通过
+
+#### 重要说明与已知风险
+
+- **未包含 3080 代理泄漏修复**：该修复在 `nas-dsh-migration` 镜像，不属于 rc.6。
+- **build 59 小于本机测试 build 61**：已安装本地测试 build 61 的设备安装 rc.6 会被系统视为降级；如无法安装/被拒，需卸载后重装或等待 build ≥61 的版本。不通过手改 build 规避。
+- **#136 日志级别尚未实现**：本版仅临时注释 Chat.geo / build itemCount / 跟随校正三类脱底排障日志以降低噪声，待 #136 实现后恢复为 debug 级别。
+- **真机未复验**：高度模型与原生 SSE 修复需在 rc.6 真机确认；本版验证为 widget/单测 + 真实代码路径回放。
+
+### English
+
+#### Added & improved
+
+- **First-open three-state loading (#129)**: the chat page now distinguishes loading, empty, and failed states on first open. Failures are retryable, and live-streamed content no longer gets misclassified as an empty state.
+- **History-paging status row (#130)**: paging back through history now shows a fixed-height status row with loading / loaded / empty / failed states and a retry action, without squeezing the conversation.
+- **View full text for long user messages (#132)**: messages over 2000 characters get a “view full text” entry inside the bubble; details load on demand and explicitly distinguish loaded vs failed instead of faking success.
+- **Subagent running indicator (#124)**: the recent-session list aggregates recursive subagent activity, so a session keeps showing as running while any descendant subagent is still active. Disconnects or host switches clear stale counts from the previous host.
+- **Localized environment diagnostics (#135)**: diagnostic metrics, services, endpoint checks, and status values now use human-readable Chinese labels instead of duplicated or bare English keys. The new SSE metrics (`mobileOldestAgeMs`, `mobileOldestIdleMs`, `mobileStalled`, `mobileEvicted`, `mobileRejected`) are covered too.
+
+#### Fixed
+
+- **Transcript height model rework (ADR 0035, #126/#103/#114)**: short content is now top-aligned and the `_liveBottomGap` bottom placeholder (and its feedback loop) is removed. Collapsed rows are fixed at 24dp; process-group bodies are capped at `min(400dp, 50% of the window)`; tool, reasoning, and user-message bodies are capped at 320dp; images are 320dp each with grids capped at `min(400dp, 50%)`. The activity bar and auto-expanded details are gone; reasoning state now lives in segment summaries, group headers, and provisional rows; gutter is a constant 38dp. This fixes content being pushed off the top, large blank areas above/below the batch-hidden process block, and scroll-range overshoot on real devices.
+- **First-screen backfill of the latest turn (#126)**: if the initial 50 events cut off the latest turn (missing `turn/start`), the app now backfills 30 events per page for up to 5 pages, stopping at the latest turn start, at the end of history, or when the user scrolls up. It does not backfill by viewport height, avoiding first-screen jumps.
+- **Removed the in-chat background-job card (#128)**: background jobs no longer occupy an inline card in the chat or trigger viewport jumps when the card appears/disappears. Cancellation is centralized in “Session tools → Jobs”; running jobs can be cancelled, stopping jobs cannot be cancelled twice, and retrying the jobs panel clears previous errors.
+- **SSE connection leaks and 503 (#131)**: the app now opens a dedicated `http.Client` per SSE connection and explicitly closes it on cancel/timeout/error/503/normal end; 503 responses use 5s/10s backoff. On the host, a full pool no longer returns 503 immediately: it evicts one age-eligible (≥60s) connection ordered by “stalled first → same clientId → same clientIp → oldest”, and only returns 503 + `Retry-After: 5` when no candidate exists. Diagnostics now expose connection age/idle/stalled/evicted/rejected metrics.
+- **Native SSE version and lifecycle (#131)**: the floating-bubble native SSE now sends `x-mobile-app-version` and a persistent `x-mobile-client-id`, starts at most one SSE thread per service instance, and guarantees `disconnect()` plus `sseConn` cleanup on setup, read, exception, and onDestroy paths.
+- **Navigation regression coverage**: added a test asserting that tapping turn tick N highlights turn N, locking the existing reading-line alignment behavior.
+
+#### Verification
+
+- Flutter analyze: 0 errors / 0 warnings (26 infos, same class as the develop baseline)
+- Flutter test: **1640 passed / 1 skipped**
+- Node suite: 1239 tests, 1218 passed / 17 skipped / **4 failed** — all four are pre-existing local root-environment issues (two `chmod 0500` cases that root bypasses, `host-canary-smoke` source identity, and aapt present under `ANDROID_HOME` but failing to execute). Re-ran the same set against the rc.5 baseline (`1e8658a`) in the same environment: identical failure set, item by item.
+- timeline-contract: 181 PASS / 0 FAIL
+- account-usage: 15 passed / 0 failed
+- Kotlin `UsagePanelModelTest`: BUILD SUCCESSFUL (27 cases, forced rerun with `--rerun-tasks`)
+- Affected tests: 323 passed across the 29 changed Flutter test files; 56 passed in the Node `issue131-sse-connections` / `sse-connections` / `session-list-running-indicator` files
+
+#### Important notes & known risks
+
+- **The 3080 proxy-leak fix is not included**: that fix lives in the `nas-dsh-migration` image and is not part of rc.6.
+- **Build 59 is lower than local test build 61**: devices with local test build 61 installed will treat rc.6 as a downgrade. If installation is rejected, uninstall/reinstall or wait for a build ≥61. Do not hand-edit the build number to work around this.
+- **Log levels (#136) are not implemented yet**: this release only comments out three noisy transcript-debug log groups (Chat.geo / build itemCount / follow correction) until #136 lands; they should return as debug-level logs then.
+- **Not re-verified on a real device**: the height model and native SSE fixes need on-device confirmation; this release was verified with widget/unit tests plus real code-path replay.
+
+
 ## v3.2.4-rc.5（build 58，真机 59aaa367）— 分批隐藏行导致的底部空白修复
 
 > 插件 `3.2.4-rc.5` / App `3.2.4+58` / 载体 `3.2.4-rc.5-app`。RC 候选：插件发布到 npm `rc` dist-tag，`latest` 保持 `3.2.3-rc.1` 不动（只有 stable 可前进）。
