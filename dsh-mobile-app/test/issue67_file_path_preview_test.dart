@@ -49,6 +49,7 @@ class _PreviewBackend {
     ..baseUrl = 'http://issue67.test'
     ..path = '/m'
     ..token = ''
+    ..sessionRelativeFilesSupported = true
     ..timelineCapabilities = const TimelineCapabilities(
       version: 1,
       live: true,

@@ -70,11 +70,12 @@ class FakeRequest extends EventEmitter {
 	}
 }
 
-function createHarness({ sessions = new Map(), workspaceRoots = [] } = {}) {
+function createHarness({ sessions = new Map(), workspaceRoots = [], sessionQuery = null } = {}) {
 	const routes = [];
 	const provided = new Map();
 	provided.set("sessions", { get: (id) => sessions.get(id) });
 	provided.set("workspaceRegistry", { list: () => workspaceRoots.map((path) => ({ path })) });
+	if (sessionQuery) provided.set("sessionQuery", sessionQuery);
 	const ctx = {
 		webServer: { host: "127.0.0.1", port: 43120, register(spec) { routes.push(spec); return () => {}; } },
 		logger: { warn() {}, info() {} },
@@ -297,6 +298,51 @@ test("旧调用兼容：无 sessionId 仅允许已注册工作区内的绝对路
 		} catch (err) {
 			assert.equal(err.code, "EEXIST", `unexpected symlink error: ${err.code}`);
 		}
+	} finally {
+		harness.clean();
+	}
+});
+
+test("dormant 会话：sessions.get 为空时用 sessionQuery 持久 header 解析 cwd", async () => {
+	const root = makeWorkspace();
+	writeFileSync(join(root, "dormant.txt"), "dormant body\n");
+	const harness = createHarness({
+		sessions: new Map(), // 内存里没有：模拟休眠/重启后的会话
+		sessionQuery: {
+			readSession: async (id) => {
+				if (id !== "dormant") {
+					throw Object.assign(new Error("not found"), { code: "SESSION_QUERY_SESSION_NOT_FOUND" });
+				}
+				return { session: { cwd: root }, events: [], header: { cwd: root } };
+			},
+		},
+	});
+	try {
+		const ok = await call(harness.route, { url: filesUrl({ sessionId: "dormant", path: "dormant.txt" }) });
+		assert.equal(ok.status, 200);
+		assert.equal(ok.raw.toString("utf8"), "dormant body\n");
+
+		const missing = await call(harness.route, { url: filesUrl({ sessionId: "unknown", path: "dormant.txt" }) });
+		assert.equal(missing.status, 404);
+		assert.equal(missing.body.error, "session-not-found");
+	} finally {
+		harness.clean();
+	}
+});
+
+test("bootstrap/hello 声明 files.sessionRelative 能力位", async () => {
+	const harness = createHarness();
+	try {
+		const req = new FakeRequest("/m/api/events");
+		const res = new FakeResponse();
+		harness.route(req, res);
+		const text = Buffer.concat(res.chunks).toString("utf8");
+		const helloLine = text.split("\n\n").find((chunk) => chunk.startsWith("data: "));
+		assert.ok(helloLine, "SSE hello 必须存在");
+		const hello = JSON.parse(helloLine.slice("data: ".length));
+		assert.equal(hello.capabilities.files.sessionRelative, true);
+		assert.equal(hello.capabilities.files.version, 1);
+		res.destroy();
 	} finally {
 		harness.clean();
 	}

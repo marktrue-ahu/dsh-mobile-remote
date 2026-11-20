@@ -876,6 +876,8 @@ fetch/push 序列化 common domain，pull/sync/abort 同时序列化 common 与 
 - App 侧断点保存在私有支持目录，按地址、API 路径与认证身份摘要隔离（不持久化口令）；恢复时核对 ETag、实际本地长度、完整区间和最终总长度，旧宿主缺标记时从头下载。暂停、断网、锁屏中断与进程退出后可从下载入口继续；保存到系统下载目录失败时保留已下载文件以便重试保存。恢复列表最多八项，七天后清理，可手动删除。
 - Android 用户发起下载后启动专用 `dataSync` 前台服务（通知提供进度与暂停，完成、失败或暂停后退出）；服务不可用或通知关闭时明确退回前台下载。服务与宠物 / 提醒保活开关独立，不传递 URL、口令或远端路径。Android 15+ 累计后台时限由系统管理，`onTimeout` 立即停止服务并通知 Dart 暂停、保留私有断点，不通过重启服务绕过预算。
 
+**能力位 `capabilities.files`（bootstrap 与 SSE hello 同形状）**：`{ "version": 1, "sessionRelative": true }`。新 App 看到 `sessionRelative=true` 才发送 `sessionId` + cwd 相对路径；旧插件缺该能力位时 App 回退旧的绝对路径契约，避免旧服务端把相对路径按宿主 cwd 解析导致 404/错文件。旧 App 忽略该字段，继续走兼容绝对路径通道。
+
 **POST `/m/api/files/upload`** — 上传文件到电脑（写会话工作目录）
 ```json
 请求: { "sessionId": "…(可选)", "name": "README.md", "data": "<base64>" }

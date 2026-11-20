@@ -16,11 +16,12 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 /// 假服务端：记录请求，按路径返回预设目录或文件内容。
 class _Backend {
-  _Backend() {
+  _Backend({bool sessionRelativeFiles = true}) {
     api = Api(client: MockClient(_handle))
       ..baseUrl = 'http://sf.test'
       ..path = '/m'
-      ..token = '';
+      ..token = ''
+      ..sessionRelativeFilesSupported = sessionRelativeFiles;
   }
 
   /// 置 true 后所有列目录请求都失败（测试里按需切换）。
@@ -240,6 +241,19 @@ void main() {
     await c.closePreview();
     expect(c.stage, BrowseStage.listing);
     expect(c.previewPath, isEmpty);
+  });
+
+  test('旧服务端无 session-relative 能力：回退绝对路径，不发送 sessionId', () async {
+    final b = _Backend(sessionRelativeFiles: false);
+    final store = _storeWithSession('s1', '/work');
+    final c = SessionFilesController(store: store, sessionId: 's1', apiClient: b.api);
+    await c.open();
+
+    await c.openFile('README.md');
+
+    expect(c.stage, BrowseStage.preview);
+    expect((c.preview! as PreviewText).text, '第一行\n第二行\n');
+    expect(b.fileRequests.last, '/work/README.md');
   });
 
   test('二进制文件预览给出不可预览原因', () async {

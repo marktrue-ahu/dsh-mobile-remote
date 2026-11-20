@@ -286,6 +286,12 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
   /// 预览也不发 Range（由调用方判断）。
   bool fileRangeSupported = false;
 
+  /// GitLab #16：服务端 `/api/files` 是否支持 `sessionId` + 会话 cwd 相对路径。
+  ///
+  /// 旧插件不下发 `capabilities.files.sessionRelative` → false，App 回退旧绝对
+  /// 路径契约（不会把相对路径发进旧实现导致 404/错文件）。
+  bool sessionRelativeFilesSupported = false;
+
   /// issue #53（§6.20）：轮末产出物能力位。旧插件不下发 → 三项皆假，App 隐藏两卡
   /// 与展示模式设置；`changed/changesDiff` 由电脑端按 `workspaceChanges` 服务真实存在判定。
   TurnTailCapabilities turnTailCapabilities = const TurnTailCapabilities();
@@ -477,6 +483,10 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
         capabilities is Map &&
         capabilities['fileRange'] is Map &&
         (capabilities['fileRange'] as Map)['supported'] == true;
+    sessionRelativeFilesSupported =
+        capabilities is Map &&
+        capabilities['files'] is Map &&
+        (capabilities['files'] as Map)['sessionRelative'] == true;
     // issue #53：轮末产出物能力位（旧插件缺失 → available=false，两卡与设置隐藏）。
     turnTailCapabilities = TurnTailCapabilities.fromJson(
       capabilities is Map && capabilities['turnTail'] is Map

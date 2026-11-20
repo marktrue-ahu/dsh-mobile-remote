@@ -64,5 +64,23 @@ void main() {
       expect(a.baseUrls.length, 3);
       expect(a.baseUrls.first, 'http://frp.example.com:3080');
     });
+
+    test('capabilities.files.sessionRelative：声明为 true；缺省/旧插件为 false', () {
+      final fresh = newApi('http://192.168.1.100:3080');
+      fresh.absorbBootstrap({
+        'ok': true,
+        'capabilities': {
+          'files': {'version': 1, 'sessionRelative': true},
+        },
+      });
+      expect(fresh.sessionRelativeFilesSupported, isTrue);
+
+      final legacy = newApi('http://192.168.1.100:3080');
+      legacy.absorbBootstrap({
+        'ok': true,
+        'capabilities': {'fileRange': {'version': 1, 'supported': true}},
+      });
+      expect(legacy.sessionRelativeFilesSupported, isFalse);
+    });
   });
 }
