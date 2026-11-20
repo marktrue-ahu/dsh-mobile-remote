@@ -357,7 +357,7 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
 
   Future<void> save({required String base, required String token}) async {
     final prefs = await SharedPreferences.getInstance();
-    resetCapabilities();
+    invalidateConnection();
     baseUrl = _normBase(base);
     path = _pathOf(base);
     await prefs.setString(_kBase, baseUrl);
@@ -461,6 +461,38 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
   /// 连接切换/销毁时清空能力位，避免上一个宿主的 `true` 跨连接残留。
   void resetCapabilities() => applyCapabilities(null);
 
+  /// 当前连接的单调代号：save/rotate/显式失效都会递增。
+  ///
+  /// bootstrap/hello 的异步回调必须携带请求发起时的代号；迟到的旧响应不得写入
+  /// 当前连接的能力位（Reviewer #16 P2 连接代竞态）。
+  int _connectionEpoch = 0;
+  int get connectionEpoch => _connectionEpoch;
+
+  /// 当前连接身份（地址 + 挂载路径 + 口令）。**只用于比较**，不得写日志/界面。
+  String get connectionIdentity => '$baseUrl\u0000$path\u0000$token';
+
+  /// 连接失效（切地址/关闭 bridge）：递增代号并清空能力位。
+  void invalidateConnection() {
+    _connectionEpoch++;
+    resetCapabilities();
+  }
+
+  /// 只有请求发起时的连接仍是当前连接，才吸收 bootstrap。
+  ///
+  /// 返回 false 表示这次响应已过期：调用方必须跳过 absorb/capability/agent 状态，
+  /// 不得用旧宿主的响应覆盖当前连接。
+  bool absorbBootstrapIfCurrent(
+    Map<String, dynamic> d, {
+    required int epoch,
+    required String identity,
+  }) {
+    if (epoch != _connectionEpoch || identity != connectionIdentity) {
+      return false;
+    }
+    absorbBootstrap(d);
+    return true;
+  }
+
   /// 吸收 bootstrap 响应：合并服务器全部地址 + 记录插件版本（持久化，断线也可见）
   /// + 校正挂载路径（v3.0.0 review：服务端为权威来源）。
   void absorbBootstrap(Map<String, dynamic> d) {
@@ -558,9 +590,11 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
 
   /// 连接成功后收集电脑全部地址（/api/bootstrap 的 server.urls 含 Tailscale/ZeroTier 等虚拟网段 IP）。
   Future<void> collectUrls() async {
+    final epoch = connectionEpoch;
+    final identity = connectionIdentity;
     try {
       final d = await getJson('/api/bootstrap');
-      absorbBootstrap(d);
+      if (!absorbBootstrapIfCurrent(d, epoch: epoch, identity: identity)) return;
       AppLog.instance.log(
         '地址收集完成：共 ${baseUrls.length} 个 → ${baseUrls.join(' , ')}',
       );
@@ -577,7 +611,7 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
     if (idx < 0) return false;
     final next = baseUrls[(idx + 1) % baseUrls.length];
     if (next == cur) return false;
-    resetCapabilities();
+    invalidateConnection();
     baseUrl = next;
     // 持久化新活动地址（失败不影响内存态切换）
     unawaited(() async {

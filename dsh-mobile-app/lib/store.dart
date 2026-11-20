@@ -819,7 +819,10 @@ class AppStore extends ChangeNotifier {
             });
           } else {
             try {
-              api.absorbBootstrap(await api.getJson('/api/bootstrap'));
+              final epoch = api.connectionEpoch;
+              final identity = api.connectionIdentity;
+              final d = await api.getJson('/api/bootstrap');
+              api.absorbBootstrapIfCurrent(d, epoch: epoch, identity: identity);
             } catch (_) {}
           }
           final current = api.pluginUpdate.transaction;
@@ -2230,14 +2233,28 @@ class AppStore extends ChangeNotifier {
     var ok = false;
     // 快照时序基准：请求发起时记下帧计数，期间若有 agent/status 帧落地则只合并不裁剪
     final epoch = _agentStatusEpoch;
+    _syncConnectionGeneration();
+    final connectionEpoch = api.connectionEpoch;
+    final identity = api.connectionIdentity;
+    bool current() =>
+        connectionEpoch == api.connectionEpoch &&
+        identity == api.connectionIdentity;
     try {
       final d = await api.getJson(
         '/api/bootstrap',
         timeout: const Duration(seconds: 8),
       );
+      // 迟到的旧宿主 bootstrap 不得覆盖当前连接的能力位/地址/hostId。
+      if (!current()) return false;
       ok = true;
       // v2.7：下拉刷新也收集地址（蒲公英等新地址及时进候选）+ 同步 agent 状态
-      api.absorbBootstrap(d);
+      if (!api.absorbBootstrapIfCurrent(
+        d,
+        epoch: connectionEpoch,
+        identity: identity,
+      )) {
+        return false;
+      }
       _emitChatEvent(ChatEvent(type: '_capabilities', data: {}));
       _syncAgentStatus(d, snapshotEpoch: epoch);
     } catch (_) {
@@ -2245,12 +2262,24 @@ class AppStore extends ChangeNotifier {
       if (api.rotateBaseUrl()) {
         AppLog.instance.log('刷新探测失败 → 切换地址 ${api.baseUrl}');
         try {
+          final retryEpoch = api.connectionEpoch;
+          final retryIdentity = api.connectionIdentity;
           final d = await api.getJson(
             '/api/bootstrap',
             timeout: const Duration(seconds: 8),
           );
+          if (retryEpoch != api.connectionEpoch ||
+              retryIdentity != api.connectionIdentity) {
+            return false;
+          }
           ok = true;
-          api.absorbBootstrap(d);
+          if (!api.absorbBootstrapIfCurrent(
+            d,
+            epoch: retryEpoch,
+            identity: retryIdentity,
+          )) {
+            return false;
+          }
           _emitChatEvent(ChatEvent(type: '_capabilities', data: {}));
           _syncAgentStatus(d, snapshotEpoch: epoch);
           // 当前 SSE 大概率也指向旧地址：重建连接
@@ -2762,14 +2791,28 @@ class AppStore extends ChangeNotifier {
 
   void connect() {
     if (_sub != null || _connecting) return;
+    // 自动地址轮换不经过 disposeBridge：连接前先识别身份变化，使旧代帧失效。
+    _syncConnectionGeneration();
+    final generation = _refreshGeneration;
+    final connectionEpoch = api.connectionEpoch;
+    final identity = api.connectionIdentity;
+    bool current() =>
+        generation == _refreshGeneration &&
+        connectionEpoch == api.connectionEpoch &&
+        identity == api.connectionIdentity;
     _connecting = true;
     _setConnState('connecting');
     AppLog.instance.log('SSE: connect → ${api.baseUrl}');
     api.onSseKeepalive = _touchLiveness;
     _startWatchdog();
     _sub = api.eventsRaw().listen(
-      _onFrame,
+      (frame) {
+        // 旧连接代的迟到帧不得写能力位/业务状态（Reviewer #16 P2）。
+        if (!current()) return;
+        _onFrame(frame);
+      },
       onError: (e) {
+        if (!current()) return;
         AppLog.instance.log('SSE: error $e');
         if ('$e'.contains('SSE HTTP 503')) _sseBusy = true;
         // 超时 = 黑洞地址（路由不可达，如手机关了组网 VPN）→ 立即轮换候选地址，
@@ -2781,6 +2824,7 @@ class AppStore extends ChangeNotifier {
         _scheduleReconnect();
       },
       onDone: () {
+        if (!current()) return;
         AppLog.instance.log('SSE: done（连接关闭）');
         _scheduleReconnect();
       },
@@ -2791,6 +2835,9 @@ class AppStore extends ChangeNotifier {
   /// App 回到前台时调用：探测电脑端在线状态，SSE 断开则立即重连，并刷新数据。
   Future<void> resume() async {
     if (api.baseUrl.isEmpty || api.token.isEmpty) return; // 未配置连接
+    _syncConnectionGeneration();
+    final connectionEpoch = api.connectionEpoch;
+    final identity = api.connectionIdentity;
     final epoch =
         _agentStatusEpoch; // 快照时序基准（见 _syncAgentStatus 的 snapshotEpoch）
     try {
@@ -2798,8 +2845,18 @@ class AppStore extends ChangeNotifier {
         '/api/bootstrap',
         timeout: const Duration(seconds: 8),
       );
+      if (connectionEpoch != api.connectionEpoch ||
+          identity != api.connectionIdentity) {
+        return;
+      }
       // 合并服务端返回的全部地址（含 Tailscale IP）+ 记录插件版本
-      api.absorbBootstrap(d);
+      if (!api.absorbBootstrapIfCurrent(
+        d,
+        epoch: connectionEpoch,
+        identity: identity,
+      )) {
+        return;
+      }
       _emitChatEvent(ChatEvent(type: '_capabilities', data: {}));
       _syncAgentStatus(d, snapshotEpoch: epoch);
       _setConnState('connected');
@@ -3280,11 +3337,17 @@ class AppStore extends ChangeNotifier {
     if (_retry >= 3) {
       _retryTimer = Timer(const Duration(seconds: 2), () async {
         final epoch = _agentStatusEpoch;
+        final connectionEpoch = api.connectionEpoch;
+        final identity = api.connectionIdentity;
         try {
           final d = await api.getJson(
             '/api/bootstrap',
             timeout: const Duration(seconds: 8),
           );
+          if (connectionEpoch != api.connectionEpoch ||
+              identity != api.connectionIdentity) {
+            return;
+          }
           _syncAgentStatus(d, snapshotEpoch: epoch);
           _retry = 0;
           connect();
@@ -3326,8 +3389,8 @@ class AppStore extends ChangeNotifier {
   }
 
   void disposeBridge() {
-    // 连接代切换：能力位只属于当前连接，先清掉；新连接的 hello/bootstrap 会重新声明。
-    api.resetCapabilities();
+    // 连接代切换：递增连接代号并清空能力位；新连接的 hello/bootstrap 会重新声明。
+    api.invalidateConnection();
     _sub?.cancel();
     _retryTimer?.cancel();
     _sessTimer?.cancel();
