@@ -889,3 +889,69 @@ test("safeFailureReason：任意异常都只产出稳定错误码，绝不夹带
 		assert.match(reason, /^[a-z-]+（.+）$/, `应为「错误码（固定文案）」，实际：${reason}`);
 	}
 });
+
+// ───────────────────── issue #140：子代理树契约 ─────────────────────
+
+test("issue #140 旧宿主 0.1.5：直接子级保留，depth 不伪造且 multiLevelUnavailable 显式降级", async () => {
+	const h = createHarness({
+		generation: "0.1.5",
+		catalog: [{ id: "child-old", createdAt: 1000, mode: "continuable", label: "旧代子代理" }],
+	});
+	try {
+		const res = await call(h.route, { url: "/m/api/subagents?parentSessionId=session-A" });
+		assert.equal(res.status, 200);
+		assert.equal(res.body.catalogDegraded, undefined, "目录可用不标 catalogDegraded");
+		assert.equal(res.body.multiLevelUnavailable, true, "旧代只有直接子级，必须显式标记多层不可用");
+		assert.equal(res.body.subagents.length, 1);
+		const row = res.body.subagents[0];
+		assert.equal(row.id, "child-old");
+		assert.equal(row.title, "旧代子代理", "既有 title 逻辑不变");
+		assert.equal(row.parentSessionId, "session-A", "直接子级的父会话为请求父会话");
+		assert.equal(row.depth, null, "无 depth 不得伪造");
+		assert.equal(row.name, null, "目录无 name 时显式 null");
+	} finally { h.clean(); }
+});
+
+test("issue #140 降级路径（目录抛错→注册表）：catalogDegraded 与 multiLevelUnavailable 并存", async () => {
+	const h = createHarness({
+		generation: "0.2.0",
+		extraSessions: [
+			{ id: "hot-child", header: { id: "hot-child", cwd: "/tmp/proj", createdAt: 2000, origin: "subagent", parentSession: "session-A" } },
+		],
+		catalog: [],
+		catalogThrows: true,
+	});
+	try {
+		const res = await call(h.route, { url: "/m/api/subagents?parentSessionId=session-A" });
+		assert.equal(res.status, 200);
+		assert.equal(res.body.catalogDegraded, true, "目录不可用必须标 catalogDegraded");
+		assert.equal(res.body.multiLevelUnavailable, true, "注册表兜底无 depth/树边，必须标多层不可用");
+		assert.equal(res.body.subagents.length, 1);
+		const row = res.body.subagents[0];
+		assert.equal(row.id, "hot-child");
+		assert.equal(row.parentSessionId, "session-A");
+		assert.equal(row.depth, null);
+		assert.equal(row.name, null);
+		assert.equal(row.status, "inactive", "既有状态字段不变");
+	} finally { h.clean(); }
+});
+
+test("issue #140 /sessions：每项带可空 parentSessionId，既有 parentSession 保留", async () => {
+	const h = createHarness({
+		generation: "0.2.0",
+		extraSessions: [
+			{ id: "child-A", header: { id: "child-A", cwd: "/tmp/proj", createdAt: 2000, origin: "subagent", parentSession: "session-A" } },
+			{ id: "fork-A", header: { id: "fork-A", cwd: "/tmp/proj", createdAt: 3000, parentSession: "session-A" } },
+		],
+	});
+	try {
+		const res = await call(h.route, { url: "/m/api/sessions?includeEmpty=1" });
+		assert.equal(res.status, 200);
+		const byId = new Map(res.body.sessions.map((row) => [row.id, row]));
+		assert.equal(byId.get("session-A").parentSessionId, null, "根会话的 parentSessionId 为 null");
+		assert.equal(byId.get("child-A").parentSessionId, "session-A");
+		assert.equal(byId.get("child-A").origin, "subagent", "既有 origin 字段保留");
+		assert.equal(byId.get("child-A").parentSession, "session-A", "既有 parentSession 字段保留（兼容旧客户端）");
+		assert.equal(byId.get("fork-A").parentSessionId, "session-A", "用户 fork（无 origin）也保留父会话标识");
+	} finally { h.clean(); }
+});

@@ -187,6 +187,7 @@
       "lastActivity": 1750000123456,
       "lastMessageAt": 1750000111000,
       "origin": "subagent",
+      "parentSessionId": "session-parent",
       "parentSession": "session-parent",
       "subagentsRunning": true
     }
@@ -207,7 +208,8 @@
 - `lastActivity`：最近活跃时间（ms）。任意会话事件（SSE）与移动端"打开会话"（3.4 touch）都会更新，持久化于 `~/.dsh/mobile-remote/session-activity.json`。保留给旧版 App，且在消息时间缺失时仍作为排序回退值；旧 App 调用 `touch` 或内部事件发生时，这类会话仍可能重排。
 - `lastMessageAt`（规划中，可选）：最近一条用户/助手可见对话消息的时间（ms）；无记录时为 `null`。打开会话不更新，工具活动与生命周期事件也不更新。字段缺失或为 `null` 时，客户端回退 `lastActivity`、再回退 `createdAt`，不提示降级；这项兼容回退不保证打开/内部事件后顺序始终不变。
 - `origin`（规划中，可选）：会话来源，子代理会话为 `"subagent"`；其余会话不返回。客户端据此隐藏子代理会话；字段缺失即不过滤。
-- `parentSession`（规划中，可选）：派生来源会话 id，为将来"折叠到父会话"预留。**不得**用它判定子代理会话——用户主动 fork 的会话只有该字段而没有 `origin`。
+- `parentSessionId`（issue #140，**始终下发**，可空）：派生的直接父会话 id；根会话为 `null`。供 #141 子代理面板按父聚合子节点、判断是否根会话。用户 fork（只有父关系、无 `origin`）同样带此字段。
+- `parentSession`（规划中，可选，兼容保留）：派生来源会话 id；与 `parentSessionId` 同值但保持"可选"的旧语义。**不得**用它判定子代理会话——用户主动 fork 的会话只有该字段而没有 `origin`。
 - `subagentsRunning`（int，**始终下发，0 也表示无**；issue #124/#133）：该会话下**递归**运行中的子代理 descendant 数（不含根自身）。服务端用**空会话过滤前**的原始会话 header 建 `origin=subagent → parentSession` 父子映射，再对 `agents.list()` 中 `status=running` 的子代理一次反向计数到各层祖先，**不**逐会话调用 `/subagents` 或 `listDescendants`（88 会话也只读一次 agent 列表）。用户 fork（只有 `parentSession`、无 `origin`）不计入。客户端优先用 SSE 帧的 `subagentsRunning`，其次本字段，缺失时才按本地树递归聚合——三路取并集，不互相门控。
 
 ### 3.4 归档 / 活跃时间接口
@@ -649,14 +651,21 @@
 
 **GET `/m/api/subagents?parentSessionId=…`** — 子代理列表（按父会话）
 ```json
-{ "ok": true, "parentAvailable": true, "catalogDegraded": true, "subagents": [
-  { "id": "…", "kind": "child", "status": "running", "title": "…", "createdAt": 1730000000000 }
+{ "ok": true, "parentAvailable": true, "catalogDegraded": true, "multiLevelUnavailable": true, "subagents": [
+  { "id": "…", "name": "reviewer", "depth": 1, "parentSessionId": "session-parent",
+    "kind": "child", "status": "running", "title": "…", "createdAt": 1730000000000 }
 ]}
 ```
 - 目录来源按优先级取（能力探测，不看宿主版本号）：
-  ① rc.2+ `ctx.subagents.listDescendants(parentSessionId, signal)`（递归，**只取 `depth===1`**）→
+  ① rc.2+ `ctx.subagents.listDescendants(parentSessionId, signal)`（递归全树；**透出整棵树**，不再按 `depth===1` 收窄）→
   ①' rc.1 `ctx.subagents.listChildren(parentSessionId, signal)` → ② 持久化枚举（父会话休眠/归档时入口不消失）→ ③ 会话注册表派生。
   **不调用 `subagents/list` Remote 端点**——该端点在宿主 0.2.0 已被删除
+- issue #140 树字段（每行）：
+  · `name`（string | null）：代理名（rc.2 目录的 `name`；目录无名字时为 `null`，不伪造）。
+  · `depth`（int | null）：距请求根会话的层数，直接子级为 `1`；只有 rc.2 `listDescendants` 提供，旧代/降级路径为 `null`（不伪造）。
+  · `parentSessionId`（string）：**直接父会话 id**；rc.2 用目录行的 `parentId`，旧代/降级路径为请求的父会话。
+  · `title`/`kind`/`status`/`createdAt` 语义不变；`title` 仍按目录 label → name → 持久标题 → 短码。
+- `multiLevelUnavailable: true`（issue #140，可选）：rc.1/持久化/注册表回退，或 rc.2 树行缺 `depth` 时显式降级——客户端不得据此行推断多层树（不能把 `null` 当 0/1）。
 - `kind`：`child`（普通子代理）或 `diagnostic`（rc.2 的 `kind:"diagnostic"` / rc.1 的 `mode:"unknown"`）。
   diagnostic 行**没有 `mode`**，客户端不得用 `row.mode` 判分支。
 - `status`：普通行为活 agent 的 AgentStatus 映射（`running`/`inactive`）；diagnostic 行为三枚举原因：

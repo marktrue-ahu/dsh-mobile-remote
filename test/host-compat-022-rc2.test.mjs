@@ -130,16 +130,16 @@ test("issue #87 rc.2：interruptByUser + 单字段 payload + accepted receipt", 
   } finally { h.dispose(); }
 });
 
-test("issue #87 rc.2：listDescendants depth1 过滤 + diagnostic 三枚举 + createdAt 回落/沉底", async () => {
+test("issue #140 rc.2：listDescendants 透出递归树（name/depth/parentSessionId）+ diagnostic 三枚举 + createdAt 回落/沉底", async () => {
   const h = harness({
     generation: "rc2",
     descendants: [
-      { id: "child-live", depth: 1, kind: "child", mode: "continuable", label: "live label", activity: "running" },
-      { id: "child-missing-time", depth: 1, kind: "child", mode: "continuable", label: "no time" },
-      { id: "grandchild", depth: 2, kind: "child", mode: "continuable", label: "grand" },
-      { id: "diag-unsupported", depth: 1, kind: "diagnostic", reason: "unsupported", label: "diag unsupported" },
-      { id: "diag-corrupt", depth: 1, kind: "diagnostic", reason: "corrupt" },
-      { id: "diag-unavailable", depth: 1, kind: "diagnostic", reason: "unavailable" },
+      { id: "child-live", depth: 1, parentId: PARENT, name: "reviewer", path: "reviewer", kind: "child", mode: "continuable", label: "live label", activity: "running" },
+      { id: "child-missing-time", depth: 1, parentId: PARENT, name: "checker", path: "checker", kind: "child", mode: "continuable", label: "no time" },
+      { id: "grandchild", depth: 2, parentId: "child-live", name: "checker", path: "reviewer/checker", kind: "child", mode: "continuable", label: "grand" },
+      { id: "diag-unsupported", depth: 1, parentId: PARENT, path: "legacy", kind: "diagnostic", reason: "unsupported", label: "diag unsupported" },
+      { id: "diag-corrupt", depth: 1, parentId: PARENT, kind: "diagnostic", reason: "corrupt" },
+      { id: "diag-unavailable", depth: 1, parentId: "child-live", kind: "diagnostic", reason: "unavailable" },
     ],
     sessions: [
       { id: "child-live", header: { id: "child-live", createdAt: 3000 } },
@@ -150,20 +150,28 @@ test("issue #87 rc.2：listDescendants depth1 过滤 + diagnostic 三枚举 + cr
     const res = await h.request(`/m/api/subagents?parentSessionId=${PARENT}`);
     assert.equal(res.status, 200);
     assert.equal(res.body.catalogDegraded, undefined, "rc.2 目录成功不得标 degraded");
+    assert.equal(res.body.multiLevelUnavailable, undefined, "rc.2 有 depth/父子边，不得标多层降级");
     const byId = new Map(res.body.subagents.map((row) => [row.id, row]));
-    assert.equal(byId.has("grandchild"), false, "只取 depth===1");
+    assert.equal(byId.has("grandchild"), true, "#140：递归树必须透出 depth>1 的行");
+    assert.equal(byId.get("child-live").name, "reviewer");
+    assert.equal(byId.get("child-live").depth, 1);
+    assert.equal(byId.get("child-live").parentSessionId, PARENT);
+    assert.equal(byId.get("grandchild").depth, 2);
+    assert.equal(byId.get("grandchild").parentSessionId, "child-live");
     assert.equal(byId.get("child-live").createdAt, 3000, "无 createdAt 时回落 session.header.createdAt");
     // session.header.createdAt 实际未填到 descendant 行：插件映射仍应回落。
     // （child-missing-time 不在 sessions 注册表 → 沉底）
     const ids = res.body.subagents.map((row) => row.id);
     // createdAt 缺失项整体沉底（组内 id 升序），不抢占有时间项的位置。
     assert.ok(ids.indexOf("child-missing-time") > ids.indexOf("diag-unsupported"));
-    assert.deepEqual(ids.slice(2), ["child-missing-time", "diag-corrupt", "diag-unavailable"]);
+    assert.deepEqual(ids.slice(2), ["child-missing-time", "diag-corrupt", "diag-unavailable", "grandchild"]);
     assert.equal(ids.filter((id) => id === "child-missing-time").length, 1);
     assert.equal(byId.get("diag-unsupported").kind, "diagnostic");
     assert.equal(byId.get("diag-unsupported").status, "unsupported");
     assert.equal(byId.get("diag-corrupt").status, "corrupt");
     assert.equal(byId.get("diag-unavailable").status, "unavailable");
+    assert.equal(byId.get("diag-unsupported").name, null, "diagnostic 无 name 时显式 null");
+    assert.equal(byId.get("diag-unsupported").depth, 1, "diagnostic 也保留树位置");
     assert.equal("mode" in byId.get("diag-unsupported"), false);
   } finally { h.dispose(); }
 });
@@ -180,8 +188,13 @@ test("issue #87 rc.1：interruptByParent 三字段 + listChildren diagnostic/cre
   try {
     const list = await h.request(`/m/api/subagents?parentSessionId=${PARENT}`);
     assert.equal(list.status, 200);
+    assert.equal(list.body.catalogDegraded, undefined, "rc.1 目录可用不标 catalogDegraded");
+    assert.equal(list.body.multiLevelUnavailable, true, "rc.1 无 depth/树边，必须显式降级");
     const ids = list.body.subagents.map((row) => row.id);
     assert.deepEqual(ids, ["child-a", "child-b"]);
+    assert.equal(list.body.subagents[0].parentSessionId, PARENT, "直接子级的父会话即请求父会话");
+    assert.equal(list.body.subagents[0].depth, null, "rc.1 不伪造 depth");
+    assert.equal(list.body.subagents[0].name, null, "无 name 时显式 null");
     assert.equal(list.body.subagents[1].kind, "diagnostic");
     assert.equal(list.body.subagents[1].status, "unsupported");
     const interrupt = await h.request("/m/api/subagents/interrupt", {
