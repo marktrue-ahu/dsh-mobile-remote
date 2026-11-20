@@ -703,7 +703,7 @@ void main() {
     await tester.pumpAndSettle();
 
     final git = find.byTooltip('Git');
-    final tools = find.byTooltip('任务 / 子代理 / 目标');
+    final tools = find.byTooltip('任务 / 目标');
     expect(git, findsOneWidget);
     expect(tools, findsOneWidget);
     expect(tester.getTopLeft(git).dy, lessThan(tester.getTopLeft(tools).dy));

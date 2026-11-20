@@ -229,6 +229,14 @@ class AppStore extends ChangeNotifier {
     }
     return false;
   }
+
+  /// issue #141：当前会话是否子代理（代理面板渲染层 + action 分发层双重 gating）。
+  /// 只认 `origin == 'subagent'`（ADR 0013）；旧插件缺 origin 时按主会话处理。
+  bool isSubagentSession(String? id) {
+    if (id == null || id.isEmpty) return false;
+    return _isKnownSubagentSession(id);
+  }
+
   String darkMode = 'system'; // system | dark | light
   DshSkin skin = DshSkin.dsh; // 主题皮肤（默认 / 深潜夜航 / 海盐汽水 / 鲸落星海）
   String appIcon = 'default'; // 桌面图标样式 id（default/deepsea/shell/moon/sticker/stamp/neon/mono）
@@ -263,18 +271,21 @@ class AppStore extends ChangeNotifier {
   List<String> conversationActionOrder = const [
     'git',
     'files',
+    'agents',
     'session_tools',
     'copy',
   ];
   static const conversationActionIds = [
     'git',
     'files',
+    'agents',
     'session_tools',
     'copy',
   ];
   static const _defaultConversationActionOrder = [
     'git',
     'files',
+    'agents',
     'session_tools',
     'copy',
   ];
@@ -2593,11 +2604,11 @@ class AppStore extends ChangeNotifier {
           sessions = fetched;
         } else {
           sessions = fetched
-              .map((s) => subagentRunningByRoot.containsKey(s.id)
-                  ? s.copyWith(
-                      subagentsRunning: subagentRunningByRoot[s.id],
-                    )
-                  : s)
+              .map(
+                (s) => subagentRunningByRoot.containsKey(s.id)
+                    ? s.copyWith(subagentsRunning: subagentRunningByRoot[s.id])
+                    : s,
+              )
               .toList();
         }
         _persistSessions(); // 本地缓存：下次打开 App 秒出列表
@@ -3233,7 +3244,9 @@ class AppStore extends ChangeNotifier {
       if (rootId is String && rootId.isNotEmpty && runningCount != null) {
         final idx = sessions.indexWhere((s) => s.id == rootId);
         if (idx >= 0 && sessions[idx].subagentsRunning != runningCount) {
-          sessions[idx] = sessions[idx].copyWith(subagentsRunning: runningCount);
+          sessions[idx] = sessions[idx].copyWith(
+            subagentsRunning: runningCount,
+          );
         }
       }
       _agentStatusEpoch++; // 增量帧落地：期间到达的 bootstrap/慢快照不再裁剪（见 _syncAgentStatus）

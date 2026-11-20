@@ -221,11 +221,11 @@ Future<AppStore> _mount(
   return store;
 }
 
-/// 从聊天页按真实入口打开「会话工具」任务页签：对话操作 → 任务 / 子代理 / 目标。
+/// 从聊天页按真实入口打开「会话工具」任务页签：对话操作 → 任务 / 目标。
 Future<void> _openJobsSheet(WidgetTester tester) async {
   await tester.tap(find.byTooltip('对话操作'));
   await tester.pumpAndSettle();
-  await tester.tap(find.byTooltip('任务 / 子代理 / 目标'));
+  await tester.tap(find.byTooltip('任务 / 目标'));
   await tester.pumpAndSettle();
   expect(find.text('会话工具'), findsOneWidget, reason: '会话工具面板应弹出');
 }
@@ -482,7 +482,7 @@ void main() {
 
       await tester.tap(find.byType(Tab).at(1));
       await tester.pumpAndSettle();
-      expect(find.textContaining('暂无子代理'), findsOneWidget);
+      expect(find.text('当前没有目标'), findsOneWidget);
 
       await tester.tap(find.byType(Tab).at(0));
       await tester.pumpAndSettle();
