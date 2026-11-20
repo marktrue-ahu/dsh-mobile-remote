@@ -812,10 +812,11 @@ test("/subagents：目录来源优先用 ctx.subagents.listChildren，不再调�
 		assert.equal(status, 200);
 		assert.equal(body.parentAvailable, true);
 		assert.deepEqual(body.subagents, [
-			{ id: "live-child", kind: "child", status: "inactive", title: "活跃子代理", createdAt: 2000 },
-			{ id: "cold-child", kind: "child", status: "inactive", title: "Review storage", createdAt: 1000 },
+			{ id: "live-child", name: null, depth: null, parentSessionId: "session-parent", kind: "child", status: "inactive", title: "活跃子代理", createdAt: 2000 },
+			{ id: "cold-child", name: null, depth: null, parentSessionId: "session-parent", kind: "child", status: "inactive", title: "Review storage", createdAt: 1000 },
 		], "目录条目按 createdAt 降序；标题取 label；无活 agent 时回落 inactive");
 		assert.equal(body.catalogDegraded, undefined, "目录可用时不得标注降级");
+		assert.equal(body.multiLevelUnavailable, true, "listChildren 直接子级路径：显式标记多层不可用");
 		assert.equal(rpcCalls.some((c) => c.endpoint === "subagents/list"), false, "不得调用宿主已删除的 subagents/list 端点");
 	} finally {
 		harness.clean();
