@@ -166,11 +166,14 @@ void main() {
         findsOneWidget,
       );
 
-      for (final key in [
-        'agent-tab-team',
-        'agent-tab-tasks',
-        'agent-tab-messages',
-      ]) {
+      // #142：团队页已有真实内容（本 fake 无 team 服务 → 降级提示）。
+      await tester.tap(find.byKey(const ValueKey<String>('agent-tab-team')));
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('agent-team-switch-card')),
+        findsOneWidget,
+      );
+      for (final key in ['agent-tab-tasks', 'agent-tab-messages']) {
         await tester.tap(find.byKey(ValueKey<String>(key)));
         await tester.pumpAndSettle();
         expect(

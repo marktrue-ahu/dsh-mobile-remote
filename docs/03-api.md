@@ -684,6 +684,36 @@
 - rc.1（仅 `subagents.interruptByParent`）：映射旧端点，payload `{ childSessionId, parentSessionId, mode: "continuable" }`；
   旧宿主无 receipt，响应省略 `accepted`。
 
+**GET `/m/api/team?sessionId=…`** — 代理面板「团队」只读摘要 + 开关状态（issue #142）
+```json
+{ "ok": true, "team": {
+  "sessionId": "…", "supported": true, "root": true, "agentLive": true,
+  "enabled": false, "modeKnown": true, "modelSelected": true,
+  "pending": false, "locked": false, "canToggle": true, "unavailableReason": null,
+  "lead": { "id": "…", "title": "…", "status": "inactive" },
+  "members": [ { "id": "…", "name": "reviewer", "title": "…", "kind": "child",
+                 "status": "running", "depth": 1, "parentSessionId": "…" } ],
+  "membersAvailable": true, "membersDegraded": false,
+  "tasks": { "total": 3, "completed": 1, "inProgress": 1, "pending": 1 },
+  "tasksAvailable": true
+}}
+```
+- 只读：成员来自 `subagents.listDescendants`（旧代回退 `listChildren` 并标 `membersDegraded`）；任务摘要来自内核 `agentTeams.listTasks` 或持久化 `team/task` 事件。**不创建/编辑/删除**团队或成员。
+- `supported`：宿主是否提供 `agentTeams.isEnabled/setEnabled`；旧宿主为 `false`，客户端隐藏/禁用写操作并显示降级提示，**不伪造**成员或任务。
+- `root`：`origin !== "subagent"`；子代理会话不可修改团队设置（POST 返回 `409 team-root-required`）。
+- `canToggle/unavailableReason`：固定优先级 `team-unavailable` → `team-root-required` → `team-session-offline` → `team-model-unselected` → `team-locked` → `team-pending`。`modelSelected` 取会话待生效模型（provider+model 均有值）。
+- `members[].status`：活 agent `running`/`inactive`；diagnostic 行为三枚举 `unsupported/corrupt/unavailable`。
+- `tasks` 只给计数（#143 任务板单独定义）；`tasksAvailable:false` 表示宿主无团队任务投影。
+
+**POST `/m/api/team`** — 切换团队协作开关
+```json
+请求: { "sessionId": "…", "enabled": true }
+响应: { "ok": true, "team": { …同上… } }
+```
+- 映射内核 `agentTeams/setEnabled(rootAgent, enabled)`；成功后返回最新状态（不乐观翻转）。
+- 失败稳定码：`400 bad-request`（缺 sessionId / enabled 非布尔）、`404 session-not-found`、`409 team-root-required`、`409 team-session-offline`（未激活，需先发消息）、`409 team-model-unselected`（先选模型）、`409 team-pending`（上一次切换在途）、`409 team-locked`（宿主锁；当前版本保留）、`500 team-save-failed`（固定文案，不泄漏原始异常）、`503 team-unavailable`（旧宿主）。
+- 不改变 `/send`、`/stop`、审批/问询语义。
+
 **GET `/m/api/goal?sessionId=…`** — 当前目标（无目标返回 `{ "goal": null }`）
 ```json
 { "ok": true, "goal": { "id": "…", "revision": 1, "objective": "…",

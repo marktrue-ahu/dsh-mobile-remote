@@ -1385,3 +1385,173 @@ for (const entry of TITLE_FALLBACK_ENTRIES) {
 		} finally { harness.clean(); }
 	});
 }
+
+// ───────────────────── issue #142：代理面板团队页契约 ─────────────────────
+
+const teamGateway = () => ({
+	async stream() {
+		return (async function* () {
+			yield {
+				type: "baseline",
+				value: {
+					projections: {
+						"root-team": { values: { modelSelection: { next: { provider: "deepseek", model: "deepseek-v4" } } } },
+					},
+				},
+			};
+		})();
+	},
+	async invokeRpc() {
+		return { ok: true, value: {} };
+	},
+});
+
+function teamHarness({ enabled = false, tasks = [], withTeam = true, rootHeader = {}, gateway = teamGateway(), subagents = true } = {}) {
+	const rootAgent = { id: "root-team", session: { id: "root-team" }, status: "idle" };
+	const childAgent = { id: "child-1", session: { id: "child-1" }, status: "running" };
+	const agents = {
+		get: (id) => (id === "root-team" ? rootAgent : id === "child-1" ? childAgent : undefined),
+		list: () => [rootAgent, childAgent],
+	};
+	const root = liveSession("root-team", [
+		{ type: "session/title", seq: 1, data: { title: "主会话" } },
+	], rootHeader);
+	const harness = createHarness({
+		records: [record("root-team")],
+		liveSessions: [root],
+		agents,
+		gateway,
+	});
+	let current = enabled;
+	if (withTeam) {
+		harness.provide("agentTeams", {
+			defaultEnabled: false,
+			isEnabled: () => current,
+			async setEnabled(_agent, value) { current = value; },
+			listTasks: () => tasks,
+		});
+	}
+	if (subagents) {
+		harness.provide("subagents", {
+			async listDescendants() {
+				return [
+					{ id: "child-1", depth: 1, parentId: "root-team", kind: "child", name: "reviewer", label: "Reviewer", mode: "continuable" },
+				];
+			},
+		});
+	}
+	return { harness, getEnabled: () => current };
+}
+
+test("issue #142 GET /team：启用态返回 Lead/成员/任务摘要，可切换", async () => {
+	const { harness } = teamHarness({
+		enabled: true,
+		tasks: [
+			{ id: "t1", status: "completed" },
+			{ id: "t2", status: "in_progress" },
+			{ id: "t3", status: "pending" },
+			{ id: "t4", status: "deleted" },
+		],
+	});
+	try {
+		const { status, body } = await call(harness.route, "/m/api/team?sessionId=root-team");
+		assert.equal(status, 200, JSON.stringify(body));
+		const team = body.team;
+		assert.equal(team.supported, true);
+		assert.equal(team.root, true);
+		assert.equal(team.agentLive, true);
+		assert.equal(team.enabled, true);
+		assert.equal(team.canToggle, true);
+		assert.equal(team.unavailableReason, null);
+		assert.equal(team.modelSelected, true);
+		assert.equal(team.lead.title, "主会话");
+		assert.deepEqual(team.members.map((m) => [m.id, m.name, m.kind, m.status]), [["child-1", "reviewer", "child", "running"]]);
+		assert.equal(team.membersAvailable, true);
+		assert.deepEqual(team.tasks, { total: 3, completed: 1, inProgress: 1, pending: 1 });
+		assert.equal(team.tasksAvailable, true);
+	} finally {
+		harness.clean();
+	}
+});
+
+test("issue #142 POST /team：切换成功返回最新状态；失败稳定错误码", async () => {
+	const { harness, getEnabled } = teamHarness({ enabled: false });
+	try {
+		const on = await call(harness.route, "/m/api/team", {
+			method: "POST",
+			body: { sessionId: "root-team", enabled: true },
+		});
+		assert.equal(on.status, 200, JSON.stringify(on.body));
+		assert.equal(on.body.team.enabled, true);
+		assert.equal(getEnabled(), true);
+		const off = await call(harness.route, "/m/api/team", {
+			method: "POST",
+			body: { sessionId: "root-team", enabled: false },
+		});
+		assert.equal(off.status, 200);
+		assert.equal(off.body.team.enabled, false);
+	} finally {
+		harness.clean();
+	}
+});
+
+test("issue #142 旧宿主：无 agentTeams → supported=false，不伪造团队数据", async () => {
+	const { harness } = teamHarness({ withTeam: false });
+	try {
+		const { status, body } = await call(harness.route, "/m/api/team?sessionId=root-team");
+		assert.equal(status, 200);
+		assert.equal(body.team.supported, false);
+		assert.equal(body.team.canToggle, false);
+		assert.equal(body.team.unavailableReason, "team-unavailable");
+		assert.equal(body.team.tasksAvailable, false);
+	} finally {
+		harness.clean();
+	}
+});
+
+test("issue #142 子代理会话：GET root=false，POST 拒绝 team-root-required", async () => {
+	const { harness } = teamHarness({ rootHeader: { origin: "subagent" } });
+	try {
+		const get = await call(harness.route, "/m/api/team?sessionId=root-team");
+		assert.equal(get.body.team.root, false);
+		assert.equal(get.body.team.canToggle, false);
+		assert.equal(get.body.team.unavailableReason, "team-root-required");
+		const post = await call(harness.route, "/m/api/team", {
+			method: "POST",
+			body: { sessionId: "root-team", enabled: true },
+		});
+		assert.equal(post.status, 409);
+		assert.equal(post.body.error, "team-root-required");
+	} finally {
+		harness.clean();
+	}
+});
+
+test("issue #142 模型未定：canToggle=false + team-model-unselected（不伪造可操作）", async () => {
+	const { harness } = teamHarness({ gateway: { async invokeRpc() { return { ok: true, value: {} }; } } });
+	try {
+		const { status, body } = await call(harness.route, "/m/api/team?sessionId=root-team");
+		assert.equal(status, 200);
+		assert.equal(body.team.modelSelected, false);
+		assert.equal(body.team.canToggle, false);
+		assert.equal(body.team.unavailableReason, "team-model-unselected");
+	} finally {
+		harness.clean();
+	}
+});
+
+test("issue #142 未激活/无 live agent：POST 返回 team-session-offline", async () => {
+	const root = liveSession("root-team", [{ type: "session/title", seq: 1, data: { title: "主会话" } }]);
+	const harness = createHarness({ records: [record("root-team")], liveSessions: [root], agents: { get: () => undefined, list: () => [] }, gateway: teamGateway() });
+	harness.provide("agentTeams", { isEnabled: () => false, async setEnabled() {} });
+	try {
+		const post = await call(harness.route, "/m/api/team", {
+			method: "POST",
+			body: { sessionId: "root-team", enabled: true },
+		});
+		assert.equal(post.status, 409);
+		assert.equal(post.body.error, "team-session-offline");
+	} finally {
+		harness.clean();
+	}
+});
