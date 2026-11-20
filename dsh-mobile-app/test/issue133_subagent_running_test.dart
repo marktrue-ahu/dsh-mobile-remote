@@ -721,6 +721,100 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('当前会话是子代理：child running 后断链，主行 idle（屏蔽 legacy 全局状态）', (
+    tester,
+  ) async {
+    _sessionRows = [
+      _row(id: 'main', createdAt: 3000),
+      _row(
+        id: 'child',
+        createdAt: 2000,
+        origin: 'subagent',
+        parentSession: 'main',
+      ),
+    ];
+    final store = await _pumpSessions(tester);
+    store.sessionId = 'child'; // 当前打开的是子代理会话
+    store.injectFrame(_statusFrame('child', 'running'));
+    await tester.pump();
+    expect(_iconOf(tester, 'main').state, SessionRowState.running);
+
+    api.baseUrl = 'http://127.0.0.1:1';
+    await tester.runAsync(() async {
+      store.connect();
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+    });
+    await tester.pump();
+    expect(store.connState, 'offline');
+    expect(
+      _iconOf(tester, 'main').state,
+      SessionRowState.idle,
+      reason: '当前 session 是子代理时，断链后不得回退 legacy 全局 agentStatus',
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('根会话 running 在断链后保留（不误清）', (tester) async {
+    _sessionRows = [_row(id: 'main', createdAt: 3000)];
+    final store = await _pumpSessions(tester);
+    store.sessionId = 'main';
+    store.injectFrame(_statusFrame('main', 'running'));
+    await tester.pump();
+    expect(_iconOf(tester, 'main').state, SessionRowState.running);
+
+    api.baseUrl = 'http://127.0.0.1:1';
+    await tester.runAsync(() async {
+      store.connect();
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+    });
+    await tester.pump();
+    expect(store.connState, 'offline');
+    expect(
+      _iconOf(tester, 'main').state,
+      SessionRowState.running,
+      reason: '根会话自己的 running 状态不得被子代理清理误删（发送/停止键语义）',
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('被列表过滤的 child：先收到 running → 断链 → 之后可见也不复活旧状态', (tester) async {
+    _sessionRows = [_row(id: 'main', createdAt: 3000)];
+    final store = await _pumpSessions(tester);
+    store.injectFrame(_statusFrame('filtered-child', 'running'));
+    await tester.pump();
+
+    api.baseUrl = 'http://127.0.0.1:1';
+    await tester.runAsync(() async {
+      store.connect();
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+    });
+    await tester.pump();
+    expect(store.connState, 'offline');
+
+    // 断链后 child 才出现在刷新列表（被过滤 → 可见），且没有新的状态帧。
+    api.baseUrl = 'http://127.0.0.1:${_server.port}';
+    _sessionRows = [
+      _row(id: 'main', createdAt: 3000),
+      _row(
+        id: 'filtered-child',
+        createdAt: 2000,
+        origin: 'subagent',
+        parentSession: 'main',
+      ),
+    ];
+    await tester.runAsync(() async {
+      await store.refreshSessions();
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    });
+    await tester.pump();
+    expect(
+      _iconOf(tester, 'main').state,
+      SessionRowState.idle,
+      reason: '断链前记录但当时不可见的 child 状态也必须失效，不能在列表可见后复活',
+    );
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('状态切换不改变行几何；running/waiting 的 Semantics 正确', (tester) async {
     _sessionRows = [
       _row(id: 'main', createdAt: 3000),

@@ -211,11 +211,24 @@ class AppStore extends ChangeNotifier {
   /// 若快照请求期间已有更新帧落地，就跳过裁剪（只合并）——否则旧快照会抹掉刚到的 running。
   /// 下一轮 bootstrap 自然收敛，不必在这里赌时序。
   int _agentStatusEpoch = 0;
-  String agentStatusForSession(String? id) => id == null
-      ? agentStatus
-      : sessionAgentStatus[id] ??
-            agentStatusMap[id] ??
-            (id == sessionId ? agentStatus : 'idle');
+  String agentStatusForSession(String? id) {
+    if (id == null) return agentStatus;
+    final mapped = sessionAgentStatus[id] ?? agentStatusMap[id];
+    if (mapped != null) return mapped;
+    if (id != sessionId) return 'idle';
+    // issue #133（复审 P2）：legacy 全局 agentStatus 只代表“当前打开的 agent”。
+    // 当前会话是子代理时，断链清理映射后这里曾继续回退到旧 running，导致主会话
+    // 经本地树聚合误报；子代理查询一律屏蔽该回退（根会话语义不变）。
+    if (_isKnownSubagentSession(id)) return 'idle';
+    return agentStatus;
+  }
+
+  bool _isKnownSubagentSession(String id) {
+    for (final s in sessions) {
+      if (s.id == id) return s.isSubagent;
+    }
+    return false;
+  }
   String darkMode = 'system'; // system | dark | light
   DshSkin skin = DshSkin.dsh; // 主题皮肤（默认 / 深潜夜航 / 海盐汽水 / 鲸落星海）
   String appIcon = 'default'; // 桌面图标样式 id（default/deepsea/shell/moon/sticker/stamp/neon/mono）
@@ -2480,15 +2493,22 @@ class AppStore extends ChangeNotifier {
   /// 且断链缓存的 `subagentsRunning` 会被读到。`copyWith(null)` 清不掉可空字段，
   /// 这里用显式 `clearSubagentsRunning`；清空后必须通知，否则换宿主瞬间旧行仍显示。
   void _clearSubagentRunningState() {
-    final subagentIds = <String>{
+    // 只保留**根会话**状态：被名单过滤掉的子代理不在 sessions 里，不能只按可见
+    // 子代理 id 清；这里反过来清所有“非根”条目（issue #133 复审 P2 盲区）。
+    final rootIds = <String>{
       for (final s in sessions)
-        if (s.isSubagent) s.id,
+        if (!s.isSubagent) s.id,
     };
+    // 当前打开的会话若已知不是子代理，也必须保留其 running（发送/停止键语义）。
+    if (sessionId != null && !_isKnownSubagentSession(sessionId!)) {
+      rootIds.add(sessionId!);
+    }
     String normalized(String agentId) =>
         agentId.startsWith('session:') ? agentId.substring(8) : agentId;
+    bool isNonRoot(String key) => !rootIds.contains(key);
     final hadSubagentStatus =
-        sessionAgentStatus.keys.any(subagentIds.contains) ||
-        agentStatusMap.keys.any((id) => subagentIds.contains(normalized(id)));
+        sessionAgentStatus.keys.any(isNonRoot) ||
+        agentStatusMap.keys.any((id) => isNonRoot(normalized(id)));
     final hadState =
         hadSubagentStatus ||
         subagentRunningByRoot.isNotEmpty ||
@@ -2499,15 +2519,9 @@ class AppStore extends ChangeNotifier {
         for (final s in sessions) s.copyWith(clearSubagentsRunning: true),
       ];
     }
-    // issue #133（复审 P2-2）：本地树 fallback 也读 agent 状态映射；断链/换宿主后
-    // 旧连接代的子代理 running 必须失效，否则清掉聚合字段后仍会从本地树读回 running。
-    // 只清子代理会话的条目，保留根会话状态（发送/停止键语义不变）。
-    if (subagentIds.isNotEmpty) {
-      sessionAgentStatus.removeWhere((id, _) => subagentIds.contains(id));
-      agentStatusMap.removeWhere(
-        (agentId, _) => subagentIds.contains(normalized(agentId)),
-      );
-    }
+    // 清掉所有非根会话状态（含 SSE 已记录、但列表被过滤的 child）。
+    sessionAgentStatus.removeWhere((id, _) => isNonRoot(id));
+    agentStatusMap.removeWhere((agentId, _) => isNonRoot(normalized(agentId)));
     if (hadState) notifyListeners();
   }
 
