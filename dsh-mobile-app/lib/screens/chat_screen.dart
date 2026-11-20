@@ -552,6 +552,10 @@ class _ChatScreenState extends State<ChatScreen> {
   final Map<String, bool> _provisionalExpansions = {};
   String _draft = '';
   bool _streaming = false;
+  // 当前流式草稿的身份（issue #129 review P2）：只用于和同 turn/step 的 durable
+  // assistant/message 去重；身份缺失（旧宿主无 turn/step）时宁可不丢弃草稿。
+  int? _draftTurn;
+  int? _draftStep;
   int _lastSeq = 0;
   // v3.1.4（issue #13）：轮次兜底同步——最近一条已渲染的真人提问 / 回复的 seq，
   // 用于判断"本轮有提问却没有回复条目"（内容被静默吞掉）时补拉一次历史。
@@ -835,6 +839,14 @@ class _ChatScreenState extends State<ChatScreen> {
   /// 当前跟随意图（只读探针）：需求/按钮用例直接断言意图，而不是用几何反推。
   @visibleForTesting
   FollowIntent get debugFollowIntent => _scrollFollow.intent;
+
+  /// issue #129 review(P2)：当前 live reasoning 文本（验证跨轮不误去重）。
+  @visibleForTesting
+  String? get debugLiveReasoningText => _liveReasoning.current?.text;
+
+  /// issue #129 review(P2)：当前 live 流式草稿（验证空页/跨轮后仍保留）。
+  @visibleForTesting
+  String get debugDraftText => _draft;
 
   /// 首屏补拉探针：最新一轮是否仍缺 turn/start（方案 2 的验收条件）。
   @visibleForTesting
@@ -1978,6 +1990,14 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  /// issue #129：任何清草稿的路径都必须连同流式身份一起清（turn/step 用于去重）。
+  void _clearDraft() {
+    _draft = '';
+    _streaming = false;
+    _draftTurn = null;
+    _draftStep = null;
+  }
+
   /// 流式草稿节流：chunk 到达只累加文本，定时（~80ms）合并刷新一次。
   void _scheduleDraftFlush() {
     _streaming = true;
@@ -2020,6 +2040,8 @@ class _ChatScreenState extends State<ChatScreen> {
       // 包含同一段文本，下面必须恢复，否则已显示的流式正文会凭空消失。
       final liveDraftBefore = _draft;
       final liveStreamingBefore = _streaming;
+      final liveDraftTurnBefore = _draftTurn;
+      final liveDraftStepBefore = _draftStep;
       // v3.1.6（app-audit ②）：守卫之后才写降级标记——过期响应（会话切换/重同步重叠）此前
       // 也会改写横幅状态：`_historyDegraded` 是赋值语义，过期页能把已置位的提示抹回 false。
       if (!mounted || generation != _loadGeneration || id != _mySessionId) {
@@ -2116,8 +2138,7 @@ class _ChatScreenState extends State<ChatScreen> {
           _liveReasoning.clear();
           _liveReasoningRevision.value++;
           _provisionalExpansions.clear();
-          _draft = '';
-          _streaming = false;
+          _clearDraft();
         }
         // v3.1.4（issue #12 姊妹需求）：任务清单按**时间正序**折叠一次（最新覆盖、turn/start 清空），
         // 与内核投影一致——历史事件在下面按倒序入列渲染，顺序敏感的状态必须单独折叠。
@@ -2145,6 +2166,8 @@ class _ChatScreenState extends State<ChatScreen> {
             events,
             draftBefore: liveDraftBefore,
             streamingBefore: liveStreamingBefore,
+            draftTurnBefore: liveDraftTurnBefore,
+            draftStepBefore: liveDraftStepBefore,
           );
         }
         // v3.1.4（issue #13）：跟踪字段按**时间正序**重算——历史是倒序入列的，
@@ -2262,53 +2285,58 @@ class _ChatScreenState extends State<ChatScreen> {
 
   /// issue #129 review(P2)：初始 history 重建后，用 durable 快照对保留的 live 缓冲去重。
   ///
-  /// 初始打开期间 SSE 可能已送来 `assistant/live-chunk`（→ `_draft`）或 reasoning delta
-  /// （→ `_liveReasoning`），它们没有持久行，重放历史不会重新生成。这里只在**durable
-  /// 快照已经包含同一段内容**时丢弃 live 副本，避免：
-  /// - 空页/失败把流式正文清掉（保留）；
-  /// - 最终 assistant/message 已落库却又多显示一条草稿/思考（去重）。
-  ///
-  /// 按文本包含判断而不是 turn/step 水位：快照里可能有同 turn 更早 step 的 assistant/message
-  /// （step 不单调），按水位会误关仍在流的 provisional。
+  /// 身份规则：只和**同一 turn/step** 的 durable assistant/message（或同一 turn 的
+  /// turn/end）比较。`turn`/`step` 缺失时宁可不丢弃 live 内容；绝不用纯文本匹配——
+  /// 旧轮回复常含相同子串（如「好的」），会把新轮草稿/思考误判为重复而删掉。
   void _reconcileLiveBuffersWithHistory(
     List<ChatEvent> events, {
     required String draftBefore,
     required bool streamingBefore,
+    required int? draftTurnBefore,
+    required int? draftStepBefore,
   }) {
     final reasoning = _liveReasoning.current;
-    final draft = draftBefore.trim();
-    var draftSettled = draft.isEmpty;
+    final hasDraft = draftBefore.trim().isNotEmpty;
+    var draftSettled = false;
     var reasoningSettled = false;
     for (final ev in events) {
+      final d = ev.data;
+      final turn = (d?['turn'] as num?)?.toInt();
       if (ev.type == 'turn/end') {
-        final turn = (ev.data?['turn'] as num?)?.toInt();
+        if (draftTurnBefore != null && turn == draftTurnBefore) {
+          draftSettled = true;
+        }
         if (reasoning != null && turn == reasoning.turn) {
           reasoningSettled = true;
-          // 同一轮的 turn/end 也是当前草稿的终结水位（流式已结束）。
-          if (!draftSettled) draftSettled = true;
         }
         continue;
       }
       if (ev.type != 'assistant/message') continue;
-      final body = (ev.data?['text'] as String? ?? '').trim();
-      final durableReasoning = (ev.data?['reasoning'] as String? ?? '').trim();
-      if (!draftSettled && body.contains(draft)) draftSettled = true;
+      final step = (d?['step'] as num?)?.toInt();
+      if (!draftSettled &&
+          draftTurnBefore != null &&
+          turn == draftTurnBefore &&
+          _sameLiveStreamStep(durableStep: step, liveStep: draftStepBefore)) {
+        draftSettled = true;
+      }
       if (reasoning != null &&
-          durableReasoning.isNotEmpty &&
-          durableReasoning.contains(reasoning.text.trim())) {
+          turn == reasoning.turn &&
+          _sameLiveStreamStep(durableStep: step, liveStep: reasoning.step)) {
         reasoningSettled = true;
       }
     }
-    if (draftSettled) {
-      _draft = '';
-      _streaming = false;
-    } else if (_draft.isEmpty && draft.isNotEmpty) {
-      // 回放被快照里**无关**的 assistant/message/turn/end 清掉了草稿：快照没有包含
-      // 同一段文本 → 恢复请求期间的 live 缓冲（避免流式正文凭空消失）。
+    if (hasDraft && draftSettled) {
+      _clearDraft();
+    } else if (_draft.isEmpty && draftBefore.isNotEmpty) {
+      // 回放被**无关**快照事件清掉（身份不匹配）：恢复请求期间的 live 草稿与身份。
       _draft = draftBefore;
       _streaming = streamingBefore;
+      _draftTurn = draftTurnBefore;
+      _draftStep = draftStepBefore;
     } else if (_draft.isEmpty && _streaming != streamingBefore) {
       _streaming = streamingBefore;
+      _draftTurn = draftTurnBefore;
+      _draftStep = draftStepBefore;
     }
     if (reasoningSettled && reasoning != null) {
       _liveReasoning.clear();
@@ -2316,6 +2344,19 @@ class _ChatScreenState extends State<ChatScreen> {
       _provisionalExpansions.clear();
       _invalidateProcessPlan();
     }
+  }
+
+  /// durable assistant/message 是否落在当前 live 流式身份上（调用方已核对 turn）：
+  /// - durable step 缺失 = 整轮落定（与 `_closeLiveReasoningFor` 的 null-step 同语义）；
+  /// - 两边都有 step 时要求 durable step >= live step；
+  /// - live step 缺失时不拿旧 step 误关，只有 durable 也缺失才判落定。
+  bool _sameLiveStreamStep({
+    required int? durableStep,
+    required int? liveStep,
+  }) {
+    if (durableStep == null) return true;
+    if (liveStep == null) return false;
+    return durableStep >= liveStep;
   }
 
   /// issue #129：首次加载成功、内容挂载后的帧后强制跟随一次。
@@ -3382,17 +3423,20 @@ class _ChatScreenState extends State<ChatScreen> {
     if (ev.type == 'assistant/chunk' || ev.type == 'assistant/live-chunk') {
       final text = ev.data?['text'] as String? ?? '';
       final reasoning = ev.data?['reasoning'] == true;
+      final turn = (ev.data?['turn'] as num?)?.toInt();
+      final step = (ev.data?['step'] as num?)?.toInt();
       var layoutChanged = false;
       if (text.isNotEmpty && !reasoning) {
         _draft += text;
+        // issue #129 review(P2)：记录草稿身份，去重只认同 turn/step 的 durable 消息。
+        _draftTurn = turn ?? _draftTurn;
+        _draftStep = step ?? _draftStep;
         // 草稿增长由 80ms 节流统一重建并请求跟随（见 _scheduleDraftFlush）。
         _scheduleDraftFlush();
       } else if (text.isNotEmpty && reasoning) {
         // issue #70：流式思考按 (turn, step) 进缓冲（活动条与 provisional 行同源）。
         // 每个 delta 只做 O(1) 追加 + 行级通知；只有结构变化（首现/切 step）才重建计划，
         // 避免「每 delta 全量 setState」（issue 性能条款）。
-        final turn = (ev.data?['turn'] as num?)?.toInt();
-        final step = (ev.data?['step'] as num?)?.toInt();
         if (turn != null) {
           // issue #70（复审 P1 配套）：durable 回放不再为历史轮次写 tombstone（见
           // `_buildInto` 的 history 隔离）。迟到 chunk 改用**只读**持久投影判定并丢弃：
@@ -4388,8 +4432,7 @@ class _ChatScreenState extends State<ChatScreen> {
         // DSH 把图片算 reply content，这里不能再整条跳过。
         if (body.trim().isEmpty && images.isEmpty) {
           if (!history || tail) {
-            _draft = '';
-            _streaming = false;
+            _clearDraft();
           }
           return;
         }
@@ -4429,8 +4472,7 @@ class _ChatScreenState extends State<ChatScreen> {
           out.insert(0, item);
         }
         if (!history || tail) {
-          _draft = '';
-          _streaming = false;
+          _clearDraft();
         }
       case 'assistant/chunk':
       case 'assistant/live-chunk':
@@ -4440,6 +4482,8 @@ class _ChatScreenState extends State<ChatScreen> {
         if (text.isNotEmpty && !reasoning) {
           _draft += text;
           _streaming = true;
+          _draftTurn = (d?['turn'] as num?)?.toInt() ?? _draftTurn;
+          _draftStep = (d?['step'] as num?)?.toInt() ?? _draftStep;
         }
         if (d?['toolCall'] != null || d?['argumentsDelta'] != null) {
           _upsertToolItem(out, ev, history: history);
@@ -4483,8 +4527,7 @@ class _ChatScreenState extends State<ChatScreen> {
         }
       case 'turn/end':
         if (!history || tail) {
-          _draft = '';
-          _streaming = false;
+          _clearDraft();
         }
         final reason = (d?['reason'] as Map<String, dynamic>?)?['kind'];
         final item = _MsgItem.divider(

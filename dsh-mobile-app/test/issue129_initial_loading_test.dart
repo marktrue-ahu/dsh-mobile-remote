@@ -145,6 +145,20 @@ class _Probe {
       .position;
 }
 
+/// 读取当前 live 草稿（验证空页/跨轮后仍保留）。
+String _draftText(WidgetTester tester) {
+  final state = tester.state(find.byType(ChatScreen));
+  // ignore: avoid_dynamic_calls
+  return (state as dynamic).debugDraftText as String;
+}
+
+/// 读取当前 live reasoning 文本（验证跨轮不误去重）。
+String? _liveReasoningText(WidgetTester tester) {
+  final state = tester.state(find.byType(ChatScreen));
+  // ignore: avoid_dynamic_calls
+  return (state as dynamic).debugLiveReasoningText as String?;
+}
+
 Future<AppStore> _pumpChat(
   WidgetTester tester, {
   required _Backend backend,
@@ -597,6 +611,91 @@ void main() {
       expect(find.byKey(_emptyKey), findsNothing);
       expect(tester.takeException(), isNull);
     });
+    testWidgets('旧轮历史回复含相同子串：新轮 live 草稿/思考不被误去重', (tester) async {
+      final completer = Completer<http.Response>();
+      final backend = _Backend((_) => completer.future);
+      final store = await _pumpChat(tester, backend: backend);
+
+      // 新轮（turn=2）的 live 正文与思考；历史快照里没有同 turn 的持久消息。
+      store.injectFrame({
+        'type': 'session/event',
+        'sessionId': _session,
+        'event': _ev('assistant/live-chunk', 1, {
+          'turn': 2,
+          'step': 1,
+          'text': '好的',
+        }),
+      });
+      store.injectFrame({
+        'type': 'session/event',
+        'sessionId': _session,
+        'event': _ev('assistant/live-chunk', 2, {
+          'turn': 2,
+          'step': 1,
+          'reasoning': true,
+          'text': '分析新问题',
+        }),
+      });
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(find.textContaining('好的'), findsWidgets);
+      expect(_liveReasoningText(tester), '分析新问题');
+
+      // 快照只有上一轮（turn=1）回复，且正文包含相同子串「好的」；思考文本也不同轮。
+      completer.complete(
+        _page([
+          _ev('turn/start', 1, {'turn': 1}),
+          _ev('user/message', 2, {
+            'messageId': 'u-old',
+            'text': '上一轮问题',
+            'sourceKind': 'user',
+          }),
+          _ev('assistant/message', 3, {
+            'turn': 1,
+            'step': 1,
+            'messageId': 'a-old',
+            'text': '好的，我已完成',
+            'reasoning': '分析旧问题',
+          }),
+        ]),
+      );
+      // 草稿保留会渲染流式光标（持续动画）：固定帧推进，不用 pumpAndSettle。
+      await tester.pump(const Duration(milliseconds: 350));
+      for (var i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+
+      expect(find.byKey(_emptyKey), findsNothing);
+      expect(find.textContaining('好的，我已完成'), findsOneWidget);
+      expect(_draftText(tester), '好的', reason: '跨轮历史回复不得清掉新轮 live 草稿');
+      expect(
+        _liveReasoningText(tester),
+        '分析新问题',
+        reason: 'reasoning 去重必须核对 turn/step，不能跨轮按文本包含误删',
+      );
+
+      // 继续 chunk 仍更新同一草稿（若草稿被旧轮文本误删，这里会只剩尾巴/不出现）。
+      store.injectFrame({
+        'type': 'session/event',
+        'sessionId': _session,
+        'event': _ev('assistant/live-chunk', 4, {
+          'turn': 2,
+          'step': 1,
+          'text': '，继续',
+        }),
+      });
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(_draftText(tester), '好的，继续');
+      expect(
+        find.textContaining('好的，继续'),
+        findsWidgets,
+        reason: '新轮草稿必须保留并继续追加，不能因旧轮同串文本被丢弃',
+      );
+      expect(tester.takeException(), isNull);
+      await tester.pump(const Duration(seconds: 1));
+    });
+
     testWidgets('成功加载有内容的会话：退出三态并渲染正文', (tester) async {
       final backend = _Backend((_) async => _page(_oneMessage('加载完成')));
       await _pumpChat(tester, backend: backend);
