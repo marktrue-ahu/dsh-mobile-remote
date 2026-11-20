@@ -17,9 +17,11 @@ import '../agent_tree.dart';
 import '../api.dart';
 import '../fmt.dart';
 import '../l10n.dart';
+import '../message_index.dart';
 import '../store.dart';
 import '../theme.dart';
 import '../toast.dart';
+import '../widgets/message_index_tab.dart';
 import 'chat_screen.dart';
 
 /// 打开「代理」面板。仅主会话可调用；调用方需先在渲染层/分发层做 gating。
@@ -29,6 +31,8 @@ Future<void> showAgentPanel(
   required String sessionId,
   required String title,
   Api? apiClient,
+  MessageIndexLoader? messageIndexLoader,
+  MessageOpenHandler? onOpenMessage,
 }) {
   return Navigator.of(context).push<void>(
     MaterialPageRoute<void>(
@@ -37,6 +41,8 @@ Future<void> showAgentPanel(
         sessionId: sessionId,
         title: title,
         apiClient: apiClient,
+        messageIndexLoader: messageIndexLoader,
+        onOpenMessage: onOpenMessage,
       ),
     ),
   );
@@ -52,12 +58,18 @@ class AgentPanelScreen extends StatefulWidget {
   final String title;
   final Api? apiClient;
 
+  /// issue #144：当前会话消息索引（由 ChatScreen 从已加载时间线派生）。
+  final MessageIndexLoader? messageIndexLoader;
+  final MessageOpenHandler? onOpenMessage;
+
   const AgentPanelScreen({
     super.key,
     required this.store,
     required this.sessionId,
     required this.title,
     this.apiClient,
+    this.messageIndexLoader,
+    this.onOpenMessage,
   });
 
   @override
@@ -245,7 +257,10 @@ class _AgentPanelScreenState extends State<AgentPanelScreen>
           _buildSubagentsTab(),
           const _AgentPlaceholderTab(icon: Icons.people_outline),
           const _AgentPlaceholderTab(icon: Icons.checklist_outlined),
-          const _AgentPlaceholderTab(icon: Icons.forum_outlined),
+          MessageIndexTab(
+            loader: widget.messageIndexLoader,
+            onOpenMessage: widget.onOpenMessage,
+          ),
         ],
       ),
     );

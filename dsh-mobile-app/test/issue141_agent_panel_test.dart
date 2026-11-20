@@ -166,11 +166,7 @@ void main() {
         findsOneWidget,
       );
 
-      for (final key in [
-        'agent-tab-team',
-        'agent-tab-tasks',
-        'agent-tab-messages',
-      ]) {
+      for (final key in ['agent-tab-team', 'agent-tab-tasks']) {
         await tester.tap(find.byKey(ValueKey<String>(key)));
         await tester.pumpAndSettle();
         expect(
@@ -179,6 +175,16 @@ void main() {
           reason: '$key 应为说明性占位',
         );
       }
+      // issue #144：消息页签已接入真实消息索引；本夹具未注入 loader → 明确降级说明。
+      await tester.tap(
+        find.byKey(const ValueKey<String>('agent-tab-messages')),
+      );
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey<String>('message-index-unsupported')),
+        findsOneWidget,
+        reason: '消息页签不再使用说明性占位',
+      );
       expect(tester.takeException(), isNull);
     });
 
