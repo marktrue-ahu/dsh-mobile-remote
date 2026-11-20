@@ -17,6 +17,12 @@ import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart'
+    show
+        RenderBox,
+        RenderObject,
+        RenderSliverList,
+        SliverMultiBoxAdaptorParentData;
 import 'package:flutter/services.dart';
 
 import '../l10n.dart';
@@ -55,6 +61,25 @@ const TextStyle _kDiffTextStyle = TextStyle(
   fontSize: 12,
 );
 
+/// 内容模式源码正文样式（行号与正文共用字号；宽度/高度测量必须与渲染同源）。
+const TextStyle _kSourceTextStyle = TextStyle(
+  fontFamily: 'monospace',
+  fontSize: 12,
+);
+
+/// 内容模式行号列与正文之间的间距（原 `SizedBox(width: 10)`）。
+const double _kSourceGutterGap = 10;
+
+/// 内容模式行号列宽度：1.0× 沿用 48；大字号按最大行号位数测量，上限 64。
+const double _kSourceGutterMinWidth = 48;
+const double _kSourceGutterMaxWidth = 64;
+
+/// 内容模式列表上下内边距（原 `EdgeInsets.symmetric(vertical: 6)`）。
+const double _kSourceListVerticalPadding = 6;
+
+/// 工具栏图标按钮命中区（issue #117：自动换行等新按钮 ≥44×44）。
+const double _kToolbarHitSize = 44;
+
 enum GitFileViewerMode { content, diff }
 
 /// 组件内部可测试的稳定 Key；不同入口用不同 [prefix] 保持既有测试键。
@@ -78,6 +103,19 @@ class GitFileViewerKeys {
   Key get retry => Key('$prefix-retry');
   Key get copy => Key('$prefix-copy');
   Key get empty => Key('$prefix-empty');
+
+  /// 内容模式「自动换行」切换（issue #117）。
+  Key get wrapToggle => Key('$prefix-wrap');
+
+  /// 关闭换行时承载横向手势的正文表面（行号列固定）。
+  Key get sourceScrollSurface => Key('$prefix-source-scroll');
+
+  /// 内容模式第 [index] 行的正文/行号（用于换行开关的行位置与固定列断言）。
+  Key sourceLineText(int index) => Key('$prefix-source-text-$index');
+  Key sourceLineNumber(int index) => Key('$prefix-source-line-$index');
+
+  /// 窄屏/大字号时 topActions 折叠后的「更多操作」菜单。
+  Key get overflowActions => Key('$prefix-overflow-actions');
 
   /// diff 模式的行（含折叠后仍保持原始行号下标）与旧/新行号列。
   Key diffLine(int index) => Key('$prefix-diff-line-$index');
@@ -188,6 +226,37 @@ class _GitFileViewerState extends State<GitFileViewer>
   final Set<int> _expandedContextRuns = <int>{};
   String _diffCacheKey = '';
 
+  /// 内容模式自动换行开关（issue #117）：只属于当前 viewer 实例，默认开启。
+  /// 关闭后正文横向滚动、行号列固定；不持久化、不跨文件记忆。
+  bool _wrap = true;
+
+  /// 切换代次：快速连点时只让最后一次帧末恢复生效，避免多次 jump 抖动。
+  int _wrapToggleToken = 0;
+
+  /// 内容列表的纵向控制器：换行切换时用它把「顶部行」恢复到原位。
+  final ScrollController _vScroll = ScrollController();
+
+  /// 内容模式行号列宽度缓存（行数与 textScaler 不变时复用）。
+  double? _gutterWidth;
+  int _gutterLineCount = -1;
+  double _gutterTextScale = -1;
+
+  /// 关闭换行时最宽正文行宽（TextPainter 实测；缓存键含渲染同源样式）。
+  double _cachedSourceMaxWidth = 0;
+  String _cachedSourceMeasureKey = '';
+
+  /// 重新开启换行时按行高累计恢复顶部行的增量缓存（只算到锚点）。
+  final List<double> _wrappedLineHeights = <double>[];
+  String _wrappedHeightKey = '';
+  double _wrappedHeightWidth = -1;
+
+  /// 关闭换行时每行（单行不折行，但 emoji/CJK 回退字体可能改变行高）缓存。
+  final List<double> _unwrappedLineHeights = <double>[];
+  String _unwrappedHeightKey = '';
+
+  /// 最近一次内容正文视口宽（LayoutBuilder 写入），切换时用于估算行位置。
+  double _lastContentWidth = 0;
+
   /// diff 预览的整块横向偏移：所有行共用，行号列不动（issue #71）。
   late final DiffScroll _hScroll;
 
@@ -231,6 +300,7 @@ class _GitFileViewerState extends State<GitFileViewer>
       ..removeListener(_onFlingTick)
       ..dispose();
     _hScroll.dispose();
+    _vScroll.dispose();
     super.dispose();
   }
 
@@ -246,9 +316,16 @@ class _GitFileViewerState extends State<GitFileViewer>
     super.didUpdateWidget(oldWidget);
     if (oldWidget.content != widget.content ||
         oldWidget.path != widget.path ||
+        oldWidget.title != widget.title ||
         oldWidget.mode != widget.mode) {
       _syncContentCaches();
       _rendered = true;
+      // 重新打开/切换文件恢复默认开启（issue #117：不跨文件记忆）。
+      // 同时作废旧切换的帧末恢复，避免把旧文件的行号跳到新文件上。
+      _wrap = true;
+      _wrapToggleToken++;
+      _flingCtrl.stop();
+      _hScroll.jumpTo(0);
     }
     final key = _diffKey();
     if (key != _diffCacheKey) {
@@ -280,6 +357,21 @@ class _GitFileViewerState extends State<GitFileViewer>
     _markdownChunks = _isMarkdown
         ? chunkMarkdownText(widget.content)
         : const [];
+    _resetContentMeasureCaches();
+  }
+
+  /// 内容数据变化后，所有按内容/行数测量的缓存都不再可信。
+  void _resetContentMeasureCaches() {
+    _gutterWidth = null;
+    _gutterLineCount = -1;
+    _gutterTextScale = -1;
+    _cachedSourceMaxWidth = 0;
+    _cachedSourceMeasureKey = '';
+    _wrappedLineHeights.clear();
+    _wrappedHeightKey = '';
+    _wrappedHeightWidth = -1;
+    _unwrappedLineHeights.clear();
+    _unwrappedHeightKey = '';
   }
 
   void _copy(BuildContext context) {
@@ -326,7 +418,16 @@ class _GitFileViewerState extends State<GitFileViewer>
       widget.topActions.isNotEmpty ||
       (widget.path ?? widget.title ?? '').isNotEmpty ||
       (widget.encodingLabel ?? '').isNotEmpty ||
-      _isMarkdown;
+      _isMarkdown ||
+      _showWrapToggle;
+
+  /// 自动换行开关只在「内容模式、非 Markdown 渲染态、可预览文本」出现。
+  /// diff、Markdown 渲染、二进制/不可预览按设计隐藏而不是灰显。
+  bool get _showWrapToggle =>
+      widget.mode == GitFileViewerMode.content &&
+      !(_isMarkdown && _rendered) &&
+      !widget.binary &&
+      widget.notice == null;
 
   String get _displayPath {
     final path = widget.path ?? widget.title ?? '';
@@ -335,41 +436,140 @@ class _GitFileViewerState extends State<GitFileViewer>
     return '$oldPath → $path';
   }
 
+  /// 工具栏。顺序按设计 §5：`[返回] [路径] [编码] [预览/源码] [自动换行]
+  /// [topActions] [复制]`；窄屏/1.5× 依次隐藏编码、图标化 Markdown 切换、
+  /// 折叠 topActions，但不横滚工具栏、不压小 44 命中区。
   Widget _header(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(4, 4, 4, 4),
-      child: Row(
-        children: [
-          if (widget.leading != null) widget.leading!,
-          Expanded(
-            child: Text(
-              _displayPath,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(fontSize: 12.5, color: DshColors.ink2(context)),
-            ),
-          ),
-          if ((widget.encodingLabel ?? '').isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 6),
-              child: Text(
-                widget.encodingLabel!,
-                style: TextStyle(
-                  fontSize: 11,
-                  color: DshColors.ink3(context),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final textScale = MediaQuery.textScalerOf(context).scale(1);
+        final compact = constraints.maxWidth <= 360 || textScale >= 1.3;
+        final overflowActions = compact
+            ? _foldableActions()
+            : const <IconButton>[];
+        final inlineActions = widget.topActions
+            .where((action) => !overflowActions.contains(action))
+            .toList(growable: false);
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(4, 4, 4, 4),
+          child: Row(
+            children: [
+              if (widget.leading != null) widget.leading!,
+              Expanded(
+                child: Text(
+                  _displayPath,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    color: DshColors.ink2(context),
+                  ),
                 ),
               ),
-            ),
-          if (_isMarkdown) _modeToggle(),
-          ...widget.topActions,
-          IconButton(
-            key: widget.keys.copy,
-            tooltip: L10n.t('复制内容', 'Copy content'),
-            visualDensity: VisualDensity.compact,
-            icon: const Icon(Icons.copy, size: 18),
-            onPressed: _hasPayload ? () => _copy(context) : null,
+              if (!compact && (widget.encodingLabel ?? '').isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
+                  child: Text(
+                    widget.encodingLabel!,
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: DshColors.ink3(context),
+                    ),
+                  ),
+                ),
+              if (_isMarkdown)
+                compact ? _modeIconToggle(context) : _modeToggle(),
+              if (_showWrapToggle) _wrapToggleButton(context),
+              ...inlineActions,
+              if (overflowActions.isNotEmpty)
+                _overflowActionsMenu(context, overflowActions),
+              IconButton(
+                key: widget.keys.copy,
+                tooltip: L10n.t('复制内容', 'Copy content'),
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(Icons.copy, size: 18),
+                onPressed: _hasPayload ? () => _copy(context) : null,
+              ),
+            ],
           ),
-        ],
+        );
+      },
+    );
+  }
+
+  /// 可折叠进「更多操作」的 topActions。
+  ///
+  /// 当前各入口注入的都是 `IconButton`（提交历史等）；其它自定义控件保持原样
+  /// inline，避免为了折叠去猜未知组件的语义。
+  List<IconButton> _foldableActions() => widget.topActions
+      .whereType<IconButton>()
+      .where((action) => action.onPressed != null)
+      .toList(growable: false);
+
+  Widget _overflowActionsMenu(BuildContext context, List<IconButton> actions) {
+    return PopupMenuButton<VoidCallback>(
+      key: widget.keys.overflowActions,
+      tooltip: L10n.t('更多操作', 'More actions'),
+      icon: const Icon(Icons.more_vert, size: 20),
+      onSelected: (callback) => callback(),
+      itemBuilder: (context) => [
+        for (final action in actions)
+          PopupMenuItem<VoidCallback>(
+            key: action.key,
+            value: action.onPressed!,
+            child: Row(
+              children: [
+                IconTheme(
+                  data: IconThemeData(color: DshColors.ink2(context), size: 20),
+                  child: action.icon,
+                ),
+                const SizedBox(width: 12),
+                Expanded(child: Text(action.tooltip ?? '')),
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+
+  /// 内容模式「自动换行」切换（issue #117）。
+  ///
+  /// 开：brand 图标 + brandSoft 圆底；关：ink2 图标、无底。tooltip 带状态；
+  /// 语义合并成单个 `toggled + button` 节点，读屏一次播报状态与动作。
+  Widget _wrapToggleButton(BuildContext context) {
+    final on = _wrap;
+    final tooltip = on
+        ? L10n.t('自动换行（已开启）', 'Wrap lines (on)')
+        : L10n.t('自动换行（已关闭）', 'Wrap lines (off)');
+    // 语义节点合并成一个「toggled + button」：读屏一次播报状态与动作。
+    // 视觉/点击仍由 IconButton 负责（isSelected 给出 Material 选中态外观）。
+    return Semantics(
+      key: widget.keys.wrapToggle,
+      button: true,
+      toggled: on,
+      label: tooltip,
+      onTap: _toggleWrap,
+      child: ExcludeSemantics(
+        child: IconButton(
+          tooltip: tooltip,
+          isSelected: on,
+          iconSize: 20,
+          padding: EdgeInsets.zero,
+          constraints: const BoxConstraints(
+            minWidth: _kToolbarHitSize,
+            minHeight: _kToolbarHitSize,
+          ),
+          style: IconButton.styleFrom(
+            foregroundColor: on
+                ? DshColors.brand(context)
+                : DshColors.ink2(context),
+            backgroundColor: on ? DshColors.brandSoft(context) : null,
+            minimumSize: const Size(_kToolbarHitSize, _kToolbarHitSize),
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          ),
+          icon: const Icon(Icons.wrap_text),
+          onPressed: _toggleWrap,
+        ),
       ),
     );
   }
@@ -407,6 +607,51 @@ class _GitFileViewerState extends State<GitFileViewer>
       children: [
         item(rendered: true, zh: '预览', en: 'Preview'),
         item(rendered: false, zh: '源码', en: 'Source'),
+      ],
+    );
+  }
+
+  /// 窄屏/大字号下的「预览 / 源码」图标切换（设计 §5：省出文字宽度）。
+  Widget _modeIconToggle(BuildContext context) {
+    Widget item({
+      required bool rendered,
+      required IconData icon,
+      required String zh,
+      required String en,
+    }) {
+      final active = _rendered == rendered;
+      return IconButton(
+        key: widget.keys.modeButton(rendered: rendered),
+        tooltip: L10n.t(zh, en),
+        isSelected: active,
+        iconSize: 20,
+        padding: EdgeInsets.zero,
+        constraints: const BoxConstraints(
+          minWidth: _kToolbarHitSize,
+          minHeight: _kToolbarHitSize,
+        ),
+        style: IconButton.styleFrom(
+          foregroundColor: active
+              ? DshColors.brand(context)
+              : DshColors.ink3(context),
+          backgroundColor: active ? DshColors.brandSoft(context) : null,
+          minimumSize: const Size(_kToolbarHitSize, _kToolbarHitSize),
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        ),
+        icon: Icon(icon),
+        onPressed: () {
+          if (_rendered == rendered) return;
+          setState(() => _rendered = rendered);
+        },
+      );
+    }
+
+    return Row(
+      key: widget.keys.modeToggle,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        item(rendered: true, icon: Icons.visibility, zh: '预览', en: 'Preview'),
+        item(rendered: false, icon: Icons.code, zh: '源码', en: 'Source'),
       ],
     );
   }
@@ -515,35 +760,332 @@ class _GitFileViewerState extends State<GitFileViewer>
         ),
       );
     }
-    return ListView.builder(
-      key: widget.keys.sourceList,
-      padding: const EdgeInsets.symmetric(vertical: 6),
-      itemCount: _sourceLines.length,
-      itemBuilder: (ctx, i) => Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 48,
-            child: Text(
-              '${i + 1}',
-              textAlign: TextAlign.right,
-              style: TextStyle(
-                fontFamily: 'monospace',
-                fontSize: 12,
-                color: DshColors.ink3(ctx),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        _lastContentWidth = constraints.maxWidth;
+        final gutterWidth = _sourceGutterWidth(context);
+        final textWidth = math.max(
+          0.0,
+          constraints.maxWidth - gutterWidth - _kSourceGutterGap,
+        );
+        if (_wrap) {
+          _syncContentExtent(0);
+        } else {
+          _syncContentExtent(
+            math.max(0.0, _sourceMaxLineWidth(context) - textWidth),
+          );
+        }
+        final canScroll = !_wrap && _hScroll.canScroll;
+        final ambient = MediaQuery.of(context);
+        return MediaQuery(
+          // 与 diff 相同的非对称阈值：外层横拖 4px，内层纵向 ListView 用
+          // 挂载点环境值；略斜横向拖动归横向，纵向滚动不受影响。
+          data: ambient.copyWith(
+            gestureSettings: const DeviceGestureSettings(touchSlop: 4),
+          ),
+          child: GestureDetector(
+            key: widget.keys.sourceScrollSurface,
+            // opaque：行尾空白区域也能接住横拖。
+            behavior: HitTestBehavior.opaque,
+            onHorizontalDragDown: canScroll ? _onHorizontalDragDown : null,
+            onHorizontalDragStart: canScroll ? _onHorizontalDragStart : null,
+            onHorizontalDragUpdate: canScroll ? _onHorizontalDragUpdate : null,
+            onHorizontalDragEnd: canScroll ? _onHorizontalDragEnd : null,
+            child: MediaQuery(
+              data: ambient,
+              child: ListView.builder(
+                key: widget.keys.sourceList,
+                controller: _vScroll,
+                padding: const EdgeInsets.symmetric(
+                  vertical: _kSourceListVerticalPadding,
+                ),
+                itemCount: _sourceLines.length,
+                itemBuilder: (ctx, i) => _sourceLine(ctx, i, gutterWidth),
               ),
             ),
           ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              _sourceLines[i],
-              style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-            ),
-          ),
-        ],
+        );
+      },
+    );
+  }
+
+  /// 内容模式的一行：行号列固定宽；关闭换行时正文随共享横向偏移平移、
+  /// 行号列不动（与 diff 相同的「一个横拖面 + 行号钉住」手势语言）。
+  Widget _sourceLine(BuildContext context, int index, double gutterWidth) {
+    final lineNumber = SizedBox(
+      width: gutterWidth,
+      child: Text(
+        '${index + 1}',
+        key: widget.keys.sourceLineNumber(index),
+        maxLines: 1,
+        softWrap: false,
+        overflow: TextOverflow.clip,
+        textAlign: TextAlign.right,
+        style: TextStyle(
+          fontFamily: 'monospace',
+          fontSize: 12,
+          color: DshColors.ink3(context),
+        ),
       ),
     );
+    final Widget body;
+    if (_wrap) {
+      body = Expanded(
+        child: Text(
+          _sourceLines[index],
+          key: widget.keys.sourceLineText(index),
+          style: _kSourceTextStyle,
+        ),
+      );
+    } else {
+      body = Expanded(
+        child: ClipRect(
+          child: ValueListenableBuilder<double>(
+            valueListenable: _hScroll,
+            builder: (context, offset, child) =>
+                Transform.translate(offset: Offset(-offset, 0), child: child),
+            child: Text(
+              _sourceLines[index],
+              key: widget.keys.sourceLineText(index),
+              softWrap: false,
+              overflow: TextOverflow.visible,
+              style: _sourceTextStyle(context),
+            ),
+          ),
+        ),
+      );
+    }
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        lineNumber,
+        const SizedBox(width: _kSourceGutterGap),
+        body,
+      ],
+    );
+  }
+
+  /// 正文样式：与渲染同源（Text 会 merge DefaultTextStyle 的 height/letterSpacing）。
+  TextStyle _sourceTextStyle(BuildContext context) =>
+      DefaultTextStyle.of(context).style.merge(_kSourceTextStyle);
+
+  /// 行号列宽度：1.0× 固定 48；大字号按最大行号位数测量（上限 64）。
+  /// 换行开/关共用同一宽度，切换时行号列不跳。
+  double _sourceGutterWidth(BuildContext context) {
+    final textScaler = MediaQuery.textScalerOf(context);
+    final scale = textScaler.scale(_kSourceTextStyle.fontSize ?? 12) / 12;
+    final lineCount = _sourceLines.length;
+    final cached = _gutterWidth;
+    if (cached != null &&
+        _gutterLineCount == lineCount &&
+        (_gutterTextScale - scale).abs() < 0.0001) {
+      return cached;
+    }
+    double width;
+    if (scale <= 1.0001) {
+      width = _kSourceGutterMinWidth;
+    } else {
+      final digits = math.max(2, '$lineCount'.length);
+      final painter = TextPainter(
+        text: TextSpan(text: '9' * digits, style: _kSourceTextStyle),
+        textDirection: Directionality.of(context),
+        textScaler: textScaler,
+        locale: Localizations.maybeLocaleOf(context),
+      )..layout();
+      // 行号右侧留 10dp 呼吸位，但不小于 48、不超过 64。
+      width = (painter.width + 10)
+          .clamp(_kSourceGutterMinWidth, _kSourceGutterMaxWidth)
+          .toDouble();
+      painter.dispose();
+    }
+    _gutterWidth = width;
+    _gutterLineCount = lineCount;
+    _gutterTextScale = scale;
+    return width;
+  }
+
+  /// 关闭换行时最宽正文行宽（TextPainter 实测；CJK/emoji/制表符与实际渲染同源）。
+  double _sourceMaxLineWidth(BuildContext context) {
+    final style = _sourceTextStyle(context);
+    final textScaler = MediaQuery.textScalerOf(context);
+    final locale = Localizations.maybeLocaleOf(context);
+    final cacheKey =
+        '${widget.content.hashCode}\u0000${style.hashCode}\u0000'
+        '${textScaler.scale(_kSourceTextStyle.fontSize ?? 12)}\u0000$locale';
+    if (_cachedSourceMeasureKey == cacheKey) return _cachedSourceMaxWidth;
+    var widest = 0.0;
+    final painter = TextPainter(
+      textDirection: Directionality.of(context),
+      textScaler: textScaler,
+      locale: locale,
+    );
+    try {
+      for (final line in _sourceLines) {
+        painter.text = TextSpan(text: line, style: style);
+        // maxWidth 默认 infinity = 整行固有宽，与 softWrap:false 的渲染一致。
+        painter.layout();
+        widest = math.max(widest, painter.width);
+      }
+    } finally {
+      painter.dispose();
+    }
+    _cachedSourceMaxWidth = widest;
+    _cachedSourceMeasureKey = cacheKey;
+    return widest;
+  }
+
+  /// 切换自动换行：记录当前顶部行 → 重建 → 帧末恢复该行并清掉横向偏移。
+  void _toggleWrap() {
+    final anchor = _firstVisibleSourceLine() ?? 0;
+    final token = ++_wrapToggleToken;
+    final turningOn = !_wrap;
+    if (turningOn) {
+      // 恢复折行前先取消横向偏移，避免多留一帧平移。
+      _flingCtrl.stop();
+      _hScroll.jumpTo(0);
+    }
+    setState(() => _wrap = !_wrap);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      // 快速连点时旧回调不再执行，最终状态只由最后一次切换决定。
+      if (!mounted || token != _wrapToggleToken) return;
+      if (_wrap) {
+        _flingCtrl.stop();
+        _hScroll.jumpTo(0);
+      }
+      _restoreSourceTopLine(anchor);
+    });
+  }
+
+  /// 当前内容列表里第一个可见行的下标；找不到（未布局）返回 null。
+  int? _firstVisibleSourceLine() {
+    final root = context.findRenderObject();
+    if (root == null) return null;
+    RenderSliverList? sliver;
+    void visit(RenderObject child) {
+      if (sliver != null) return;
+      if (child is RenderSliverList) {
+        sliver = child;
+        return;
+      }
+      child.visitChildren(visit);
+    }
+
+    root.visitChildren(visit);
+    final list = sliver;
+    if (list == null) return null;
+    final scrollOffset = list.constraints.scrollOffset;
+    RenderBox? child = list.firstChild;
+    while (child != null) {
+      final parentData = child.parentData;
+      if (parentData is SliverMultiBoxAdaptorParentData) {
+        final index = parentData.index;
+        final layoutOffset = parentData.layoutOffset;
+        if (index != null &&
+            layoutOffset != null &&
+            layoutOffset + child.size.height > scrollOffset) {
+          return index;
+        }
+      }
+      child = list.childAfter(child);
+    }
+    return null;
+  }
+
+  /// 把 [anchor] 行恢复到列表顶部（换行开/关的行高不同，按实测行高累计）。
+  void _restoreSourceTopLine(int index) {
+    if (!_vScroll.hasClients) return;
+    final width = _lastContentWidth;
+    if (width <= 0) return;
+    final textWidth = math.max(
+      0.0,
+      width - _sourceGutterWidth(context) - _kSourceGutterGap,
+    );
+    final lineCount = _sourceLines.length;
+    if (lineCount == 0) return;
+    final anchor = math.min(math.max(0, index), lineCount - 1);
+    var offset = _kSourceListVerticalPadding.toDouble();
+    if (_wrap) {
+      offset += _wrappedHeightUpTo(anchor, textWidth);
+    } else {
+      offset += _unwrappedHeightUpTo(anchor);
+    }
+    final position = _vScroll.position;
+    _vScroll.jumpTo(offset.clamp(0.0, position.maxScrollExtent).toDouble());
+  }
+
+  /// 换行态下 [0, endExclusive) 行的累计高度；按内容/宽度增量缓存，只算到锚点。
+  double _wrappedHeightUpTo(int endExclusive, double maxWidth) {
+    if (endExclusive <= 0) return 0;
+    final style = _sourceTextStyle(context);
+    final textScaler = MediaQuery.textScalerOf(context);
+    final locale = Localizations.maybeLocaleOf(context);
+    final cacheKey =
+        '${widget.content.hashCode}\u0000${style.hashCode}\u0000'
+        '${textScaler.scale(_kSourceTextStyle.fontSize ?? 12)}\u0000$locale';
+    if (_wrappedHeightKey != cacheKey || _wrappedHeightWidth != maxWidth) {
+      _wrappedLineHeights.clear();
+      _wrappedHeightKey = cacheKey;
+      _wrappedHeightWidth = maxWidth;
+    }
+    final target = math.min(endExclusive, _sourceLines.length);
+    final painter = TextPainter(
+      textDirection: Directionality.of(context),
+      textScaler: textScaler,
+      locale: locale,
+    );
+    try {
+      for (var i = _wrappedLineHeights.length; i < target; i++) {
+        painter.text = TextSpan(text: _sourceLines[i], style: style);
+        painter.layout(maxWidth: maxWidth);
+        _wrappedLineHeights.add(painter.height);
+      }
+    } finally {
+      painter.dispose();
+    }
+    var total = 0.0;
+    for (var i = 0; i < target; i++) {
+      total += _wrappedLineHeights[i];
+    }
+    return total;
+  }
+
+  /// 关闭换行态下 [0, endExclusive) 行的累计高度。
+  ///
+  /// 不折行时行高通常一致，但 emoji/CJK 回退字体可能更高；按逐行实测累计，
+  /// 保证切换后顶部行不因字体回退而偏移。缓存与换行态同源。
+  double _unwrappedHeightUpTo(int endExclusive) {
+    if (endExclusive <= 0) return 0;
+    final style = _sourceTextStyle(context);
+    final textScaler = MediaQuery.textScalerOf(context);
+    final locale = Localizations.maybeLocaleOf(context);
+    final cacheKey =
+        '${widget.content.hashCode}\u0000${style.hashCode}\u0000'
+        '${textScaler.scale(_kSourceTextStyle.fontSize ?? 12)}\u0000$locale';
+    if (_unwrappedHeightKey != cacheKey) {
+      _unwrappedLineHeights.clear();
+      _unwrappedHeightKey = cacheKey;
+    }
+    final target = math.min(endExclusive, _sourceLines.length);
+    final painter = TextPainter(
+      textDirection: Directionality.of(context),
+      textScaler: textScaler,
+      locale: locale,
+    );
+    try {
+      for (var i = _unwrappedLineHeights.length; i < target; i++) {
+        painter.text = TextSpan(text: _sourceLines[i], style: style);
+        // softWrap:false 时 RenderParagraph 用固有宽度排版，行高与视口宽无关。
+        painter.layout();
+        _unwrappedLineHeights.add(painter.height);
+      }
+    } finally {
+      painter.dispose();
+    }
+    var total = 0.0;
+    for (var i = 0; i < target; i++) {
+      total += _unwrappedLineHeights[i];
+    }
+    return total;
   }
 
   Widget _diffBody(BuildContext context) {
@@ -630,6 +1172,18 @@ class _GitFileViewerState extends State<GitFileViewer>
   /// 视口宽度只能布局时拿到，而布局期直接 `notifyListeners` 会让正在布局
   /// 的子树变脏；只有当前偏移真的被夹取时才在帧末补一次广播。
   void _syncDiffExtent(double maxExtent) {
+    if (!_hScroll.updateExtent(maxExtent)) return;
+    if (_extentRefreshScheduled) return;
+    _extentRefreshScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _extentRefreshScheduled = false;
+      if (!mounted) return;
+      _hScroll.refresh();
+    });
+  }
+
+  /// 内容模式关闭换行时的共享横向余量（与 diff 同一套帧末广播约定）。
+  void _syncContentExtent(double maxExtent) {
     if (!_hScroll.updateExtent(maxExtent)) return;
     if (_extentRefreshScheduled) return;
     _extentRefreshScheduled = true;
