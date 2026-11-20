@@ -630,6 +630,97 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('本地树 fallback 连接代隔离：同 sessionId 子会话跨宿主不继承 running', (
+    tester,
+  ) async {
+    // 宿主 A：主会话 + 子代理会话（旧宿主 SSE 无 root 字段 → 走本地树聚合）。
+    _sessionRows = [
+      _row(id: 'main', createdAt: 3000),
+      _row(
+        id: 'child',
+        createdAt: 2000,
+        origin: 'subagent',
+        parentSession: 'main',
+      ),
+    ];
+    final store = await _pumpSessions(tester);
+    store.injectFrame(_statusFrame('child', 'running'));
+    await tester.pump();
+    expect(_iconOf(tester, 'main').state, SessionRowState.running);
+
+    // 切到宿主 B（同 sessionId，子会话不出现）：慢快照在途时旧本地树状态必须失效。
+    api.baseUrl = 'http://127.0.0.1:${_serverB.port}';
+    _sessionRowsB = [_row(id: 'main', createdAt: 3000)];
+    _sessionsGateB = Completer<void>();
+    addTearDown(() => _sessionsGateB = null);
+    late Future<void> refreshFuture;
+    await tester.runAsync(() async {
+      refreshFuture = store.refreshSessions();
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+    });
+    await tester.pump();
+    expect(
+      _iconOf(tester, 'main').state,
+      SessionRowState.idle,
+      reason: '旧连接代的子代理 agent 状态不得作为本地 fallback',
+    );
+    await tester.runAsync(() async {
+      _sessionsGateB!.complete();
+      await refreshFuture;
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    });
+    await tester.pump();
+    expect(_iconOf(tester, 'main').state, SessionRowState.idle);
+
+    // 切回 A：旧 running 不继承；新帧到达才重新显示。
+    api.baseUrl = 'http://127.0.0.1:${_server.port}';
+    _sessionRows = [
+      _row(id: 'main', createdAt: 3000),
+      _row(
+        id: 'child',
+        createdAt: 2000,
+        origin: 'subagent',
+        parentSession: 'main',
+      ),
+    ];
+    await tester.runAsync(() async {
+      await store.refreshSessions();
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    });
+    await tester.pump();
+    expect(_iconOf(tester, 'main').state, SessionRowState.idle);
+    store.injectFrame(_statusFrame('child', 'running'));
+    await tester.pump();
+    expect(_iconOf(tester, 'main').state, SessionRowState.running);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('真实断链：旧 count=1 → offline 后行立即 idle（connect 失败路径）', (
+    tester,
+  ) async {
+    _sessionRows = [
+      _row(id: 'main', createdAt: 3000, subagentsRunning: 1),
+      _row(id: 'other', createdAt: 2000),
+    ];
+    final store = await _pumpSessions(tester);
+    expect(_iconOf(tester, 'main').state, SessionRowState.running);
+
+    // 指向不可达端口并走真实 connect：onError → _scheduleReconnect → offline。
+    api.baseUrl = 'http://127.0.0.1:1';
+    await tester.runAsync(() async {
+      store.connect();
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+    });
+    await tester.pump();
+    expect(store.connState, 'offline');
+    expect(
+      _iconOf(tester, 'main').state,
+      SessionRowState.idle,
+      reason: '断链后必须清掉旧连接代的子代理运行计数/快照/本地状态',
+    );
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('状态切换不改变行几何；running/waiting 的 Semantics 正确', (tester) async {
     _sessionRows = [
       _row(id: 'main', createdAt: 3000),

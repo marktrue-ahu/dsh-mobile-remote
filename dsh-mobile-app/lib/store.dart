@@ -2480,7 +2480,17 @@ class AppStore extends ChangeNotifier {
   /// 且断链缓存的 `subagentsRunning` 会被读到。`copyWith(null)` 清不掉可空字段，
   /// 这里用显式 `clearSubagentsRunning`；清空后必须通知，否则换宿主瞬间旧行仍显示。
   void _clearSubagentRunningState() {
+    final subagentIds = <String>{
+      for (final s in sessions)
+        if (s.isSubagent) s.id,
+    };
+    String normalized(String agentId) =>
+        agentId.startsWith('session:') ? agentId.substring(8) : agentId;
+    final hadSubagentStatus =
+        sessionAgentStatus.keys.any(subagentIds.contains) ||
+        agentStatusMap.keys.any((id) => subagentIds.contains(normalized(id)));
     final hadState =
+        hadSubagentStatus ||
         subagentRunningByRoot.isNotEmpty ||
         sessions.any((s) => s.subagentsRunning != null);
     subagentRunningByRoot.clear();
@@ -2488,6 +2498,15 @@ class AppStore extends ChangeNotifier {
       sessions = [
         for (final s in sessions) s.copyWith(clearSubagentsRunning: true),
       ];
+    }
+    // issue #133（复审 P2-2）：本地树 fallback 也读 agent 状态映射；断链/换宿主后
+    // 旧连接代的子代理 running 必须失效，否则清掉聚合字段后仍会从本地树读回 running。
+    // 只清子代理会话的条目，保留根会话状态（发送/停止键语义不变）。
+    if (subagentIds.isNotEmpty) {
+      sessionAgentStatus.removeWhere((id, _) => subagentIds.contains(id));
+      agentStatusMap.removeWhere(
+        (agentId, _) => subagentIds.contains(normalized(agentId)),
+      );
     }
     if (hadState) notifyListeners();
   }
@@ -2688,6 +2707,9 @@ class AppStore extends ChangeNotifier {
   String connState = 'connecting';
 
   void _setConnState(String v) {
+    // issue #133：普通断链（_scheduleReconnect / resume catch / 看门狗）也必须让
+    // 子代理运行数据失效，否则列表行会一直显示旧的 running。
+    if (v == 'offline') _clearSubagentRunningState();
     if (connState != v) {
       connState = v;
       notifyListeners();
@@ -2713,6 +2735,8 @@ class AppStore extends ChangeNotifier {
         AppLog.instance.log(
           'SSE: 心跳超时（${DateTime.now().difference(_lastLiveness).inSeconds}s），强制重建连接',
         );
+        // issue #133：静默断链同样是连接代失效——清掉旧子代理运行数据。
+        _clearSubagentRunningState();
         _sub?.cancel();
         _sub = null;
         _connecting = false;
