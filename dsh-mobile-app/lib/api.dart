@@ -357,6 +357,7 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
 
   Future<void> save({required String base, required String token}) async {
     final prefs = await SharedPreferences.getInstance();
+    resetCapabilities();
     baseUrl = _normBase(base);
     path = _pathOf(base);
     await prefs.setString(_kBase, baseUrl);
@@ -418,6 +419,48 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
     ..path = _pathOf(base)
     ..token = token;
 
+  /// 统一应用服务端能力位（bootstrap 与 SSE hello 共用）。
+  ///
+  /// 关键生命周期约束（Reviewer #16 P2）：
+  /// - 能力位只属于**当前连接**；调用方在切换宿主/地址/连接代时必须先
+  ///   [resetCapabilities] 或由新连接的 hello/bootstrap 重新覆盖；
+  /// - 传 null / 字段缺失一律清成 false，不能保留上一个宿主的 true；
+  /// - `files.sessionRelative` 决定 App 是否发送 sessionId + cwd 相对路径，
+  ///   缺失时回退旧绝对路径契约。
+  void applyCapabilities(Object? capabilities) {
+    final c = capabilities is Map ? capabilities : const {};
+    timelineCapabilities = TimelineCapabilities.fromJson(
+      c['eventTimeline'] is Map
+          ? Map<String, dynamic>.from(c['eventTimeline'] as Map)
+          : null,
+    );
+    turnOutlineCapabilities = TurnOutlineCapabilities.fromJson(
+      c['turnOutline'] is Map
+          ? Map<String, dynamic>.from(c['turnOutline'] as Map)
+          : null,
+    );
+    // v3.2.3：普通文件下载是否支持 Range/HEAD/ETag（旧插件不声明 → App 回退整文件）。
+    fileRangeSupported =
+        c['fileRange'] is Map && (c['fileRange'] as Map)['supported'] == true;
+    sessionRelativeFilesSupported =
+        c['files'] is Map && (c['files'] as Map)['sessionRelative'] == true;
+    // issue #53：轮末产出物能力位（旧插件缺失 → available=false，两卡与设置隐藏）。
+    turnTailCapabilities = TurnTailCapabilities.fromJson(
+      c['turnTail'] is Map
+          ? Map<String, dynamic>.from(c['turnTail'] as Map)
+          : null,
+    );
+    // issue #54：工具卡能力位（旧插件缺失 → 全部通用卡）。
+    toolCardsCapabilities = ToolCardsCapabilities.fromJson(
+      c['toolCards'] is Map
+          ? Map<String, dynamic>.from(c['toolCards'] as Map)
+          : null,
+    );
+  }
+
+  /// 连接切换/销毁时清空能力位，避免上一个宿主的 `true` 跨连接残留。
+  void resetCapabilities() => applyCapabilities(null);
+
   /// 吸收 bootstrap 响应：合并服务器全部地址 + 记录插件版本（持久化，断线也可见）
   /// + 校正挂载路径（v3.0.0 review：服务端为权威来源）。
   void absorbBootstrap(Map<String, dynamic> d) {
@@ -461,44 +504,7 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
       appVersion: appVersion,
       server: align is Map ? Map<String, dynamic>.from(align) : null,
     );
-    final capabilities = d['capabilities'];
-    timelineCapabilities = capabilities is Map
-        ? TimelineCapabilities.fromJson(
-            capabilities['eventTimeline'] is Map
-                ? Map<String, dynamic>.from(
-                    capabilities['eventTimeline'] as Map,
-                  )
-                : null,
-          )
-        : const TimelineCapabilities();
-    turnOutlineCapabilities = capabilities is Map
-        ? TurnOutlineCapabilities.fromJson(
-            capabilities['turnOutline'] is Map
-                ? Map<String, dynamic>.from(capabilities['turnOutline'] as Map)
-                : null,
-          )
-        : const TurnOutlineCapabilities();
-    // v3.2.3：普通文件下载是否支持 Range/HEAD/ETag（旧插件不声明 → App 回退整文件）。
-    fileRangeSupported =
-        capabilities is Map &&
-        capabilities['fileRange'] is Map &&
-        (capabilities['fileRange'] as Map)['supported'] == true;
-    sessionRelativeFilesSupported =
-        capabilities is Map &&
-        capabilities['files'] is Map &&
-        (capabilities['files'] as Map)['sessionRelative'] == true;
-    // issue #53：轮末产出物能力位（旧插件缺失 → available=false，两卡与设置隐藏）。
-    turnTailCapabilities = TurnTailCapabilities.fromJson(
-      capabilities is Map && capabilities['turnTail'] is Map
-          ? Map<String, dynamic>.from(capabilities['turnTail'] as Map)
-          : null,
-    );
-    // issue #54：工具卡能力位（旧插件缺失 → 全部通用卡）。
-    toolCardsCapabilities = ToolCardsCapabilities.fromJson(
-      capabilities is Map && capabilities['toolCards'] is Map
-          ? Map<String, dynamic>.from(capabilities['toolCards'] as Map)
-          : null,
-    );
+    applyCapabilities(d['capabilities']);
     // 正在运行的内容标识 + 插件自更新状态 + 三角色发布快照：接续/门禁/App 安装的依据
     _absorbUpdateFields(d);
     // 统一接续入口：所有吸收 bootstrap 的路径（首连/自动重连/刷新/探测）都走到这里
@@ -571,6 +577,7 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
     if (idx < 0) return false;
     final next = baseUrls[(idx + 1) % baseUrls.length];
     if (next == cur) return false;
+    resetCapabilities();
     baseUrl = next;
     // 持久化新活动地址（失败不影响内存态切换）
     unawaited(() async {

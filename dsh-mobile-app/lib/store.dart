@@ -2843,34 +2843,9 @@ class AppStore extends ChangeNotifier {
     _retry = 0;
     final type = frame['type'];
     if (type == 'hello') {
-      final capabilities = frame['capabilities'];
-      api.timelineCapabilities =
-          capabilities is Map && capabilities['eventTimeline'] is Map
-          ? TimelineCapabilities.fromJson(
-              Map<String, dynamic>.from(capabilities['eventTimeline'] as Map),
-            )
-          : const TimelineCapabilities();
-      // issue #25 二期：轮次大纲能力同样由服务端显式声明（不按版本推断）。
-      api.turnOutlineCapabilities =
-          capabilities is Map && capabilities['turnOutline'] is Map
-          ? TurnOutlineCapabilities.fromJson(
-              Map<String, dynamic>.from(capabilities['turnOutline'] as Map),
-            )
-          : const TurnOutlineCapabilities();
-      // issue #53：轮末产出物能力位（bootstrap 与 hello 同判据；旧插件不下发 → 降级隐藏）。
-      api.turnTailCapabilities =
-          capabilities is Map && capabilities['turnTail'] is Map
-          ? TurnTailCapabilities.fromJson(
-              Map<String, dynamic>.from(capabilities['turnTail'] as Map),
-            )
-          : const TurnTailCapabilities();
-      // issue #54：工具卡能力位（bootstrap 与 hello 同判据；旧插件 → 全部通用卡）。
-      api.toolCardsCapabilities =
-          capabilities is Map && capabilities['toolCards'] is Map
-          ? ToolCardsCapabilities.fromJson(
-              Map<String, dynamic>.from(capabilities['toolCards'] as Map),
-            )
-          : const ToolCardsCapabilities();
+      // 统一解析：bootstrap 与 SSE hello 同判据；hello 是当前连接的能力权威，
+      // 缺失字段会清 false，避免新宿主→旧宿主时旧 true 跨连接残留（#16 P2）。
+      api.applyCapabilities(frame['capabilities']);
       _emitChatEvent(ChatEvent(type: '_capabilities', data: {}));
       _setConnState('connected');
       _catchup();
@@ -3351,6 +3326,8 @@ class AppStore extends ChangeNotifier {
   }
 
   void disposeBridge() {
+    // 连接代切换：能力位只属于当前连接，先清掉；新连接的 hello/bootstrap 会重新声明。
+    api.resetCapabilities();
     _sub?.cancel();
     _retryTimer?.cancel();
     _sessTimer?.cancel();
