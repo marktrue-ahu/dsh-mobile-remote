@@ -187,7 +187,8 @@
       "lastActivity": 1750000123456,
       "lastMessageAt": 1750000111000,
       "origin": "subagent",
-      "parentSession": "session-parent"
+      "parentSession": "session-parent",
+      "subagentsRunning": true
     }
   ]
 }
@@ -207,6 +208,7 @@
 - `lastMessageAt`（规划中，可选）：最近一条用户/助手可见对话消息的时间（ms）；无记录时为 `null`。打开会话不更新，工具活动与生命周期事件也不更新。字段缺失或为 `null` 时，客户端回退 `lastActivity`、再回退 `createdAt`，不提示降级；这项兼容回退不保证打开/内部事件后顺序始终不变。
 - `origin`（规划中，可选）：会话来源，子代理会话为 `"subagent"`；其余会话不返回。客户端据此隐藏子代理会话；字段缺失即不过滤。
 - `parentSession`（规划中，可选）：派生来源会话 id，为将来"折叠到父会话"预留。**不得**用它判定子代理会话——用户主动 fork 的会话只有该字段而没有 `origin`。
+- `subagentsRunning`（int，**始终下发，0 也表示无**；issue #124/#133）：该会话下**递归**运行中的子代理 descendant 数（不含根自身）。服务端用**空会话过滤前**的原始会话 header 建 `origin=subagent → parentSession` 父子映射，再对 `agents.list()` 中 `status=running` 的子代理一次反向计数到各层祖先，**不**逐会话调用 `/subagents` 或 `listDescendants`（88 会话也只读一次 agent 列表）。用户 fork（只有 `parentSession`、无 `origin`）不计入。客户端优先用 SSE 帧的 `subagentsRunning`，其次本字段，缺失时才按本地树递归聚合——三路取并集，不互相门控。
 
 ### 3.4 归档 / 活跃时间接口
 
@@ -318,7 +320,7 @@
 | type | 说明 |
 |---|---|
 | `session/context` | `{ sessionId, contextWindow }`——模型上下文窗口（`request/context` 事件，PC 端圆环同源） |
-| `agent/status` | `{ agentId, sessionId, status, child }`——`status` 只有 `running` / `idle` 两值（内核 `AgentStatus` 即为二元联合）；`sessionId` 为去 `session:` 前缀的会话 id，`child` 标记子代理会话（v2.7.2 起携带后两字段）。**不存在 `waiting`**：等待用户审批/作答时 agent 仍为 `running`，该事实由 `mobile/frame` 的挂起问询/审批承载 |
+| `agent/status` | `{ agentId, sessionId, status, child, rootSessionId?, subagentsRunning? }`——`status` 只有 `running` / `idle` 两值（内核 `AgentStatus` 即为二元联合）；`sessionId` 为去 `session:` 前缀的会话 id，`child` 标记子代理会话（v2.7.2 起携带后两字段）。**不存在 `waiting`**：等待用户审批/作答时 agent 仍为 `running`，该事实由 `mobile/frame` 的挂起问询/审批承载。issue #124/#133 起附 `rootSessionId`（该 agent 所属主会话根；根 agent 即自身）与 `subagentsRunning`（该根下递归 running 子代理数，**0 也发**）；子代理 root 解析失败时**省略**两字段、不猜。`agent/disposed` 没有 orchestration idle 帧时，插件补发一条合成 `status=idle` 的 `agent/status`（同字段），供客户端清除运行指示 |
 | `notifications/changed` | 通知记录增删（如移动端删除后），客户端刷新列表与角标 |
 | `mobile/notify` | `{ notification: { id, kind, sessionId, title, detail, time } }`——插件"真结束"判定后推送的通知（completed / failed / needs-answer），桌面宠物/App 与通知中心同源渲染（v2.7.2） |
 | `mobile/frame` | 内核瞬态帧（问询/审批）。`frame` 字段为 `question/requested`（含 `rpcId`、`questions[]`）、`question/resolved`（`questionRpcId`）、`approval/requested`（`rpcId`、`approvalId`、`toolName`、`reason?`）、`approval/resolved`（`approvalId`）。**`approvalId` 标识一次实际审批请求**：同一 `callId` 的 pre-execute 与 sandbox escalation 是两个不同 `approvalId`，`callId` 仅作关联（issue #60 R16）；`$events` 路径的 `rpcId` 使用稳定的 `eventId`。**App 断线重连时服务端补发挂起的待答帧**（`pendingFrames` 回放） |
