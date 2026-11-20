@@ -232,6 +232,352 @@ class _PluginUpdateDetailsPanelState extends State<_PluginUpdateDetailsPanel> {
   }
 }
 
+/// issue #135：环境诊断的中文名与纯文本渲染（从 State 抽出，便于单测）。
+///
+/// 约束：
+/// - 已知 key 只显示本地化名称，不再重复 `中文（key）`；未知 key 原样回退，便于复制排障。
+/// - 常用状态值友好化（ok→正常、up-to-date→已是最新、config→配置；npm 源保留）。
+/// - 不删版本号/路径/IP/插件名，保留可对照信息。
+
+String diagnosticFormText(Object? form) {
+  if (form == 'desktop') return L10n.t('桌面版', 'DSH Desktop');
+  if (form == 'cli') return L10n.t('命令行 / 网页', 'CLI / Web');
+  if (form == null || '$form'.isEmpty) return L10n.t('未知', 'unknown');
+  return '$form';
+}
+
+String diagnosticMetricName(String key) {
+  switch (key) {
+    case 'mobileOnline':
+      return L10n.t('手机在线连接', 'Phone connections');
+    case 'mobileOldestAgeMs':
+      return L10n.t('最旧连接年龄（毫秒）', 'Oldest connection age (ms)');
+    case 'mobileOldestIdleMs':
+      return L10n.t('最久未写连接（毫秒）', 'Longest idle connection (ms)');
+    case 'mobileStalled':
+      return L10n.t('停滞连接', 'Stalled connections');
+    case 'mobileEvicted':
+      return L10n.t('累计驱逐连接', 'Connections evicted');
+    case 'mobileRejected':
+      return L10n.t('累计拒绝连接', 'Connections rejected');
+    case 'agents':
+      return L10n.t('运行中 Agent', 'Live agents');
+    case 'sessions':
+      return L10n.t('会话数', 'Sessions');
+    case 'workspaces':
+      return L10n.t('工作区数', 'Workspaces');
+    case 'pushChannels':
+      return L10n.t('推送通道', 'Push channels');
+    default:
+      return key;
+  }
+}
+
+String diagnosticItemName(String section, String key) {
+  if (section == 'services') {
+    switch (key) {
+      case 'webServer':
+        return L10n.t('网页服务', 'Web server');
+      case 'agents':
+        return L10n.t('Agent 服务', 'Agents');
+      case 'sessions':
+        return L10n.t('会话服务', 'Sessions');
+      case 'llm':
+        return L10n.t('模型服务', 'LLM');
+      case 'permissionPresets':
+        return L10n.t('权限预设', 'Permission presets');
+      case 'agentPresets':
+        return L10n.t('Agent 预设', 'Agent presets');
+      case 'workspaceRegistry':
+        return L10n.t('工作区服务', 'Workspaces');
+      case 'approval':
+        return L10n.t('审批服务', 'Approval');
+      case 'credentials':
+        return L10n.t('凭据服务', 'Credentials');
+      case 'messageFeedback':
+        return L10n.t('消息反馈', 'Message feedback');
+      case 'userQuestions':
+        return L10n.t('问询服务', 'Questions');
+      case 'pluginManager':
+        return L10n.t('插件管理（免重启更新）', 'Plugin manager (restart-free)');
+      case 'hmr':
+        return L10n.t('热更新（HMR）', 'Hot reload (HMR)');
+      case 'apiProxy':
+        return L10n.t(
+          '旧帧桥 apiProxy（0.1.1 内核）',
+          'Legacy apiProxy (0.1.1 kernel)',
+        );
+      default:
+        return key;
+    }
+  }
+  switch (key) {
+    case 'modelsRpc':
+      return L10n.t('模型目录 RPC', 'Model catalog RPC');
+    case 'sessionsList':
+      return L10n.t('会话列表', 'Session list');
+    case 'directories':
+      return L10n.t('目录浏览', 'Directory browse');
+    case 'workspaces':
+      return L10n.t('工作区列表', 'Workspace list');
+    case 'notifications':
+      return L10n.t('通知中心', 'Notifications');
+    case 'actions':
+      return L10n.t('动作区', 'Actions');
+    case 'approvalMode':
+      return L10n.t('审批策略', 'Approval mode');
+    case 'remoteEvents':
+      return L10n.t('双端审批通道', 'Dual-end channel');
+    case 'respondBridge':
+      return L10n.t('旧帧桥应答（0.1.1 内核）', 'Legacy respond (0.1.1 kernel)');
+    case 'frameBridge':
+      return L10n.t('旧帧桥循环（0.1.1 内核）', 'Legacy frame loop (0.1.1 kernel)');
+    case 'pendingFrames':
+      return L10n.t('挂起待答', 'Pending frames');
+    case 'pendingApprovals':
+      return L10n.t('待处理审批', 'Pending approvals');
+    case 'pendingQuestions':
+      return L10n.t('待处理问询', 'Pending questions');
+    case 'sseConnections':
+      return L10n.t('SSE 连接', 'SSE connections');
+    case 'hostCapabilities':
+      return L10n.t('宿主能力', 'Host capabilities');
+    case 'hostCapabilityReasons':
+      return L10n.t('能力降级原因', 'Capability reasons');
+    case 'hostGeneration':
+      return L10n.t('宿主代际', 'Host generation');
+    case 'appAlignment':
+      return L10n.t('两端版本对齐', 'App/plugin alignment');
+    case 'pluginUpdate':
+      return L10n.t('插件更新', 'Plugin update');
+    case 'appArtifact':
+      return L10n.t('App 分发包', 'App artifact');
+    case 'currentRelease':
+      return L10n.t('当前发布', 'Current release');
+    case 'currentReleaseHealth':
+      return L10n.t('当前发布健康', 'Current release health');
+    case 'updateTarget':
+      return L10n.t('更新目标', 'Update target');
+    case 'updateDir':
+      return L10n.t('更新目录', 'Update dir');
+    default:
+      return key;
+  }
+}
+
+/// 单个稳定状态码/短语的友好文案（未知码原样返回，便于对照日志）。
+String diagnosticStatusToken(String token) {
+  switch (token) {
+    case 'ok':
+      return L10n.t('正常', 'OK');
+    case 'fail':
+    case 'failed':
+      return L10n.t('失败', 'failed');
+    case 'up-to-date':
+      return L10n.t('已是最新', 'up to date');
+    case 'outdated':
+      return L10n.t('有更新', 'update available');
+    case 'config':
+      return L10n.t('配置', 'config');
+    case 'generated':
+      return L10n.t('已生成', 'generated');
+    case 'default':
+      return L10n.t('默认', 'default');
+    case 'npm':
+      return 'npm';
+    case 'ready':
+      return L10n.t('就绪', 'ready');
+    case 'not-ready':
+      return L10n.t('未就绪', 'not ready');
+    case 'missing':
+      return L10n.t('缺失', 'missing');
+    case 'drift':
+      return L10n.t('状态漂移', 'drift');
+    case 'unknown':
+      return L10n.t('未知', 'unknown');
+    case 'none':
+      return L10n.t('无', 'none');
+    case 'unavailable':
+      return L10n.t('不可用', 'unavailable');
+    case 'idle':
+      return L10n.t('空闲', 'idle');
+    case 'stalled':
+      return L10n.t('停滞', 'stalled');
+    case 'legacy':
+      return L10n.t('旧代', 'legacy');
+    case 'controlArg':
+      return L10n.t('控制参数', 'control arg');
+    case 'legacyArg':
+      return L10n.t('旧参数', 'legacy arg');
+    case 'get':
+      return L10n.t('读取', 'get');
+    case 'describe':
+      return L10n.t('描述', 'describe');
+    case 'sessionId':
+      return L10n.t('按会话', 'sessionId');
+    case 'agent':
+      return L10n.t('按 Agent', 'agent');
+    case 'createPeer':
+      return L10n.t('进程内 Peer', 'in-process Peer');
+    case 'operatorPeer':
+      return L10n.t('网关 Peer', 'gateway Peer');
+    case 'descendants':
+      return L10n.t('后代目录', 'descendants');
+    case 'children':
+      return L10n.t('子会话', 'children');
+    case 'user':
+      return L10n.t('用户中断', 'user');
+    case 'parent':
+      return L10n.t('父级中断', 'parent');
+    case 'both':
+      return L10n.t('双端同卡，先答生效', 'both ends, first answer wins');
+    case 'mobile':
+      return L10n.t('手机在线独占', 'phone-exclusive while online');
+    case 'desktop':
+      return L10n.t('仅桌面 GUI', 'desktop GUI only');
+    default:
+      return token;
+  }
+}
+
+/// 状态字符串友好化：精确码、`current <id>`/`target <id>`/`ok <time>` 等前缀、
+/// `state(reason)` 括号组合，以及句子里的 `stalled` 等独立词。
+String diagnosticStatusText(String value) {
+  if (value.isEmpty) return value;
+  final direct = diagnosticStatusToken(value);
+  if (direct != value) return direct;
+  if (value.startsWith('current ')) {
+    return '${L10n.t('当前', 'current')} ${value.substring(8)}';
+  }
+  if (value.startsWith('target ')) {
+    return '${L10n.t('目标', 'target')} ${value.substring(7)}';
+  }
+  if (value.startsWith('ok ')) {
+    return '${L10n.t('正常', 'OK')} ${value.substring(3)}';
+  }
+  if (value.startsWith('fail ')) {
+    return '${L10n.t('失败', 'failed')} ${value.substring(5)}';
+  }
+  if (value.startsWith('idle')) {
+    return '${L10n.t('空闲', 'idle')}${value.substring(4)}';
+  }
+  final pair = RegExp(r'^([a-z][a-z-]*)\(([^()]*)\)$').firstMatch(value);
+  if (pair != null) {
+    return '${diagnosticStatusToken(pair.group(1)!)}（${diagnosticStatusToken(pair.group(2)!)}）';
+  }
+  var out = value;
+  for (final token in const [
+    'up-to-date',
+    'not-ready',
+    'unavailable',
+    'outdated',
+    'stalled',
+    'missing',
+    'drift',
+    'config',
+    'unknown',
+    'none',
+    'ready',
+  ]) {
+    out = out.replaceAll(
+      RegExp(r'(?<![A-Za-z-])' + RegExp.escape(token) + r'(?![A-Za-z-])'),
+      diagnosticStatusToken(token),
+    );
+  }
+  return out;
+}
+
+/// 诊断值渲染：Map/List 保留结构（嵌套 key 原样，值友好化），字符串走状态友好化。
+String diagnosticValueText(Object? value, {bool nested = false}) {
+  if (value is Map) {
+    final parts = <String>[];
+    value.forEach((k, v) {
+      parts.add('$k: ${diagnosticValueText(v, nested: true)}');
+    });
+    return '{${parts.join(', ')}}';
+  }
+  if (value is Iterable) {
+    return '[${value.map((v) => diagnosticValueText(v, nested: true)).join(', ')}]';
+  }
+  if (value is String) {
+    // 嵌套长文本（hint 等）不做逐词替换，避免误伤自然语言；短状态值友好化。
+    if (nested && value.length > 40) return value;
+    return diagnosticStatusText(value);
+  }
+  return '$value';
+}
+
+/// 环境诊断纯文本（设置页「环境诊断」与复制按钮共用）。
+String buildDiagnosticsText(Map<String, dynamic>? d) {
+  if (d == null) return L10n.t('检测失败', 'Check failed');
+  final buf = StringBuffer();
+  final runtime = d['runtime'] as Map<String, dynamic>? ?? {};
+  final formText = diagnosticFormText(runtime['form']);
+  buf.writeln(
+    '${L10n.t('运行形态: ', 'Mode: ')}$formText${runtime['authEnabled'] == true ? L10n.t(' · 口令已启用', ' · auth on') : L10n.t(' · 口令未启用', ' · auth off')}',
+  );
+  buf.writeln(
+    '${L10n.t('监听: ', 'Listen: ')}${runtime['host']}:${runtime['port']}',
+  );
+  buf.writeln('${L10n.t('进程目录: ', 'CWD: ')}${runtime['cwd']}');
+  final metrics = runtime['metrics'] as Map<String, dynamic>?;
+  if (metrics != null && metrics.isNotEmpty) {
+    buf.writeln();
+    buf.writeln(L10n.t('实时指标:', 'Live metrics:'));
+    metrics.forEach((k, v) {
+      buf.writeln('  • ${diagnosticMetricName(k)} = $v');
+    });
+  }
+  buf.writeln();
+  final services = d['services'] as Map<String, dynamic>? ?? {};
+  buf.writeln(L10n.t('服务:', 'Services:'));
+  services.forEach((k, v) {
+    buf.writeln(
+      '  ${v == true ? '✅' : '❌'} ${diagnosticItemName('services', k)}',
+    );
+  });
+  buf.writeln();
+  final checks = d['checks'] as Map<String, dynamic>? ?? {};
+  buf.writeln(L10n.t('端点实测:', 'Endpoint checks:'));
+  checks.forEach((k, v) {
+    final shown = diagnosticItemName('checks', k);
+    if (k == 'approvalMode') {
+      final m = v == 'both'
+          ? L10n.t('双端同卡，先答生效', 'both ends, first answer wins')
+          : v == 'mobile'
+          ? L10n.t('手机在线独占', 'phone-exclusive while online')
+          : v == 'desktop'
+          ? L10n.t('仅桌面 GUI', 'desktop GUI only')
+          : '${v ?? '?'}';
+      buf.writeln('  ℹ $shown：$m');
+    } else if (v == true) {
+      buf.writeln('  ✅ $shown');
+    } else if (v == false) {
+      buf.writeln('  ❌ $shown');
+    } else if (v is num) {
+      buf.writeln(
+        '  ${v == 0 ? '✅' : '⚠'} $shown = $v${v == 0 ? '' : L10n.t('（有审批/问询待处理）', ' (approval/question pending)')}',
+      );
+    } else {
+      buf.writeln('  ℹ $shown = ${diagnosticValueText(v)}');
+    }
+  });
+  final notes = d['notes'] as List? ?? [];
+  if (notes.isNotEmpty) {
+    buf.writeln();
+    buf.writeln(L10n.t('备注:', 'Notes:'));
+    for (final n in notes) {
+      buf.writeln('  • $n');
+    }
+  }
+  final plugin = d['plugin'] as Map<String, dynamic>? ?? {};
+  buf.writeln();
+  buf.writeln(
+    '${L10n.t('插件: ', 'Plugin: ')}${plugin['name']} v${plugin['version']}',
+  );
+  return buf.toString();
+}
+
 class SettingsScreen extends StatefulWidget {
   final AppStore store;
   final Future<void> Function() onReconfigure;
@@ -844,11 +1190,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final detailLine = awaitingDetail
         ? '正在导入/校验 App 载体，就绪后即可检查 App 更新…'
         : (failureLine ??
-              (_progressLine.isNotEmpty
-                  ? _progressLine
-                  : progress.stageText));
+              (_progressLine.isNotEmpty ? _progressLine : progress.stageText));
     // 次级行：只在失败时把最新一行日志放到主行下方（同一次读取、不额外请求）。
-    final secondaryLine = !awaitingDetail &&
+    final secondaryLine =
+        !awaitingDetail &&
             failureLine != null &&
             _progressLine.isNotEmpty &&
             _progressLine != failureLine
@@ -1059,11 +1404,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
       widget.store.gitTabs.map(_gitTabName).join(' · ');
 
   /// issue #86：分支图选中上限（5/10/不限）的当前值文案（设置行 trailing）。
-  String get _gitGraphLimitSummary => switch (widget.store.gitGraphBranchLimit) {
-    GitGraphBranchLimit.five => '5',
-    GitGraphBranchLimit.ten => '10',
-    GitGraphBranchLimit.unlimited => L10n.t('不限', 'Unlimited'),
-  };
+  String get _gitGraphLimitSummary =>
+      switch (widget.store.gitGraphBranchLimit) {
+        GitGraphBranchLimit.five => '5',
+        GitGraphBranchLimit.ten => '10',
+        GitGraphBranchLimit.unlimited => L10n.t('不限', 'Unlimited'),
+      };
 
   /// issue #86：设置行说明（§2.1 文案表；下次打开分支图时生效，不暗示持久化已选）。
   String get _gitGraphLimitSub => switch (widget.store.gitGraphBranchLimit) {
@@ -1435,172 +1781,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
-  String get _diagText {
-    final d = _diag;
-    if (d == null) return L10n.t('检测失败', 'Check failed');
-    final buf = StringBuffer();
-    final runtime = d['runtime'] as Map<String, dynamic>? ?? {};
-    final form = runtime['form'];
-    final formText = form == 'desktop'
-        ? 'desktop · ${L10n.t('桌面版', 'DSH Desktop')}'
-        : form == 'cli'
-        ? 'cli · ${L10n.t('命令行/网页', 'CLI / Web')}'
-        : '${form ?? '?'}';
-    buf.writeln(
-      '${L10n.t('运行形态: ', 'Mode: ')}$formText${runtime['authEnabled'] == true ? L10n.t(' · 口令已启用', ' · auth on') : L10n.t(' · 口令未启用', ' · auth off')}',
-    );
-    buf.writeln(
-      '${L10n.t('监听: ', 'Listen: ')}${runtime['host']}:${runtime['port']}',
-    );
-    buf.writeln('${L10n.t('进程目录: ', 'CWD: ')}${runtime['cwd']}');
-    final metrics = runtime['metrics'] as Map<String, dynamic>?;
-    if (metrics != null && metrics.isNotEmpty) {
-      buf.writeln();
-      buf.writeln(L10n.t('实时指标:', 'Live metrics:'));
-      metrics.forEach((k, v) {
-        final n = _metricsName(k);
-        buf.writeln('  • $n（$k）= $v');
-      });
-    }
-    buf.writeln();
-    final services = d['services'] as Map<String, dynamic>? ?? {};
-    buf.writeln(L10n.t('服务:', 'Services:'));
-    services.forEach((k, v) {
-      final n = _diagName('services', k);
-      buf.writeln('  ${v == true ? '✅' : '❌'} ${k == n ? n : '$n ($k)'}');
-    });
-    buf.writeln();
-    final checks = d['checks'] as Map<String, dynamic>? ?? {};
-    buf.writeln(L10n.t('端点实测:', 'Endpoint checks:'));
-    checks.forEach((k, v) {
-      final n = _diagName('checks', k);
-      final shown = k == n ? n : '$n ($k)';
-      if (k == 'approvalMode') {
-        // v3.1.3：审批策略取值说明（both 双端同卡 / mobile 手机独占 / desktop 仅桌面）
-        final m = v == 'both'
-            ? L10n.t('both · 双端同卡，先答生效', 'both · both ends, first answer wins')
-            : v == 'mobile'
-            ? L10n.t('mobile · 手机在线独占', 'mobile · phone-exclusive while online')
-            : v == 'desktop'
-            ? L10n.t('desktop · 仅桌面 GUI', 'desktop · desktop GUI only')
-            : '${v ?? '?'}';
-        buf.writeln('  ℹ $shown：$m');
-      } else if (v == true) {
-        buf.writeln('  ✅ $shown');
-      } else if (v == false) {
-        buf.writeln('  ❌ $shown');
-      } else if (v is num) {
-        // 计数字段（如 pendingFrames 挂起待答数）：0 正常，>0 表示有问询/审批待处理
-        buf.writeln(
-          '  ${v == 0 ? '✅' : '⚠'} $shown = $v${v == 0 ? '' : L10n.t('（有审批/问询待处理）', ' (approval/question pending)')}',
-        );
-      } else {
-        // v3.1.3（issue #9）：策略/状态字符串字段（如 approvalMode = both）友好直读
-        buf.writeln('  ℹ $shown = $v');
-      }
-    });
-    final notes = d['notes'] as List? ?? [];
-    if (notes.isNotEmpty) {
-      buf.writeln();
-      buf.writeln(L10n.t('备注:', 'Notes:'));
-      for (final n in notes) {
-        buf.writeln('  • $n');
-      }
-    }
-    final plugin = d['plugin'] as Map<String, dynamic>? ?? {};
-    buf.writeln();
-    buf.writeln(
-      '${L10n.t('插件: ', 'Plugin: ')}${plugin['name']} v${plugin['version']}',
-    );
-    return buf.toString();
-  }
-
-  /// 实时指标中文名（v3.1.3 runtime.metrics）。未知 key 原样返回。
-  String _metricsName(String key) {
-    switch (key) {
-      case 'mobileOnline':
-        return L10n.t('手机在线连接', 'Phone connections');
-      case 'agents':
-        return L10n.t('运行中 Agent', 'Live agents');
-      case 'sessions':
-        return L10n.t('会话数', 'Sessions');
-      case 'workspaces':
-        return L10n.t('工作区数', 'Workspaces');
-      case 'pushChannels':
-        return L10n.t('推送通道', 'Push channels');
-      default:
-        return key;
-    }
-  }
-
-  /// 服务/实测项中文名（环境诊断可读化，v3.1.3+）。未知 key 原样返回。
-  /// 渲染时保留英文 key 便于复制粘贴排障（issue/日志对照）。
-  String _diagName(String section, String key) {
-    switch (section) {
-      case 'services':
-        switch (key) {
-          case 'webServer':
-            return L10n.t('网页服务', 'Web server');
-          case 'agents':
-            return L10n.t('Agent 服务', 'Agents');
-          case 'sessions':
-            return L10n.t('会话服务', 'Sessions');
-          case 'llm':
-            return L10n.t('模型服务', 'LLM');
-          case 'permissionPresets':
-            return L10n.t('权限预设', 'Permission presets');
-          case 'agentPresets':
-            return L10n.t('Agent 预设', 'Agent presets');
-          case 'workspaceRegistry':
-            return L10n.t('工作区服务', 'Workspaces');
-          case 'approval':
-            return L10n.t('审批服务', 'Approval');
-          case 'credentials':
-            return L10n.t('凭据服务', 'Credentials');
-          case 'messageFeedback':
-            return L10n.t('消息反馈', 'Message feedback');
-          case 'userQuestions':
-            return L10n.t('问询服务', 'Questions');
-          case 'apiProxy':
-            return L10n.t(
-              '旧帧桥 apiProxy（0.1.1 内核）',
-              'Legacy apiProxy (0.1.1 kernel)',
-            );
-          default:
-            return key;
-        }
-      default:
-        switch (key) {
-          case 'modelsRpc':
-            return L10n.t('模型目录 RPC', 'Model catalog RPC');
-          case 'sessionsList':
-            return L10n.t('会话列表', 'Session list');
-          case 'directories':
-            return L10n.t('目录浏览', 'Directory browse');
-          case 'workspaces':
-            return L10n.t('工作区列表', 'Workspace list');
-          case 'notifications':
-            return L10n.t('通知中心', 'Notifications');
-          case 'actions':
-            return L10n.t('动作区', 'Actions');
-          case 'approvalMode':
-            return L10n.t('审批策略', 'Approval mode');
-          case 'remoteEvents':
-            return L10n.t('双端审批通道', 'Dual-end channel');
-          case 'respondBridge':
-            return L10n.t('旧帧桥应答（0.1.1 内核）', 'Legacy respond (0.1.1 kernel)');
-          case 'frameBridge':
-            return L10n.t(
-              '旧帧桥循环（0.1.1 内核）',
-              'Legacy frame loop (0.1.1 kernel)',
-            );
-          case 'pendingFrames':
-            return L10n.t('挂起待答', 'Pending frames');
-          default:
-            return key;
-        }
-    }
-  }
+  String get _diagText => buildDiagnosticsText(_diag);
 
   /// 外观：主题皮肤（4 选 1）+ App 图标（8 选 1，仅 Android）。
   Widget _appearanceCard() {
@@ -2671,7 +2852,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _settingsSessionId = session;
   }
 
-  Future<Map<String, dynamic>?> _runPluginUpdateCheck({String? resumeCheckId}) async {
+  Future<Map<String, dynamic>?> _runPluginUpdateCheck({
+    String? resumeCheckId,
+  }) async {
     if (_pluginCheckRunning) return null;
     setState(() => _pluginCheckRunning = true);
     try {
@@ -3283,8 +3466,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     WorkStepDisplayMode.concise => L10n.t('简洁', 'Concise'),
                     WorkStepDisplayMode.standard => L10n.t('标准', 'Standard'),
                     WorkStepDisplayMode.detailed => L10n.t('详细', 'Detailed'),
-                    WorkStepDisplayMode.expanded =>
-                      L10n.t('完全展开', 'Expanded'),
+                    WorkStepDisplayMode.expanded => L10n.t('完全展开', 'Expanded'),
                   },
                   style: TextStyle(
                     fontSize: 14,
