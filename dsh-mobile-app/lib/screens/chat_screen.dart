@@ -7312,6 +7312,12 @@ class _ChatScreenState extends State<ChatScreen> {
         'Could not confirm the full text — retry',
       );
     }
+    if (code == 'event-detail-incomplete') {
+      return L10n.t(
+        '详情正文不完整，请重试',
+        'The detail text is incomplete — retry',
+      );
+    }
     return L10n.t('完整正文加载失败，请重试', 'Failed to load the full text — retry');
   }
 
@@ -7516,6 +7522,29 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           );
           _showUserDetailErrorToast('event-detail-text-truncated');
+          _requestScrollFollow();
+          return;
+        }
+        // 复审 P2-3：服务端声明了未截断长度时，canonical 必须覆盖该长度才算完整；
+        // 只比较 canonical 与摘要长度会漏掉“canonical 有增长但少于 textChars”的残缺响应。
+        final declaredChars = current.detailTextChars;
+        if (declaredChars != null && fullText.length < declaredChars) {
+          // 展示已拿到的更长部分（若有），但保留入口并显式提示不完整。
+          setState(
+            () => _replaceTimelineItem(
+              item,
+              current.copyUser(
+                text: fullText.length > current.text.length
+                    ? fullText
+                    : current.text,
+                rawData: full,
+                detailAvailable: true,
+                detailLoading: false,
+                detailErrorCode: 'event-detail-incomplete',
+              ),
+            ),
+          );
+          _showUserDetailErrorToast('event-detail-incomplete');
           _requestScrollFollow();
           return;
         }

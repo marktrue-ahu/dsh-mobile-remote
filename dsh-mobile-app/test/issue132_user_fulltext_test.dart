@@ -315,6 +315,65 @@ void main() {
     await _finish(tester, store);
   });
 
+  testWidgets('声明 textChars=5000 但 canonical 只有 2500：incomplete，不隐藏入口', (
+    tester,
+  ) async {
+    final partial = '$_summary\nPARTIAL-END';
+    final backend = _Backend(
+      events: _historyEvents(
+        userText: _summary,
+        detail: {'available': true, 'seq': 2, 'textChars': 5000},
+      ),
+    );
+    backend.detailResponses.add(
+      () async => backend.okEvent(_detailEvent(partial)),
+    );
+    final store = await _mount(tester, backend);
+    await tester.tap(find.text('查看全文'));
+    await _pumpDetail(tester);
+
+    final footer = _footerFor(2);
+    expect(
+      find.descendant(of: footer, matching: find.text('详情正文不完整，请重试')),
+      findsOneWidget,
+      reason: 'canonical 少于声明的 textChars 时必须显式 incomplete，不得当成功',
+    );
+    expect(
+      find.descendant(of: footer, matching: find.text('重试')),
+      findsOneWidget,
+    );
+    expect(
+      find.textContaining('PARTIAL-END'),
+      findsOneWidget,
+      reason: '已拿到的更长部分可以展示，但仍保留入口',
+    );
+    expect(find.text('查看全文'), findsNothing, reason: '保留 footer，不回到入口态');
+    expect(tester.takeException(), isNull);
+    await _finish(tester, store);
+  });
+
+  testWidgets('canonical 覆盖声明 textChars：才可标记完整并隐藏入口', (tester) async {
+    final complete = '$_summary\nCOVERS-DECLARED-LENGTH';
+    final backend = _Backend(
+      events: _historyEvents(
+        userText: _summary,
+        detail: {'available': true, 'seq': 2, 'textChars': complete.length},
+      ),
+    );
+    backend.detailResponses.add(
+      () async => backend.okEvent(_detailEvent(complete)),
+    );
+    final store = await _mount(tester, backend);
+    await tester.tap(find.text('查看全文'));
+    await _pumpDetail(tester);
+
+    expect(find.textContaining('COVERS-DECLARED-LENGTH'), findsOneWidget);
+    expect(find.text('查看全文'), findsNothing);
+    expect(find.text('详情正文不完整，请重试'), findsNothing);
+    expect(tester.takeException(), isNull);
+    await _finish(tester, store);
+  });
+
   testWidgets('canonical 超过 20k 渲染上限：不得虚假成功，footer 保留受限态', (tester) async {
     final over = '${'X' * 20500}\n$_endMarker';
     final backend = _Backend(events: _historyEvents(userText: _summary));
