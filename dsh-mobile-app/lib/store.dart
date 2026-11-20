@@ -2488,6 +2488,8 @@ class AppStore extends ChangeNotifier {
     _sessionsInFlight = false;
     _sessionsPending = false;
     _sessionsWaiters = null;
+    // issue #133：连接代切换（换地址/重连/销毁）后，旧宿主的 SSE 子代理计数失效。
+    subagentRunningByRoot.clear();
     _finishAllRounds();
   }
 
