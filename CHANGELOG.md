@@ -1,5 +1,104 @@
 # Changelog
 
+## v3.2.4（build 60）— 首个 stable：对话页高度模型、加载态、SSE 与诊断稳定性
+
+> 插件 `3.2.4` / App `3.2.4+60` / 载体 `3.2.4-app`。稳定版：插件发布到 npm `latest`，`app` 指针前进到本载体；`rc` 保持 `3.2.4-rc.6`，`alpha` 保持 `3.2.4-alpha.21`。内容与 `v3.2.4-rc.6`（build 59）一致，仅版本号稳定化，无代码变更。
+
+### 中文
+
+#### 对话页与阅读体验
+
+- **高度模型重做（ADR 0035，#126/#103/#114）**：短内容顶对齐，删除底部占位反馈环；折叠行固定 24dp，过程组 body 上限 `min(400dp, 50% 窗口)`，工具/思考/用户消息正文上限 320dp，图片单张 320dp、网格上限 `min(400dp, 50%)`；gutter 恒定 38dp；删除活动条与自动详情。修复分批隐藏行场景下内容被推离顶部、上下方大段空白与滚动越界。
+- **首屏补拉最新轮（#126）**：初始 50 条若截断最新一轮，自动补拉 30 条/页、最多 5 页，保证过程块来自完整轮次。
+- **首次打开三态加载（#129）**：loading / empty / failed 明确区分，失败可重试，流式内容到达后不再误判为空态。
+- **上翻历史状态行（#130）**：顶部固定高度状态行展示 loading / 已加载 / 空 / 失败四态与重试，不挤压聊天内容。
+- **长用户消息查看全文（#132）**：入口移入气泡内，按需加载详情并显式区分已加载 / 失败。
+- **历史阅读位置与组折叠（#118/#122/#123）**：上翻历史位置不再被新事件抢回；过程组/工具组折叠状态改为 widget 层 `ValueKey` 复用 + 数据层“用户选择缓存”，组身份唯一但不承诺稳定，identity 变化回落默认。
+- **后台任务与子代理（#128/#124）**：移除聊天页「后台任务进行中」内联卡，取消入口统一到「会话工具 → 任务」；主会话列表聚合递归子代理运行状态，断链/切换宿主清空旧计数。
+
+#### SSE、宿主与诊断
+
+- **SSE 连接泄漏与 503（#131）**：App 每次 SSE 使用独立 `http.Client` 并在取消/超时/错误/503/正常结束路径关闭，503 使用 5s/10s 退避；宿主满额时按「stalled 优先 → 同 clientId → 同 clientIp → 最旧」驱逐 1 条满龄（≥60s）连接，无候选才 503 + `Retry-After: 5`。
+- **原生 SSE（#131）**：悬浮球原生 SSE 上报 `x-mobile-app-version` 与持久化 `x-mobile-client-id`，单服务实例只启动一条 SSE 线程，异常/销毁路径保证 `disconnect` 与状态清理。
+- **环境诊断（#135）**：指标、服务、端点与状态值中文化；新增 `mobileOldestAgeMs` / `mobileOldestIdleMs` / `mobileStalled` / `mobileEvicted` / `mobileRejected`。
+- **宿主兼容与更新（#88/#96/#110/#112/#116 等 alpha/rc 累积）**：0.2.x 宿主能力三态诊断、免重启插件更新、宿主拒绝错误码透传与可执行动作、更新恢复与 restart-pending 收尾。
+
+#### 工作步骤、导航与内容
+
+- 工作步骤四档 v4、过程段/工具组视觉与折叠、轮末改动/交付卡、工具卡结构化；
+- 轮次导航、历史位置、滚动跟随单一 owner、上翻与回底体验；
+- 文件浏览（隐藏项）、文件历史、Git 图与分支上限、图片查看/下载、会话文件浏览；
+- 任务清单仅更新面板（#119）、空会话过滤（#109）、会话标题与运行状态聚合等。
+
+> 完整逐版本明细见本文件 `v3.2.4-alpha.1` 至 `v3.2.4-rc.6` 各条目。
+
+#### 验证
+
+- Flutter analyze：0 error / 0 warning（26 info，与 rc.6 基线同类）
+- Flutter test：**1640 通过 / 1 skip**
+- Node 套件（clean tree，隔离 HOME）：1239 例，1218 通过 / 17 skip / **4 失败**——均为本机 root 环境既有问题（`chmod 0500` 在 root 下失效 ×2、`host-canary-smoke` source identity、`ANDROID_HOME` 下 aapt 存在却执行失败），与 rc.6 基线同集合
+- timeline-contract：181 PASS / 0 FAIL
+- account-usage：15 通过 / 0 失败
+- Kotlin `UsagePanelModelTest`：27 用例，BUILD SUCCESSFUL（`--rerun-tasks`）
+- 发布前 CI（rc.6）已通过 Node/Flutter 测试、签名 APK、发布演练与 npm 发布；本 stable 与 rc.6 代码一致，仅版本元数据不同
+
+
+#### 重要说明与已知风险
+
+- **本版为 bootstrap 后首个 stable**：npm `latest` 从 `3.2.3-rc.1` 前进到 `3.2.4`；`rc` 仍为 `3.2.4-rc.6`，`alpha` 仍为 `3.2.4-alpha.21`；`app` 从 `3.2.4-rc.6-app` 前进到 `3.2.4-app`。
+- **build 60 小于本机测试 build 61**：已安装本地测试 build 61 的设备安装 stable 会被系统视为降级；如被拒需卸载重装或等待 build ≥61。不通过手改 build 规避。
+- **未包含 3080 代理泄漏修复**：该修复在 `nas-dsh-migration` 镜像，不属于本版。
+- **#136 日志级别尚未实现**：本版沿用 rc.6 的临时降噪（Chat.geo / build itemCount / 跟随校正三类日志注释），待 #136 后恢复 debug。
+- **真机验收**：rc.6 已在用户真机确认可用；stable 与其代码一致，仅版本号与发布通道不同。
+
+### English
+
+#### Conversation view & reading experience
+
+- **Transcript height model rework (ADR 0035, #126/#103/#114)**: short content is top-aligned and the bottom-placeholder feedback loop is removed. Collapsed rows are fixed at 24dp; process-group bodies are capped at `min(400dp, 50% of the window)`; tool, reasoning, and user-message bodies are capped at 320dp; images are 320dp each with grids capped at `min(400dp, 50%)`; the gutter is a constant 38dp. The activity bar and auto-expanded details are gone. Fixes content pushed off the top, large blank areas above/below batch-hidden process blocks, and scroll-range overshoot.
+- **First-screen backfill (#126)**: if the initial 50 events cut off the latest turn, the app backfills 30 events per page for up to 5 pages so process blocks come from a complete turn.
+- **First-open three-state loading (#129)**: loading / empty / failed are now explicit; failures are retryable and live-streamed content no longer gets misclassified as empty.
+- **History-paging status row (#130)**: a fixed-height status row shows loading / loaded / empty / failed with retry, without squeezing the conversation.
+- **View full text for long user messages (#132)**: the entry moves inside the bubble; details load on demand and explicitly distinguish loaded vs failed.
+- **Reading position and group folding (#118/#122/#123)**: a paged-back reading position is no longer stolen by new events; process/tool group folding moved to widget-layer `ValueKey` reconciliation plus a data-layer user-choice cache. Group identity is unique but not guaranteed stable; identity changes fall back to the default.
+- **Jobs and subagents (#128/#124)**: removed the in-chat background-job card and centralized cancellation in “Session tools → Jobs”; the recent-session list aggregates recursive subagent activity and clears stale counts after disconnects or host switches.
+
+#### SSE, host, and diagnostics
+
+- **SSE leaks and 503 (#131)**: the app opens a dedicated `http.Client` per SSE connection and closes it on cancel/timeout/error/503/normal end, with 5s/10s backoff on 503. A full host pool evicts one age-eligible (≥60s) connection ordered by “stalled first → same clientId → same clientIp → oldest” and only returns 503 + `Retry-After: 5` when no candidate exists.
+- **Native SSE (#131)**: the floating-bubble SSE now sends `x-mobile-app-version` and a persistent `x-mobile-client-id`, runs at most one SSE thread per service instance, and guarantees `disconnect()` plus state cleanup on exception and destroy paths.
+- **Environment diagnostics (#135)**: metrics, services, endpoint checks, and status values are localized; new `mobileOldestAgeMs`, `mobileOldestIdleMs`, `mobileStalled`, `mobileEvicted`, and `mobileRejected` are exposed.
+- **Host compatibility and updates (cumulative from #88/#96/#110/#112/#116)**: 0.2.x host-capability diagnostics, no-restart plugin updates, host-rejection error codes with actionable next steps, and update recovery / restart-pending handling.
+
+#### Work steps, navigation, and content
+
+- Work-step display modes v4, process/tool group visuals and folding, turn-end changed/deliverable cards, structured tool cards;
+- Turn navigation, reading position, single-owner scroll following, and paging-back / back-to-latest behavior;
+- File browsing (hidden entries), file history, git graph and branch limits, image viewing/download, session files;
+- Todo list updates only refresh the panel (#119), empty-session filtering (#109), session title and running-status aggregation, and more.
+
+> Full per-version details are in the `v3.2.4-alpha.1` through `v3.2.4-rc.6` entries above.
+
+#### Verification
+
+- Flutter analyze: 0 errors / 0 warnings (26 infos, same class as the rc.6 baseline)
+- Flutter test: **1640 passed / 1 skipped**
+- Node suite (clean tree, isolated HOME): 1239 tests, 1218 passed / 17 skipped / **4 failed** — all four are pre-existing local root-environment issues (two `chmod 0500` cases root bypasses, `host-canary-smoke` source identity, and aapt present under `ANDROID_HOME` but failing to execute), matching the rc.6 baseline set
+- timeline-contract: 181 PASS / 0 FAIL
+- account-usage: 15 passed / 0 failed
+- Kotlin `UsagePanelModelTest`: 27 cases, BUILD SUCCESSFUL (forced rerun with `--rerun-tasks`)
+- The pre-release rc.6 CI already passed the Node/Flutter tests, signed APK build, release drill, and npm publish; this stable tree is code-identical to rc.6 and differs only in version metadata
+
+
+#### Important notes & known risks
+
+- **First stable after bootstrap**: npm `latest` moves from `3.2.3-rc.1` to `3.2.4`; `rc` stays at `3.2.4-rc.6`, `alpha` stays at `3.2.4-alpha.21`, and `app` moves from `3.2.4-rc.6-app` to `3.2.4-app`.
+- **Build 60 is lower than local test build 61**: devices with local test build 61 installed will treat this stable as a downgrade. If installation is rejected, uninstall/reinstall or wait for build ≥61. Do not hand-edit the build number.
+- **The 3080 proxy-leak fix is not included**: that fix lives in the `nas-dsh-migration` image and is not part of this release.
+- **Log levels (#136) are not implemented yet**: this release keeps the temporary rc.6 log noise reduction (three transcript-debug log groups commented out) until #136 lands.
+- **Device acceptance**: rc.6 was confirmed working on the user’s real device; stable is code-identical and differs only in version and release channel.
+
+
 ## v3.2.4-rc.6（build 59，issues #124 #126 #128 #129 #130 #131 #132 #135）— 对话页高度模型重做、加载态与 SSE 修复
 
 > 插件 `3.2.4-rc.6` / App `3.2.4+59` / 载体 `3.2.4-rc.6-app`。RC 候选：插件发布到 npm `rc` dist-tag，`latest` 保持 `3.2.3-rc.1` 不动（只有 stable 可前进）。
