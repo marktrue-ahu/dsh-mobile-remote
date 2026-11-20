@@ -1555,3 +1555,106 @@ test("issue #142 未激活/无 live agent：POST 返回 team-session-offline", a
 		harness.clean();
 	}
 });
+
+test("issue #142 复审 P2：休眠 fork 不手折父会话 team 事件，权威 projection 不可得 → 显式降级", async () => {
+	const snapshot = {
+		header: { id: "fork-session", createdAt: 1000 },
+		events: [
+			{ type: "team/mode", seq: 1, data: { enabled: true } }, // 继承自父会话的假状态
+			{ type: "team/task", seq: 2, data: { version: 2, teamId: "parent-team", task: { id: "t1", revision: 1, status: "completed", subject: "父任务" } } },
+		],
+	};
+	const harness = createHarness({
+		records: [record("fork-session")],
+		liveSessions: [],
+		query: { listSessions: async () => [], readSession: async () => snapshot },
+	});
+	harness.provide("agentTeams", { isEnabled: () => false, async setEnabled() {} });
+	try {
+		const { status, body } = await call(harness.route, "/m/api/team?sessionId=fork-session");
+		assert.equal(status, 200, JSON.stringify(body));
+		assert.equal(body.team.modeKnown, false, "无 Session 投影：模式未知");
+		assert.equal(body.team.enabled, false, "不得把父会话 team/mode 当本会话状态");
+		assert.equal(body.team.tasksAvailable, false, "不得手折 team/task");
+		assert.deepEqual(body.team.tasks, { total: 0, completed: 0, inProgress: 0, pending: 0 });
+		assert.equal(body.team.unavailableReason, "team-session-offline");
+	} finally {
+		harness.clean();
+	}
+});
+
+test("issue #142 复审 P2：live 会话但宿主无 agentTeams 时，不从事件伪造 mode/tasks", async () => {
+	const root = liveSession("root-team", [
+		{ type: "team/mode", seq: 1, data: { enabled: true } },
+		{ type: "team/task", seq: 2, data: { version: 2, teamId: "other-team", task: { id: "t1", revision: 1, status: "completed" } } },
+	], {});
+	const agents = { get: (id) => (id === "root-team" ? { id, session: { id }, status: "idle" } : undefined), list: () => [] };
+	const harness = createHarness({ records: [record("root-team")], liveSessions: [root], agents, gateway: teamGateway() });
+	try {
+		const { status, body } = await call(harness.route, "/m/api/team?sessionId=root-team");
+		assert.equal(status, 200);
+		assert.equal(body.team.supported, false);
+		assert.equal(body.team.modeKnown, false);
+		assert.equal(body.team.enabled, false);
+		assert.equal(body.team.tasksAvailable, false);
+	} finally {
+		harness.clean();
+	}
+});
+
+test("issue #142 复审 P2：并发 POST 第二个 409 team-pending，setEnabled 只调用一次", async () => {
+	let release;
+	const gate = new Promise((resolve) => { release = resolve; });
+	let calls = 0;
+	const { harness } = teamHarness();
+	harness.provide("agentTeams", {
+		defaultEnabled: false,
+		isEnabled: () => false,
+		async setEnabled() { calls++; await gate; },
+		listTasks: () => [],
+	});
+	try {
+		const first = call(harness.route, "/m/api/team", { method: "POST", body: { sessionId: "root-team", enabled: true } });
+		// 等第一次进入 setEnabled（pending 已 claim）
+		for (let i = 0; i < 50 && calls === 0; i++) await new Promise((r) => setTimeout(r, 5));
+		assert.equal(calls, 1);
+		const second = await call(harness.route, "/m/api/team", { method: "POST", body: { sessionId: "root-team", enabled: false } });
+		assert.equal(second.status, 409);
+		assert.equal(second.body.error, "team-pending");
+		release();
+		const done = await first;
+		assert.equal(done.status, 200);
+		assert.equal(calls, 1, "并发穿透不得重复调用 setEnabled");
+	} finally {
+		harness.clean();
+	}
+});
+
+test("issue #142 复审 P2：未知版本/其他 teamId 事件不参与权威任务摘要", async () => {
+	const root = liveSession("root-team", [
+		{ type: "session/title", seq: 1, data: { title: "主会话" } },
+		{ type: "team/task", seq: 2, data: { version: 999, teamId: "other-team", task: { id: "evil", revision: 1, status: "completed" } } },
+	]);
+	const rootAgent = { id: "root-team", session: { id: "root-team" }, status: "idle" };
+	const harness = createHarness({
+		records: [record("root-team")],
+		liveSessions: [root],
+		agents: { get: (id) => (id === "root-team" ? rootAgent : undefined), list: () => [rootAgent] },
+		gateway: teamGateway(),
+	});
+	harness.provide("agentTeams", {
+		isEnabled: () => true,
+		async setEnabled() {},
+		listTasks: () => [{ id: "t1", status: "completed" }],
+	});
+	harness.provide("subagents", { async listDescendants() { return []; } });
+	try {
+		const { status, body } = await call(harness.route, "/m/api/team?sessionId=root-team");
+		assert.equal(status, 200);
+		assert.equal(body.team.enabled, true);
+		assert.deepEqual(body.team.tasks, { total: 1, completed: 1, inProgress: 0, pending: 0 },
+			"只使用权威 listTasks，不折叠未知版本/其他 teamId 的事件");
+	} finally {
+		harness.clean();
+	}
+});

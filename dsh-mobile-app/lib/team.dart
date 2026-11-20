@@ -101,6 +101,28 @@ class TeamStatus {
     required this.tasksAvailable,
   });
 
+  /// 旧插件没有 `/api/team` 路由（404 非 session-not-found）时的显式降级形态。
+  factory TeamStatus.unsupported(String sessionId) => TeamStatus(
+    sessionId: sessionId,
+    supported: false,
+    root: true,
+    agentLive: false,
+    enabled: false,
+    modeKnown: false,
+    modelSelected: false,
+    pending: false,
+    locked: false,
+    canToggle: false,
+    unavailableReason: 'team-unavailable',
+    leadTitle: '',
+    leadStatus: 'inactive',
+    members: const [],
+    membersAvailable: false,
+    membersDegraded: true,
+    tasks: const TeamTaskSummary(),
+    tasksAvailable: false,
+  );
+
   factory TeamStatus.fromJson(Map<String, dynamic> j) {
     final lead = j['lead'] as Map<String, dynamic>? ?? const {};
     final rawMembers = j['members'];

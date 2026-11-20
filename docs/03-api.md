@@ -698,12 +698,13 @@
   "tasksAvailable": true
 }}
 ```
-- 只读：成员来自 `subagents.listDescendants`（旧代回退 `listChildren` 并标 `membersDegraded`）；任务摘要来自内核 `agentTeams.listTasks` 或持久化 `team/task` 事件。**不创建/编辑/删除**团队或成员。
+- 只读：成员来自 `subagents.listDescendants`（旧代回退 `listChildren` 并标 `membersDegraded`）；任务摘要**只**来自内核 `agentTeams.listTasks`（权威 projection）。**不创建/编辑/删除**团队或成员。
+- `enabled/modeKnown/tasks`：只认 live Session + `agentTeams.isEnabled/listTasks` 的权威 projection。休眠会话没有可投影的 Session 对象，**不手工折叠** `team/mode`/`team/task` 事件（fork 继承事件可能把父会话状态误当本会话）→ `modeKnown:false`、`enabled:false`、`tasksAvailable:false`，由客户端显式降级。
 - `supported`：宿主是否提供 `agentTeams.isEnabled/setEnabled`；旧宿主为 `false`，客户端隐藏/禁用写操作并显示降级提示，**不伪造**成员或任务。
 - `root`：`origin !== "subagent"`；子代理会话不可修改团队设置（POST 返回 `409 team-root-required`）。
 - `canToggle/unavailableReason`：固定优先级 `team-unavailable` → `team-root-required` → `team-session-offline` → `team-model-unselected` → `team-locked` → `team-pending`。`modelSelected` 取会话待生效模型（provider+model 均有值）。
 - `members[].status`：活 agent `running`/`inactive`；diagnostic 行为三枚举 `unsupported/corrupt/unavailable`。
-- `tasks` 只给计数（#143 任务板单独定义）；`tasksAvailable:false` 表示宿主无团队任务投影。
+- `tasks` 只给计数（#143 任务板单独定义）；`tasksAvailable:false` 表示宿主无团队任务投影/当前会话未激活，不伪造。
 
 **POST `/m/api/team`** — 切换团队协作开关
 ```json

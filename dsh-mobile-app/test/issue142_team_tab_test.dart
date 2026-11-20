@@ -37,6 +37,7 @@ Map<String, dynamic> _team({
   bool agentLive = true,
   bool enabled = false,
   bool modelSelected = true,
+  bool modeKnown = true,
   bool pending = false,
   bool locked = false,
   bool canToggle = true,
@@ -50,7 +51,7 @@ Map<String, dynamic> _team({
   'root': root,
   'agentLive': agentLive,
   'enabled': enabled,
-  'modeKnown': true,
+  'modeKnown': modeKnown,
   'modelSelected': modelSelected,
   'pending': pending,
   'locked': locked,
@@ -71,7 +72,10 @@ class _Backend {
   int getCalls = 0;
   int postCalls = 0;
   Completer<http.Response>? holdPost;
+  Completer<http.Response>? holdGetOnce;
   bool failPost = false;
+  int? failGetStatus;
+  String failGetCode = 'not-found';
 
   late final Api api = Api(client: MockClient(_handle))
     ..baseUrl = 'http://team-tab.test'
@@ -83,17 +87,23 @@ class _Backend {
     if (path == '/m/api/team') {
       if (request.method == 'GET') {
         getCalls++;
+        final hold = holdGetOnce;
+        holdGetOnce = null;
+        if (hold != null) return hold.future;
+        if (failGetStatus != null) {
+          return _json({'error': failGetCode}, failGetStatus!);
+        }
         return _json({'ok': true, 'team': team});
       }
       postCalls++;
+      final body = jsonDecode(request.body) as Map<String, dynamic>;
+      team = {...team, 'enabled': body['enabled'] == true};
       final hold = holdPost;
       holdPost = null;
       if (hold != null) return hold.future;
       if (failPost) {
         return _json({'ok': false, 'error': 'team-save-failed'}, 500);
       }
-      final body = jsonDecode(request.body) as Map<String, dynamic>;
-      team = {...team, 'enabled': body['enabled'] == true};
       return _json({'ok': true, 'team': team});
     }
     if (path == '/m/api/subagents') {
@@ -303,6 +313,67 @@ void main() {
 
     await _mountTeam(tester, _Backend(_team(enabled: true)));
     expect(find.textContaining('暂无团队成员'), findsOneWidget);
+  });
+
+  testWidgets('旧插件 /api/team 404：映射不支持，不显示通用加载失败', (tester) async {
+    final backend = _Backend(_team())..failGetStatus = 404;
+    await _mountTeam(tester, backend);
+    expect(find.textContaining('不支持团队协作'), findsOneWidget);
+    expect(find.byKey(const ValueKey('agent-team-error')), findsNothing);
+    expect(find.byType(Switch), findsNothing);
+  });
+
+  testWidgets('404 session-not-found：仍显示会话错误，不冒充旧插件降级', (tester) async {
+    final backend = _Backend(_team())
+      ..failGetStatus = 404
+      ..failGetCode = 'session-not-found';
+    await _mountTeam(tester, backend);
+    expect(find.byKey(const ValueKey('agent-team-error')), findsOneWidget);
+    expect(find.textContaining('会话不存在'), findsOneWidget);
+  });
+
+  testWidgets('modeKnown=false（未激活）：显式说明，不显示空态/成员', (tester) async {
+    await _mountTeam(
+      tester,
+      _Backend(
+        _team(
+          enabled: true,
+          modeKnown: false,
+          agentLive: false,
+          canToggle: false,
+          reason: 'team-session-offline',
+        ),
+      ),
+    );
+    expect(find.textContaining('暂无法读取团队状态'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('agent-team-member-child-1')),
+      findsNothing,
+    );
+    expect(find.byKey(const ValueKey('agent-team-off-note')), findsNothing);
+  });
+
+  testWidgets('乱序：save 后旧 GET 返回不得覆盖权威 enabled', (tester) async {
+    final backend = _Backend(_team(enabled: false));
+    await _mountTeam(tester, backend);
+    final hold = Completer<http.Response>();
+    backend.holdGetOnce = hold;
+    // 触发一次团队 GET（AppBar 刷新），令其挂起。
+    await tester.tap(find.byTooltip('刷新'));
+    await tester.pump();
+    // 期间切换开关：POST + 权威 GET 完成，显示 enabled=true。
+    await tester.tap(find.byType(Switch));
+    await tester.pumpAndSettle();
+    expect(tester.widget<Switch>(find.byType(Switch)).value, isTrue);
+    // 旧的挂起 GET 此刻返回 stale=false：必须被代次丢弃。
+    hold.complete(_json({'ok': true, 'team': _team(enabled: false)}));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(
+      tester.widget<Switch>(find.byType(Switch)).value,
+      isTrue,
+      reason: '旧 GET 不得覆盖 save 后状态',
+    );
   });
 
   testWidgets('320dp / 深色 / 1.5x：团队页不溢出', (tester) async {

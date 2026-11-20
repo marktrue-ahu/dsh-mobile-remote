@@ -451,6 +451,8 @@ class _TeamTabState extends State<_TeamTab> {
   bool _loading = false;
   bool _saving = false;
   String? _saveError;
+  // #142 复审 P2：请求代次——旧 GET 不得覆盖 save 后的权威状态。
+  int _requestGen = 0;
 
   Api get _api => widget.apiClient ?? api;
 
@@ -472,20 +474,37 @@ class _TeamTabState extends State<_TeamTab> {
   }
 
   Future<void> _load() async {
-    if (!mounted) return;
+    if (!mounted || _saving) return;
+    final gen = ++_requestGen;
     setState(() {
       _loading = _status == null;
       _error = null;
     });
     try {
       final status = await _api.team(widget.sessionId);
-      if (!mounted) return;
+      if (!mounted || gen != _requestGen) return;
       setState(() {
         _status = status;
         _loading = false;
       });
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || gen != _requestGen) return;
+      // #142 复审 P2：旧插件没有路由时是 404 not-found，不等于加载失败；
+      // 只有明确的 session-not-found 才是会话错误。
+      if (e is ApiException && e.status == 404) {
+        if (e.code == 'session-not-found') {
+          setState(() {
+            _error = L10n.t('会话不存在', 'Session not found');
+            _loading = false;
+          });
+          return;
+        }
+        setState(() {
+          _status = TeamStatus.unsupported(widget.sessionId);
+          _loading = false;
+        });
+        return;
+      }
       setState(() {
         _error = '$e';
         _loading = false;
@@ -502,23 +521,21 @@ class _TeamTabState extends State<_TeamTab> {
   }
 
   Future<void> _save(bool value) async {
+    final gen = ++_requestGen; // 作废在途 GET，避免旧状态覆盖保存结果
     setState(() {
       _saving = true;
       _saveError = null;
     });
     try {
-      final status = await _api.setTeamMode(widget.sessionId, value);
-      if (!mounted) return;
-      setState(() {
-        _status = status;
-        _saving = false;
-      });
+      await _api.setTeamMode(widget.sessionId, value);
+      if (!mounted || gen != _requestGen) return;
+      // 不信任 POST 响应的镜像：完成后发权威 GET 再更新 UI。
+      final status = await _api.team(widget.sessionId);
+      if (!mounted || gen != _requestGen) return;
+      setState(() => _status = status);
     } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _saving = false;
-        _saveError = '$e';
-      });
+      if (!mounted || gen != _requestGen) return;
+      setState(() => _saveError = '$e');
       showToast(
         context,
         L10n.t(
@@ -526,6 +543,10 @@ class _TeamTabState extends State<_TeamTab> {
           'Could not confirm the agent teamwork setting was saved. Try again: $e',
         ),
       );
+    } finally {
+      if (mounted && gen == _requestGen) {
+        setState(() => _saving = false);
+      }
     }
   }
 
@@ -656,7 +677,7 @@ class _TeamTabState extends State<_TeamTab> {
             ink3: ink3,
             danger: danger,
           ),
-          if (status.supported && status.enabled) ...[
+          if (status.supported && status.modeKnown && status.enabled) ...[
             const SizedBox(height: 14),
             _teamLeadRow(context, status, ink2, ink3),
             if (status.membersAvailable || status.tasksAvailable)
@@ -708,7 +729,7 @@ class _TeamTabState extends State<_TeamTab> {
                 if (i > 0) Divider(height: 1, color: DshColors.line(context)),
                 _teamMemberRow(context, normalMembers[i]),
               ],
-          ] else if (status.supported && !status.enabled)
+          ] else if (status.supported && status.modeKnown && !status.enabled)
             Padding(
               padding: const EdgeInsets.only(top: 12),
               child: Text(
@@ -718,6 +739,14 @@ class _TeamTabState extends State<_TeamTab> {
                 ),
                 key: const ValueKey('agent-team-off-note'),
                 style: TextStyle(fontSize: 12.5, color: ink3),
+              ),
+            )
+          else if (status.supported && !status.modeKnown)
+            _teamEmptyNote(
+              context,
+              L10n.t(
+                '当前会话未激活，暂无法读取团队状态',
+                'This session is not live; team status is unavailable',
               ),
             ),
         ],
