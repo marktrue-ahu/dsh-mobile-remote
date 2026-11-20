@@ -30,16 +30,25 @@ Map<String, dynamic> _bootstrap({required bool sessionRelative}) => {
   'agents': <Object>[],
 };
 
+class _RaceApi extends Api {
+  _RaceApi({http.Client? client}) : super(client: client);
+
+  final leaky = _LeakyStream();
+
+  @override
+  Stream<Map<String, dynamic>> eventsRaw() => leaky;
+}
+
 class _RaceBackend {
   _RaceBackend({required this.sessionRelative}) {
-    api = Api(client: MockClient(_handle))
+    api = _RaceApi(client: MockClient(_handle))
       ..baseUrl = 'http://new.test'
       ..path = '/m'
       ..token = 'new-token';
   }
 
   final bool sessionRelative;
-  late final Api api;
+  late final _RaceApi api;
   Completer<http.Response>? bootstrapGate;
   int bootstrapCalls = 0;
 
@@ -120,7 +129,8 @@ void main() {
 
     // 等待期间切到旧宿主，并收到旧宿主的 hello（没有 files 能力位）。
     await backend.api.save(base: 'http://old.test', token: 'old-token');
-    store.injectFrame({'type': 'hello', 'capabilities': {}});
+    store.connect();
+    backend.api.leaky.emit({'type': 'hello', 'capabilities': {}});
     expect(backend.api.sessionRelativeFilesSupported, isFalse);
 
     // 新宿主的 bootstrap 现在才到：必须被连接代守卫拒绝。
@@ -139,7 +149,8 @@ void main() {
     final refresh = store.refreshAll();
     await _until(() => backend.bootstrapCalls == 1);
     await backend.api.save(base: 'http://new.test', token: 'new-token');
-    store.injectFrame({
+    store.connect();
+    backend.api.leaky.emit({
       'type': 'hello',
       'capabilities': {
         'files': {'version': 1, 'sessionRelative': true},
