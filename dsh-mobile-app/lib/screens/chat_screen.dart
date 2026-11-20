@@ -1618,10 +1618,12 @@ class _ChatScreenState extends State<ChatScreen> {
   @visibleForTesting
   bool get debugOlderLoadingOverlayVisible => _olderLoadingOverlayVisible;
 
-  /// issue #130 P2：loading 时首 sliver 状态行是否仍在视口上方。
+  /// issue #130 P2：loading 时首 sliver 状态行是否仍不足以承担提示。
   ///
-  /// 状态行占据 `[minScrollExtent, min + 36]`；`pixels >= min + 36` 时它完全在
-  /// 视口上方（用户停在距顶 36–80px 的触发带里），需要顶部 overlay 补位。
+  /// 状态行高 36dp，但“进入视口”不等于“转圈/文案可见”：距顶 9–35px 时只露出
+  /// 行的底部若干像素，文字仍被裁掉。因此 overlay 只在**接近顶部**（距顶 ≤8px，
+  /// 行内主要内容已进入视口）时才让位，其余触发带（8–80px）继续由 pill 补位；
+  /// 交接区间允许 pill 与行短暂重叠，不做 35px 硬切。
   /// 只读几何，不写入 owner、不触发校正。
   bool _computeOlderLoadingOverlayVisible() {
     if (!_infiniteMode || _inHistory || !_loadingMore) return false;
@@ -1629,7 +1631,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!_scrollCtrl.hasClients) return false;
     final pos = _scrollCtrl.position;
     if (!pos.hasContentDimensions) return false;
-    return pos.pixels >= pos.minScrollExtent + olderHistoryStatusRowHeight;
+    return pos.pixels > pos.minScrollExtent + 8;
   }
 
   /// 已构建**子项**的实测几何（内容顺序索引 + 内容偏移 + 高度），供定位循环判断目标

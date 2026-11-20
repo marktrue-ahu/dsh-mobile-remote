@@ -590,13 +590,58 @@ void main() {
     final extentWhilePill =
         probe.position.maxScrollExtent - probe.position.minScrollExtent;
 
-    // 继续上翻到顶：pill 隐藏，由首 sliver 行显示 loading；请求数不变。
+    // ── 交接区间：继续滑到距顶 30–35px 停手（复审指出的漏测点）──────────────
+    // 状态行只露出底部几像素，转圈/文案仍被裁掉；pill 必须继续可见。
+    await _dragToDistanceFromTop(tester, probe, 32);
+    final handoffDistance = probe.pixels - probe.minExtent;
+    expect(handoffDistance, lessThan(36));
+    expect(handoffDistance, greaterThan(8));
+    final pillAtHandoff = find.byKey(olderLoadingOverlayKey);
+    expect(
+      pillAtHandoff,
+      findsOneWidget,
+      reason: '距顶 30–35px 时状态行内容仍被裁，pill 不得提前隐藏',
+    );
+    final pillHandoffRect = tester.getRect(pillAtHandoff);
+    expect(
+      pillHandoffRect.top,
+      greaterThanOrEqualTo(viewport.top - 0.5),
+    );
+    expect(
+      pillHandoffRect.bottom,
+      lessThanOrEqualTo(viewport.bottom + 0.5),
+    );
+    expect(
+      backend.beforeCalls,
+      1,
+      reason: '交接区间继续上翻不得重复请求（${backend.beforeCursors}）',
+    );
+
+    // 再滑到顶 0px：pill 隐藏，首 sliver 行的转圈与文案都进入视口；请求数仍 1。
     await _dragToTop(tester, probe);
     expect(find.byKey(olderLoadingOverlayKey), findsNothing, reason: '到顶后不得双显');
     final rowAtTop = tester.getRect(probe.statusRow);
     expect(rowAtTop.top, greaterThanOrEqualTo(viewport.top - 0.5));
     expect(rowAtTop.bottom, lessThanOrEqualTo(viewport.bottom));
-    expect(find.text(_loadingLabel), findsOneWidget);
+    final rowLabelRect = tester.getRect(
+      find.descendant(
+        of: probe.statusRow,
+        matching: find.text(_loadingLabel),
+      ),
+    );
+    expect(
+      rowLabelRect.top,
+      greaterThanOrEqualTo(viewport.top - 0.5),
+      reason: '状态行文案必须真正进入视口（不被顶部裁掉）',
+    );
+    expect(rowLabelRect.bottom, lessThanOrEqualTo(viewport.bottom + 0.5));
+    final rowSpinnerRect = tester.getRect(
+      find.descendant(
+        of: probe.statusRow,
+        matching: find.byType(CircularProgressIndicator),
+      ),
+    );
+    expect(rowSpinnerRect.top, greaterThanOrEqualTo(viewport.top - 0.5));
     expect(
       backend.beforeCalls,
       1,
