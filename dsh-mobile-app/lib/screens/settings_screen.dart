@@ -440,69 +440,110 @@ String diagnosticStatusToken(String token) {
   }
 }
 
-/// 状态字符串友好化：精确码、`current <id>`/`target <id>`/`ok <time>` 等前缀、
-/// `state(reason)` 括号组合，以及句子里的 `stalled` 等独立词。
-String diagnosticStatusText(String value) {
-  if (value.isEmpty) return value;
-  final direct = diagnosticStatusToken(value);
-  if (direct != value) return direct;
-  if (value.startsWith('current ')) {
-    return '${L10n.t('当前', 'current')} ${value.substring(8)}';
-  }
-  if (value.startsWith('target ')) {
-    return '${L10n.t('目标', 'target')} ${value.substring(7)}';
-  }
-  if (value.startsWith('ok ')) {
-    return '${L10n.t('正常', 'OK')} ${value.substring(3)}';
-  }
-  if (value.startsWith('fail ')) {
-    return '${L10n.t('失败', 'failed')} ${value.substring(5)}';
-  }
-  if (value.startsWith('idle')) {
-    return '${L10n.t('空闲', 'idle')}${value.substring(4)}';
-  }
-  final pair = RegExp(r'^([a-z][a-z-]*)\(([^()]*)\)$').firstMatch(value);
-  if (pair != null) {
-    return '${diagnosticStatusToken(pair.group(1)!)}（${diagnosticStatusToken(pair.group(2)!)}）';
-  }
-  var out = value;
-  for (final token in const [
-    'up-to-date',
-    'not-ready',
-    'unavailable',
-    'outdated',
-    'stalled',
-    'missing',
-    'drift',
-    'config',
-    'unknown',
-    'none',
-    'ready',
-  ]) {
-    out = out.replaceAll(
-      RegExp(r'(?<![A-Za-z-])' + RegExp.escape(token) + r'(?![A-Za-z-])'),
-      diagnosticStatusToken(token),
-    );
-  }
-  return out;
-}
+/// 状态字符串友好化：**只做确切 token 映射**。
+///
+/// 路径/URL/版本/任意 unknown 字符串原样返回。禁止对任意字符串做逐词替换——
+/// 那会把 `/home/u/config/npm` 改成 `/home/u/配置/npm`、把 `https://host/ready`
+/// 改成 `https://host/就绪`，破坏可复制排障（review P2）。
+String diagnosticStatusText(String value) => diagnosticStatusToken(value);
 
-/// 诊断值渲染：Map/List 保留结构（嵌套 key 原样，值友好化），字符串走状态友好化。
-String diagnosticValueText(Object? value, {bool nested = false}) {
+/// 允许做状态友好化的顶层 check key 白名单（其余 key 的值一律原样）。
+const Set<String> _diagStatusStringKeys = {'currentReleaseHealth'};
+
+/// 单条 check 值渲染：仅白名单字段/语义化格式做翻译；Map 按明确子 key 白名单；
+/// 未知 key/value 原样保留。
+String diagnosticCheckValueText(String key, Object? value) {
   if (value is Map) {
     final parts = <String>[];
     value.forEach((k, v) {
-      parts.add('$k: ${diagnosticValueText(v, nested: true)}');
+      parts.add('$k: ${_diagnosticNestedValueText(key, '$k', v)}');
     });
     return '{${parts.join(', ')}}';
   }
   if (value is Iterable) {
-    return '[${value.map((v) => diagnosticValueText(v, nested: true)).join(', ')}]';
+    return '[${value.map(diagnosticValueText).join(', ')}]';
   }
-  if (value is String) {
-    // 嵌套长文本（hint 等）不做逐词替换，避免误伤自然语言；短状态值友好化。
-    if (nested && value.length > 40) return value;
-    return diagnosticStatusText(value);
+  if (value is String) return _diagnosticCheckString(key, value);
+  return '$value';
+}
+
+String _diagnosticCheckString(String key, String value) {
+  if (key == 'sseConnections') {
+    // 服务端摘要已是中文，只替换独立词 stalled；数字/路径/URL 不碰。
+    return value.replaceAll(
+      RegExp(r'(?<![A-Za-z-])stalled(?![A-Za-z-])'),
+      L10n.t('停滞', 'stalled'),
+    );
+  }
+  if (key == 'currentRelease') {
+    if (value.startsWith('current ')) {
+      return '${L10n.t('当前', 'current')} ${value.substring(8)}';
+    }
+    return diagnosticStatusToken(value);
+  }
+  if (key == 'updateTarget') {
+    if (value.startsWith('target ')) {
+      return '${L10n.t('目标', 'target')} ${value.substring(7)}';
+    }
+    return diagnosticStatusToken(value);
+  }
+  if (key == 'appArtifact' || key == 'updateDir') {
+    final pair = RegExp(r'^([a-z][a-z-]*)\(([^()]*)\)$').firstMatch(value);
+    if (pair != null) {
+      return '${diagnosticStatusToken(pair.group(1)!)}（${diagnosticStatusToken(pair.group(2)!)}）';
+    }
+    return diagnosticStatusToken(value);
+  }
+  if (key.startsWith('push:')) {
+    final prefix = RegExp(r'^(ok|fail|idle)(?=\s|$)').firstMatch(value);
+    if (prefix != null) {
+      return '${diagnosticStatusToken(prefix.group(1)!)}${value.substring(prefix.end)}';
+    }
+    return value;
+  }
+  if (_diagStatusStringKeys.contains(key)) {
+    return diagnosticStatusToken(value);
+  }
+  return value;
+}
+
+String _diagnosticNestedValueText(
+  String parentKey,
+  String childKey,
+  Object? value,
+) {
+  if (value is Map || value is Iterable) return diagnosticValueText(value);
+  if (value is! String) return '$value';
+  // 明确白名单：只有这些父/子字段的值是稳定状态码。
+  switch (parentKey) {
+    case 'hostCapabilities':
+    case 'hostCapabilityReasons':
+    case 'hostGeneration':
+      return diagnosticStatusToken(value);
+    case 'appAlignment':
+      return (childKey == 'state' || childKey == 'reason')
+          ? diagnosticStatusToken(value)
+          : value;
+    case 'pluginUpdate':
+      return (childKey == 'state' || childKey == 'installShape')
+          ? diagnosticStatusToken(value)
+          : value;
+    default:
+      return value;
+  }
+}
+
+/// 仅保留结构的通用值渲染（**不做任何状态词替换**）；未知/任意字符串原样。
+String diagnosticValueText(Object? value) {
+  if (value is Map) {
+    final parts = <String>[];
+    value.forEach((k, v) {
+      parts.add('$k: ${diagnosticValueText(v)}');
+    });
+    return '{${parts.join(', ')}}';
+  }
+  if (value is Iterable) {
+    return '[${value.map(diagnosticValueText).join(', ')}]';
   }
   return '$value';
 }
@@ -559,7 +600,7 @@ String buildDiagnosticsText(Map<String, dynamic>? d) {
         '  ${v == 0 ? '✅' : '⚠'} $shown = $v${v == 0 ? '' : L10n.t('（有审批/问询待处理）', ' (approval/question pending)')}',
       );
     } else {
-      buf.writeln('  ℹ $shown = ${diagnosticValueText(v)}');
+      buf.writeln('  ℹ $shown = ${diagnosticCheckValueText(k, v)}');
     }
   });
   final notes = d['notes'] as List? ?? [];

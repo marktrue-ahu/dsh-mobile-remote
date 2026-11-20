@@ -43,10 +43,22 @@ Map<String, dynamic> _fixture() => {
   },
   'checks': {
     'sseConnections': '1 / 8 · 最旧 1s · stalled 0 · 累计驱逐 0',
-    'hostCapabilities': {'jobs.callerShape': 'ok', 'settings.read': 'drift'},
+    'hostCapabilities': {
+      'jobs.callerShape': 'ok',
+      'settings.read': 'drift',
+      'future.cap': 'weird token',
+    },
     'hostGeneration': {'jobsCaller': 'sessionId'},
-    'appAlignment': {'state': 'ok', 'appVersion': '3.5.1'},
-    'pluginUpdate': {'state': 'up-to-date', 'installShape': 'npm'},
+    'appAlignment': {
+      'state': 'ok',
+      'appVersion': '3.5.1',
+      'hint': 'see https://host/ready and ok',
+    },
+    'pluginUpdate': {
+      'state': 'up-to-date',
+      'installShape': 'npm',
+      'message': 'path /home/user/config',
+    },
     'appArtifact': 'ready(some-reason)',
     'currentRelease': 'current 123456789abc…',
     'currentReleaseHealth': 'ok',
@@ -54,6 +66,8 @@ Map<String, dynamic> _fixture() => {
     'updateDir': 'config(not-ready)',
     'approvalMode': 'both',
     'futureCheck': 'weird',
+    'extraPath': '/home/user/config/npm',
+    'extraUrl': 'https://host/ready',
   },
   'notes': <String>[],
   'plugin': {'name': 'dsh-mobile-remote', 'version': '3.5.1'},
@@ -161,6 +175,15 @@ void main() {
       // 未知 key 保留 fallback（可复制排障）
       expect(text, contains('futureMetric = 7'));
       expect(text, contains('futureCheck = weird'));
+
+      // review P2：路径/URL/未知嵌套值必须原样；不得被状态词替换破坏
+      expect(text, contains('/home/user/config/npm'));
+      expect(text, isNot(contains('/home/user/配置/npm')));
+      expect(text, contains('https://host/ready'));
+      expect(text, isNot(contains('https://host/就绪')));
+      expect(text, contains('future.cap: weird token'));
+      expect(text, contains('see https://host/ready and ok'));
+      expect(text, contains('path /home/user/config'));
     });
 
     test('英文模式保留英文名称，不回退重复 key', () {
@@ -177,6 +200,8 @@ void main() {
       expect(text, contains('up to date'));
       expect(text, contains('Update dir = config'));
       expect(text, contains('futureMetric = 7'));
+      expect(text, contains('/home/user/config/npm'));
+      expect(text, contains('https://host/ready'));
       expect(text, isNot(contains('cli · ')));
     });
 
