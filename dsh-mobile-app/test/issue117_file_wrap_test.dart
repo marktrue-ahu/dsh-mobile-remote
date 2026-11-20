@@ -352,6 +352,53 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('320 / 1.5x single long line keeps intra-line position', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(320, 640);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    final line = List<String>.filled(6000, 'z').join();
+
+    await _pump(
+      tester,
+      GitFileViewer(
+        mode: GitFileViewerMode.content,
+        path: 'one-line.json',
+        content: line,
+      ),
+      theme: DshTheme.dark(),
+      textScaler: const TextScaler.linear(1.5),
+    );
+    final baseLeft = _left(tester, _viewerKeys.sourceLineText(0));
+    await tester.drag(
+      find.byKey(_viewerKeys.sourceList),
+      const Offset(0, -400),
+    );
+    await tester.pumpAndSettle();
+    final before = _wrappedTopChar(tester, line);
+    expect(before, greaterThan(50));
+
+    await tester.tap(find.byKey(_viewerKeys.wrapToggle));
+    await tester.pumpAndSettle();
+    final offOffset =
+        baseLeft - _left(tester, _viewerKeys.sourceLineText(0));
+    expect(offOffset, greaterThan(50));
+    final offChar = _unwrappedLeftChar(
+      tester,
+      line,
+      horizontalOffset: offOffset,
+    );
+    expect((offChar - before).abs(), lessThan(50));
+
+    await tester.tap(find.byKey(_viewerKeys.wrapToggle));
+    await tester.pumpAndSettle();
+    final after = _wrappedTopChar(tester, line);
+    expect((after - before).abs(), lessThan(50));
+    expect(find.byKey(_viewerKeys.sourceScrollSurface), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('wrap on again: folds, resets offset, keeps top line and copy', (
     tester,
   ) async {
