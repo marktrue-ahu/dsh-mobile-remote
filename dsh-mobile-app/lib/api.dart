@@ -9,6 +9,7 @@ import 'package:crypto/crypto.dart' as crypto;
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'agent_tree.dart';
 import 'download.dart';
 import 'logger.dart';
 import 'models.dart';
@@ -1449,10 +1450,15 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
 
   /// 子代理列表（按父会话查询，与内核 subagent.list 契约一致）。
   Future<List<Map<String, dynamic>>> subagents(String parentSessionId) async {
+    return (await subagentCatalog(parentSessionId)).rows;
+  }
+
+  /// issue #140/#141：子代理目录 + 树能力标记（catalogDegraded / multiLevelUnavailable）。
+  Future<SubagentCatalog> subagentCatalog(String parentSessionId) async {
     final data = await getJson(
       '/api/subagents?parentSessionId=${Uri.encodeQueryComponent(parentSessionId)}',
     );
-    return (data['subagents'] as List? ?? []).cast<Map<String, dynamic>>();
+    return parseSubagentCatalog(data);
   }
 
   /// 中断子代理（内核契约：parentSessionId + childSessionId + mode=continuable）。
