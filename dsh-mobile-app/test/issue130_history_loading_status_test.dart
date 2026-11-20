@@ -299,6 +299,34 @@ Future<void> _dragUp(WidgetTester tester, double distance) async {
   await tester.pump(const Duration(milliseconds: 400));
 }
 
+/// issue #130 P2：真实上翻到「距视觉顶部 [target] px」停手（不拖到顶）。
+///
+/// 粗步进靠近后改用小步进，最后停顿消除惯性；用于复现“触发带 50–80px 内停手”的
+/// 真实场景（此时首 sliver 状态行仍在视口上方）。
+Future<void> _dragToDistanceFromTop(
+  WidgetTester tester,
+  _Probe probe,
+  double target,
+) async {
+  final gesture = await tester.startGesture(
+    tester.getCenter(find.byType(CustomScrollView)),
+  );
+  await tester.pump(const Duration(milliseconds: 20));
+  for (var i = 0; i < 400; i++) {
+    final distance = probe.pixels - probe.minExtent;
+    if (distance <= target) break;
+    final remaining = distance - target;
+    final step = remaining > 90 ? 90.0 : remaining.clamp(1.0, 20.0);
+    await gesture.moveBy(Offset(0, step));
+    await tester.pump(const Duration(milliseconds: 16));
+  }
+  // 停手消除 fling 惯性（否则会继续冲到顶部）。
+  await tester.pump(const Duration(milliseconds: 160));
+  await gesture.up();
+  await tester.pump(const Duration(milliseconds: 200));
+  await tester.pump(const Duration(milliseconds: 200));
+}
+
 /// 真实上翻到视觉顶部（逐帧手势，直到 `pixels == min`）。
 Future<void> _dragToTop(WidgetTester tester, _Probe probe) async {
   for (var i = 0; i < 40; i++) {
@@ -510,6 +538,80 @@ void main() {
     backend.completeBefore(hasMore: false);
     await tester.pump(const Duration(milliseconds: 100));
     await tester.pump(const Duration(milliseconds: 400));
+    expect(tester.takeException(), isNull);
+    await _finish(tester, store);
+  });
+
+  testWidgets('P2：触发带内停手时顶部 pill 在屏幕可见；到顶后 pill 隐藏、sliver 行显示', (tester) async {
+    final backend = _HistoryBackend(_history());
+    final store = await _mount(tester, backend);
+    final probe = _Probe(tester);
+    final viewport = tester.getRect(find.byType(CustomScrollView));
+
+    // 只上翻到距顶 60px（触发带 50–80px），不拖到顶。
+    backend.holdBefore = true;
+    await _dragToDistanceFromTop(tester, probe, 60);
+    final distance = probe.pixels - probe.minExtent;
+    expect(backend.beforeCalls, 1, reason: '80px 内应触发一次 before 请求');
+    expect(
+      distance,
+      greaterThan(olderHistoryStatusRowHeight),
+      reason: '前提：首 sliver 状态行此时应完全在视口上方（${probe.geometry()}）',
+    );
+    expect(distance, lessThan(80));
+
+    // 顶部 pill 必须真实可见（屏幕坐标落在消息视口内），而不是只改 model。
+    final pill = find.byKey(olderLoadingOverlayKey);
+    expect(pill, findsOneWidget, reason: '触发带内停手必须能看到 loading pill');
+    final pillRect = tester.getRect(pill);
+    expect(
+      pillRect.top,
+      greaterThanOrEqualTo(viewport.top - 0.5),
+      reason: 'pill 不得被 AppBar 遮住（${pillRect.top} vs ${viewport.top}）',
+    );
+    expect(
+      pillRect.bottom,
+      lessThanOrEqualTo(viewport.bottom + 0.5),
+      reason: 'pill 必须在消息视口内（${pillRect.bottom} vs ${viewport.bottom}）',
+    );
+    expect(pillRect.width, greaterThan(0));
+    // 此时首 sliver 行仍在视口上方（不能是它在显示 loading）。
+    // 反向 sliver 可能还没被懒构建——未构建同样等于不可见。
+    if (probe.statusRow.evaluate().isNotEmpty) {
+      final rowOffscreen = tester.getRect(probe.statusRow);
+      expect(
+        rowOffscreen.bottom,
+        lessThanOrEqualTo(viewport.top + 0.5),
+        reason: '状态行应仍在视口上方（bottom=${rowOffscreen.bottom}）',
+      );
+    }
+
+    // overlay 不改变滚动 extent（不是 sliver、不参与布局）。
+    final extentWhilePill =
+        probe.position.maxScrollExtent - probe.position.minScrollExtent;
+
+    // 继续上翻到顶：pill 隐藏，由首 sliver 行显示 loading；请求数不变。
+    await _dragToTop(tester, probe);
+    expect(find.byKey(olderLoadingOverlayKey), findsNothing, reason: '到顶后不得双显');
+    final rowAtTop = tester.getRect(probe.statusRow);
+    expect(rowAtTop.top, greaterThanOrEqualTo(viewport.top - 0.5));
+    expect(rowAtTop.bottom, lessThanOrEqualTo(viewport.bottom));
+    expect(find.text(_loadingLabel), findsOneWidget);
+    expect(
+      backend.beforeCalls,
+      1,
+      reason: '继续上翻不得重复请求（${backend.beforeCursors}）',
+    );
+    expect(
+      probe.position.maxScrollExtent - probe.position.minScrollExtent,
+      extentWhilePill,
+      reason: 'pill 不得改变滚动 extent',
+    );
+
+    backend.completeBefore(hasMore: false);
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(find.byKey(olderLoadingOverlayKey), findsNothing);
     expect(tester.takeException(), isNull);
     await _finish(tester, store);
   });
