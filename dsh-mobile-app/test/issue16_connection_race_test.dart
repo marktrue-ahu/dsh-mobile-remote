@@ -163,6 +163,46 @@ void main() {
     expect(backend.api.sessionRelativeFilesSupported, isTrue);
   });
 
+  test('A 宿主 bootstrap 迟到失败：不得轮换当前 B 的地址', () async {
+    final backend = _RaceBackend(sessionRelative: false);
+    backend.api.baseUrls = ['http://new.test', 'http://old.test'];
+    final store = AppStore(apiClient: backend.api);
+    addTearDown(store.disposeBridge);
+
+    backend.bootstrapGate = Completer<http.Response>();
+    final refresh = store.refreshAll();
+    await _until(() => backend.bootstrapCalls == 1);
+
+    await backend.api.save(base: 'http://b.test', token: 'b-token');
+    backend.bootstrapGate!.completeError(
+      TimeoutException('旧宿主 A 超时（迟到）'),
+    );
+    final ok = await refresh;
+
+    expect(ok, isFalse);
+    expect(backend.api.baseUrl, 'http://b.test', reason: '迟到的 A 失败不得 rotate 当前 B');
+  });
+
+  test('resume 的 A 宿主 bootstrap 迟到失败：不得把 B 标 offline/取消连接', () async {
+    final backend = _RaceBackend(sessionRelative: false);
+    final store = AppStore(apiClient: backend.api);
+    addTearDown(store.disposeBridge);
+    store.connState = 'connected';
+
+    backend.bootstrapGate = Completer<http.Response>();
+    final resume = store.resume();
+    await _until(() => backend.bootstrapCalls == 1);
+
+    await backend.api.save(base: 'http://b.test', token: 'b-token');
+    backend.bootstrapGate!.completeError(
+      TimeoutException('旧宿主 A 超时（迟到）'),
+    );
+    await resume;
+
+    expect(store.connState, 'connected', reason: '旧代失败不得把新连接标 offline');
+    expect(backend.api.baseUrl, 'http://b.test');
+  });
+
   test('旧 SSE 帧跨连接代不写能力位（传输层 cancel 后仍回调）', () async {
     final api = _LeakyApi()
       ..baseUrl = 'http://host.test'

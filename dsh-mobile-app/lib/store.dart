@@ -2258,12 +2258,14 @@ class AppStore extends ChangeNotifier {
       _emitChatEvent(ChatEvent(type: '_capabilities', data: {}));
       _syncAgentStatus(d, snapshotEpoch: epoch);
     } catch (_) {
+      // 旧连接代的失败不得轮换/影响新连接（Reviewer #16 P2 失败路径）。
+      if (!current()) return false;
       // 连接不通：尝试轮换到下一个候选地址（黑洞快速切换）再探测一次
       if (api.rotateBaseUrl()) {
         AppLog.instance.log('刷新探测失败 → 切换地址 ${api.baseUrl}');
+        final retryEpoch = api.connectionEpoch;
+        final retryIdentity = api.connectionIdentity;
         try {
-          final retryEpoch = api.connectionEpoch;
-          final retryIdentity = api.connectionIdentity;
           final d = await api.getJson(
             '/api/bootstrap',
             timeout: const Duration(seconds: 8),
@@ -2286,6 +2288,11 @@ class AppStore extends ChangeNotifier {
           disposeBridge();
           connect();
         } catch (_) {
+          // 旧代的失败同样不得继续影响当前连接。
+          if (retryEpoch != api.connectionEpoch ||
+              retryIdentity != api.connectionIdentity) {
+            return false;
+          }
           // 候选地址也不通：保持离线自愈（看门狗/重试会继续处理）
         }
       }
@@ -2878,6 +2885,11 @@ class AppStore extends ChangeNotifier {
       _emitChatEvent(ChatEvent(type: '_catchup', data: {}));
       refreshAll();
     } catch (_) {
+      // 旧连接代的失败不得把新连接标 offline / 取消新 SSE（Reviewer #16 P2）。
+      if (connectionEpoch != api.connectionEpoch ||
+          identity != api.connectionIdentity) {
+        return;
+      }
       _setConnState('offline');
       // 探针失败：旧流同样不可信，直接重建（重连机制会持续尝试直到成功）
       if (_sub != null) {
@@ -3352,6 +3364,10 @@ class AppStore extends ChangeNotifier {
           _retry = 0;
           connect();
         } catch (_) {
+          if (connectionEpoch != api.connectionEpoch ||
+              identity != api.connectionIdentity) {
+            return;
+          }
           // 当前地址连续失败：轮换到下一个候选地址（外出自动切 Tailscale）
           if (api.rotateBaseUrl()) {
             AppLog.instance.log('连接切换地址 → ${api.baseUrl}');
