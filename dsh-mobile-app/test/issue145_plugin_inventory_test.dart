@@ -174,7 +174,7 @@ void main() {
 
     await tester.tap(find.text('dsh-bad'));
     await tester.pumpAndSettle();
-    expect(find.text('只读视图：当前版本不提供安装、升级、卸载、启停或重启操作。'), findsOneWidget);
+    expect(find.text('仅使用电脑端已配置的渠道；失败由宿主自动回滚；不提供卸载/启停/重启。'), findsOneWidget);
     semantics.dispose();
   });
 

@@ -128,7 +128,14 @@ test("已安装清单：版本/来源/启停/健康/兼容与当前连接标记�
 		assert.match(bad.compatibility.requirements, /engines\.dsh/);
 		// 只读：没有任何写能力/写动作字段；诊断原文（含本机路径）不外泄。
 		for (const p of body.plugins) {
-			assert.deepEqual(p.management, { readOnly: true });
+			if (p.independent === true) {
+				assert.deepEqual(p.management, { readOnly: true });
+			} else {
+				assert.equal(p.management.readOnly, false);
+				assert.equal(p.management.canUninstall, false);
+				assert.equal(p.management.canToggle, false);
+				assert.equal(p.management.canRestart, false);
+			}
 			assert.equal("install" in p || "uninstall" in p || "toggle" in p || "restart" in p, false);
 		}
 		assert.equal(JSON.stringify(body).includes("/home/secret"), false);
