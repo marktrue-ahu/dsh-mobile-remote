@@ -139,7 +139,7 @@ test("issue #140 rc.2：listDescendants 透出递归树（name/depth/parentSessi
       { id: "grandchild", depth: 2, parentId: "child-live", name: "checker", path: "reviewer/checker", kind: "child", mode: "continuable", label: "grand" },
       { id: "diag-unsupported", depth: 1, parentId: PARENT, path: "legacy", kind: "diagnostic", reason: "unsupported", label: "diag unsupported" },
       { id: "diag-corrupt", depth: 1, parentId: PARENT, kind: "diagnostic", reason: "corrupt" },
-      { id: "diag-unavailable", depth: 1, parentId: "child-live", kind: "diagnostic", reason: "unavailable" },
+      { id: "diag-unavailable", depth: 2, parentId: "child-live", kind: "diagnostic", reason: "unavailable" },
     ],
     sessions: [
       { id: "child-live", header: { id: "child-live", createdAt: 3000 } },
@@ -170,9 +170,79 @@ test("issue #140 rc.2：listDescendants 透出递归树（name/depth/parentSessi
     assert.equal(byId.get("diag-unsupported").status, "unsupported");
     assert.equal(byId.get("diag-corrupt").status, "corrupt");
     assert.equal(byId.get("diag-unavailable").status, "unavailable");
+    assert.equal(byId.get("diag-unavailable").depth, 2);
+    assert.equal(byId.get("diag-unavailable").parentSessionId, "child-live");
     assert.equal(byId.get("diag-unsupported").name, null, "diagnostic 无 name 时显式 null");
     assert.equal(byId.get("diag-unsupported").depth, 1, "diagnostic 也保留树位置");
     assert.equal("mode" in byId.get("diag-unsupported"), false);
+  } finally { h.dispose(); }
+});
+
+test("issue #140 复审 P2：depth=2 缺 parentId → 该行及后代输出 null，multiLevelUnavailable，不伪造挂根", async () => {
+  const h = harness({
+    generation: "rc2",
+    descendants: [
+      { id: "root-child", depth: 1, parentId: PARENT, name: "root-child-name", kind: "child", mode: "continuable", label: "直接子级" },
+      // 兼容宿主异常：depth=2 但没有 parentId。
+      { id: "orphan-depth2", depth: 2, name: "orphan", kind: "child", mode: "continuable", label: "缺父行" },
+      // 依赖缺父行的孙代理：父行无效必须连带失效，不得挂到请求根。
+      { id: "descendant-of-orphan", depth: 3, parentId: "orphan-depth2", kind: "child", mode: "continuable", label: "孙级" },
+    ],
+  });
+  try {
+    const res = await h.request(`/m/api/subagents?parentSessionId=${PARENT}`);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.multiLevelUnavailable, true, "递归路径父子边缺失必须显式降级");
+    const byId = new Map(res.body.subagents.map((row) => [row.id, row]));
+    assert.equal(byId.get("orphan-depth2").parentSessionId, null, "不猜请求根");
+    assert.equal(byId.get("orphan-depth2").depth, null, "非法行 depth 输出 null");
+    assert.equal(byId.get("descendant-of-orphan").parentSessionId, null, "无效父行连带整条链失效");
+    assert.equal(byId.get("descendant-of-orphan").depth, null);
+    assert.equal(byId.get("root-child").parentSessionId, PARENT, "合法直系行保持原值");
+    assert.equal(byId.get("root-child").depth, 1);
+    assert.equal(byId.get("root-child").name, "root-child-name");
+  } finally { h.dispose(); }
+});
+
+test("issue #140 复审 P2：非法 depth（负数/小数/缺字段）→ 不猜层级并降级", async () => {
+  const h = harness({
+    generation: "rc2",
+    descendants: [
+      { id: "negative", depth: -1, parentId: PARENT, kind: "child", mode: "continuable" },
+      { id: "fraction", depth: 1.5, parentId: PARENT, kind: "child", mode: "continuable" },
+      { id: "missing", parentId: PARENT, kind: "child", mode: "continuable" },
+      { id: "valid", depth: 1, parentId: PARENT, kind: "child", mode: "continuable" },
+    ],
+  });
+  try {
+    const res = await h.request(`/m/api/subagents?parentSessionId=${PARENT}`);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.multiLevelUnavailable, true);
+    const byId = new Map(res.body.subagents.map((row) => [row.id, row]));
+    for (const id of ["negative", "fraction", "missing"]) {
+      assert.equal(byId.get(id).depth, null, `${id} 非法 depth 应为 null`);
+      assert.equal(byId.get(id).parentSessionId, null, `${id} 不猜父会话`);
+    }
+    assert.equal(byId.get("valid").depth, 1);
+    assert.equal(byId.get("valid").parentSessionId, PARENT);
+  } finally { h.dispose(); }
+});
+
+test("issue #140 复审 P2：父行 depth 与子 depth 不一致 → 降级且不猜", async () => {
+  const h = harness({
+    generation: "rc2",
+    descendants: [
+      { id: "same-depth-parent", depth: 2, parentId: PARENT, kind: "child", mode: "continuable" },
+      { id: "child-of-bad", depth: 2, parentId: "same-depth-parent", kind: "child", mode: "continuable" },
+    ],
+  });
+  try {
+    const res = await h.request(`/m/api/subagents?parentSessionId=${PARENT}`);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.multiLevelUnavailable, true);
+    const byId = new Map(res.body.subagents.map((row) => [row.id, row]));
+    assert.equal(byId.get("same-depth-parent").parentSessionId, null, "depth=2 父不是根，缺深度 1 父行 → 无效");
+    assert.equal(byId.get("child-of-bad").parentSessionId, null);
   } finally { h.dispose(); }
 });
 

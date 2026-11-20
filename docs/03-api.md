@@ -663,9 +663,9 @@
 - issue #140 树字段（每行）：
   · `name`（string | null）：代理名（rc.2 目录的 `name`；目录无名字时为 `null`，不伪造）。
   · `depth`（int | null）：距请求根会话的层数，直接子级为 `1`；只有 rc.2 `listDescendants` 提供，旧代/降级路径为 `null`（不伪造）。
-  · `parentSessionId`（string）：**直接父会话 id**；rc.2 用目录行的 `parentId`，旧代/降级路径为请求的父会话。
+  · `parentSessionId`（string | null）：**直接父会话 id**；rc.2 合法行用目录行的 `parentId`，`listChildren`/持久化/注册表等直系路径为请求的父会话；递归路径缺/非法 `parentId` 或父子链不一致时为 `null`（不猜、不回填请求根）。
   · `title`/`kind`/`status`/`createdAt` 语义不变；`title` 仍按目录 label → name → 持久标题 → 短码。
-- `multiLevelUnavailable: true`（issue #140，可选）：rc.1/持久化/注册表回退，或 rc.2 树行缺 `depth` 时显式降级——客户端不得据此行推断多层树（不能把 `null` 当 0/1）。
+- `multiLevelUnavailable: true`（issue #140，可选）：rc.1/持久化/注册表回退，或 rc.2 递归行缺/非法 `depth`（负数/小数/缺字段）、缺/非法 `parentId`、父子深度链不一致时显式降级。此时无效行及依赖它的后代的 `depth`/`parentSessionId` 输出 `null`（不伪造层级、不挂请求根）；客户端不得把 `null` 当 0/1 推断多层树。
 - `kind`：`child`（普通子代理）或 `diagnostic`（rc.2 的 `kind:"diagnostic"` / rc.1 的 `mode:"unknown"`）。
   diagnostic 行**没有 `mode`**，客户端不得用 `row.mode` 判分支。
 - `status`：普通行为活 agent 的 AgentStatus 映射（`running`/`inactive`）；diagnostic 行为三枚举原因：
