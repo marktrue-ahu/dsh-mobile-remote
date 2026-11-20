@@ -501,7 +501,7 @@ Widget _buildTasksTab() {
   final tasks = board.tasks;
   final refreshError = _tasksError;
   final summary = _TaskSummary(tasks: tasks);
-  if (tasks.isEmpty && failure == null && !board.unavailable) {
+  if (tasks.isEmpty && failure == null && refreshError == null && !board.unavailable) {
     return _TaskEmptyState(
       key: const ValueKey('agent-tasks-empty'),
       icon: Icons.checklist_outlined,
