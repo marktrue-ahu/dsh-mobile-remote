@@ -31,6 +31,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 late HttpServer _server;
 List<Map<String, dynamic>> _sessionRows = const [];
+late HttpServer _serverB;
+List<Map<String, dynamic>> _sessionRowsB = const [];
+Completer<void>? _sessionsGateB;
 
 Map<String, dynamic> _row({
   required String id,
@@ -119,6 +122,23 @@ Future<void> _bootServer() async {
   api.baseUrl = 'http://127.0.0.1:${_server.port}';
   api.token = '';
   api.path = '/m';
+
+  // 宿主 B：同一挂载路径/口令，仅地址不同（复现同 sessionId 换宿主）。
+  _serverB = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  _serverB.listen((req) async {
+    if (req.uri.path == '/m/api/sessions' && _sessionsGateB != null) {
+      await _sessionsGateB!.future;
+    }
+    final body = switch (req.uri.path) {
+      '/m/api/sessions' => {'ok': true, 'sessions': _sessionRowsB},
+      _ => {'ok': true},
+    };
+    req.response
+      ..statusCode = HttpStatus.ok
+      ..headers.contentType = ContentType.json
+      ..write(jsonEncode(body))
+      ..close();
+  });
 }
 
 Future<AppStore> _pumpSessions(
@@ -177,6 +197,7 @@ void main() {
 
   tearDown(() async {
     await _server.close(force: true);
+    await _serverB.close(force: true);
   });
 
   group('递归聚合纯函数', () {
@@ -542,6 +563,71 @@ void main() {
       SessionRowState.running,
       reason: '慢快照比 SSE 帧旧，不得覆盖新帧',
     );
+  });
+
+  testWidgets('连接代切换：A 的 running 不带到 B；B 慢快照不覆盖新帧；切回 A 不继承', (tester) async {
+    _sessionRows = [
+      _row(id: 'main', createdAt: 3000, subagentsRunning: 1),
+      _row(id: 'other', createdAt: 2000),
+    ];
+    final store = await _pumpSessions(tester);
+    expect(_iconOf(tester, 'main').state, SessionRowState.running);
+
+    // 切到宿主 B（同 sessionId）：B 快照慢响应，先到一帧 agent/status 改变 epoch。
+    api.baseUrl = 'http://127.0.0.1:${_serverB.port}';
+    _sessionRowsB = [
+      _row(id: 'main', createdAt: 3000, subagentsRunning: 0),
+      _row(id: 'other', createdAt: 2000),
+    ];
+    _sessionsGateB = Completer<void>();
+    addTearDown(() => _sessionsGateB = null);
+    late Future<void> refreshFuture;
+    await tester.runAsync(() async {
+      refreshFuture = store.refreshSessions();
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+    });
+    // 连接代切换当下即失效旧快照字段：不得沿用 A 的 count=1。
+    await tester.pump();
+    expect(
+      _iconOf(tester, 'main').state,
+      SessionRowState.idle,
+      reason: '切宿主后 A 的 subagentsRunning 必须立即失效',
+    );
+    store.injectFrame(_statusFrame('main', 'idle'));
+    await tester.pump();
+
+    // B 的旧快照返回（0）——不得把 A 的 count 带进来，也不得被新帧覆盖成 running。
+    await tester.runAsync(() async {
+      _sessionsGateB!.complete();
+      await refreshFuture;
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    });
+    await tester.pump();
+    expect(_iconOf(tester, 'main').state, SessionRowState.idle);
+    store.injectFrame(
+      _rootStatusFrame(
+        sessionId: 'child',
+        rootSessionId: 'main',
+        subagentsRunning: 0,
+        status: 'idle',
+      ),
+    );
+    await tester.pump();
+    expect(_iconOf(tester, 'main').state, SessionRowState.idle);
+
+    // 切回 A：B 的缓存/字段不得被继承（A 快照 idle 就保持 idle）。
+    api.baseUrl = 'http://127.0.0.1:${_server.port}';
+    _sessionRows = [
+      _row(id: 'main', createdAt: 3000, subagentsRunning: 0),
+      _row(id: 'other', createdAt: 2000),
+    ];
+    await tester.runAsync(() async {
+      await store.refreshSessions();
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    });
+    await tester.pump();
+    expect(_iconOf(tester, 'main').state, SessionRowState.idle);
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('状态切换不改变行几何；running/waiting 的 Semantics 正确', (tester) async {

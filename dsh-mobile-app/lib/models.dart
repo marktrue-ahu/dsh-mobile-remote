@@ -82,6 +82,8 @@ class Session {
     String? origin,
     String? parentSession,
     int? subagentsRunning,
+    /// issue #133：显式清空瞬态子代理计数（copyWith(null) 无法清掉可空字段）。
+    bool clearSubagentsRunning = false,
   }) => Session(
     id: id,
     title: title ?? this.title,
@@ -92,7 +94,9 @@ class Session {
     lastMessageAt: lastMessageAt ?? this.lastMessageAt,
     origin: origin ?? this.origin,
     parentSession: parentSession ?? this.parentSession,
-    subagentsRunning: subagentsRunning ?? this.subagentsRunning,
+    subagentsRunning: clearSubagentsRunning
+        ? null
+        : (subagentsRunning ?? this.subagentsRunning),
   );
 
   /// 排序键（ADR 0013）：最新消息时间 → 最近活跃时间 → 创建时间。

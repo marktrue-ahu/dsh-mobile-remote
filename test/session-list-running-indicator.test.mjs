@@ -148,10 +148,31 @@ function createHarness({ records, liveSessions = [], query, noQuery = false, age
 	};
 	const dispose = apply(ctx, CONFIG);
 	const onSessionEvent = handlers.find(([e]) => e === "session/event")?.[1];
+	const onAgentStatus = handlers.find(([e]) => e === "agent/status")?.[1];
+	const handler = routes.find((route) => route.path === "/m/api").handler;
 	return {
-		route: routes.find((route) => route.path === "/m/api").handler,
+		route: handler,
 		/** 投递一条实时会话事件（走插件真实的 session/event 订阅路径）。 */
 		emit(sessionId, event) { onSessionEvent?.({ id: sessionId }, event); },
+		/** 投递一条真实 agent/status 订阅回调（走插件真实广播路径）。 */
+		emitAgentStatus(payload) { onAgentStatus?.(payload); },
+		/** 打开真实 /events SSE 连接并捕获广播帧。 */
+		openSse() {
+			const req = new FakeRequest("/m/api/events");
+			const res = new FakeResponse();
+			handler(req, res);
+			return {
+				frames() {
+					return res.chunks
+						.join("")
+						.split("\n\n")
+						.flatMap((block) => block.split("\n"))
+						.filter((line) => line.startsWith("data: "))
+						.map((line) => JSON.parse(line.slice(6)));
+				},
+				close() { res.emit("close"); },
+			};
+		},
 		/** 追加/替换一个内核服务：目录、取消与宿主兼容用例都用它注入服务。 */
 		provide(name, value) { provided.set(name, value); },
 		/** 捕获到的 warn 日志（断言"取消不记为失败"用）。 */
@@ -263,6 +284,7 @@ test("会话列表：lastActivity 字段语义不变（旧版 App 仍可读）",
 test("会话列表：subagentsRunning 递归聚合子代理运行（含孙代理；fork 不误聚合）", async () => {
 	const statuses = {
 		"session-grand": "running",
+		"session-child-2": "running",
 		"session-fork": "running",
 	};
 	const harness = createHarness({
@@ -270,12 +292,17 @@ test("会话列表：subagentsRunning 递归聚合子代理运行（含孙代理
 			record("session-main"),
 			record("session-child", { origin: "subagent", parentSession: "session-main" }),
 			record("session-grand", { origin: "subagent", parentSession: "session-child" }),
+			record("session-child-2", { origin: "subagent", parentSession: "session-main" }),
 			record("session-other"),
 			record("session-fork", { parentSession: "session-main" }),
 		],
 		liveSessions: [],
 		agents: {
-			list: () => Object.entries(statuses).map(([sessionId, status]) => ({ sessionId, status })),
+			list: () => Object.entries(statuses).map(([id, status]) => ({
+				id: `session:${id}`,
+				session: { id },
+				status,
+			})),
 			get: (id) => (statuses[id] ? { id, status: statuses[id] } : undefined),
 		},
 	});
@@ -283,12 +310,14 @@ test("会话列表：subagentsRunning 递归聚合子代理运行（含孙代理
 		const { status, body } = await sessions(harness.route);
 		assert.equal(status, 200);
 		const byId = new Map(body.sessions.map((row) => [row.id, row]));
-		assert.equal(byId.get("session-main").subagentsRunning, 1, "孙代理 running 必须计入主会话");
+		assert.equal(byId.get("session-main").subagentsRunning, 2, "孙代理 + 直接子代理 running 都计入主会话");
 		assert.equal(byId.get("session-child").subagentsRunning, 1, "子会话也应聚合其孙代理");
+		assert.equal(byId.get("session-child-2").subagentsRunning, 0);
 		assert.equal(byId.get("session-other").subagentsRunning, 0, "无子代理的会话下发 0");
 		// 用户 fork 只有 parentSession、没有 origin：即使它自己在跑也不得算作主会话的子代理。
 		assert.equal(byId.get("session-fork").subagentsRunning, 0);
 		statuses["session-grand"] = "idle";
+		statuses["session-child-2"] = "idle";
 		statuses["session-fork"] = "idle";
 		const idle = await sessions(harness.route);
 		const idleMain = idle.body.sessions.find((row) => row.id === "session-main");
@@ -312,7 +341,11 @@ test("会话列表：空会话过滤仍按过滤前 header 计数（被过滤的
 			}),
 		],
 		agents: {
-			list: () => [{ sessionId: "session-empty-child", status: "running" }],
+			list: () => [{
+				id: "session:session-empty-child",
+				session: { id: "session-empty-child" },
+				status: "running",
+			}],
 			get: (id) => (id === "session-empty-child" ? { id, status: "running" } : undefined),
 		},
 	});
@@ -358,8 +391,8 @@ test("agent/status 新字段：rootSessionId + subagentsRunning（0 也发；for
 	assert.equal(resolveSubagentRoot("grand", parentById, known), "root");
 	assert.equal(resolveSubagentRoot("fork", parentById, known), null, "fork 不算子代理");
 	const agents = [
-		{ sessionId: "grand", status: "running" },
-		{ sessionId: "fork", status: "running" },
+		{ id: "session:grand", session: { id: "grand" }, status: "running" },
+		{ id: "session:fork", session: { id: "fork" }, status: "running" },
 	];
 	const counts = computeSubagentRunningCounts(agents, parentById, known);
 	assert.equal(counts.get("root"), 1, "递归孙代理计入根，fork 不计");
@@ -387,6 +420,62 @@ test("agent/status 新字段：rootSessionId + subagentsRunning（0 也发；for
 	});
 	assert.equal("rootSessionId" in broken, false, "root 解析失败必须省略，不猜");
 	assert.equal("subagentsRunning" in broken, false);
+});
+
+test("SSE listener：dormant root 完整语料解析；多子代理计数/任意一个结束；空 child 仍计（真实广播）", async () => {
+	const statuses = { "empty-child": "running", "empty-child-2": "running" };
+	const agentRow = (id, status) => ({
+		id: `session:${id}`,
+		session: { id },
+		status,
+	});
+	const harness = createHarness({
+		records: [
+			record("dormant-root"),
+			record("empty-child", { origin: "subagent", parentSession: "dormant-root" }),
+			record("empty-child-2", { origin: "subagent", parentSession: "dormant-root" }),
+		],
+		liveSessions: [
+			liveSession("dormant-root", [messageEvent(1, 1_000)], {}),
+			liveSession("empty-child", [], { origin: "subagent", parentSession: "dormant-root" }),
+			liveSession("empty-child-2", [], { origin: "subagent", parentSession: "dormant-root" }),
+		],
+		agents: {
+			list: () => Object.entries(statuses).map(([id, status]) => agentRow(id, status)),
+			get: () => undefined,
+		},
+	});
+	try {
+		// 默认 /sessions 会过滤空 child；root 行仍应有完整计数（过滤前语料建映射）。
+		const listed = await call(harness.route, "/m/api/sessions");
+		assert.equal(listed.body.sessions.some((row) => row.id === "empty-child"), false);
+		assert.equal(
+			listed.body.sessions.find((row) => row.id === "dormant-root").subagentsRunning,
+			2,
+			"两个 running 子代理必须都计入",
+		);
+
+		const sse = harness.openSse();
+		const framesOf = () => sse.frames().filter((f) => f.type === "agent/status");
+		harness.emitAgentStatus({
+			agent: { id: "session:empty-child", session: { id: "empty-child" } },
+			status: "running",
+		});
+		assert.equal(framesOf().at(-1).rootSessionId, "dormant-root", "dormant root 必须能解析");
+		assert.equal(framesOf().at(-1).subagentsRunning, 2, "SSE 首帧计数包含另一个 running 子代理");
+
+		// 任意一个结束：child-2 idle → root 计数降为 1。
+		statuses["empty-child-2"] = "idle";
+		harness.emitAgentStatus({
+			agent: { id: "session:empty-child-2", session: { id: "empty-child-2" } },
+			status: "idle",
+		});
+		assert.equal(framesOf().at(-1).rootSessionId, "dormant-root");
+		assert.equal(framesOf().at(-1).subagentsRunning, 1, "任意一个子代理结束应立即减少计数");
+		sse.close();
+	} finally {
+		harness.clean();
+	}
 });
 
 test("会话列表：origin=subagent 透出；fork 会话只有 parentSession 不带 origin", async () => {

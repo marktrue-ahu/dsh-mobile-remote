@@ -1654,6 +1654,8 @@ class AppStore extends ChangeNotifier {
         final list = jsonDecode(raw) as List;
         sessions = list
             .map((e) => Session.fromJson(e as Map<String, dynamic>))
+            // issue #133：子代理运行数是瞬态数据（连接相关），不得从本地缓存带出来。
+            .map((s) => s.copyWith(clearSubagentsRunning: true))
             .toList();
       }
     } catch (_) {
@@ -1668,7 +1670,14 @@ class AppStore extends ChangeNotifier {
         final prefs = await SharedPreferences.getInstance();
         await prefs.setString(
           _kSessCache,
-          jsonEncode(sessions.map((s) => s.toJson()).toList()),
+          jsonEncode(
+            sessions.map((s) {
+              final json = s.toJson();
+              // issue #133：瞬态字段不落盘（避免下次启动/切宿主误显示运行中）。
+              json.remove('subagentsRunning');
+              return json;
+            }).toList(),
+          ),
         );
       } catch (_) {}
     }());
@@ -2465,6 +2474,24 @@ class AppStore extends ChangeNotifier {
     }
   }
 
+  /// issue #133：丢弃**瞬态**子代理运行数据（SSE 计数 + 会话快照里的字段）。
+  ///
+  /// 连接代切换/断链时必须做：否则同 sessionId 在宿主 B 上会沿用宿主 A 的 running，
+  /// 且断链缓存的 `subagentsRunning` 会被读到。`copyWith(null)` 清不掉可空字段，
+  /// 这里用显式 `clearSubagentsRunning`；清空后必须通知，否则换宿主瞬间旧行仍显示。
+  void _clearSubagentRunningState() {
+    final hadState =
+        subagentRunningByRoot.isNotEmpty ||
+        sessions.any((s) => s.subagentsRunning != null);
+    subagentRunningByRoot.clear();
+    if (sessions.any((s) => s.subagentsRunning != null)) {
+      sessions = [
+        for (final s in sessions) s.copyWith(clearSubagentsRunning: true),
+      ];
+    }
+    if (hadState) notifyListeners();
+  }
+
   /// 连接身份变化 → 旧代的刷新归属全部失效（幂等：身份没变就什么都不做）。
   void _syncConnectionGeneration() {
     final id = _connectionIdentity;
@@ -2475,6 +2502,8 @@ class AppStore extends ChangeNotifier {
     _sessionsInFlight = false;
     _sessionsPending = false;
     _sessionsWaiters = null;
+    // issue #133：旧宿主的子代理运行数据不得进入新连接（SSE 计数 + 快照字段）。
+    _clearSubagentRunningState();
     // 释放旧代**全部**等待者——包括已经变成「补发中」的那一轮（WARNING 2）。
     _finishAllRounds();
   }
@@ -2488,8 +2517,9 @@ class AppStore extends ChangeNotifier {
     _sessionsInFlight = false;
     _sessionsPending = false;
     _sessionsWaiters = null;
-    // issue #133：连接代切换（换地址/重连/销毁）后，旧宿主的 SSE 子代理计数失效。
-    subagentRunningByRoot.clear();
+    // issue #133：连接代切换（换地址/重连/销毁）后，旧宿主的子代理运行数据失效
+    // （SSE 计数 + 快照字段；断链缓存也不得残留）。
+    _clearSubagentRunningState();
     _finishAllRounds();
   }
 
