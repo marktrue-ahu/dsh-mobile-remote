@@ -122,6 +122,7 @@ test("已安装清单：版本/来源/启停/健康/兼容与当前连接标记�
 		assert.deepEqual(extra.source, { kind: "git", label: "Git" });
 		const bad = body.plugins.find((p) => p.packageName === "dsh-bad");
 		assert.equal(bad.health.state, "failed");
+		assert.equal(bad.enabled, true, "有兼容错误不等于已停用；enabled 保留配置事实");
 		assert.equal(bad.health.reasonCode, "incompatible-version");
 		assert.equal(bad.compatibility.ok, false);
 		assert.equal(bad.compatibility.state, "incompatible");
@@ -338,4 +339,82 @@ test("完整清单：两侧都成功但为空 → supported=true（合法空清�
 		assert.equal(body.degraded, false);
 		assert.deepEqual(body.plugins, []);
 	} finally { h.clean(); }
+});
+
+test("同 module 不同 entryId：bundle-owned A 与独立 B 都保留（B failed 不丢失）", async () => {
+	const h = createHarness({
+		pluginManager: {
+			async listBundles() {
+				return [bundle("dsh-shared", {
+					rows: [{ rowId: "a", moduleName: "dsh-shared", entryId: "entry-a" }],
+				})];
+			},
+		},
+		pluginInventory: {
+			async list() {
+				return { entries: [
+					{ entryId: "entry-a", moduleName: "dsh-shared", enabled: true, fiberPhase: "active" },
+					{ entryId: "entry-b", moduleName: "dsh-shared", enabled: true, fiberPhase: "failed" },
+				] };
+			},
+		},
+	});
+	try {
+		const { body } = await call(h.route);
+		assert.equal(body.supported, true);
+		assert.equal(body.plugins.length, 2, "同 module 的独立 entryId 不得被 module 去重丢弃");
+		const independent = body.plugins.filter((p) => p.independent === true);
+		assert.equal(independent.length, 1);
+		assert.equal(independent[0].id, "entry-b");
+		assert.equal(independent[0].health.state, "failed");
+	} finally { h.clean(); }
+});
+
+test("无可靠 entryId：跳过并显式 partial（entry-identity-missing）", async () => {
+	const h = createHarness({
+		pluginManager: {
+			async listBundles() {
+				return [bundle("dsh-shared", {
+					rows: [{ rowId: "a", moduleName: "dsh-shared", entryId: "entry-a" }],
+				})];
+			},
+		},
+		pluginInventory: {
+			async list() {
+				return { entries: [
+					{ entryId: "entry-a", moduleName: "dsh-shared", enabled: true, fiberPhase: "active" },
+					{ moduleName: "dsh-shared", enabled: true, fiberPhase: "active" },
+				] };
+			},
+		},
+	});
+	try {
+		const { body } = await call(h.route);
+		assert.equal(body.supported, false);
+		assert.equal(body.complete, false);
+		assert.equal(body.degraded, true);
+		assert.equal(body.reason, "entry-identity-missing");
+		assert.equal(body.plugins.length, 1);
+	} finally { h.clean(); }
+});
+
+test("malformed 返回形状：非数组/ null/ 缺 entries 不得冒充完整清单", async () => {
+	const cases = [
+		{ name: "bundles null", manager: { async listBundles() { return null; } }, inventory: { async list() { return { entries: [] }; } }, reason: "host-plugin-manager-malformed" },
+		{ name: "bundles object", manager: { async listBundles() { return { rows: [] }; } }, inventory: { async list() { return { entries: [] }; } }, reason: "host-plugin-manager-malformed" },
+		{ name: "entries null", manager: { async listBundles() { return [bundle("dsh-a")]; } }, inventory: { async list() { return null; } }, reason: "runtime-inventory-malformed" },
+		{ name: "entries missing", manager: { async listBundles() { return [bundle("dsh-a")]; } }, inventory: { async list() { return {}; } }, reason: "runtime-inventory-malformed" },
+		{ name: "entries object", manager: { async listBundles() { return [bundle("dsh-a")]; } }, inventory: { async list() { return { entries: {} }; } }, reason: "runtime-inventory-malformed" },
+	];
+	for (const item of cases) {
+		const h = createHarness({ pluginManager: item.manager, pluginInventory: item.inventory });
+		try {
+			const { status, body } = await call(h.route);
+			assert.equal(status, 200, item.name);
+			assert.equal(body.supported, false, item.name);
+			assert.equal(body.complete, false, item.name);
+			assert.equal(body.degraded, true, item.name);
+			assert.equal(body.reason, item.reason, item.name);
+		} finally { h.clean(); }
+	}
 });

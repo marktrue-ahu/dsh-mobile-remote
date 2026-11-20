@@ -1486,9 +1486,9 @@ POST 请求体：`{"sessionId","repositoryId","tips":[...],"limit"?,"snapshotId"
 }
 ```
 
-- **清单完整性**：`supported=true` 仅当宿主 `pluginManager.listBundles()` 与 `pluginInventory.list()` **两侧都成功**；`complete` 同义。任一侧不可得时 `supported=false`、`degraded=true`、`reason` 为 `runtime-inventory-unavailable` 或 `host-plugin-manager-unavailable`，仍可返回另一侧的部分行，但**不冒充完整清单**。旧插件没有该路由时 App 按 404 整页降级。
-- **bundle 与独立 plugin entry**：bundle 行来自 profile/安装的 bundle 包清单；独立配置/非 bundle-owned 的 plugin entry 来自运行期 snapshot，按 `entryId`（并以 `moduleName` 兜底）去重后合并，`independent=true`、`source.kind="entry"`、无版本。
-- **健康事实**：`enabled` 只是配置事实；`ok` 仅在**所有 bundle rows 都匹配且 fiberPhase 全为 active**（或独立 entry active）时给出。缺失运行期服务/抛错/空 entries/无匹配（`runtime-unknown`）、`pending|loading|unloading`（`starting`）、`failed`（`failed`）都不得冒充健康。不返回 `diagnostic` 原文。
+- **清单完整性**：`supported=true` 仅当宿主 `pluginManager.listBundles()` 与 `pluginInventory.list()` **两侧都成功且返回合法形状**（bundle 为数组、snapshot 非 null 且 `entries` 为数组）；`complete` 同义。任一侧缺失/抛错/**malformed**（null、对象、缺 `entries`、非数组）时 `supported=false`、`degraded=true`、`reason` 为 `host-plugin-manager-unavailable|malformed`、`runtime-inventory-unavailable|malformed` 或 `entry-identity-missing`，仍可返回另一侧的部分行，但**不冒充完整清单**。旧插件没有该路由时 App 按 404 整页降级。
+- **bundle 与独立 plugin entry**：bundle 行来自 profile/安装的 bundle 包清单；独立配置/非 bundle-owned 的 plugin entry 来自运行期 snapshot，**按精确 `entryId` 去重**后合并（同 module 的不同 entryId 不合并），`independent=true`、`source.kind="entry"`、无版本。没有可靠 `entryId` 的 entry 无法安全去重：跳过并把清单标为 partial（`entry-identity-missing`）。
+- **启用与健康分离**：`enabled` 保留宿主配置启用事实（即使有兼容/加载错误也不改写为停用）；健康/兼容错误由 `health`/`compatibility` 单独表达。`ok` 仅在**所有 bundle rows 都匹配且 fiberPhase 全为 active**（或独立 entry active）时给出。缺失运行期服务/抛错/空 entries/无匹配（`runtime-unknown`）、`pending|loading|unloading`（`starting`）、`failed`（`failed`）都不得冒充健康。不返回 `diagnostic` 原文。
 - **兼容事实**：只有宿主明确报告 `incompatible-version` 才是 `state:"incompatible"`（`ok:false`，`requirements` ≤4 项）；其余无判定信息一律 `state:"unknown"`、`ok:null`，不得 `ok:true`。
 - **来源本地化**：服务端 `label` 是中文兜底；App 对已知 `kind` 按当前语言映射，未知 kind 才回退 `label`。
 - `current=true` 表示该插件是当前手机连接所依赖的插件；不提供任何安装/升级/卸载/启停/重启字段或方法。
