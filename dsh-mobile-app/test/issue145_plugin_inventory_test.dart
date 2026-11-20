@@ -2,12 +2,15 @@
 //
 // 覆盖：清单/版本/来源/启停/健康/兼容；无写入口；旧宿主降级；空/加载/失败/重试；
 // 320 / 深色 / 1.5x；Semantics 行播报。
+import 'package:dsh_mobile_app/api.dart';
 import 'package:dsh_mobile_app/plugin_inventory.dart';
 import 'package:dsh_mobile_app/screens/plugin_inventory_screen.dart';
 import 'package:dsh_mobile_app/store.dart';
 import 'package:dsh_mobile_app/theme.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 PluginInfo plugin(
@@ -79,6 +82,32 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   setUp(() {
     SharedPreferences.setMockInitialValues({});
+  });
+
+  test('旧插件 404 → unsupported；新端点字段可解析', () async {
+    final old = Api(
+      client: MockClient(
+        (_) async => http.Response('{"error":"not-found"}', 404),
+      ),
+    )..baseUrl = 'http://127.0.0.1:1';
+    final oldInventory = await old.pluginInventory();
+    expect(oldInventory.supported, isFalse);
+    expect(oldInventory.reason, 'endpoint-missing');
+
+    final fresh = Api(
+      client: MockClient(
+        (_) async => http.Response(
+          '{"ok":true,"supported":true,"host":{"id":"h1","pluginVersion":"3.3.0"},"plugins":[{"name":"dsh-x","packageName":"dsh-x","version":"2.0.0","source":{"kind":"registry","label":"配置渠道"},"enabled":true,"health":{"state":"ok"},"compatibility":{"ok":true}}]}',
+          200,
+          headers: {'content-type': 'application/json'},
+        ),
+      ),
+    )..baseUrl = 'http://127.0.0.1:1';
+    final freshInventory = await fresh.pluginInventory();
+    expect(freshInventory.supported, isTrue);
+    expect(freshInventory.host.id, 'h1');
+    expect(freshInventory.plugins.single.version, '2.0.0');
+    expect(freshInventory.plugins.single.health.label, '运行中');
   });
 
   testWidgets('清单与宿主事实一致，且没有安装/升级/卸载/启停/重启入口', (tester) async {
