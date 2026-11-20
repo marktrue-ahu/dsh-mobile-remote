@@ -13,6 +13,7 @@
 // 精确重跑：
 //   cd dsh-mobile-app && flutter test --no-pub test/issue133_subagent_running_test.dart
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -39,6 +40,7 @@ Map<String, dynamic> _row({
   String? origin,
   String? parentSession,
   bool archived = false,
+  int? subagentsRunning,
 }) => {
   'id': id,
   'title': title ?? id,
@@ -47,6 +49,7 @@ Map<String, dynamic> _row({
   'origin': ?origin,
   'parentSession': ?parentSession,
   'archived': archived,
+  'subagentsRunning': ?subagentsRunning,
 };
 
 Map<String, dynamic> _statusFrame(String sessionId, String status) => {
@@ -55,6 +58,34 @@ Map<String, dynamic> _statusFrame(String sessionId, String status) => {
   'agentId': 'agent-$sessionId',
   'status': status,
 };
+
+/// 新宿主 SSE 帧：rootSessionId + 递归 running 子代理数（0 也发）。
+Map<String, dynamic> _rootStatusFrame({
+  required String sessionId,
+  required String rootSessionId,
+  required int subagentsRunning,
+  String status = 'running',
+}) => {
+  'type': 'agent/status',
+  'sessionId': sessionId,
+  'agentId': 'agent-$sessionId',
+  'status': status,
+  'rootSessionId': rootSessionId,
+  'subagentsRunning': subagentsRunning,
+};
+
+Map<String, dynamic> _approvalFrame(String sessionId) => {
+  'type': 'mobile/frame',
+  'frame': {
+    'type': 'approval/requested',
+    'rpcId': 'rpc-1',
+    'approvalId': 'ap-1',
+    'sessionId': sessionId,
+    'toolName': 'bash',
+  },
+};
+
+Completer<void>? _sessionsGate;
 
 /// 主会话 + 直接/递归子代理的典型树（子代理会话列表层不显示）。
 List<Map<String, dynamic>> _treeRows() => [
@@ -71,7 +102,10 @@ List<Map<String, dynamic>> _treeRows() => [
 
 Future<void> _bootServer() async {
   _server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
-  _server.listen((req) {
+  _server.listen((req) async {
+    if (req.uri.path == '/m/api/sessions' && _sessionsGate != null) {
+      await _sessionsGate!.future;
+    }
     final body = switch (req.uri.path) {
       '/m/api/sessions' => {'ok': true, 'sessions': _sessionRows},
       _ => {'ok': true},
@@ -249,6 +283,34 @@ void main() {
     });
   });
 
+  test('列表/首页面板计数同口径：根 idle + 子代理 running 计 1', () {
+    final sessions = [
+      Session(id: 'main', createdAt: 3, title: 'main'),
+      Session(
+        id: 'child',
+        createdAt: 2,
+        origin: 'subagent',
+        parentSession: 'main',
+      ),
+      Session(id: 'idle', createdAt: 1),
+    ];
+    final count = runningSessionCountOf(
+      sessions.where((s) => !s.isSubagent),
+      (id) => sessionRowState(
+        agentStatus: 'idle',
+        hasRunningJobs: false,
+        hasRunningSubagents: hasRunningSubagentDescendant(
+          sessionId: id,
+          sessions: sessions,
+          agentStatusOf: (sid) => sid == 'child' ? 'running' : 'idle',
+        ),
+        hasPendingQuestion: false,
+        hasPendingApproval: false,
+      ),
+    );
+    expect(count, 1, reason: '根 idle 但子代理运行的面板计数必须与行一致，不能是 0');
+  });
+
   testWidgets('根 idle + 直接子代理 running：主会话行旋转，子代理行不出现；子结束即消失', (tester) async {
     _sessionRows = _treeRows();
     final store = await _pumpSessions(tester);
@@ -369,6 +431,149 @@ void main() {
     store.injectFrame(_statusFrame('archived-main', 'running'));
     await tester.pump();
     expect(_iconOf(tester, 'archived-main').state, SessionRowState.running);
+  });
+
+  testWidgets('服务端聚合提示：子代理会话不在列表时主会话仍显示运行中；刷新清除后消失', (tester) async {
+    _sessionRows = [
+      _row(id: 'main', createdAt: 3000, subagentsRunning: 1),
+      _row(id: 'other', createdAt: 2000),
+    ];
+    final store = await _pumpSessions(tester);
+    expect(_iconOf(tester, 'main').state, SessionRowState.running);
+    expect(_iconOf(tester, 'main').effectiveAnimation, isNotNull);
+    expect(_iconOf(tester, 'other').state, SessionRowState.idle);
+
+    // 子代理结束后服务端聚合提示清除：刷新列表 → 指示消失。
+    _sessionRows = [
+      _row(id: 'main', createdAt: 3000, subagentsRunning: 0),
+      _row(id: 'other', createdAt: 2000, subagentsRunning: 0),
+    ];
+    await tester.runAsync(() async {
+      await store.refreshSessions();
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+    });
+    await tester.pump();
+    expect(_iconOf(tester, 'main').state, SessionRowState.idle);
+  });
+
+  testWidgets('SSE rootSessionId 帧：子代理行缺失也能显示；idle/disposed 合成帧立即清除', (
+    tester,
+  ) async {
+    _sessionRows = [
+      _row(id: 'main', createdAt: 3000, subagentsRunning: 0),
+      _row(id: 'other', createdAt: 2000),
+    ];
+    final store = await _pumpSessions(tester);
+    expect(_iconOf(tester, 'main').state, SessionRowState.idle);
+
+    // 子代理会话被 includeEmpty 过滤（列表里看不到行），仍靠 SSE 根字段显示。
+    store.injectFrame(
+      _rootStatusFrame(
+        sessionId: 'hidden-child',
+        rootSessionId: 'main',
+        subagentsRunning: 1,
+      ),
+    );
+    await tester.pump();
+    expect(_iconOf(tester, 'main').state, SessionRowState.running);
+    expect(_iconOf(tester, 'main').effectiveAnimation, isNotNull);
+
+    // 子代理 idle → 根计数 0 → 指示消失（无需等 /sessions 刷新）。
+    store.injectFrame(
+      _rootStatusFrame(
+        sessionId: 'hidden-child',
+        rootSessionId: 'main',
+        subagentsRunning: 0,
+        status: 'idle',
+      ),
+    );
+    await tester.pump();
+    expect(_iconOf(tester, 'main').state, SessionRowState.idle);
+
+    // agent/disposed 的合成 idle 帧（同形状）也不得复活指示。
+    store.injectFrame(
+      _rootStatusFrame(
+        sessionId: 'hidden-child-2',
+        rootSessionId: 'main',
+        subagentsRunning: 0,
+        status: 'idle',
+      ),
+    );
+    await tester.pump();
+    expect(_iconOf(tester, 'main').state, SessionRowState.idle);
+  });
+
+  testWidgets('旧 /sessions 慢快照不覆盖请求期间到达的新 SSE 帧', (tester) async {
+    _sessionRows = [
+      _row(id: 'main', createdAt: 3000, subagentsRunning: 0),
+      _row(id: 'other', createdAt: 2000),
+    ];
+    final store = await _pumpSessions(tester);
+    expect(_iconOf(tester, 'main').state, SessionRowState.idle);
+
+    _sessionsGate = Completer<void>();
+    addTearDown(() => _sessionsGate = null);
+    late Future<void> refreshFuture;
+    await tester.runAsync(() async {
+      refreshFuture = store.refreshSessions();
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+    });
+
+    // 请求在途时子代理开始运行：新帧先落地（根计数 1）。
+    store.injectFrame(
+      _rootStatusFrame(
+        sessionId: 'late-child',
+        rootSessionId: 'main',
+        subagentsRunning: 1,
+      ),
+    );
+    await tester.pump();
+    expect(_iconOf(tester, 'main').state, SessionRowState.running);
+
+    // 旧快照返回（subagentsRunning=0）不得清掉新帧。
+    await tester.runAsync(() async {
+      _sessionsGate!.complete();
+      await refreshFuture;
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    });
+    await tester.pump();
+    expect(
+      _iconOf(tester, 'main').state,
+      SessionRowState.running,
+      reason: '慢快照比 SSE 帧旧，不得覆盖新帧',
+    );
+  });
+
+  testWidgets('状态切换不改变行几何；running/waiting 的 Semantics 正确', (tester) async {
+    _sessionRows = [
+      _row(id: 'main', createdAt: 3000),
+      _row(id: 'other', createdAt: 2000),
+    ];
+    final handle = tester.ensureSemantics();
+    final store = await _pumpSessions(tester);
+    final row = find.byKey(const ValueKey('session-row-main'));
+    final heightBefore = tester.getSize(row).height;
+
+    store.injectFrame(
+      _rootStatusFrame(
+        sessionId: 'hidden-child',
+        rootSessionId: 'main',
+        subagentsRunning: 1,
+      ),
+    );
+    await tester.pump();
+    expect(tester.getSize(row).height, heightBefore, reason: '运行指示不得改变行高');
+    expect(find.bySemanticsLabel('运行中'), findsWidgets);
+
+    // 等待态优先于运行态：静态虚线 + “等待你处理”，不旋转。
+    store.injectFrame(_approvalFrame('main'));
+    await tester.pump();
+    final waiting = _iconOf(tester, 'main');
+    expect(waiting.state, SessionRowState.waiting);
+    expect(waiting.effectiveAnimation, isNull);
+    expect(find.bySemanticsLabel('等待你处理'), findsWidgets);
+    expect(tester.getSize(row).height, heightBefore);
+    handle.dispose();
   });
 
   testWidgets('320dp + 深色 + 1.5×：指示可见、不溢出、Semantics 含「运行中」', (tester) async {

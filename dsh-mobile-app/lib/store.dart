@@ -203,6 +203,10 @@ class AppStore extends ChangeNotifier {
   /// SSE 的 agentId 与 sessionId 不是同一标识时，按 session 维护页面状态。
   final Map<String, String> sessionAgentStatus = {};
 
+  /// issue #124/#133：主会话根 → 递归 running 子代理数（SSE agent/status 帧维护）。
+  /// 值可为 0（显式“没有运行子代理”）；缺失时才回退 `/sessions` 字段或本地树聚合。
+  final Map<String, int> subagentRunningByRoot = {};
+
   /// agent/status 帧计数（v3.1.6）：`/bootstrap` 是"某一刻的活跃 agent 全量快照"，
   /// 若快照请求期间已有更新帧落地，就跳过裁剪（只合并）——否则旧快照会抹掉刚到的 running。
   /// 下一轮 bootstrap 自然收敛，不必在这里赌时序。
@@ -2069,19 +2073,39 @@ class AppStore extends ChangeNotifier {
   ///
   /// issue #124/#133：主会话行还要聚合**递归子代理**的运行状态——根 agent 已 idle、
   /// 但只要任一子代理仍在 running，行仍显示运行中（子代理会话本身不进入列表）。
-  /// 状态来源是现有 `/sessions` 的 `origin/parentSession` + SSE `agent/status`
-  /// 维护的每会话状态，因此子代理启停会随帧即时更新，且无需逐会话请求。
-  SessionRowState rowStateOf(String sessionId) => sessionRowState(
-    agentStatus: agentStatusForSession(sessionId),
-    hasRunningJobs: hasRunningJobs(sessionId),
-    hasRunningSubagents: hasRunningSubagentDescendant(
+  ///
+  /// 双来源：
+  /// - 列表里能看到子代理行时，用本地递归聚合（SSE `agent/status` 即时更新，子结束立即消失）；
+  /// - 看不到子代理行时（新宿主 `/sessions` 的 `subagentsRunning` 聚合提示，可覆盖
+  ///   被 includeEmpty 过滤掉的空子会话），退回服务端提示；
+  /// - 旧宿主两者都缺 → false（保持既有行为，不发额外请求）。
+  SessionRowState rowStateOf(String sessionId) {
+    final aggregate = subagentRunAggregate(
       sessionId: sessionId,
       sessions: sessions,
       agentStatusOf: agentStatusForSession,
-    ),
-    hasPendingQuestion: questionForSession(sessionId) != null,
-    hasPendingApproval: approvalForSession(sessionId) != null,
-  );
+    );
+    // issue #124/#133（UI 规范 §3）：SSE / `/sessions` 字段 / 本地树三者**取并集**，
+    // 不互相门控——任一路径说 running 就显示；SSE 帧与快照合并保证不互相抹掉。
+    final sseCount = subagentRunningByRoot[sessionId];
+    final serverCount = _sessionSubagentCount(sessionId);
+    final hasRunningSubagents =
+        (sseCount ?? 0) > 0 || (serverCount ?? 0) > 0 || aggregate.running;
+    return sessionRowState(
+      agentStatus: agentStatusForSession(sessionId),
+      hasRunningJobs: hasRunningJobs(sessionId),
+      hasRunningSubagents: hasRunningSubagents,
+      hasPendingQuestion: questionForSession(sessionId) != null,
+      hasPendingApproval: approvalForSession(sessionId) != null,
+    );
+  }
+
+  int? _sessionSubagentCount(String sessionId) {
+    for (final s in sessions) {
+      if (s.id == sessionId) return s.subagentsRunning;
+    }
+    return null;
+  }
 
   /// 当前列表里是否存在需要驱动旋转标识的会话（存在运行中会话才启动动画）。
   bool hasRunningSessions(Iterable<Session> visible) =>
@@ -2485,6 +2509,9 @@ class AppStore extends ChangeNotifier {
   Future<void> _runSessionRefresh(bool notify) async {
     final generation = _refreshGeneration;
     final identity = _refreshIdentity;
+    // issue #133：慢快照与 SSE 合并——请求期间若没有新 agent/status 帧，快照是权威的；
+    // 有新帧则保留帧里的 subagentsRunning（旧快照不得清掉新帧）。
+    final agentEpochAtStart = _agentStatusEpoch;
     _sessionsInFlight = true;
     try {
       try {
@@ -2494,7 +2521,20 @@ class AppStore extends ChangeNotifier {
         // 旧地址的数据就会被应用上去。
         if (generation != _refreshGeneration || identity != _connectionIdentity)
           return;
-        sessions = fetched;
+        // issue #133：慢快照与 SSE 合并——请求期间若有新 agent/status 帧，旧快照不得
+        // 覆盖新帧：用 SSE 计数回填这些根的服务端字段；无新帧时快照才是权威。
+        if (agentEpochAtStart == _agentStatusEpoch) {
+          subagentRunningByRoot.clear();
+          sessions = fetched;
+        } else {
+          sessions = fetched
+              .map((s) => subagentRunningByRoot.containsKey(s.id)
+                  ? s.copyWith(
+                      subagentsRunning: subagentRunningByRoot[s.id],
+                    )
+                  : s)
+              .toList();
+        }
         _persistSessions(); // 本地缓存：下次打开 App 秒出列表
         // 排障日志：打印工作区选择与会话 cwd 样本，便于定位筛选不显示的问题
         AppLog.instance.log(
@@ -3105,11 +3145,33 @@ class AppStore extends ChangeNotifier {
       final sid = frame['sessionId'] as String?;
       final st = frame['status'];
       final norm = normalizeAgentStatus(st);
-      _agentStatusEpoch++; // 增量帧落地：期间到达的 bootstrap 快照不再裁剪（见 _syncAgentStatus）
+      // issue #124/#133：新宿主帧携带 rootSessionId + 递归 running 子代理数（0 也发）。
+      // 根 idle、子 running 时会话列表据此立即显示运行指示；子结束/agent disposed
+      // （插件补合成 idle 帧）时立即清零。字段缺失（旧宿主）→ 本地树 fallback。
+      final rootId = frame['rootSessionId'];
+      final runningRaw = frame['subagentsRunning'];
+      final runningCount = runningRaw is num ? runningRaw.toInt() : null;
+      var subagentsChanged = false;
+      if (rootId is String &&
+          rootId.isNotEmpty &&
+          runningCount != null &&
+          subagentRunningByRoot[rootId] != runningCount) {
+        subagentRunningByRoot[rootId] = runningCount;
+        subagentsChanged = true;
+      }
+      // 同步内存会话字段（union 读取时会用到；不必等下一次 /sessions 慢快照）。
+      if (rootId is String && rootId.isNotEmpty && runningCount != null) {
+        final idx = sessions.indexWhere((s) => s.id == rootId);
+        if (idx >= 0 && sessions[idx].subagentsRunning != runningCount) {
+          sessions[idx] = sessions[idx].copyWith(subagentsRunning: runningCount);
+        }
+      }
+      _agentStatusEpoch++; // 增量帧落地：期间到达的 bootstrap/慢快照不再裁剪（见 _syncAgentStatus）
       // v3.1.6（issue #14）：会话列表的 running 标识必须随**任意**会话的状态变化实时
       // 启停（此前只在"当前打开的会话"变化时通知界面，列表动效会卡住不动）。
       // 但也不能每帧都通知——高频重复帧会让整页反复重建；只在取值真的变化时通知。
       final changed =
+          subagentsChanged ||
           (aid != null && aid.isNotEmpty && agentStatusMap[aid] != norm) ||
           (sid != null && sid.isNotEmpty && sessionAgentStatus[sid] != norm);
       if (aid != null && aid.isNotEmpty) agentStatusMap[aid] = norm;

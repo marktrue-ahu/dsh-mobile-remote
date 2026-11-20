@@ -78,7 +78,7 @@ class SessionIcon extends StatelessWidget {
     final semanticLabel = switch (state) {
       // issue #124/#133：运行/等待不能只靠动画与颜色区分，读屏必须有明确语义。
       SessionRowState.running => L10n.t('运行中', 'Running'),
-      SessionRowState.waiting => L10n.t('等待输入', 'Waiting for input'),
+      SessionRowState.waiting => L10n.t('等待你处理', 'Needs your input'),
       SessionRowState.idle => null,
     };
     final iconBody = SizedBox(
