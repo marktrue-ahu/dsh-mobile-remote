@@ -381,8 +381,7 @@ void main() {
 
     await tester.tap(find.byKey(_viewerKeys.wrapToggle));
     await tester.pumpAndSettle();
-    final offOffset =
-        baseLeft - _left(tester, _viewerKeys.sourceLineText(0));
+    final offOffset = baseLeft - _left(tester, _viewerKeys.sourceLineText(0));
     expect(offOffset, greaterThan(50));
     final offChar = _unwrappedLeftChar(
       tester,
@@ -398,6 +397,59 @@ void main() {
     expect(find.byKey(_viewerKeys.sourceScrollSurface), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets(
+    'same-frame double toggle on one 6000-char line keeps mid-line char/pixels',
+    (tester) async {
+      // reviewer P2：同一帧连点两次时第二次 _toggleWrap 发生在 _wrap=false 但
+      // 折行 UI 尚未重建的窗口里；若从该状态重新采集锚点会读到 hScroll=0 →
+      // charOffset=0，最终恢复把长行跳回行首。
+      final line = List<String>.filled(6000, 'w').join();
+      await _pump(
+        tester,
+        GitFileViewer(
+          mode: GitFileViewerMode.content,
+          path: 'one-long-line.json',
+          content: line,
+        ),
+      );
+
+      await tester.drag(
+        find.byKey(_viewerKeys.sourceList),
+        const Offset(0, -500),
+      );
+      await tester.pumpAndSettle();
+      final beforeChar = _wrappedTopChar(tester, line);
+      final beforeTop = tester
+          .getTopLeft(find.byKey(_viewerKeys.sourceLineText(0)))
+          .dy;
+      expect(beforeChar, greaterThan(100));
+
+      // 两次点击之间不 pump：第二次点击时布局仍是首次切换前的折行态。
+      await tester.tap(find.byKey(_viewerKeys.wrapToggle));
+      await tester.tap(find.byKey(_viewerKeys.wrapToggle));
+      await tester.pumpAndSettle();
+
+      // 连点两次回到换行开；位置必须仍在中段（不能跳回长行开头）。
+      expect(_wrapButton(tester).isSelected, isTrue);
+      final afterChar = _wrappedTopChar(tester, line);
+      final afterTop = tester
+          .getTopLeft(find.byKey(_viewerKeys.sourceLineText(0)))
+          .dy;
+      expect(afterChar, greaterThan(100), reason: '不能跳回长行开头');
+      expect(
+        (afterChar - beforeChar).abs(),
+        lessThan(130),
+        reason: '字符位置应保持在同一视觉行附近',
+      );
+      expect(
+        (afterTop - beforeTop).abs(),
+        lessThan(20),
+        reason: '屏幕像素位置应保持，不跳回长行开头',
+      );
+      expect(tester.takeException(), isNull);
+    },
+  );
 
   testWidgets('wrap on again: folds, resets offset, keeps top line and copy', (
     tester,

@@ -233,6 +233,12 @@ class _GitFileViewerState extends State<GitFileViewer>
   /// 切换代次：快速连点时只让最后一次帧末恢复生效，避免多次 jump 抖动。
   int _wrapToggleToken = 0;
 
+  /// 尚未在帧末恢复的切换锚点。同一帧内连续点击时，第二次点击发生在
+  /// `_wrap` 已翻转、折行 UI 尚未重建的过渡态；此时必须复用首次切换前
+  /// 从**已渲染布局**采集的锚点，不能从过渡态重采（换行开→关后
+  /// `_hScroll` 仍为 0，会把 charOffset 记成 0，最终跳回长行行首）。
+  _WrapAnchor? _pendingWrapAnchor;
+
   /// 内容列表的纵向控制器：换行切换时用它把「顶部行」恢复到原位。
   final ScrollController _vScroll = ScrollController();
 
@@ -279,10 +285,9 @@ class _GitFileViewerState extends State<GitFileViewer>
 
   bool get _isMarkdown => isMarkdownPath(widget.path ?? widget.title ?? '');
 
-  bool get _hasPayload =>
-      widget.mode == GitFileViewerMode.diff
-          ? widget.diff.isNotEmpty
-          : widget.content.isNotEmpty;
+  bool get _hasPayload => widget.mode == GitFileViewerMode.diff
+      ? widget.diff.isNotEmpty
+      : widget.content.isNotEmpty;
 
   @override
   void initState() {
@@ -324,6 +329,7 @@ class _GitFileViewerState extends State<GitFileViewer>
       // 同时作废旧切换的帧末恢复，避免把旧文件的行号跳到新文件上。
       _wrap = true;
       _wrapToggleToken++;
+      _pendingWrapAnchor = null;
       _flingCtrl.stop();
       _hScroll.jumpTo(0);
     }
@@ -576,7 +582,11 @@ class _GitFileViewerState extends State<GitFileViewer>
 
   /// 「预览 / 源码」切换：仅对 Markdown 内容出现（与旧会话文件页一致）。
   Widget _modeToggle() {
-    Widget item({required bool rendered, required String zh, required String en}) {
+    Widget item({
+      required bool rendered,
+      required String zh,
+      required String en,
+    }) {
       final active = _rendered == rendered;
       return TextButton(
         key: widget.keys.modeButton(rendered: rendered),
@@ -660,10 +670,7 @@ class _GitFileViewerState extends State<GitFileViewer>
     final message =
         widget.truncatedMessage ??
         (widget.mode == GitFileViewerMode.diff
-            ? L10n.t(
-                '差异已截断，仅显示安全上限内的内容',
-                'Diff truncated at the safety limit.',
-              )
+            ? L10n.t('差异已截断，仅显示安全上限内的内容', 'Diff truncated at the safety limit.')
             : L10n.t(
                 '内容已截断，仅显示安全上限内的部分',
                 'Content truncated at the safety limit.',
@@ -711,10 +718,7 @@ class _GitFileViewerState extends State<GitFileViewer>
     final message =
         widget.notice ??
         (widget.binary
-            ? L10n.t(
-                '二进制文件不提供行级预览',
-                'Binary files have no line preview',
-              )
+            ? L10n.t('二进制文件不提供行级预览', 'Binary files have no line preview')
             : L10n.t('没有可显示的内容', 'Nothing to display'));
     return Center(
       child: Padding(
@@ -937,7 +941,11 @@ class _GitFileViewerState extends State<GitFileViewer>
   /// 切换自动换行：记录视口顶部锚点（源行 + 行内字符/偏移）→ 重建 →
   /// 帧末恢复同一行内位置。单行超长内容不能只记行号，否则会跳回行首。
   void _toggleWrap() {
-    final anchor = _captureSourceAnchor();
+    // [reviewer P2] 同一帧内快速连点：第二次点击时 `_wrap` 已是下一次的目标值，
+    // 但布局还是首次切换前的模式。复用首个 pending transition 的已渲染锚点，
+    // 整串切换都基于同一份布局；否则会从未重建状态读到 hScroll=0 → charOffset=0。
+    final anchor = _pendingWrapAnchor ?? _captureSourceAnchor();
+    _pendingWrapAnchor = anchor;
     final token = ++_wrapToggleToken;
     final turningOn = !_wrap;
     if (turningOn) {
@@ -949,6 +957,7 @@ class _GitFileViewerState extends State<GitFileViewer>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       // 快速连点时旧回调不再执行，最终状态只由最后一次切换决定。
       if (!mounted || token != _wrapToggleToken) return;
+      _pendingWrapAnchor = null;
       if (_wrap) {
         _flingCtrl.stop();
         _hScroll.jumpTo(0);
@@ -1084,7 +1093,10 @@ class _GitFileViewerState extends State<GitFileViewer>
   double _sourceTextWidth() {
     final width = _lastContentWidth;
     if (width <= 0) return 0;
-    return math.max(0.0, width - _sourceGutterWidth(context) - _kSourceGutterGap);
+    return math.max(
+      0.0,
+      width - _sourceGutterWidth(context) - _kSourceGutterGap,
+    );
   }
 
   /// 按当前换行状态构造与渲染同源的段落，供行内字符/像素映射使用。
@@ -1186,10 +1198,7 @@ class _GitFileViewerState extends State<GitFileViewer>
           padding: const EdgeInsets.all(24),
           child: Text(
             widget.emptyMessage ??
-                L10n.t(
-                  '没有可显示的行级差异',
-                  'No line changes to display',
-                ),
+                L10n.t('没有可显示的行级差异', 'No line changes to display'),
             key: widget.keys.empty,
           ),
         ),
@@ -1516,11 +1525,7 @@ class _GitFileViewerState extends State<GitFileViewer>
     );
   }
 
-  Widget _diffLine(
-    BuildContext context,
-    _DiffLineData line, {
-    int? lineIndex,
-  }) {
+  Widget _diffLine(BuildContext context, _DiffLineData line, {int? lineIndex}) {
     final color = switch (line.marker) {
       '+' => DshColors.ok(context),
       '-' => DshColors.danger(context),
@@ -1761,4 +1766,6 @@ class DiffScroll extends ChangeNotifier implements ValueListenable<double> {
 }
 
 /// unified diff hunk header：`@@ -oldStart,oldCount +newStart,newCount @@`。
-final RegExp _hunkHeader = RegExp(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@');
+final RegExp _hunkHeader = RegExp(
+  r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@',
+);
