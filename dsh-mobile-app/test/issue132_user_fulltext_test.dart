@@ -315,6 +315,69 @@ void main() {
     await _finish(tester, store);
   });
 
+  testWidgets('canonical 超过 20k 渲染上限：不得虚假成功，footer 保留受限态', (tester) async {
+    final over = '${'X' * 20500}\n$_endMarker';
+    final backend = _Backend(events: _historyEvents(userText: _summary));
+    backend.detailResponses.add(
+      () async => backend.okEvent(_detailEvent(over)),
+    );
+    final store = await _mount(tester, backend);
+
+    await tester.tap(find.text('查看全文'));
+    await _pumpDetail(tester);
+    final footer = _footerFor(2);
+    expect(
+      find.descendant(
+        of: footer,
+        matching: find.textContaining('正文超过 20000 字'),
+      ),
+      findsOneWidget,
+      reason: '被 20k 渲染上限截断时必须显式受限态，不能隐藏入口当成功',
+    );
+    expect(
+      find.descendant(of: footer, matching: find.text('重试')),
+      findsOneWidget,
+    );
+    expect(find.text(_endMarker), findsNothing, reason: '>20k 的尾部不可达；不得宣称完整');
+    expect(find.text('查看全文'), findsNothing, reason: '受限态保留 footer，不回到入口');
+    expect(tester.takeException(), isNull);
+    await _finish(tester, store);
+  });
+
+  testWidgets('缺 textChars + canonical 与摘要等长：显式 no-growth，不无条件成功', (
+    tester,
+  ) async {
+    final complete = 'H' * 2000;
+    final backend = _Backend(
+      events: _historyEvents(
+        userText: complete,
+        detail: {'available': true, 'seq': 2},
+      ),
+    );
+    // 旧插件/未来插件都可能没有 textChars；服务端返回与摘要等长的 canonical
+    // （恰好 2000 字的完整消息也是这种形状）——无法确认完整性，必须显式报错。
+    backend.detailResponses.add(
+      () async => backend.okEvent(_detailEvent(complete)),
+    );
+    final store = await _mount(tester, backend);
+
+    expect(find.text('查看全文'), findsOneWidget);
+    await tester.tap(find.text('查看全文'));
+    await _pumpDetail(tester);
+    final footer = _footerFor(2);
+    expect(
+      find.descendant(of: footer, matching: find.text('无法确认正文是否完整，请重试')),
+      findsOneWidget,
+      reason: '缺少 textChars 且无增长时必须显式 no-growth，不得隐藏入口',
+    );
+    expect(
+      find.descendant(of: footer, matching: find.text('重试')),
+      findsOneWidget,
+    );
+    expect(tester.takeException(), isNull);
+    await _finish(tester, store);
+  });
+
   testWidgets('旧插件 rc.5：详情无 canonical text → 显式错误 + 重试 + toast，不静默成功', (
     tester,
   ) async {

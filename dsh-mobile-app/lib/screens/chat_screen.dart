@@ -7300,6 +7300,18 @@ class _ChatScreenState extends State<ChatScreen> {
         'This connection does not support reading the full text',
       );
     }
+    if (code == 'event-detail-text-truncated') {
+      return L10n.t(
+        '正文超过 20000 字，当前仅显示前 20000 字（完整内容请在电脑端查看）',
+        'Text exceeds 20,000 characters; showing the first 20,000 (open on desktop for the full text)',
+      );
+    }
+    if (code == 'event-detail-no-growth') {
+      return L10n.t(
+        '无法确认正文是否完整，请重试',
+        'Could not confirm the full text — retry',
+      );
+    }
     return L10n.t('完整正文加载失败，请重试', 'Failed to load the full text — retry');
   }
 
@@ -7460,32 +7472,61 @@ class _ChatScreenState extends State<ChatScreen> {
         );
       } else if (current.kind == _MsgKind.user) {
         // 用户消息详情：服务端附 canonical text（blocksToText，去图片占位）；
-        // 摘要只下发前 2000 字，完整正文仅在详情里。仍限制在 20k 渲染上限内。
+        // 摘要只下发前 2000 字，完整正文仅在详情里。渲染仍限制在 20k 上限内。
         //
-        // issue #132：**空/非 String 或声明被截断却无增长不得当成功**——旧插件
-        // （rc.5）详情只有原始 content、没有 canonical text，必须显式报错并保留摘要。
-        final canonical = timelineDetailText(data);
-        final fullText = clampTimelineDetailText(canonical ?? '');
-        final claimsTruncated =
-            current.detailTextChars != null &&
-            current.detailTextChars! > current.text.length;
-        final noGrowth =
-            claimsTruncated && fullText.length <= current.text.length;
-        // 空正文 / 声明被截断却无增长 / 竟然比摘要更短：都不得静默覆盖摘要。
-        if (fullText.isEmpty ||
-            noGrowth ||
-            fullText.length < current.text.length) {
+        // issue #132（复审 P2-1/P2-2）：只有“确认拿到增量”才算成功。
+        //  - canonical 为空/非 String（旧插件 rc.5）→ 显式不可用；
+        //  - canonical 超过 20k 渲染上限 → 只能显示前 20k，**不得** detailLoaded=true
+        //    永久隐藏入口；footer 保留“仅显示前 20000 字”的受限态；
+        //  - 缺 textChars 且 canonical 长度 <= 摘要 → 无法确认完整性 → 显式 no-growth 错误；
+        //  - canonical 比摘要短 → 服务端异常，保留摘要并报不可用。
+        void failWith(String code) {
           setState(
             () => _replaceTimelineItem(
               item,
               current.copyUser(
                 detailLoading: false,
-                detailErrorCode: 'event-detail-text-unavailable',
+                detailErrorCode: code,
               ),
             ),
           );
-          _showUserDetailErrorToast('event-detail-text-unavailable');
+          _showUserDetailErrorToast(code);
           _requestScrollFollow();
+        }
+
+        final canonical = timelineDetailText(data) ?? '';
+        if (canonical.isEmpty) {
+          failWith('event-detail-text-unavailable');
+          return;
+        }
+        final overLimit = canonical.length > timelineDetailTextMax;
+        final fullText = clampTimelineDetailText(canonical);
+        if (overLimit) {
+          // 先渲染前 20k（比截断摘要多），但保留 footer：入口不得永久隐藏。
+          setState(
+            () => _replaceTimelineItem(
+              item,
+              current.copyUser(
+                text: fullText,
+                rawData: full,
+                detailAvailable: true,
+                detailLoading: false,
+                detailErrorCode: 'event-detail-text-truncated',
+              ),
+            ),
+          );
+          _showUserDetailErrorToast('event-detail-text-truncated');
+          _requestScrollFollow();
+          return;
+        }
+        if (fullText.length < current.text.length) {
+          failWith('event-detail-text-unavailable');
+          return;
+        }
+        if (fullText.length == current.text.length) {
+          // 无增长：没有 textChars 时无法确认摘要是否完整；即使刚好 2000 字也
+          // 不得无条件宣称成功（复审 P2-2）。
+          failWith('event-detail-no-growth');
           return;
         }
         setState(
