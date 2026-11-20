@@ -153,6 +153,15 @@ test("session 模式：cwd 内相对路径可下载，Range/HEAD 仍可用", asy
 		});
 		assert.equal(head.status, 200);
 		assert.equal(head.raw.length, 0);
+
+		const empty = await call(harness.route, { url: filesUrl({ sessionId: "s1", path: "empty.txt" }) });
+		assert.equal(empty.status, 200);
+		assert.equal(empty.raw.length, 0);
+
+		// POSIX 上反斜杠没有 Windows 语义：直接拒绝，避免 `..\` 类绕过歧义。
+		const backslash = await call(harness.route, { url: filesUrl({ sessionId: "s1", path: "sub\\..\\README.md" }) });
+		assert.equal(backslash.status, 403);
+		assert.equal(backslash.body.error, "path-outside-workspace");
 	} finally {
 		harness.clean();
 	}
@@ -274,6 +283,20 @@ test("旧调用兼容：无 sessionId 仅允许已注册工作区内的绝对路
 		const relative = await call(harness.route, { url: filesUrl({ path: "README.md" }) });
 		assert.equal(relative.status, 400);
 		assert.equal(relative.body.error, "session-required");
+
+		const legacyDotdot = await call(harness.route, { url: filesUrl({ path: join(root, "..", "outside.txt") }) });
+		assert.equal(legacyDotdot.status, 403);
+		assert.equal(legacyDotdot.body.error, "path-outside-workspace");
+
+		// 旧调用同样不允许 symlink 逃逸：注册工作区内的链接指向外部时拒绝。
+		try {
+			symlinkSync(join(outside, "secret.txt"), join(root, "legacy-link.txt"));
+			const legacyLink = await call(harness.route, { url: filesUrl({ path: join(root, "legacy-link.txt") }) });
+			assert.equal(legacyLink.status, 403);
+			assert.equal(legacyLink.body.error, "path-outside-workspace");
+		} catch (err) {
+			assert.equal(err.code, "EEXIST", `unexpected symlink error: ${err.code}`);
+		}
 	} finally {
 		harness.clean();
 	}
