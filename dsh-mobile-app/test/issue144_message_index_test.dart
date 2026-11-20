@@ -47,6 +47,7 @@ MessageIndexEntry _entry(
   DateTime? time,
   String? messageId,
   MessageDeliveryStatus? delivery,
+  bool visible = true,
 }) => MessageIndexEntry(
   seq: seq,
   category: category,
@@ -56,6 +57,7 @@ MessageIndexEntry _entry(
   time: time,
   messageId: messageId,
   deliveryStatus: delivery,
+  visibleInTimeline: visible,
 );
 
 MessageIndexSnapshot _snapshot({
@@ -281,6 +283,42 @@ void main() {
       find.byKey(const ValueKey<String>('message-index-degraded')),
       findsNothing,
     );
+  });
+
+  testWidgets('无可跳转目标：行禁用、显示「仅日志」并给出准确 Semantics 原因', (tester) async {
+    final handle = tester.ensureSemantics();
+    var opened = <int>[];
+    await _pumpTab(
+      tester,
+      loader: () async => _snapshot(
+        entries: [
+          _entry(
+            9,
+            MessageIndexCategory.team,
+            '发布协调员',
+            '前端审计',
+            '这条消息只在团队日志里，普通对话没有可见行。',
+            delivery: MessageDeliveryStatus.queued,
+            visible: false,
+          ),
+        ],
+      ),
+      onOpenMessage: (seq) async => opened.add(seq),
+    );
+
+    expect(_row(9), findsOneWidget);
+    expect(find.textContaining('仅日志'), findsOneWidget);
+    final rowInk = tester.widget<InkWell>(_row(9));
+    expect(rowInk.onTap, isNull, reason: '无可见目标时不得假装可跳转');
+    final semantics = tester.getSemantics(_row(9));
+    expect(semantics.label, contains('无法跳转'));
+    expect(semantics.flagsCollection.isButton, isFalse);
+
+    await tester.tap(_row(9), warnIfMissed: false);
+    await tester.pump();
+    expect(opened, isEmpty);
+    expect(tester.takeException(), isNull);
+    handle.dispose();
   });
 
   testWidgets('320 / 深色 / 1.5×：不溢出、状态与时间列仍可读', (tester) async {

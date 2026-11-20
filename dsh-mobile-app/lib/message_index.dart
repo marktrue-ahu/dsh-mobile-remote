@@ -42,6 +42,12 @@ class MessageIndexEntry {
   final String? messageId;
   final MessageDeliveryStatus? deliveryStatus;
 
+  /// 普通对话时间线里是否存在**可见**目标行（跳转锚点）。
+  ///
+  /// team/message/queued|delivered 是 debug-only 事件，普通模式没有可见行；
+  /// 只有同一 messageId 的 `user/message`（入站团队消息）才是可跳转目标。
+  final bool visibleInTimeline;
+
   const MessageIndexEntry({
     required this.seq,
     required this.category,
@@ -51,22 +57,26 @@ class MessageIndexEntry {
     this.time,
     this.messageId,
     this.deliveryStatus,
+    this.visibleInTimeline = true,
   });
 
   MessageIndexEntry copyWith({
     String? sender,
     String? target,
     String? text,
+    DateTime? time,
     MessageDeliveryStatus? deliveryStatus,
+    bool? visibleInTimeline,
   }) => MessageIndexEntry(
     seq: seq,
     category: category,
     sender: sender ?? this.sender,
     target: target ?? this.target,
     text: text ?? this.text,
-    time: time,
+    time: time ?? this.time,
     messageId: messageId,
     deliveryStatus: deliveryStatus ?? this.deliveryStatus,
+    visibleInTimeline: visibleInTimeline ?? this.visibleInTimeline,
   );
 }
 
@@ -172,6 +182,7 @@ class MessageIndexBuilder {
         deliveryStatus:
             existing?.deliveryStatus ??
             (messageId == null ? null : MessageDeliveryStatus.delivered),
+        visible: true,
       );
       return;
     }
@@ -230,6 +241,7 @@ class MessageIndexBuilder {
       text: text,
       time: _timeOf(event),
       deliveryStatus: MessageDeliveryStatus.queued,
+      visible: false,
     );
   }
 
@@ -259,6 +271,7 @@ class MessageIndexBuilder {
       time: _timeOf(event),
       messageId: messageId,
       deliveryStatus: MessageDeliveryStatus.delivered,
+      visibleInTimeline: false,
     );
     _seqByMessageId[messageId] = seq;
   }
@@ -269,7 +282,12 @@ class MessageIndexBuilder {
     return seq == null ? null : _bySeq[seq];
   }
 
-  /// queued 与 delivered 按 messageId 合并：同一消息只保留一行，delivered 只更新状态。
+  /// queued / delivered / 入站 user(messageId) 按 messageId 合并：同一消息只保留一行。
+  ///
+  /// 两条硬约束（reviewer P2）：
+  /// 1. 跳转目标优先选**普通时间线可见**的 `user/message` seq；debug-only
+  ///    queued/delivered 不能冒充可跳转目标。
+  /// 2. 投递状态单调：delivered 一旦出现不得被后到的 queued 或倒序观察回退。
   void _upsertTeam({
     required int seq,
     required String? messageId,
@@ -278,22 +296,47 @@ class MessageIndexBuilder {
     required String text,
     required DateTime? time,
     required MessageDeliveryStatus? deliveryStatus,
+    required bool visible,
   }) {
     final existing = _existingByMessageId(messageId);
     if (existing != null) {
-      _bySeq[existing.seq] = MessageIndexEntry(
-        seq: existing.seq,
-        category: MessageIndexCategory.team,
-        sender: existing.sender == L10n.t('未知', 'Unknown')
-            ? sender
-            : existing.sender,
-        target: existing.target == L10n.t('未知', 'Unknown')
-            ? target
-            : existing.target,
+      final mergedStatus = _mergeDeliveryStatus(
+        existing.deliveryStatus,
+        deliveryStatus,
+      );
+      final mergedSender = existing.sender == L10n.t('未知', 'Unknown')
+          ? sender
+          : existing.sender;
+      final mergedTarget = existing.target == L10n.t('未知', 'Unknown')
+          ? target
+          : existing.target;
+      // 同一 messageId 的可见 user/message 成为跳转目标：把行迁移到它的 seq。
+      if (visible && !existing.visibleInTimeline) {
+        _bySeq.remove(existing.seq);
+        _bySeq[seq] = MessageIndexEntry(
+          seq: seq,
+          category: MessageIndexCategory.team,
+          // 可见 user/message 是展示与跳转的权威行：发送方/接收方/正文以它为准，
+          // 仅当它缺失时回退到 queued/delivered 投影。
+          sender: sender == L10n.t('未知', 'Unknown') ? mergedSender : sender,
+          target: target == L10n.t('未知', 'Unknown') ? mergedTarget : target,
+          text: text.isNotEmpty ? text : existing.text,
+          time: time ?? existing.time,
+          messageId: messageId,
+          deliveryStatus: mergedStatus,
+          visibleInTimeline: true,
+        );
+        if (messageId != null) _seqByMessageId[messageId] = seq;
+        return;
+      }
+      _bySeq[existing.seq] = existing.copyWith(
+        sender: mergedSender,
+        target: mergedTarget,
         text: existing.text.isEmpty ? text : existing.text,
         time: existing.time ?? time,
-        messageId: messageId,
-        deliveryStatus: deliveryStatus ?? existing.deliveryStatus,
+        deliveryStatus: mergedStatus,
+        // debug 事件不能让已可见目标退回不可见。
+        visibleInTimeline: existing.visibleInTimeline || visible,
       );
       return;
     }
@@ -306,8 +349,25 @@ class MessageIndexBuilder {
       time: time,
       messageId: messageId,
       deliveryStatus: deliveryStatus,
+      visibleInTimeline: visible,
     );
     if (messageId != null) _seqByMessageId[messageId] = seq;
+  }
+
+  /// 投递状态单调合并：delivered > queued > 未知。
+  MessageDeliveryStatus? _mergeDeliveryStatus(
+    MessageDeliveryStatus? existing,
+    MessageDeliveryStatus? incoming,
+  ) {
+    if (existing == MessageDeliveryStatus.delivered ||
+        incoming == MessageDeliveryStatus.delivered) {
+      return MessageDeliveryStatus.delivered;
+    }
+    if (existing == MessageDeliveryStatus.queued ||
+        incoming == MessageDeliveryStatus.queued) {
+      return MessageDeliveryStatus.queued;
+    }
+    return null;
   }
 
   DateTime? _timeOf(ChatEvent event) {

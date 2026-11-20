@@ -204,7 +204,7 @@ void main() {
     expect(store.sessionId, _session, reason: '跳转不改变当前会话');
   });
 
-  testWidgets('隐藏的团队事件行：不跳零高度锚点，明确 toast', (tester) async {
+  testWidgets('无可见目标的团队行：禁用并显示「仅日志」，不关闭面板', (tester) async {
     final hiddenTeam = {
       'seq': 41,
       'type': 'team/message/queued',
@@ -222,16 +222,105 @@ void main() {
 
     final row = find.byKey(const ValueKey<String>('message-index-row:41'));
     expect(row, findsOneWidget);
-    await tester.tap(row);
+    expect(find.textContaining('仅日志'), findsOneWidget);
+    expect(
+      tester.widget<InkWell>(row).onTap,
+      isNull,
+      reason: '只有 debug-only 团队事件时不得假装可跳转',
+    );
+
+    await tester.tap(row, warnIfMissed: false);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(
+      find.byType(AgentPanelScreen),
+      findsOneWidget,
+      reason: '不可跳转行不应关闭面板',
+    );
+    expect(find.text('未找到该消息（可能已被压缩或替换）'), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('真实历史倒序：queued→delivered→可见 user 同 messageId 时跳到 user、状态已投递', (
+    tester,
+  ) async {
+    // 历史按时间正序返回；ChatScreen 用 events.reversed 观察 → delivered 先入索引，
+    // 再 queued、最后才是可见 user/message。必须：目标 seq = user(41)，状态不回退。
+    final teamVisibleUser = {
+      'seq': 41,
+      'type': 'user/message',
+      'data': {
+        'messageId': 'um-team',
+        'text': '请补截图',
+        'sourceKind': 'team-message',
+        'sourceSenderName': '前端审计',
+        'sourceSenderId': 'session-c',
+        'sourceMessageId': 'tm-visible',
+      },
+      'time': 3100,
+    };
+    final teamQueued = {
+      'seq': 42,
+      'type': 'team/message/queued',
+      'data': {
+        'messageId': 'tm-visible',
+        'senderName': '前端审计',
+        'targetId': 'session-b',
+        'text': '请补截图',
+      },
+      'time': 3110,
+    };
+    final teamDelivered = {
+      'seq': 43,
+      'type': 'team/message/delivered',
+      'data': {'messageId': 'tm-visible', 'targetId': 'session-b'},
+      'time': 3120,
+    };
+    final backend = _Backend(
+      events: [..._history(), teamVisibleUser, teamQueued, teamDelivered],
+    );
+    await _pumpChat(tester, backend);
+    await _openMessagesTab(tester);
+
+    // 同一 messageId 只一行，且落在可见 user seq；投递状态为已投递（非已排队）。
+    expect(
+      find.byKey(const ValueKey<String>('message-index-row:41')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey<String>('message-index-row:43')),
+      findsNothing,
+      reason: 'debug-only delivered seq 不得成为跳转目标',
+    );
+    expect(find.text('已投递'), findsOneWidget);
+    expect(find.text('已排队'), findsNothing);
+    expect(find.textContaining('团队 · 前端审计 → 主代理'), findsOneWidget);
+
+    final targetText = find.text('请补截图');
+    await tester.tap(
+      find.byKey(const ValueKey<String>('message-index-row:41')),
+    );
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 400));
-
-    expect(
-      find.text('未找到该消息（可能已被压缩或替换）'),
-      findsOneWidget,
-      reason: '普通时间线不可见的事件不能静默跳到零高度锚点',
-    );
     expect(find.byType(AgentPanelScreen), findsNothing);
+
+    var sawHighlight = false;
+    for (var i = 0; i < 60; i++) {
+      await tester.pump(const Duration(milliseconds: 50));
+      if (find
+          .byKey(const ValueKey<String>('message-highlight:41'))
+          .evaluate()
+          .isNotEmpty) {
+        sawHighlight = true;
+      }
+    }
+    expect(
+      _inChatViewport(tester, targetText),
+      isTrue,
+      reason: '跳转目标必须是普通时间线可见的 team user 消息',
+    );
+    expect(sawHighlight, isTrue);
+    expect(find.text('未找到该消息（可能已被压缩或替换）'), findsNothing);
     expect(tester.takeException(), isNull);
   });
 

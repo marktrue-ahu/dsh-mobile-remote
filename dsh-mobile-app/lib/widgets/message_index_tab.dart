@@ -185,7 +185,9 @@ class _MessageIndexTabState extends State<MessageIndexTab>
         _MessageRow(
           entry: entry,
           busy: _jumpingSeq == entry.seq,
-          onTap: widget.onOpenMessage == null ? null : () => _open(entry),
+          onTap: widget.onOpenMessage == null || !entry.visibleInTimeline
+              ? null
+              : () => _open(entry),
         ),
       );
       if (i != entries.length - 1) {
@@ -330,7 +332,9 @@ class _MessageRow extends StatelessWidget {
       '${entry.sender} → ${entry.target}',
       messageClockLabel(entry.time),
       if (delivery != null) messageDeliveryLabel(delivery),
-      L10n.t('跳转到对话', 'Jump to conversation'),
+      entry.visibleInTimeline
+          ? L10n.t('跳转到对话', 'Jump to conversation')
+          : L10n.t('不在当前对话中，无法跳转', 'Not in the conversation; cannot jump'),
     ].join('，');
     return Semantics(
       button: onTap != null,
@@ -356,7 +360,8 @@ class _MessageRow extends StatelessWidget {
                     children: [
                       Text(
                         '${messageCategoryLabel(entry.category)} · '
-                        '${entry.sender} → ${entry.target}',
+                        '${entry.sender} → ${entry.target}'
+                        '${entry.visibleInTimeline ? '' : ' · ${L10n.t('仅日志', 'Log only')}'}',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(fontSize: 11.5, color: ink3),

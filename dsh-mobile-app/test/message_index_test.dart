@@ -65,6 +65,7 @@ void main() {
     expect(entry.target, '主代理');
     expect(entry.messageId, 'tm-2');
     expect(entry.deliveryStatus, MessageDeliveryStatus.delivered);
+    expect(entry.visibleInTimeline, isTrue, reason: '入站 user/message 是可见跳转目标');
   });
 
   test('代理入站消息：无发送方名称时回退短 id，不伪造投递状态', () {
@@ -108,6 +109,100 @@ void main() {
     expect(entry.target, 'session-b');
     expect(entry.deliveryStatus, MessageDeliveryStatus.delivered);
     expect(index.entries.length, 1, reason: 'delivered 不得再生成第二行');
+    expect(
+      entry.visibleInTimeline,
+      isFalse,
+      reason: '只有 queued/delivered 时普通时间线没有可见行，不能冒充可跳转',
+    );
+  });
+
+  test('倒序观察（delivered→queued→可见 user）：目标迁移到 user seq，状态不回退', () {
+    // 真实 ChatScreen 初始 _load 用 events.reversed 观察：同一 messageId 先看到
+    // delivered（debug-only），再 queued，最后才是可见的 user/message。
+    final index = MessageIndexBuilder()
+      ..observe(
+        _event(43, 'team/message/delivered', {
+          'messageId': 'tm-x',
+          'targetId': 'session-b',
+        }),
+      )
+      ..observe(
+        _event(42, 'team/message/queued', {
+          'messageId': 'tm-x',
+          'senderName': '前端审计',
+          'targetId': 'session-b',
+          'text': '请补截图',
+        }),
+      )
+      ..observe(
+        _event(41, 'user/message', {
+          'text': '请补截图',
+          'sourceKind': 'team-message',
+          'sourceSenderName': '前端审计',
+          'sourceSenderId': 'session-c',
+          'sourceMessageId': 'tm-x',
+        }),
+      );
+
+    final entry = index.entries.single;
+    expect(entry.seq, 41, reason: '必须落到可见 user/message 的 seq');
+    expect(entry.visibleInTimeline, isTrue);
+    expect(entry.deliveryStatus, MessageDeliveryStatus.delivered);
+    expect(entry.text, '请补截图');
+  });
+
+  test('正序观察（user→queued→delivered）：seq 保持可见 user，状态变已投递', () {
+    final index = MessageIndexBuilder()
+      ..observe(
+        _event(50, 'user/message', {
+          'text': '请补截图',
+          'sourceKind': 'team-message',
+          'sourceSenderName': '前端审计',
+          'sourceMessageId': 'tm-y',
+        }),
+      )
+      ..observe(
+        _event(51, 'team/message/queued', {
+          'messageId': 'tm-y',
+          'senderName': '前端审计',
+          'targetId': 'session-b',
+          'text': '请补截图',
+        }),
+      )
+      ..observe(
+        _event(52, 'team/message/delivered', {
+          'messageId': 'tm-y',
+          'targetId': 'session-b',
+        }),
+      );
+
+    final entry = index.entries.single;
+    expect(entry.seq, 50);
+    expect(entry.visibleInTimeline, isTrue);
+    expect(entry.deliveryStatus, MessageDeliveryStatus.delivered);
+  });
+
+  test('delivered→queued 倒序（无可见 user）：状态仍是已投递，不得回退成已排队', () {
+    final index = MessageIndexBuilder()
+      ..observe(
+        _event(61, 'team/message/delivered', {
+          'messageId': 'tm-z',
+          'targetId': 'session-b',
+        }),
+      )
+      ..observe(
+        _event(60, 'team/message/queued', {
+          'messageId': 'tm-z',
+          'senderName': '发布协调员',
+          'targetId': 'session-b',
+          'text': '补一条回归',
+        }),
+      );
+
+    final entry = index.entries.single;
+    expect(entry.deliveryStatus, MessageDeliveryStatus.delivered);
+    expect(entry.text, '补一条回归');
+    expect(entry.visibleInTimeline, isFalse);
   });
 
   test('只有 queued：已排队；只有 delivered：已投递且正文如实留空', () {
@@ -136,6 +231,7 @@ void main() {
     expect(entry.deliveryStatus, MessageDeliveryStatus.delivered);
     expect(entry.text, '');
     expect(entry.sender, '未知');
+    expect(entry.visibleInTimeline, isFalse);
   });
 
   test('会话名解析：团队消息接收方优先显示会话标题，否则短 id', () {
