@@ -1,0 +1,428 @@
+// #124 / 实现跟踪 #133：主会话列表聚合递归子代理的运行指示。
+//
+// 需求：
+//   - 根 agent idle、但任一（递归）子代理 running 时，主会话行显示现有旋转虚线；
+//   - 子代理全部结束后指示消失；SSE agent/status 到达即时更新；
+//   - 刷新列表 / 首页与列表页切换均保持正确；
+//   - 子代理会话本身不进入列表；普通/归档/历史会话不误显示；
+//   - 320 / 深色 / 1.5× 字号可见且不溢出；Semantics 含「运行中」。
+//
+// 数据源（不新增逐会话请求）：/api/sessions 已下发子代理会话的
+// origin=subagent + parentSession；SSE agent/status 已按 sessionId 维护每会话状态。
+//
+// 精确重跑：
+//   cd dsh-mobile-app && flutter test --no-pub test/issue133_subagent_running_test.dart
+
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:dsh_mobile_app/api.dart';
+import 'package:dsh_mobile_app/models.dart';
+import 'package:dsh_mobile_app/screens/home_screen.dart';
+import 'package:dsh_mobile_app/screens/sessions_screen.dart';
+import 'package:dsh_mobile_app/session_list.dart';
+import 'package:dsh_mobile_app/store.dart';
+import 'package:dsh_mobile_app/theme.dart';
+import 'package:dsh_mobile_app/widgets/session_indicator.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+late HttpServer _server;
+List<Map<String, dynamic>> _sessionRows = const [];
+
+Map<String, dynamic> _row({
+  required String id,
+  String? title,
+  int createdAt = 1000,
+  int? lastMessageAt,
+  String? origin,
+  String? parentSession,
+  bool archived = false,
+}) => {
+  'id': id,
+  'title': title ?? id,
+  'createdAt': createdAt,
+  'lastMessageAt': lastMessageAt ?? createdAt,
+  'origin': ?origin,
+  'parentSession': ?parentSession,
+  'archived': archived,
+};
+
+Map<String, dynamic> _statusFrame(String sessionId, String status) => {
+  'type': 'agent/status',
+  'sessionId': sessionId,
+  'agentId': 'agent-$sessionId',
+  'status': status,
+};
+
+/// 主会话 + 直接/递归子代理的典型树（子代理会话列表层不显示）。
+List<Map<String, dynamic>> _treeRows() => [
+  _row(id: 'main', createdAt: 3000),
+  _row(id: 'child', createdAt: 2000, origin: 'subagent', parentSession: 'main'),
+  _row(
+    id: 'grandchild',
+    createdAt: 1000,
+    origin: 'subagent',
+    parentSession: 'child',
+  ),
+  _row(id: 'other', createdAt: 500),
+];
+
+Future<void> _bootServer() async {
+  _server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  _server.listen((req) {
+    final body = switch (req.uri.path) {
+      '/m/api/sessions' => {'ok': true, 'sessions': _sessionRows},
+      _ => {'ok': true},
+    };
+    req.response
+      ..statusCode = HttpStatus.ok
+      ..headers.contentType = ContentType.json
+      ..write(jsonEncode(body))
+      ..close();
+  });
+  api.baseUrl = 'http://127.0.0.1:${_server.port}';
+  api.token = '';
+  api.path = '/m';
+}
+
+Future<AppStore> _pumpSessions(
+  WidgetTester tester, {
+  Size size = const Size(390, 844),
+  bool dark = false,
+  double textScale = 1.0,
+}) async {
+  final store = AppStore();
+  await store.loadPrefs();
+  await tester.binding.setSurfaceSize(size);
+  addTearDown(() => tester.binding.setSurfaceSize(null));
+  await tester.runAsync(() async {
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: dark ? DshTheme.forSkin(DshSkin.dsh, Brightness.dark) : null,
+        home: Builder(
+          builder: (context) => MediaQuery(
+            data: MediaQueryData(
+              size: size,
+              textScaler: TextScaler.linear(textScale),
+            ),
+            child: Scaffold(
+              body: SessionsScreen(
+                store: store,
+                onOpenSession: () {},
+                visible: true,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await store.refreshSessions();
+    await Future<void>.delayed(const Duration(milliseconds: 150));
+  });
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 50));
+  return store;
+}
+
+SessionIcon _iconOf(WidgetTester tester, String sessionId) =>
+    tester.widget<SessionIcon>(
+      find.descendant(
+        of: find.byKey(ValueKey('session-row-$sessionId')),
+        matching: find.byType(SessionIcon),
+      ),
+    );
+
+void main() {
+  setUp(() async {
+    HttpOverrides.global = null;
+    SharedPreferences.setMockInitialValues({});
+    await _bootServer();
+  });
+
+  tearDown(() async {
+    await _server.close(force: true);
+  });
+
+  group('递归聚合纯函数', () {
+    final sessions = [
+      Session(id: 'main', createdAt: 3, title: 'main'),
+      Session(
+        id: 'child',
+        createdAt: 2,
+        origin: 'subagent',
+        parentSession: 'main',
+      ),
+      Session(
+        id: 'grandchild',
+        createdAt: 1,
+        origin: 'subagent',
+        parentSession: 'child',
+      ),
+      // 用户 fork：只有 parentSession、没有 origin → 不得当子代理聚合。
+      Session(id: 'fork', createdAt: 1, parentSession: 'main'),
+    ];
+
+    test('直接子代理 running → 主会话 running；全部 idle → false', () {
+      expect(
+        hasRunningSubagentDescendant(
+          sessionId: 'main',
+          sessions: sessions,
+          agentStatusOf: (id) => id == 'child' ? 'running' : 'idle',
+        ),
+        isTrue,
+      );
+      expect(
+        hasRunningSubagentDescendant(
+          sessionId: 'main',
+          sessions: sessions,
+          agentStatusOf: (_) => 'idle',
+        ),
+        isFalse,
+      );
+    });
+
+    test('孙代理 running（直接子级 idle）也计入；子自身 running 不影响其它根', () {
+      expect(
+        hasRunningSubagentDescendant(
+          sessionId: 'main',
+          sessions: sessions,
+          agentStatusOf: (id) => id == 'grandchild' ? 'running' : 'idle',
+        ),
+        isTrue,
+      );
+      expect(
+        hasRunningSubagentDescendant(
+          sessionId: 'other',
+          sessions: sessions,
+          agentStatusOf: (id) => id == 'grandchild' ? 'running' : 'idle',
+        ),
+        isFalse,
+      );
+    });
+
+    test('用户 fork（无 origin）不参与聚合；无环安全', () {
+      expect(
+        hasRunningSubagentDescendant(
+          sessionId: 'main',
+          sessions: sessions,
+          agentStatusOf: (id) => id == 'fork' ? 'running' : 'idle',
+        ),
+        isFalse,
+      );
+      final cyclic = [
+        Session(id: 'a', createdAt: 1, origin: 'subagent', parentSession: 'b'),
+        Session(id: 'b', createdAt: 1, origin: 'subagent', parentSession: 'a'),
+      ];
+      expect(
+        hasRunningSubagentDescendant(
+          sessionId: 'a',
+          sessions: cyclic,
+          agentStatusOf: (_) => 'idle',
+        ),
+        isFalse,
+      );
+    });
+
+    test('等待态优先于子代理运行态', () {
+      expect(
+        sessionRowState(
+          agentStatus: 'idle',
+          hasRunningJobs: false,
+          hasRunningSubagents: true,
+          hasPendingQuestion: true,
+          hasPendingApproval: false,
+        ),
+        SessionRowState.waiting,
+      );
+      expect(
+        sessionRowState(
+          agentStatus: 'idle',
+          hasRunningJobs: false,
+          hasRunningSubagents: true,
+          hasPendingQuestion: false,
+          hasPendingApproval: false,
+        ),
+        SessionRowState.running,
+      );
+    });
+  });
+
+  testWidgets('根 idle + 直接子代理 running：主会话行旋转，子代理行不出现；子结束即消失', (tester) async {
+    _sessionRows = _treeRows();
+    final store = await _pumpSessions(tester);
+
+    expect(find.byKey(const ValueKey('session-row-child')), findsNothing);
+    expect(find.byKey(const ValueKey('session-row-grandchild')), findsNothing);
+    expect(_iconOf(tester, 'main').state, SessionRowState.idle);
+    expect(_iconOf(tester, 'other').state, SessionRowState.idle);
+
+    store.injectFrame(_statusFrame('child', 'running'));
+    await tester.pump();
+    final running = _iconOf(tester, 'main');
+    expect(running.state, SessionRowState.running);
+    expect(
+      running.effectiveAnimation,
+      isNotNull,
+      reason: '必须复用现有旋转/脉冲动效，不能只是静态色点',
+    );
+    expect(_iconOf(tester, 'other').state, SessionRowState.idle);
+
+    store.injectFrame(_statusFrame('child', 'idle'));
+    await tester.pump();
+    expect(_iconOf(tester, 'main').state, SessionRowState.idle);
+    expect(_iconOf(tester, 'main').effectiveAnimation, isNull);
+  });
+
+  testWidgets('递归层级：直接子级 idle、孙代理 running 时主会话仍显示运行中', (tester) async {
+    _sessionRows = _treeRows();
+    final store = await _pumpSessions(tester);
+
+    store.injectFrame(_statusFrame('child', 'idle'));
+    store.injectFrame(_statusFrame('grandchild', 'running'));
+    await tester.pump();
+
+    expect(_iconOf(tester, 'main').state, SessionRowState.running);
+    expect(_iconOf(tester, 'main').effectiveAnimation, isNotNull);
+  });
+
+  testWidgets('刷新后新增子代理 + 状态帧：主会话立即更新；首页同样生效', (tester) async {
+    _sessionRows = [_row(id: 'main', createdAt: 3000)];
+    final store = await _pumpSessions(tester);
+    expect(_iconOf(tester, 'main').state, SessionRowState.idle);
+
+    // 刷新：子代理会话出现在 /sessions（仍不显示行）。
+    _sessionRows = [
+      _row(id: 'main', createdAt: 3000),
+      _row(
+        id: 'child',
+        createdAt: 2000,
+        origin: 'subagent',
+        parentSession: 'main',
+      ),
+    ];
+    await tester.runAsync(() async {
+      await store.refreshSessions();
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+    });
+    await tester.pump();
+    store.injectFrame(_statusFrame('child', 'running'));
+    await tester.pump();
+    expect(_iconOf(tester, 'main').state, SessionRowState.running);
+    expect(find.byKey(const ValueKey('session-row-child')), findsNothing);
+
+    // 切到首页：同一行状态同样聚合子代理（切页不丢）。
+    final handle = tester.ensureSemantics();
+    await pumpHomeFor(tester, store);
+    expect(_homeIconState(tester, 'main'), SessionRowState.running);
+    handle.dispose();
+  });
+
+  testWidgets('归档/普通/历史会话不误显示：无运行子代理时保持 idle；归档视图仍走 ADR 0013', (tester) async {
+    _sessionRows = [
+      _row(id: 'normal', createdAt: 5000),
+      _row(id: 'archived-main', createdAt: 4000, archived: true),
+      _row(
+        id: 'archived-child',
+        createdAt: 3000,
+        archived: true,
+        origin: 'subagent',
+        parentSession: 'archived-main',
+      ),
+      _row(
+        id: 'normal-child',
+        createdAt: 2000,
+        origin: 'subagent',
+        parentSession: 'normal',
+      ),
+    ];
+    final store = await _pumpSessions(tester);
+    // 活跃视图：普通会话 + 运行中子代理 → running；归档主会话不在活跃视图。
+    expect(_iconOf(tester, 'normal').state, SessionRowState.idle);
+    expect(
+      find.byKey(const ValueKey('session-row-archived-main')),
+      findsNothing,
+    );
+    store.injectFrame(_statusFrame('normal-child', 'running'));
+    await tester.pump();
+    expect(_iconOf(tester, 'normal').state, SessionRowState.running);
+    expect(
+      find.byKey(const ValueKey('session-row-normal-child')),
+      findsNothing,
+    );
+
+    // 归档视图：子代理行仍隐藏；无运行子代理的归档会话保持 idle（不误显示）。
+    store.injectFrame(_statusFrame('normal-child', 'idle'));
+    await tester.tap(find.textContaining('已归档'));
+    await tester.pump();
+    expect(
+      find.byKey(const ValueKey('session-row-archived-child')),
+      findsNothing,
+    );
+    expect(
+      _iconOf(tester, 'archived-main').state,
+      SessionRowState.idle,
+      reason: '没有运行中的子代理时，归档会话不得出现运行指示',
+    );
+    // ADR 0013：归档只是分类，不代表会话停了——归档主会话自身 running 仍显示。
+    store.injectFrame(_statusFrame('archived-main', 'running'));
+    await tester.pump();
+    expect(_iconOf(tester, 'archived-main').state, SessionRowState.running);
+  });
+
+  testWidgets('320dp + 深色 + 1.5×：指示可见、不溢出、Semantics 含「运行中」', (tester) async {
+    _sessionRows = _treeRows();
+    final handle = tester.ensureSemantics();
+    final store = await _pumpSessions(
+      tester,
+      size: const Size(320, 640),
+      dark: true,
+      textScale: 1.5,
+    );
+    store.injectFrame(_statusFrame('child', 'running'));
+    await tester.pump();
+
+    final icon = _iconOf(tester, 'main');
+    expect(icon.state, SessionRowState.running);
+    final rect = tester.getRect(find.byKey(const ValueKey('session-row-main')));
+    expect(rect.left, greaterThanOrEqualTo(0));
+    expect(rect.right, lessThanOrEqualTo(320));
+    expect(
+      find.bySemanticsLabel('运行中'),
+      findsWidgets,
+      reason: '运行中必须有无障碍语义，不能只靠动画/颜色',
+    );
+    expect(tester.takeException(), isNull);
+    final theme = Theme.of(tester.element(find.byType(SessionsScreen)));
+    expect(theme.brightness, Brightness.dark);
+    handle.dispose();
+  });
+}
+
+/// 在同一 store 上切到首页（模拟 IndexedStack 切页）。
+Future<void> pumpHomeFor(WidgetTester tester, AppStore store) async {
+  await tester.runAsync(() async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: HomeScreen(store: store, onOpenSession: () {}),
+        ),
+      ),
+    );
+    await store.refreshSessions();
+    await Future<void>.delayed(const Duration(milliseconds: 150));
+  });
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 50));
+}
+
+SessionRowState _homeIconState(WidgetTester tester, String sessionId) {
+  final icon = tester.widget<SessionIcon>(
+    find.descendant(
+      of: find.byKey(ValueKey('home-session-row-$sessionId')),
+      matching: find.byType(SessionIcon),
+    ),
+  );
+  return icon.state;
+}

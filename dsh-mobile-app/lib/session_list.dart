@@ -19,7 +19,9 @@ enum SessionRowState { idle, running, waiting }
 bool isSessionRunning({
   required String? agentStatus,
   required bool hasRunningJobs,
-}) => agentStatus == 'running' || hasRunningJobs;
+  bool hasRunningSubagents = false,
+}) =>
+    agentStatus == 'running' || hasRunningJobs || hasRunningSubagents;
 
 /// 等待判定：该会话存在挂起的问询或审批。
 /// 该信息来自已有的独立待答通道，与会话运行状态无关。
@@ -32,6 +34,7 @@ bool isSessionWaitingForUser({
 SessionRowState sessionRowState({
   required String? agentStatus,
   required bool hasRunningJobs,
+  bool hasRunningSubagents = false,
   required bool hasPendingQuestion,
   required bool hasPendingApproval,
 }) {
@@ -41,7 +44,11 @@ SessionRowState sessionRowState({
   )) {
     return SessionRowState.waiting;
   }
-  if (isSessionRunning(agentStatus: agentStatus, hasRunningJobs: hasRunningJobs)) {
+  if (isSessionRunning(
+    agentStatus: agentStatus,
+    hasRunningJobs: hasRunningJobs,
+    hasRunningSubagents: hasRunningSubagents,
+  )) {
     return SessionRowState.running;
   }
   return SessionRowState.idle;
@@ -74,6 +81,41 @@ List<Session> sortSessionsForList(Iterable<Session> sessions) {
 /// 归档只是分类，不代表会话停了——因此**已归档但仍运行**的会话同样带状态标识。
 List<Session> projectSessions(Iterable<Session> sessions) =>
     sortSessionsForList(visibleSessions(sessions));
+
+/// issue #124/#133：该会话是否有**递归**运行中的子代理（主会话行聚合运行指示）。
+///
+/// 数据源完全来自现有 `/api/sessions`（子代理会话带 `origin=subagent` 与
+/// `parentSession`，列表层按 ADR 0013 过滤不显示）与 SSE/`bootstrap` 维护的
+/// 每会话 agent 状态——**不逐会话请求**，旧宿主缺 `origin/parentSession` 时
+/// 自然退化为“无子代理”（保持既有行为）。
+///
+/// 递归：直接子代理、孙代理……任一层 running 都算；同时用 visited 防御环。
+bool hasRunningSubagentDescendant({
+  required String sessionId,
+  required Iterable<Session> sessions,
+  required String Function(String sessionId) agentStatusOf,
+}) {
+  final childrenByParent = <String, List<Session>>{};
+  for (final s in sessions) {
+    // 只认 origin === 'subagent'（用户 fork 只有 parentSession，不得当子代理）。
+    if (s.origin != 'subagent') continue;
+    final parent = s.parentSession;
+    if (parent == null || parent.isEmpty) continue;
+    childrenByParent.putIfAbsent(parent, () => <Session>[]).add(s);
+  }
+  if (childrenByParent.isEmpty) return false;
+  final visited = <String>{sessionId};
+  final queue = <String>[sessionId];
+  while (queue.isNotEmpty) {
+    final parent = queue.removeLast();
+    for (final child in childrenByParent[parent] ?? const <Session>[]) {
+      if (!visited.add(child.id)) continue;
+      if (agentStatusOf(child.id) == 'running') return true;
+      queue.add(child.id);
+    }
+  }
+  return false;
+}
 
 /// 状态标识的旋转是否需要 ticker 运行（ADR 0013 的动效生命周期）。
 ///

@@ -2066,9 +2066,19 @@ class AppStore extends ChangeNotifier {
 
   /// 会话行的状态标识（ADR 0013）：等待态优先于运行态。
   /// 「等待用户处理」来自挂起的问询/审批，不是运行状态的第三个取值。
+  ///
+  /// issue #124/#133：主会话行还要聚合**递归子代理**的运行状态——根 agent 已 idle、
+  /// 但只要任一子代理仍在 running，行仍显示运行中（子代理会话本身不进入列表）。
+  /// 状态来源是现有 `/sessions` 的 `origin/parentSession` + SSE `agent/status`
+  /// 维护的每会话状态，因此子代理启停会随帧即时更新，且无需逐会话请求。
   SessionRowState rowStateOf(String sessionId) => sessionRowState(
     agentStatus: agentStatusForSession(sessionId),
     hasRunningJobs: hasRunningJobs(sessionId),
+    hasRunningSubagents: hasRunningSubagentDescendant(
+      sessionId: sessionId,
+      sessions: sessions,
+      agentStatusOf: agentStatusForSession,
+    ),
     hasPendingQuestion: questionForSession(sessionId) != null,
     hasPendingApproval: approvalForSession(sessionId) != null,
   );
