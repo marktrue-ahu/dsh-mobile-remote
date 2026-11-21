@@ -19,6 +19,7 @@ import '../fmt.dart';
 import '../l10n.dart';
 import '../store.dart';
 import '../team.dart';
+import '../team_tasks.dart';
 import '../theme.dart';
 import '../toast.dart';
 import 'chat_screen.dart';
@@ -75,16 +76,70 @@ class _AgentPanelScreenState extends State<AgentPanelScreen>
   final Set<String> _interruptBusy = <String>{};
   final ValueNotifier<int> _refreshTick = ValueNotifier<int>(0);
 
+  // #143：只读任务板（按页签懒加载；旧宿主 unsupported，团队未启用时显示引导）。
+  TeamTaskBoard? _taskBoard;
+  bool _tasksLoading = false;
+  String? _tasksError;
+  bool _tasksRequested = false;
+  String? _expandedTaskId;
+
   Api get _api => widget.apiClient ?? api;
 
   @override
   void initState() {
     super.initState();
+    _tabs.addListener(_onTabChanged);
     _load();
+  }
+
+  void _onTabChanged() {
+    if (_tabs.index == 2) _loadTasks();
+  }
+
+  Future<void> _loadTasks({bool force = false}) async {
+    if (_tasksLoading || (_tasksRequested && !force)) return;
+    _tasksRequested = true;
+    if (mounted) {
+      setState(() {
+        _tasksLoading = true;
+        _tasksError = null;
+      });
+    }
+    try {
+      final board = await _api.teamTasks(widget.sessionId);
+      if (!mounted) return;
+      // 刷新失败但上一轮已有任务：保留旧任务并标“可能不是最新”，不让列表变空。
+      final previous = _taskBoard;
+      final next = board.failure != null &&
+              board.tasks.isEmpty &&
+              (previous?.tasks.isNotEmpty ?? false)
+          ? TeamTaskBoard(
+              supported: board.supported,
+              enabled: board.enabled,
+              tasks: previous!.tasks,
+              failure: board.failure,
+              unavailable: board.unavailable,
+            )
+          : board;
+      setState(() {
+        _taskBoard = next;
+        _tasksLoading = false;
+        if (board.tasks.every((task) => task.id != _expandedTaskId)) {
+          _expandedTaskId = null;
+        }
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _tasksError = '$e';
+        _tasksLoading = false;
+      });
+    }
   }
 
   @override
   void dispose() {
+    _tabs.removeListener(_onTabChanged);
     _refreshTick.dispose();
     _tabs.dispose();
     super.dispose();
@@ -93,6 +148,7 @@ class _AgentPanelScreenState extends State<AgentPanelScreen>
   void _refreshAll() {
     _load();
     _refreshTick.value++;
+    _loadTasks(force: true);
   }
 
   Future<void> _load() async {
@@ -257,7 +313,7 @@ class _AgentPanelScreenState extends State<AgentPanelScreen>
             apiClient: widget.apiClient,
             refresh: _refreshTick,
           ),
-          const _AgentPlaceholderTab(icon: Icons.checklist_outlined),
+          _buildTasksTab(),
           const _AgentPlaceholderTab(icon: Icons.forum_outlined),
         ],
       ),
@@ -387,6 +443,151 @@ class _AgentPanelScreenState extends State<AgentPanelScreen>
     walk(roots, 1);
     return out;
   }
+
+/// #143 只读任务板页签。
+Widget _buildTasksTab() {
+  final board = _taskBoard;
+  if (_tasksLoading && board == null) {
+    return const Center(
+      key: ValueKey('agent-tasks-loading'),
+      child: SizedBox(
+        width: 20,
+        height: 20,
+        child: CircularProgressIndicator(strokeWidth: 2),
+      ),
+    );
+  }
+  if (_tasksError != null && board == null) {
+    return _TaskEmptyState(
+      key: const ValueKey('agent-tasks-error'),
+      icon: Icons.error_outline,
+      title: L10n.t('任务板加载失败', 'Failed to load tasks'),
+      detail: _tasksError!,
+      action: TextButton(
+        key: const ValueKey('agent-tasks-retry'),
+        onPressed: () => _loadTasks(force: true),
+        child: Text(L10n.t('重试', 'Retry')),
+      ),
+    );
+  }
+  if (board == null) {
+    return const Center(
+      key: ValueKey('agent-tasks-loading'),
+      child: SizedBox(
+        width: 20,
+        height: 20,
+        child: CircularProgressIndicator(strokeWidth: 2),
+      ),
+    );
+  }
+  if (!board.supported) {
+    return _TaskEmptyState(
+      key: const ValueKey('agent-tasks-unsupported'),
+      icon: Icons.checklist_outlined,
+      title: L10n.t('当前电脑端不支持共享任务板', 'Shared task board is not supported on this computer'),
+      detail: L10n.t(
+        '请把电脑端插件更新到包含任务板的版本。',
+        'Update the computer-side plugin to a version with task boards.',
+      ),
+    );
+  }
+  if (!board.enabled) {
+    return _TaskEmptyState(
+      key: const ValueKey('agent-tasks-disabled'),
+      icon: Icons.groups_outlined,
+      title: L10n.t('任务板需要先启用团队协作', 'Enable agent teamwork first'),
+      detail: L10n.t(
+        '启用后，主代理在对话中创建的任务会在这里只读展示。',
+        'After enabling, tasks created by the lead agent appear here read-only.',
+      ),
+      action: TextButton(
+        key: const ValueKey('agent-tasks-goto-team'),
+        onPressed: () => _tabs.animateTo(1),
+        child: Text(L10n.t('前往团队', 'Go to Team')),
+      ),
+    );
+  }
+
+  final failure = board.failure;
+  final tasks = board.tasks;
+  final refreshError = _tasksError;
+  final summary = _TaskSummary(tasks: tasks);
+  if (tasks.isEmpty && failure == null && refreshError == null && !board.unavailable) {
+    return _TaskEmptyState(
+      key: const ValueKey('agent-tasks-empty'),
+      icon: Icons.checklist_outlined,
+      title: L10n.t('暂无共享任务', 'No shared tasks yet'),
+      detail: L10n.t(
+        '让主代理在对话中创建任务后会显示在这里。',
+        'Tasks created by the lead agent in the conversation appear here.',
+      ),
+    );
+  }
+  if (tasks.isEmpty && board.unavailable) {
+    return _TaskEmptyState(
+      key: const ValueKey('agent-tasks-unavailable'),
+      icon: Icons.hourglass_empty,
+      title: L10n.t('任务板暂不可用', 'Task board is temporarily unavailable'),
+      detail: L10n.t(
+        '会话当前没有活动 agent；重新打开会话后再试。',
+        'The session has no live agent right now. Reopen the session and retry.',
+      ),
+      action: TextButton(
+        key: const ValueKey('agent-tasks-retry'),
+        onPressed: () => _loadTasks(force: true),
+        child: Text(L10n.t('重试', 'Retry')),
+      ),
+    );
+  }
+  return Column(
+    key: const ValueKey('agent-tasks-board'),
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      if (refreshError != null)
+        _TaskBoardNotice(
+          key: const ValueKey('agent-tasks-stale'),
+          message: L10n.t(
+            '刷新失败，显示上次结果：$refreshError',
+            'Refresh failed; showing the previous result: $refreshError',
+          ),
+        ),
+      if (failure != null || board.unavailable)
+        _TaskBoardNotice(
+          key: const ValueKey('agent-tasks-degraded'),
+          message: failure == null
+              ? L10n.t('当前电脑端仅提供部分任务信息', 'Only partial task information is available')
+              : L10n.t(
+                  '任务记录无效：$failure',
+                  'Invalid persisted task record: $failure',
+                ),
+        ),
+      if (tasks.isNotEmpty) summary,
+      Expanded(
+        child: ListView.separated(
+          padding: EdgeInsets.zero,
+          itemCount: tasks.length,
+          separatorBuilder: (_, _) => Divider(
+            height: 1,
+            thickness: 1,
+            color: Theme.of(context).dividerColor.withValues(alpha: 0.5),
+          ),
+          itemBuilder: (_, index) {
+            final task = tasks[index];
+            return _TaskBoardRow(
+              task: task,
+              byId: {for (final item in tasks) item.id: item},
+              expanded: _expandedTaskId == task.id,
+              onTap: () => setState(
+                () => _expandedTaskId = _expandedTaskId == task.id ? null : task.id,
+              ),
+            );
+          },
+        ),
+      ),
+    ],
+  );
+}
+
 }
 
 class _VisibleAgent {
@@ -1248,6 +1449,258 @@ class _AgentTrianglePainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _AgentTrianglePainter old) =>
       old.expanded != expanded || old.color != color;
+}
+
+class _TaskSummary extends StatelessWidget {
+  const _TaskSummary({required this.tasks});
+  final List<TeamTask> tasks;
+
+  @override
+  Widget build(BuildContext context) {
+    final completed = tasks.where((task) => task.status == TeamTaskStatus.completed).length;
+    final active = tasks.where((task) => task.status == TeamTaskStatus.inProgress).length;
+    final pending = tasks.where((task) => task.status == TeamTaskStatus.pending).length;
+    final parts = <String>[
+      if (completed > 0) L10n.t('$completed 已完成', '$completed completed'),
+      if (active > 0) L10n.t('$active 进行中', '$active in progress'),
+      if (pending > 0) L10n.t('$pending 待处理', '$pending pending'),
+    ];
+    if (parts.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      key: const ValueKey('agent-tasks-summary'),
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+      child: Text(
+        parts.join(' · '),
+        style: TextStyle(fontSize: 11.5, color: DshColors.ink3(context)),
+      ),
+    );
+  }
+}
+
+class _TaskBoardNotice extends StatelessWidget {
+  const _TaskBoardNotice({super.key, required this.message});
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      color: DshColors.brandSoft(context),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Text(
+        message,
+        style: TextStyle(fontSize: 11.5, color: DshColors.ink2(context)),
+      ),
+    );
+  }
+}
+
+class _TaskEmptyState extends StatelessWidget {
+  const _TaskEmptyState({
+    super.key,
+    required this.icon,
+    required this.title,
+    required this.detail,
+    this.action,
+  });
+
+  final IconData icon;
+  final String title;
+  final String detail;
+  final Widget? action;
+
+  @override
+  Widget build(BuildContext context) {
+    final ink3 = DshColors.ink3(context);
+    final ink2 = DshColors.ink2(context);
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 30, color: ink3),
+            const SizedBox(height: 10),
+            Text(
+              title,
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: ink2),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              detail,
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 12.5, height: 1.5, color: ink3),
+            ),
+            if (action != null) ...[const SizedBox(height: 8), action!],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _TaskBoardRow extends StatelessWidget {
+  const _TaskBoardRow({
+    required this.task,
+    required this.byId,
+    required this.expanded,
+    required this.onTap,
+  });
+
+  final TeamTask task;
+  final Map<String, TeamTask> byId;
+  final bool expanded;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final icon = switch (task.status) {
+      TeamTaskStatus.pending => task.blocked ? Icons.block : Icons.radio_button_unchecked,
+      TeamTaskStatus.inProgress => Icons.radio_button_checked,
+      TeamTaskStatus.completed => Icons.check_circle,
+    };
+    final iconColor = task.blocked
+        ? DshColors.warn(context)
+        : switch (task.status) {
+            TeamTaskStatus.pending => DshColors.ink3(context),
+            TeamTaskStatus.inProgress => DshColors.brand(context),
+            TeamTaskStatus.completed => DshColors.ok(context),
+          };
+    final statusLabel = switch (task.status) {
+      TeamTaskStatus.pending => task.blocked
+          ? L10n.t('被依赖阻塞', 'Blocked by dependencies')
+          : L10n.t('待处理', 'Pending'),
+      TeamTaskStatus.inProgress => L10n.t('进行中', 'In progress'),
+      TeamTaskStatus.completed => L10n.t('已完成', 'Completed'),
+    };
+    final statusColor = task.blocked
+        ? DshColors.ink2(context)
+        : switch (task.status) {
+            TeamTaskStatus.pending => DshColors.ink3(context),
+            TeamTaskStatus.inProgress => DshColors.brand(context),
+            TeamTaskStatus.completed => DshColors.ok(context),
+          };
+    final owner = task.ownerLabel.isEmpty
+        ? L10n.t('未分配', 'Unowned')
+        : task.ownerLabel;
+    return Semantics(
+      container: true,
+      button: true,
+      expanded: expanded,
+      label: '${task.subject}，$statusLabel，${expanded ? L10n.t('已展开', 'Expanded') : L10n.t('已收起', 'Collapsed')}',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            key: ValueKey('agent-task-${task.id}'),
+            onTap: onTap,
+            child: Container(
+              constraints: const BoxConstraints(minHeight: 52),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              child: Row(
+                children: [
+                  Icon(icon, size: 14, color: iconColor, semanticLabel: statusLabel),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      task.subject,
+                      maxLines: expanded ? null : 2,
+                      overflow: expanded ? null : TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, height: 1.3),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    statusLabel,
+                    key: ValueKey('agent-task-status-${task.id}'),
+                    maxLines: 1,
+                    style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: statusColor),
+                  ),
+                  const SizedBox(width: 2),
+                  Icon(
+                    expanded ? Icons.expand_less : Icons.expand_more,
+                    size: 16,
+                    color: DshColors.ink3(context),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (expanded)
+            Padding(
+              key: ValueKey('agent-task-details-${task.id}'),
+              padding: const EdgeInsets.fromLTRB(40, 0, 16, 10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _TaskDetailLine(
+                    label: L10n.t('负责人：', 'Owner: '),
+                    value: owner,
+                    key: ValueKey('agent-task-owner-${task.id}'),
+                  ),
+                  const SizedBox(height: 4),
+                  _TaskDetailLine(
+                    label: L10n.t('依赖：', 'Dependencies: '),
+                    value: _dependencyText(),
+                    key: ValueKey('agent-task-deps-${task.id}'),
+                  ),
+                  const SizedBox(height: 4),
+                  _TaskDetailLine(
+                    label: L10n.t('状态：', 'Status: '),
+                    value: statusLabel,
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  String _dependencyText() {
+    if (task.blockedBy.isEmpty) return L10n.t('无', 'None');
+    final shown = <String>[];
+    for (final id in task.blockedBy.take(2)) {
+      final blocker = byId[id];
+      if (blocker != null) {
+        shown.add(blocker.subject);
+      } else {
+        final short = id.length <= 8 ? id : id.substring(0, 8);
+        shown.add(L10n.t('$short（已删除）', '$short (deleted)'));
+      }
+    }
+    final rest = task.blockedBy.length - shown.length;
+    if (rest > 0) shown.add(L10n.t('等 $rest 个', 'and $rest more'));
+    return shown.join('、');
+  }
+}
+
+class _TaskDetailLine extends StatelessWidget {
+  const _TaskDetailLine({
+    super.key,
+    required this.label,
+    required this.value,
+  });
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: TextStyle(fontSize: 11.5, color: DshColors.ink3(context))),
+        Expanded(
+          child: Text(
+            value,
+            style: TextStyle(fontSize: 12.5, height: 1.4, color: DshColors.ink2(context)),
+          ),
+        ),
+      ],
+    );
+  }
 }
 
 /// 团队/任务板/消息的说明性占位（#142/#143/#144 接续）。
