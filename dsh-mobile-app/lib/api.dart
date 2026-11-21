@@ -14,6 +14,7 @@ import 'team.dart';
 import 'download.dart';
 import 'logger.dart';
 import 'models.dart';
+import 'team_tasks.dart';
 import 'plugin_inventory.dart';
 import 'turn_tail.dart';
 import 'git_models.dart';
@@ -2163,6 +2164,21 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
 
   String _gitQuery(String route, Map<String, String> parameters) =>
       '$route?${Uri(queryParameters: parameters).query}';
+
+  /// GitLab #143：只读任务板（当前会话 root 的 Team 任务）。
+  ///
+  /// 旧宿主没有该端点 → 返回 [TeamTaskBoard.unsupported]，UI 显示“不支持”而不是伪造空任务。
+  Future<TeamTaskBoard> teamTasks(String sessionId) async {
+    try {
+      final data = await getJson(
+        '/api/team/tasks?sessionId=${Uri.encodeQueryComponent(sessionId)}',
+      );
+      return TeamTaskBoard.fromJson(data);
+    } on ApiException catch (e) {
+      if (e.status == 404) return TeamTaskBoard.unsupported;
+      rethrow;
+    }
+  }
 
   @override
   Future<GitReadCapabilities> capabilities(String sessionId) async {
