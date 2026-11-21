@@ -48,7 +48,7 @@ class FakeRequest extends EventEmitter {
 	pause() {}
 }
 
-function createHarness({ pluginManager, pluginInventory } = {}) {
+function createHarness({ pluginManager, pluginInventory, runtime } = {}) {
 	const routes = [];
 	const handlers = [];
 	const provided = new Map([["sessions", { get: () => undefined, list: () => [] }]]);
@@ -63,7 +63,7 @@ function createHarness({ pluginManager, pluginInventory } = {}) {
 		effect(callback) { const d = callback?.(); return typeof d === "function" ? d : () => {}; },
 		inject() {},
 	};
-	const dispose = apply(ctx, CONFIG);
+	const dispose = apply(ctx, CONFIG, runtime);
 	return {
 		route: routes.find((r) => r.path === "/m/api").handler,
 		handlers,
@@ -292,5 +292,118 @@ test("安装/升级约束与取消：不可安装、非 registry、重复操作�
 		assert.equal(done.cancelled, true);
 		// 方法约束
 		assert.equal((await call(h.route, "/m/api/plugin-inventory/install")).status, 405);
+	} finally { h.clean(); }
+});
+
+test("卸载：宿主 removeBundle 结果透传；失败标记结果未知；取消不适用", async () => {
+	let removed = 0;
+	const h = inventory({
+		async listBundles() { return [bundle("dsh-remove", { removable: true })]; },
+		async removeBundle(name) { removed += 1; assert.equal(name, "dsh-remove"); return { application: "applied", changed: true, stage: "remove", target: name }; },
+	});
+	try {
+		const started = await call(h.route, "/m/api/plugin-inventory/uninstall", { method: "POST", body: { name: "dsh-remove" } });
+		assert.equal(started.status, 200);
+		const done = await waitOp(h.route, started.body.operation.opId);
+		assert.equal(done.action, "uninstall");
+		assert.equal(done.status, "succeeded");
+		assert.equal(removed, 1);
+		assert.equal(done.outcomeUnknown, false);
+
+		const cancel = await call(h.route, "/m/api/plugin-inventory/op/cancel", { method: "POST", body: { opId: done.opId } });
+		assert.equal(cancel.status, 200);
+		assert.equal(cancel.body.cancel, "not-running");
+	} finally { h.clean(); }
+
+	let release;
+	const gate = new Promise((resolve) => { release = resolve; });
+	const h2 = inventory({
+		async listBundles() { return [bundle("dsh-remove", { removable: true })]; },
+		async removeBundle() { await gate; return { application: "failed", changed: false, error: { code: "operation-error" }, stage: "remove", target: "dsh-remove" }; },
+	});
+	try {
+		const started = await call(h2.route, "/m/api/plugin-inventory/uninstall", { method: "POST", body: { name: "dsh-remove" } });
+		const cancel = await call(h2.route, "/m/api/plugin-inventory/op/cancel", { method: "POST", body: { opId: started.body.operation.opId } });
+		assert.equal(cancel.status, 409, "卸载不可取消，必须明确拒绝");
+		release();
+		const done = await waitOp(h2.route, started.body.operation.opId);
+		assert.equal(done.status, "failed");
+		assert.equal(done.outcomeUnknown, true, "卸载失败不能断言已完全回滚");
+	} finally { h2.clean(); }
+});
+
+test("启停：宿主 setBundleEnabled；重启需求透传；readOnly/未安装被拒绝", async () => {
+	const calls = [];
+	const manager = {
+		async listBundles() { return [bundle("dsh-toggle", { update: "registry" }), bundle("dsh-locked", { readOnlyReason: "management-required" })]; },
+		async setBundleEnabled(name, enabled) { calls.push({ name, enabled }); return { application: "restart-required", changed: true, stage: "enable", target: name, enabled }; },
+	};
+	const h = inventory(manager);
+	try {
+		const disable = await call(h.route, "/m/api/plugin-inventory/toggle", { method: "POST", body: { name: "dsh-toggle", enabled: false } });
+		assert.equal(disable.status, 200);
+		const done = await waitOp(h.route, disable.body.operation.opId);
+		assert.equal(done.action, "toggle");
+		assert.equal(done.status, "succeeded");
+		assert.equal(done.restartRequired, true);
+		assert.deepEqual(calls[0], { name: "dsh-toggle", enabled: false });
+		const locked = await call(h.route, "/m/api/plugin-inventory/toggle", { method: "POST", body: { name: "dsh-locked", enabled: true } });
+		assert.equal(locked.status, 409);
+		assert.equal(locked.body.error, "management-required");
+		const missing = await call(h.route, "/m/api/plugin-inventory/toggle", { method: "POST", body: { name: "nope", enabled: true } });
+		assert.equal(missing.status, 404);
+	} finally { h.clean(); }
+});
+
+test("重启：必须显式 confirm，调用宿主重启执行器，绝不自动重启", async () => {
+	const restarts = [];
+	const h = createHarness({
+		pluginManager: { async listBundles() { return []; } },
+		pluginInventory: { async list() { return { entries: [] }; } },
+		runtime: {
+			pluginUpdates: { restartForm: () => "web-foreground" },
+			pluginManagement: { restart: ({ plan, pid }) => { restarts.push({ plan, pid }); return { ok: true, pid: 123 }; } },
+		},
+	});
+	try {
+		const noConfirm = await call(h.route, "/m/api/plugin-inventory/restart", { method: "POST", body: {} });
+		assert.equal(noConfirm.status, 400);
+		assert.equal(noConfirm.body.error, "restart-confirmation-required");
+		assert.equal(restarts.length, 0, "未确认不得触发重启");
+		const ok = await call(h.route, "/m/api/plugin-inventory/restart", { method: "POST", body: { confirm: true } });
+		assert.equal(ok.status, 200);
+		assert.equal(ok.body.accepted, true);
+		assert.equal(restarts.length, 1);
+		assert.equal(restarts[0].pid, process.pid);
+		assert.equal(restarts[0].plan.mode, "respawn");
+		assert.equal(JSON.stringify(ok.body).includes("bash"), false);
+	} finally { h.clean(); }
+});
+
+test("卸载/启停的客户端权限原因与半卸载：清单 management 字段来自宿主事实", async () => {
+	const h = createHarness({
+		pluginManager: {
+			async listBundles() {
+				return [
+					bundle("dsh-removable", { removable: true }),
+					bundle("dsh-protected", { removable: false }),
+					bundle("dsh-locked", { readOnlyReason: "management-required" }),
+				];
+			},
+		},
+		pluginInventory: { async list() { return { entries: [] }; } },
+	});
+	try {
+		const { body } = await call(h.route, "/m/api/plugin-inventory");
+		const removable = body.plugins.find((p) => p.packageName === "dsh-removable");
+		assert.equal(removable.management.canUninstall, true);
+		assert.equal(removable.management.canToggle, true);
+		const protectedRow = body.plugins.find((p) => p.packageName === "dsh-protected");
+		assert.equal(protectedRow.management.canUninstall, false);
+		assert.equal(protectedRow.management.toggleReasonCode, "not-removable");
+		const locked = body.plugins.find((p) => p.packageName === "dsh-locked");
+		assert.equal(locked.management.canUninstall, false);
+		assert.equal(locked.management.canToggle, false);
+		assert.equal(locked.management.toggleReasonCode, "management-required");
 	} finally { h.clean(); }
 });
