@@ -163,7 +163,7 @@ class Updater {
       final info = await PackageInfo.fromPlatform();
       return parseAppVersion('${info.version}+${info.buildNumber}');
     } catch (e) {
-      AppLog.instance.log('Update: 读取本地版本失败 $e');
+      AppLog.instance.warn('Update: 读取本地版本失败 $e');
       return null;
     }
   }
@@ -238,7 +238,7 @@ class Updater {
         error: hostCheckErrorMessage(e),
       );
     } catch (e) {
-      AppLog.instance.log('Update: 主机清单检查失败 $e');
+      AppLog.instance.warn('Update: 主机清单检查失败 $e');
       return UpdateCheckOutcome(
         verdict: UpdateVerdict.upToDate,
         error: '主机源检查失败：$e',
@@ -424,7 +424,7 @@ class Updater {
       await NativeUpdate.installApk(target.path);
       return null;
     } catch (e) {
-      AppLog.instance.log('Update: 下载/安装失败 $e');
+      AppLog.instance.warn('Update: 下载/安装失败 $e');
       if (cancel?.cancelled == true) return await abortCancelled();
       try {
         if (sink != null) {

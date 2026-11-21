@@ -32,6 +32,7 @@ import '../update_flow.dart';
 import '../updater.dart';
 import '../version_alignment.dart';
 import 'sheets.dart';
+import 'log_sheet.dart';
 import 'providers_screen.dart';
 import 'plugin_inventory_screen.dart';
 import 'usage_screen.dart';
@@ -1821,7 +1822,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         _diag = null;
         _diagTime = '';
       });
-      AppLog.instance.log('环境诊断失败: $e');
+      AppLog.instance.warn('环境诊断失败: $e');
     }
   }
 
@@ -1911,7 +1912,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 physics: const NeverScrollableScrollPhysics(),
                 mainAxisSpacing: 10,
                 crossAxisSpacing: 8,
-                childAspectRatio: 0.82,
+                // #136 UI 矩阵：1.5x 下图标格随字号增高，避免 320dp 裁字。
+                childAspectRatio:
+                    MediaQuery.textScalerOf(context).scale(1) > 1.25
+                    ? 0.68
+                    : 0.82,
                 children: [
                   for (final icon in AppIconStyle.all) _iconTile(icon),
                 ],
@@ -2761,6 +2766,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 style: TextStyle(fontSize: 12, color: brand),
               ),
             ),
+          ),
+          _row(
+            key: const ValueKey('settings-log-level'),
+            leading: const Icon(Icons.tune_outlined),
+            title: L10n.t('日志记录级别', 'Log level'),
+            sub: L10n.t(
+              '默认 info；debug 仅排障时开启；warn/error 始终保留',
+              'Default info; debug only for troubleshooting; warn/error always kept',
+            ),
+            trailing: Text(
+              _logLevelName(AppLog.instance.level),
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: brand,
+              ),
+            ),
+            onTap: _pickLogLevel,
           ),
           _row(
             leading: const Icon(Icons.article_outlined),
@@ -3731,63 +3754,67 @@ class _SettingsScreenState extends State<SettingsScreen> {
     ]);
   }
 
-  /// 应用日志：查看 / 复制 / 清空
-  Future<void> _openLog() async {
-    final text = await AppLog.instance.readAll();
-    if (!mounted) return;
+  /// #136：日志记录级别（写入/展示阈值）；失败保持原值。
+  void _pickLogLevel() {
     final msgr = ScaffoldMessenger.of(context);
-    showSheet(context, L10n.t('应用日志', 'App log'), [
-      Text(
-        '${L10n.t('最近 ', 'Last ')}${AppLog.instance.lines.length}${L10n.t(' 条 · 文件 dsh_mobile.log', ' entries · file dsh_mobile.log')}',
-        textAlign: TextAlign.center,
-        style: TextStyle(fontSize: 11, color: DshColors.ink3(context)),
-      ),
-      const SizedBox(height: 8),
-      ConstrainedBox(
-        constraints: const BoxConstraints(maxHeight: 320),
-        child: SingleChildScrollView(
-          // v3.0.0：日志倒序展示——最新日志在最上面，不用每次翻到底部
-          child: SelectableText(
-            text.isEmpty ? L10n.t('（暂无日志）', '(No logs)') : _reverseLog(text),
-            style: TextStyle(
-              fontSize: 11.5,
-              height: 1.6,
-              color: DshColors.ink(context),
-              fontFamily: 'monospace',
-            ),
+    showChoiceSheet(
+      context,
+      title: L10n.t('日志记录级别', 'Log level'),
+      selectedId: AppLog.instance.level.name,
+      items: [
+        (
+          id: AppLogLevel.debug.name,
+          name: L10n.t('调试（debug）', 'Debug'),
+          sub: L10n.t(
+            '记录所有日志，包括高频排障信息；可能增加日志体积',
+            'Record everything, including high-frequency troubleshooting data; may increase log size',
           ),
         ),
-      ),
-      const SizedBox(height: 12),
-      Row(
-        children: [
-          Expanded(
-            child: OutlinedButton(
-              onPressed: () async {
-                await AppLog.instance.clear();
-                showToastAt(msgr, L10n.t('日志已清空', 'Log cleared'));
-              },
-              child: Text(L10n.t('清空', 'Clear')),
-            ),
+        (
+          id: AppLogLevel.info.name,
+          name: L10n.t('信息（info）', 'Info'),
+          sub: L10n.t(
+            '默认；启动、连接、关键动作',
+            'Default; startup, connection, key actions',
           ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: FilledButton(
-              // 复制时也按倒序：否则用户"看到的是最新、粘出去的是最旧"（排查时反复踩到）。
-              onPressed: () => _copy(text.isEmpty ? text : _reverseLog(text)),
-              child: Text(L10n.t('复制（最新在上）', 'Copy (newest first)')),
-            ),
-          ),
-        ],
+        ),
+        (
+          id: AppLogLevel.warn.name,
+          name: L10n.t('警告（warn）', 'Warning'),
+          sub: L10n.t('仅警告与错误', 'Warnings and errors only'),
+        ),
+        (
+          id: AppLogLevel.error.name,
+          name: L10n.t('错误（error）', 'Error'),
+          sub: L10n.t('仅错误', 'Errors only'),
+        ),
+      ],
+      footnote: L10n.t(
+        '只影响之后写入与日志页展示；已有日志不删除。低于当前级别的历史行会被隐藏。',
+        'Affects future writes and this view only; existing logs are not deleted. Older lines below the level are hidden.',
       ),
-    ]);
+      onPick: (id) async {
+        final level = AppLogLevel.tryParse(id) ?? AppLogLevel.info;
+        final failure = await AppLog.instance.setLevel(level);
+        if (!mounted) return;
+        if (failure != null) {
+          showToastAt(msgr, '${L10n.t('设置失败：', 'Failed: ')}$failure');
+          return;
+        }
+        setState(() {});
+      },
+    );
   }
 
-  /// v3.0.0：日志倒序展示（最新在上，省去翻到底部）——逐行倒排，丢弃尾部空行。
-  static String _reverseLog(String text) {
-    final lines = text.split('\n');
-    return lines.reversed.where((l) => l.isNotEmpty).join('\n');
-  }
+  String _logLevelName(AppLogLevel level) => switch (level) {
+    AppLogLevel.debug => L10n.t('调试', 'Debug'),
+    AppLogLevel.info => L10n.t('信息', 'Info'),
+    AppLogLevel.warn => L10n.t('警告', 'Warning'),
+    AppLogLevel.error => L10n.t('错误', 'Error'),
+  };
+
+  /// 应用日志：查看 / 复制 / 清空（#136 级别过滤）。
+  Future<void> _openLog() async => showLogSheet(context);
 
   Future<void> _openDiag() async {
     // 每次打开都实时拉取（修复：旧版只在首次加载，之后永远显示过期版本）

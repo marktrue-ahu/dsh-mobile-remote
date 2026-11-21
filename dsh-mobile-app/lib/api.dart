@@ -597,7 +597,8 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
     final identity = connectionIdentity;
     try {
       final d = await getJson('/api/bootstrap');
-      if (!absorbBootstrapIfCurrent(d, epoch: epoch, identity: identity)) return;
+      if (!absorbBootstrapIfCurrent(d, epoch: epoch, identity: identity))
+        return;
       AppLog.instance.log(
         '地址收集完成：共 ${baseUrls.length} 个 → ${baseUrls.join(' , ')}',
       );
@@ -656,7 +657,7 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
           .timeout(timeout);
       return _decode(res);
     } catch (e) {
-      AppLog.instance.log('GET $path 失败: $e');
+      AppLog.instance.warn('GET $path 失败: $e');
       rethrow;
     }
   }
@@ -672,7 +673,7 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
           .timeout(timeout);
       return _decode(res);
     } catch (e) {
-      AppLog.instance.log('POST $path 失败: $e');
+      AppLog.instance.warn('POST $path 失败: $e');
       rethrow;
     }
   }
@@ -705,7 +706,7 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
       }
       return res.bodyBytes;
     } catch (e) {
-      AppLog.instance.log('GET /api/files 失败: $e');
+      AppLog.instance.warn('GET /api/files 失败: $e');
       rethrow;
     }
   }
@@ -864,7 +865,7 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
       cancelled = true;
       rethrow;
     } catch (e) {
-      AppLog.instance.log('GET /api/files（流式）失败: $e');
+      AppLog.instance.warn('GET /api/files（流式）失败: $e');
       rethrow;
     } finally {
       if (ownsClient) client.close();
@@ -922,7 +923,7 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
     } on TimeoutException {
       throw ApiException('预览超时（长时间无数据）');
     } catch (e) {
-      AppLog.instance.log('GET /api/files（前缀）失败: $e');
+      AppLog.instance.warn('GET /api/files（前缀）失败: $e');
       rethrow;
     }
   }

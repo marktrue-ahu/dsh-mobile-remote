@@ -235,11 +235,11 @@ class LocalNotifier {
           }
         }
       } catch (e) {
-        AppLog.instance.log('通知：读取冷启动来源失败（$e）');
+        AppLog.instance.warn('通知：读取冷启动来源失败（$e）');
       }
     } catch (e) {
       _ready = false;
-      AppLog.instance.log('通知：初始化失败（$e）');
+      AppLog.instance.warn('通知：初始化失败（$e）');
     }
   }
 
@@ -306,7 +306,7 @@ class LocalNotifier {
       AppLog.instance.log('通知：权限检查 → $enabled');
       return enabled;
     } catch (e) {
-      AppLog.instance.log('通知：权限检查失败（$e）');
+      AppLog.instance.warn('通知：权限检查失败（$e）');
       return false;
     }
   }
@@ -370,7 +370,7 @@ class LocalNotifier {
       return AttentionShowResult.shown;
     } catch (e) {
       // 系统层拒绝/通道被删时不阻断主流程，但要留痕。
-      AppLog.instance.log('通知：展示失败（$e）');
+      AppLog.instance.warn('通知：展示失败（$e）');
       return AttentionShowResult.failed;
     }
   }
@@ -382,7 +382,7 @@ class LocalNotifier {
       await _plugin.cancel(id: id);
       AppLog.instance.log('通知：已撤销 id=$id');
     } catch (e) {
-      AppLog.instance.log('通知：撤销失败 id=$id（$e）');
+      AppLog.instance.warn('通知：撤销失败 id=$id（$e）');
     }
   }
 }

@@ -1016,13 +1016,13 @@ class _ChatScreenState extends State<ChatScreen> {
     debugLastFollowTarget = correction.targetPixels;
     if (!_scrolledLogged) {
       _scrolledLogged = true;
-      // rc.6 发布前：脱底排障日志先关闭；日志级别能力见 #136，后续再迁移为 debug。
-      // AppLog.instance.log(
-      //   'Chat: 跟随校正(${correction.reason.name}) '
-      //   'pixels=${position.pixels.toStringAsFixed(0)} '
-      //   'target=${correction.targetPixels.toStringAsFixed(0)} '
-      //   'attempt=${correction.attempt + 1}/${correction.budget}',
-      // );
+      // #136：脱底排障日志恢复，归入 debug（默认 info 不可见）。
+      AppLog.instance.debug(
+        'Chat: 跟随校正(${correction.reason.name}) '
+        'pixels=${position.pixels.toStringAsFixed(0)} '
+        'target=${correction.targetPixels.toStringAsFixed(0)} '
+        'attempt=${correction.attempt + 1}/${correction.budget}',
+      );
     }
     debugFollowJumps += 1;
     _scrollFollow.beginProgrammaticScroll();
@@ -1459,7 +1459,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final extent = sliver is RenderSliverMultiBoxAdaptor
         ? sliver.geometry?.scrollExtent
         : null;
-    AppLog.instance.log(
+    AppLog.instance.debug(
       'Chat.geo[$reason] sid=$sidShort mode=${widget.store.stepDisplayMode.name} '
       'scale=${scale.toStringAsFixed(2)} vp=${viewportBox.size.height.toStringAsFixed(1)} '
       'pixels=${pos?.pixels.toStringAsFixed(1) ?? 'n/a'} '
@@ -2405,7 +2405,7 @@ class _ChatScreenState extends State<ChatScreen> {
       if (!mounted || generation != _loadGeneration || id != _mySessionId) {
         return;
       }
-      AppLog.instance.log('Chat: 历史加载失败 $id → $e');
+      AppLog.instance.warn('Chat: 历史加载失败 $id → $e');
       if (!mounted) return;
       if (_hasTimelineContent) {
         // issue #129：已有内容（含 SSE 先到）时不进整页失败态——保留时间线，只 toast。
@@ -2686,7 +2686,7 @@ class _ChatScreenState extends State<ChatScreen> {
     } catch (e) {
       // issue #130：失败后置门禁——80px 自动触发不再连续重发，只允许点状态行重试。
       _olderLoadFailed = true;
-      AppLog.instance.log('Chat: 上翻失败 $e');
+      AppLog.instance.warn('Chat: 上翻失败 $e');
       return _PrependOutcome.failed;
     } finally {
       _loadingMore = false;
@@ -2973,7 +2973,7 @@ class _ChatScreenState extends State<ChatScreen> {
       });
       _scrollToTopOfHistory();
     } catch (e) {
-      AppLog.instance.log('Chat: 查看更早失败 $e');
+      AppLog.instance.warn('Chat: 查看更早失败 $e');
     } finally {
       _loadingMore = false;
     }
@@ -3012,7 +3012,7 @@ class _ChatScreenState extends State<ChatScreen> {
       });
       _scrollToTopOfHistory();
     } catch (e) {
-      AppLog.instance.log('Chat: 历史更早失败 $e');
+      AppLog.instance.warn('Chat: 历史更早失败 $e');
     } finally {
       _loadingMore = false;
     }
@@ -3051,7 +3051,7 @@ class _ChatScreenState extends State<ChatScreen> {
       });
       _scrollToTopOfHistory();
     } catch (e) {
-      AppLog.instance.log('Chat: 历史更新失败 $e');
+      AppLog.instance.warn('Chat: 历史更新失败 $e');
     } finally {
       _loadingMore = false;
     }
@@ -3315,10 +3315,10 @@ class _ChatScreenState extends State<ChatScreen> {
     final itemCount = _olderItems.length + _items.length + currentExtra;
     if (itemCount != _lastLoggedCount) {
       _lastLoggedCount = itemCount;
-      // rc.6 发布前：脱底排障日志先关闭；日志级别能力见 #136。
-      // AppLog.instance.log(
-      //   'Chat: build itemCount=$itemCount streaming=$_streaming draftLen=${_draft.length} items=${_items.length + _olderItems.length}',
-      // );
+      // #136：高频布局日志恢复，归入 debug（默认 info 不可见）。
+      AppLog.instance.debug(
+        'Chat: build itemCount=$itemCount streaming=$_streaming draftLen=${_draft.length} items=${_items.length + _olderItems.length}',
+      );
     }
     // v3.1.5（issue #15）：整条消息流包一层 SelectionArea —— 普通 Text 也能长按选中复制，
     // 且不引入 SelectableText（后者在部分 Android 设备上长文本换行/重叠渲染异常，见 md.dart 注释）。
@@ -3957,7 +3957,7 @@ class _ChatScreenState extends State<ChatScreen> {
       // issue #118：任务面板在 composer 上方，高度变化会改变消息视口。
       _onEventLayoutChanged();
     } catch (e) {
-      AppLog.instance.log('Chat: 任务清单拉取失败 $id → $e');
+      AppLog.instance.warn('Chat: 任务清单拉取失败 $id → $e');
     }
   }
 
@@ -4048,7 +4048,7 @@ class _ChatScreenState extends State<ChatScreen> {
         });
       }
     } catch (e) {
-      AppLog.instance.log('Chat: 队列刷新失败: $e');
+      AppLog.instance.warn('Chat: 队列刷新失败: $e');
     }
   }
 
@@ -5586,7 +5586,7 @@ class _ChatScreenState extends State<ChatScreen> {
       // 目录取不到（休眠/未挂载会话的 404 session-not-found、网络故障、旧服务端无此接口）：
       // 无法判定这行是不是命令 → **绝不阻塞**，按普通消息发送（与今日行为一致；
       // 消息还能顺带唤醒休眠会话，正是本条命令之后需要的）。
-      AppLog.instance.log('Chat: 命令目录取回失败，按普通消息发送 → $e');
+      AppLog.instance.warn('Chat: 命令目录取回失败，按普通消息发送 → $e');
       return false;
     }
     if (catalog.any((c) => c['name'] == name)) {
@@ -5834,7 +5834,7 @@ class _ChatScreenState extends State<ChatScreen> {
         if (idx != -1) _items[idx] = _items[idx].copyWith(messageId: mid);
       });
     } catch (e) {
-      AppLog.instance.log('Chat: 发送异常（$mode）→ $e');
+      AppLog.instance.error('Chat: 发送异常（$mode）→ $e');
       if (!mounted) return;
       final definitive = e is ApiException && isDefinitiveSendRejection(e.code);
       if (definitive) {
@@ -6096,7 +6096,7 @@ class _ChatScreenState extends State<ChatScreen> {
       // v3.0.0：发送成功（含排队持存）即清空输入框——此前文字残留，用户误以为没发出而重复发送
       if (_inputCtrl.text == text) _inputCtrl.clear();
     } catch (e) {
-      AppLog.instance.log('Chat: 发送(图)异常 → $e');
+      AppLog.instance.error('Chat: 发送(图)异常 → $e');
       if (!mounted) return;
       if (requestId == null) {
         // 发送前校验/读图阶段异常：未发出任何请求 → 按普通失败处理

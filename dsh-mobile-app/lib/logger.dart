@@ -1,22 +1,74 @@
 // 应用日志：关键事件写入本地文件 + 内存环形缓冲，设置页可查看/复制/清空。
 // 用途：排查"加载不出来/连接异常"等问题（release 无控制台输出时唯一手段）。
+//
+// issue #136：日志级别（debug/info/warn/error）。默认 info；阈值同时控制**写入**与
+// **展示**：低于阈值的日志不写文件/内存，也不在日志页显示；warn/error 不会被额外过滤。
+// 旧日志文件无级别行仍可读取，按 info 处理；文件路径、15 天清理、256KB 截断、800 行
+// 缓冲语义保持不变。
 import 'dart:io';
+
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+enum AppLogLevel {
+  debug(0, 'DEBUG'),
+  info(1, 'INFO'),
+  warn(2, 'WARN'),
+  error(3, 'ERROR');
+
+  const AppLogLevel(this.rank, this.label);
+  final int rank;
+  final String label;
+
+  static AppLogLevel? tryParse(String? raw) {
+    final value = raw?.trim().toLowerCase();
+    for (final level in values) {
+      if (level.name == value) return level;
+    }
+    return null;
+  }
+}
+
+/// 一行日志的解析结果（level + 原文）。旧格式无级别 → info，且 [hasLevel] false。
+class AppLogEntry {
+  const AppLogEntry({
+    required this.raw,
+    required this.level,
+    required this.hasLevel,
+  });
+
+  final String raw;
+  final AppLogLevel level;
+  final bool hasLevel;
+}
+
+final RegExp _newLogPrefix = RegExp(
+  r'^\[\d\d-\d\d \d\d:\d\d:\d\d(?:\.\d+)?\] \[(DEBUG|INFO|WARN|ERROR)\] ?(.*)$',
+);
 
 class AppLog {
   AppLog._();
   static final AppLog instance = AppLog._();
 
+  static const prefsKey = 'app_log_level';
+  static const defaultLevel = AppLogLevel.info;
+
   final List<String> _buf = [];
   File? _file;
   static const _maxBuf = 800;
+
   /// 日志文件体积近似计账（不每行 stat——移动端 flash 上每行 stat+fsync 会让 SSE 流式期间掉帧）
   int _approxBytes = 0;
+
   /// 日志保留天数（默认 15 天）：文件最后写入时间超过该期限，启动时清空。
   static const _keepDays = 15;
 
-  /// 启动时调用：定位日志文件（应用文档目录 dsh_mobile.log），并做过期清理。
+  AppLogLevel _level = defaultLevel;
+  AppLogLevel get level => _level;
+
+  /// 启动时调用：加载持久化级别、定位日志文件（应用文档目录 dsh_mobile.log），并做过期清理。
   Future<void> init() async {
+    await loadLevel();
     try {
       final dir = await getApplicationDocumentsDirectory();
       final f = File('${dir.path}/dsh_mobile.log');
@@ -39,8 +91,41 @@ class AppLog {
     }
   }
 
-  void log(String msg) {
-    final line = '[${DateTime.now().toString().substring(5, 23)}] $msg';
+  /// 读取持久化级别；失败/非法值回退 info（不影响日志可用性）。
+  Future<void> loadLevel() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      _level = AppLogLevel.tryParse(prefs.getString(prefsKey)) ?? defaultLevel;
+    } catch (_) {
+      _level = defaultLevel;
+    }
+  }
+
+  /// 持久化并立即切换级别；失败返回错误文案且保持原级别（调用方 toast）。
+  Future<String?> setLevel(AppLogLevel level) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final ok = await prefs.setString(prefsKey, level.name);
+      if (!ok) return '偏好写入失败';
+      _level = level;
+      return null;
+    } catch (e) {
+      return '$e';
+    }
+  }
+
+  /// 默认 info 级别（兼容既有调用点；不改所有调用方）。
+  void log(String msg) => info(msg);
+
+  void debug(String msg) => _write(AppLogLevel.debug, msg);
+  void info(String msg) => _write(AppLogLevel.info, msg);
+  void warn(String msg) => _write(AppLogLevel.warn, msg);
+  void error(String msg) => _write(AppLogLevel.error, msg);
+
+  void _write(AppLogLevel level, String msg) {
+    if (level.rank < _level.rank) return;
+    final line =
+        '[${DateTime.now().toString().substring(5, 23)}] [${level.label}] $msg';
     _buf.add(line);
     if (_buf.length > _maxBuf) _buf.removeAt(0);
     // print 在 release 下也会进入 logcat（tag=flutter），便于 adb 抓取排障
@@ -82,4 +167,28 @@ class AppLog {
       await _file?.writeAsString('');
     } catch (_) {}
   }
+
+  /// 解析日志文本：新格式取 `[LEVEL]`，旧格式/未知级别按 info 且 hasLevel=false。
+  static List<AppLogEntry> parseLines(String text) {
+    final out = <AppLogEntry>[];
+    for (final raw in text.split('\n')) {
+      if (raw.isEmpty) continue;
+      final match = _newLogPrefix.firstMatch(raw);
+      if (match != null) {
+        final level = AppLogLevel.tryParse(match.group(1)) ?? AppLogLevel.info;
+        out.add(AppLogEntry(raw: raw, level: level, hasLevel: true));
+      } else {
+        out.add(
+          AppLogEntry(raw: raw, level: AppLogLevel.info, hasLevel: false),
+        );
+      }
+    }
+    return out;
+  }
+
+  /// 阈值过滤（`>=`）；旧格式按 info。
+  static List<AppLogEntry> filterEntries(
+    List<AppLogEntry> entries,
+    AppLogLevel level,
+  ) => entries.where((entry) => entry.level.rank >= level.rank).toList();
 }
