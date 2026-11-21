@@ -188,12 +188,15 @@ void main() {
         find.byKey(const ValueKey('agent-tasks-disabled')),
         findsOneWidget,
       );
-      // 消息仍是占位。
-      await tester.tap(find.byKey(const ValueKey<String>('agent-tab-messages')));
+      // issue #144：消息页签已接入真实消息索引；本夹具未注入 loader → 明确降级说明。
+      await tester.tap(
+        find.byKey(const ValueKey<String>('agent-tab-messages')),
+      );
       await tester.pumpAndSettle();
       expect(
-        find.textContaining('将在后续版本并入本面板'),
+        find.byKey(const ValueKey('message-index-unsupported')),
         findsOneWidget,
+        reason: '消息页签不再使用说明性占位',
       );
       expect(tester.takeException(), isNull);
     });
