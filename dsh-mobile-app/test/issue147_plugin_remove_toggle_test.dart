@@ -275,6 +275,32 @@ void main() {
     expect(find.textContaining('正在重启电脑端'), findsOneWidget);
   });
 
+  testWidgets('宿主不支持重启：restartRequired 也不显示重启按钮', (tester) async {
+    final fake = FakeActions(
+      operation: op(action: 'toggle', target: 'off', status: 'running'),
+      poll: op(
+        action: 'toggle',
+        target: 'off',
+        status: 'succeeded',
+        restartRequired: true,
+      ),
+    );
+    await pump(
+      tester,
+      data: inventory([plugin(current: false)], restartSupported: false),
+      actions: fake.actions,
+    );
+    await tester.tap(find.text('dsh-x'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byType(DshSwitch));
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('需要重启电脑端宿主'), findsOneWidget);
+    expect(find.widgetWithText(OutlinedButton, '重启电脑端'), findsNothing);
+    expect(fake.restartCalls, 0);
+  });
+
   testWidgets('320 / 深色 / 1.5x：启停与卸载入口仍可读/可点，不溢出', (tester) async {
     final fake = FakeActions(
       operation: op(action: 'toggle', target: 'off'),

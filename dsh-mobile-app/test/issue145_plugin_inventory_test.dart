@@ -99,7 +99,7 @@ void main() {
     final fresh = Api(
       client: MockClient(
         (_) async => http.Response(
-          '{"ok":true,"supported":true,"host":{"id":"h1","pluginVersion":"3.3.0"},"plugins":[{"name":"dsh-x","packageName":"dsh-x","version":"2.0.0","source":{"kind":"registry","label":"配置渠道"},"enabled":true,"health":{"state":"ok"},"compatibility":{"ok":true}}]}',
+          '{"ok":true,"supported":true,"host":{"id":"h1","pluginVersion":"3.3.0","restartSupported":true},"plugins":[{"name":"dsh-x","packageName":"dsh-x","version":"2.0.0","source":{"kind":"registry","label":"配置渠道"},"enabled":true,"health":{"state":"ok"},"compatibility":{"ok":true}}]}',
           200,
           headers: {'content-type': 'application/json'},
         ),
@@ -108,6 +108,8 @@ void main() {
     final freshInventory = await fresh.pluginInventory();
     expect(freshInventory.supported, isTrue);
     expect(freshInventory.host.id, 'h1');
+    expect(freshInventory.host.restartSupported, isTrue);
+    expect(oldInventory.host.restartSupported, isFalse);
     expect(freshInventory.plugins.single.version, '2.0.0');
     expect(freshInventory.plugins.single.health.label, '运行中');
   });

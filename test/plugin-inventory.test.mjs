@@ -43,7 +43,7 @@ class FakeRequest extends EventEmitter {
 	on() { return this; } pause() {}
 }
 
-function createHarness({ pluginManager, pluginInventory, sessions } = {}) {
+function createHarness({ pluginManager, pluginInventory, sessions, runtime } = {}) {
 	const routes = [];
 	const provided = new Map([
 		["sessions", sessions ?? { get: () => undefined, list: () => [] }],
@@ -59,7 +59,7 @@ function createHarness({ pluginManager, pluginInventory, sessions } = {}) {
 		effect(callback) { const d = callback?.(); return typeof d === "function" ? d : () => {}; },
 		inject() {},
 	};
-	const dispose = apply(ctx, CONFIG);
+	const dispose = apply(ctx, CONFIG, runtime);
 	return { route: routes.find((r) => r.path === "/m/api").handler, clean() { dispose?.(); } };
 }
 
@@ -108,6 +108,7 @@ test("已安装清单：版本/来源/启停/健康/兼容与当前连接标记�
 		assert.equal(status, 200);
 		assert.equal(body.supported, true);
 		assert.equal(typeof body.host.id, "string");
+		assert.equal(typeof body.host.restartSupported, "boolean");
 		assert.equal(body.plugins.length, 3);
 		const mobile = body.plugins.find((p) => p.packageName === "@marktrue/dsh-mobile-remote");
 		assert.equal(mobile.version, "3.3.0");
@@ -297,6 +298,29 @@ test("完整清单：合并独立 plugin entry；与 bundle 重叠按 entryId/mo
 		assert.equal(failedEntry.compatibility.state, "unknown");
 		assert.equal(JSON.stringify(body).includes("/home/x"), false);
 	} finally { h.clean(); }
+});
+
+test("host.restartSupported：可重启形态为 true，不可重启为 false", async () => {
+	const pluginManager = { async listBundles() { return []; } };
+	const pluginInventory = { async list() { return { entries: [] }; } };
+	const unsupported = createHarness({
+		pluginManager,
+		pluginInventory,
+		runtime: { pluginUpdates: { restartForm: () => "unsupported" } },
+	});
+	try {
+		const { body } = await call(unsupported.route);
+		assert.equal(body.host.restartSupported, false);
+	} finally { unsupported.clean(); }
+	const supported = createHarness({
+		pluginManager,
+		pluginInventory,
+		runtime: { pluginUpdates: { restartForm: () => "systemd" } },
+	});
+	try {
+		const { body } = await call(supported.route);
+		assert.equal(body.host.restartSupported, true);
+	} finally { supported.clean(); }
 });
 
 test("完整清单：任一侧不可得 → supported=false/degraded，不冒充完整", async () => {

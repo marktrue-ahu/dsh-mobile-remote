@@ -1551,7 +1551,7 @@ POST 请求体：`{"sessionId","repositoryId","tips":[...],"limit"?,"snapshotId"
   "complete": true,
   "degraded": false,
   "reason": "",
-  "host": { "id": "<宿主稳定身份>", "pluginVersion": "3.3.0" },
+  "host": { "id": "<宿主稳定身份>", "pluginVersion": "3.3.0", "restartSupported": false },
   "plugins": [{
     "id": "@scope/pkg", "name": "@scope/pkg", "title": { "zh": "显示名", "en": "Display" },
     "description": null, "packageName": "@scope/pkg", "version": "1.2.3",
@@ -1570,7 +1570,8 @@ POST 请求体：`{"sessionId","repositoryId","tips":[...],"limit"?,"snapshotId"
 - **启用与健康分离**：`enabled` 保留宿主配置启用事实（即使有兼容/加载错误也不改写为停用）；健康/兼容错误由 `health`/`compatibility` 单独表达。`ok` 仅在**所有 bundle rows 都匹配且 fiberPhase 全为 active**（或独立 entry active）时给出。缺失运行期服务/抛错/空 entries/无匹配（`runtime-unknown`）、`pending|loading|unloading`（`starting`）、`failed`（`failed`）都不得冒充健康。不返回 `diagnostic` 原文。
 - **兼容事实**：只有宿主明确报告 `incompatible-version` 才是 `state:"incompatible"`（`ok:false`，`requirements` ≤4 项）；其余无判定信息一律 `state:"unknown"`、`ok:null`，不得 `ok:true`。
 - **来源本地化**：服务端 `label` 是中文兜底；App 对已知 `kind` 按当前语言映射，未知 kind 才回退 `label`。
-- `current=true` 表示该插件是当前手机连接所依赖的插件；不提供任何安装/升级/卸载/启停/重启字段或方法。
+- `current=true` 表示该插件是当前手机连接所依赖的插件；不提供任何安装/升级/卸载/启停/重启**写方法**。
+- **`host.restartSupported`（bool，始终下发；issue #156）**：当前宿主形态是否允许手机触发重启（`restartFormOf() !== "unsupported"`）。仅作为能力位，供 App 在 `restartRequired` 时决定是否显示「重启电脑端」；实际重启仍走 `POST /plugin-inventory/restart`（#147，需显式 confirm）。旧宿主缺字段时 App 按 `false` 处理。
 - `updateAvailable` 固定 `null`：更新候选检查属于 #146/#147，本端点不触网检查 registry。
 
 ### 6.26 插件安装/升级（v3.3，issue #146）
