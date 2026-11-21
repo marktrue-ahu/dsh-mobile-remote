@@ -16,6 +16,9 @@ import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { apply } from "../lib/index.js";
 
+/** 已注册工作区（GitLab #16 后旧调用按它兜底；makeWorkspace 创建时登记）。 */
+const registeredWorkspaceRoots = [];
+
 const CONFIG = {
 	path: "/m",
 	authToken: "1234567890123456",
@@ -73,6 +76,9 @@ class FakeRequest extends EventEmitter {
 function createHarness() {
 	const routes = [];
 	const provided = new Map();
+	provided.set("workspaceRegistry", {
+		list: () => registeredWorkspaceRoots.map((path) => ({ path })),
+	});
 	const ctx = {
 		webServer: { host: "127.0.0.1", port: 43120, register(spec) { routes.push(spec); return () => {}; } },
 		logger: { warn() {}, info() {} },
@@ -115,6 +121,7 @@ function makeWorkspace() {
 	writeFileSync(join(root, "README.md"), "hello 世界\n");
 	writeFileSync(join(root, ".hidden-file"), "secret\n");
 	writeFileSync(join(root, "data.bin"), Buffer.from([0, 1, 2, 3]));
+	registeredWorkspaceRoots.push(root);
 	return root;
 }
 
@@ -249,9 +256,14 @@ test("files：缺 path 返回 bad-request；路径不存在返回 file-not-found
 		assert.equal(missing.status, 400);
 		assert.equal(missing.body.error, "bad-request");
 
-		const notFound = await call(route, { url: "/m/api/files?path=/definitely/not/here-xyz.txt" });
+		const root = makeWorkspace();
+		const notFound = await call(route, { url: `/m/api/files?path=${encodeURIComponent(join(root, "nope.txt"))}` });
 		assert.equal(notFound.status, 404);
 		assert.equal(notFound.body.error, "file-not-found");
+
+		const outside = await call(route, { url: "/m/api/files?path=/definitely/not/here-xyz.txt" });
+		assert.equal(outside.status, 403);
+		assert.equal(outside.body.error, "path-outside-workspace");
 	} finally {
 		clean();
 	}
@@ -283,11 +295,10 @@ test("files：错误响应不回显主机路径（脱敏）", async () => {
 });
 
 /**
- * 记录当前信任模型：文件下载不做工作区包含校验，符号链接可指向工作区外。
- * 这不是"期望的安全行为"，而是把现状固定下来，避免将来收紧时无人察觉，
- * 也避免有人误以为这里已有保护（见 #16；docs/04-security.md 已按现状修正）。
+ * GitLab #16：文件通道不再跟随符号链接。工作区内指向外部的链接必须被拒绝，
+ * 且错误体不得泄露链接目标/主机路径。
  */
-test("files：当前不校验工作区包含（符号链接可越界，记录现状）", async (t) => {
+test("files：符号链接越界被拒绝（#16）", async (t) => {
 	const { route, clean } = createHarness();
 	try {
 		const outside = mkdtempSync(join(tmpdir(), "wb-outside-"));
@@ -296,15 +307,16 @@ test("files：当前不校验工作区包含（符号链接可越界，记录现
 		try {
 			symlinkSync(join(outside, "secret.txt"), join(root, "link.txt"));
 		} catch (err) {
-			// Windows 未开开发者模式/非管理员时 symlinkSync 抛 EPERM。
-			// 这是**宿主权限**限制，与"服务端是否跟随符号链接"无关，故跳过而非判失败。
 			t.skip(`宿主不允许创建符号链接（${err.code}），跳过本用例`);
 			return;
 		}
 
 		const res = await call(route, { url: `/m/api/files?path=${encodeURIComponent(join(root, "link.txt"))}` });
-		assert.equal(res.status, 200, "现状：符号链接会被跟随");
-		assert.equal(res.raw.toString("utf8"), "outside\n");
+		assert.equal(res.status, 403);
+		assert.equal(res.body.error, "path-outside-workspace");
+		const text = JSON.stringify(res.body);
+		assert.ok(!text.includes(outside), "错误体不得泄露链接目标");
+		assert.ok(!text.includes("secret.txt"), "错误体不得泄露目标文件");
 	} finally {
 		clean();
 	}

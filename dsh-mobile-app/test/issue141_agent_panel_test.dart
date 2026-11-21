@@ -174,15 +174,13 @@ void main() {
         findsOneWidget,
       );
 
-      for (final key in ['agent-tab-team', 'agent-tab-messages']) {
-        await tester.tap(find.byKey(ValueKey<String>(key)));
-        await tester.pumpAndSettle();
-        expect(
-          find.textContaining('将在后续版本并入本面板'),
-          findsOneWidget,
-          reason: '$key 应为说明性占位',
-        );
-      }
+      // #142：团队页已有真实内容（本 fake 无 team 服务 → 降级提示）。
+      await tester.tap(find.byKey(const ValueKey<String>('agent-tab-team')));
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('agent-team-switch-card')),
+        findsOneWidget,
+      );
       // #143：任务板已接真实只读端点；团队未启用时显示启用引导，不再是占位。
       await tester.tap(find.byKey(const ValueKey<String>('agent-tab-tasks')));
       await tester.pumpAndSettle();
@@ -190,7 +188,13 @@ void main() {
         find.byKey(const ValueKey('agent-tasks-disabled')),
         findsOneWidget,
       );
-      expect(find.textContaining('将在后续版本并入本面板'), findsNothing);
+      // 消息仍是占位。
+      await tester.tap(find.byKey(const ValueKey<String>('agent-tab-messages')));
+      await tester.pumpAndSettle();
+      expect(
+        find.textContaining('将在后续版本并入本面板'),
+        findsOneWidget,
+      );
       expect(tester.takeException(), isNull);
     });
 

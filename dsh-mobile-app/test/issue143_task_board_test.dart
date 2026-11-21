@@ -153,7 +153,8 @@ void main() {
 
     await tester.tap(find.byKey(const ValueKey('agent-tasks-goto-team')));
     await _settle(tester);
-    expect(find.textContaining('将在后续版本并入本面板'), findsOneWidget);
+    // #142 已把团队页做成真实 Team 卡；这里只验证切页成功。
+    expect(find.byKey(const ValueKey('agent-team-switch-card')), findsOneWidget);
   });
 
   testWidgets('旧宿主不支持 / 启用但无任务 / 加载中', (tester) async {

@@ -18,6 +18,7 @@ import '../api.dart';
 import '../fmt.dart';
 import '../l10n.dart';
 import '../store.dart';
+import '../team.dart';
 import '../team_tasks.dart';
 import '../theme.dart';
 import '../toast.dart';
@@ -73,6 +74,7 @@ class _AgentPanelScreenState extends State<AgentPanelScreen>
   bool _loading = false;
   final Set<String> _expanded = <String>{};
   final Set<String> _interruptBusy = <String>{};
+  final ValueNotifier<int> _refreshTick = ValueNotifier<int>(0);
 
   // #143：只读任务板（按页签懒加载；旧宿主 unsupported，团队未启用时显示引导）。
   TeamTaskBoard? _taskBoard;
@@ -138,8 +140,15 @@ class _AgentPanelScreenState extends State<AgentPanelScreen>
   @override
   void dispose() {
     _tabs.removeListener(_onTabChanged);
+    _refreshTick.dispose();
     _tabs.dispose();
     super.dispose();
+  }
+
+  void _refreshAll() {
+    _load();
+    _refreshTick.value++;
+    _loadTasks(force: true);
   }
 
   Future<void> _load() async {
@@ -253,10 +262,7 @@ class _AgentPanelScreenState extends State<AgentPanelScreen>
           IconButton(
             icon: const Icon(Icons.refresh, size: 20),
             tooltip: L10n.t('刷新', 'Refresh'),
-            onPressed: () {
-              _load();
-              _loadTasks(force: true);
-            },
+            onPressed: _refreshAll,
           ),
         ],
         bottom: TabBar(
@@ -301,7 +307,12 @@ class _AgentPanelScreenState extends State<AgentPanelScreen>
         controller: _tabs,
         children: [
           _buildSubagentsTab(),
-          const _AgentPlaceholderTab(icon: Icons.people_outline),
+          _TeamTab(
+            store: widget.store,
+            sessionId: widget.sessionId,
+            apiClient: widget.apiClient,
+            refresh: _refreshTick,
+          ),
           _buildTasksTab(),
           const _AgentPlaceholderTab(icon: Icons.forum_outlined),
         ],
@@ -613,6 +624,596 @@ class _AgentNotice extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+/// issue #142：「团队」页签——只读摘要 + 团队开关。
+class _TeamTab extends StatefulWidget {
+  final AppStore store;
+  final String sessionId;
+  final Api? apiClient;
+  final ValueNotifier<int> refresh;
+
+  const _TeamTab({
+    required this.store,
+    required this.sessionId,
+    required this.apiClient,
+    required this.refresh,
+  });
+
+  @override
+  State<_TeamTab> createState() => _TeamTabState();
+}
+
+class _TeamTabState extends State<_TeamTab> {
+  TeamStatus? _status;
+  String? _error;
+  bool _loading = false;
+  bool _saving = false;
+  String? _saveError;
+  // #142 复审 P2：请求代次——旧 GET 不得覆盖 save 后的权威状态。
+  int _requestGen = 0;
+
+  Api get _api => widget.apiClient ?? api;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.refresh.addListener(_onRefresh);
+    _load();
+  }
+
+  @override
+  void dispose() {
+    widget.refresh.removeListener(_onRefresh);
+    super.dispose();
+  }
+
+  void _onRefresh() {
+    if (mounted) _load();
+  }
+
+  Future<void> _load() async {
+    if (!mounted || _saving) return;
+    final gen = ++_requestGen;
+    setState(() {
+      _loading = _status == null;
+      _error = null;
+    });
+    try {
+      final status = await _api.team(widget.sessionId);
+      if (!mounted || gen != _requestGen) return;
+      setState(() {
+        _status = status;
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted || gen != _requestGen) return;
+      // #142 复审 P2：旧插件没有路由时是 404 not-found，不等于加载失败；
+      // 只有明确的 session-not-found 才是会话错误。
+      if (e is ApiException && e.status == 404) {
+        if (e.code == 'session-not-found') {
+          setState(() {
+            _error = L10n.t('会话不存在', 'Session not found');
+            _loading = false;
+          });
+          return;
+        }
+        setState(() {
+          _status = TeamStatus.unsupported(widget.sessionId);
+          _loading = false;
+        });
+        return;
+      }
+      setState(() {
+        _error = '$e';
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _onToggle(bool value) async {
+    if (value == false) {
+      final confirmed = await _confirmDisable();
+      if (confirmed != true || !mounted) return;
+    }
+    await _save(value);
+  }
+
+  Future<void> _save(bool value) async {
+    final gen = ++_requestGen; // 作废在途 GET，避免旧状态覆盖保存结果
+    setState(() {
+      _saving = true;
+      _saveError = null;
+    });
+    try {
+      await _api.setTeamMode(widget.sessionId, value);
+      if (!mounted || gen != _requestGen) return;
+      // 不信任 POST 响应的镜像：完成后发权威 GET 再更新 UI。
+      final status = await _api.team(widget.sessionId);
+      if (!mounted || gen != _requestGen) return;
+      setState(() => _status = status);
+    } catch (e) {
+      if (!mounted || gen != _requestGen) return;
+      setState(() => _saveError = '$e');
+      showToast(
+        context,
+        L10n.t(
+          '无法确认智能体团队协作设置已保存，请重试：$e',
+          'Could not confirm the agent teamwork setting was saved. Try again: $e',
+        ),
+      );
+    } finally {
+      if (mounted && gen == _requestGen) {
+        setState(() => _saving = false);
+      }
+    }
+  }
+
+  Future<bool?> _confirmDisable() {
+    return showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(L10n.t('确认停用智能体团队协作？', 'Disable agent teamwork?')),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                L10n.t(
+                  '对话过程中停用智能体团队协作，将停止共享任务工具和团队协调指令。',
+                  'Disabling agent teamwork during a conversation stops the use of shared task tools and team coordination instructions.',
+                ),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                L10n.t(
+                  '停用后可能影响缓存复用、增加后续 token 用量与开销，并影响当前任务的协作效果。',
+                  'Disabling it may affect cache reuse, increase subsequent token usage and costs, and affect collaboration on the current task.',
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: _saving ? null : () => Navigator.of(ctx).pop(false),
+            child: Text(L10n.t('取消', 'Cancel')),
+          ),
+          FilledButton(
+            onPressed: _saving ? null : () => Navigator.of(ctx).pop(true),
+            child: Text(L10n.t('确认停用', 'Disable')),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String? _unavailableReason(TeamStatus status) {
+    if (!status.root) {
+      return L10n.t(
+        '子代理会话继承根会话的团队设置，不能单独修改',
+        'Subagent sessions inherit the root session team setting',
+      );
+    }
+    if (!status.supported) {
+      return L10n.t(
+        '当前电脑端不支持团队协作，已隐藏相关操作',
+        'This desktop does not support agent teamwork; related actions are hidden',
+      );
+    }
+    if (!status.lockedKnown) {
+      return L10n.t(
+        '当前电脑端未提供团队锁状态',
+        'This desktop does not provide the team lock state',
+      );
+    }
+    if (status.locked) {
+      return L10n.t(
+        '当前会话已锁定，无法修改团队协作',
+        'This session is locked; agent teamwork cannot be changed',
+      );
+    }
+    if (!status.agentLive) {
+      return L10n.t('未连接电脑端', 'Not connected to the desktop');
+    }
+    if (status.pending) {
+      return L10n.t('正在应用团队设置，请稍候', 'Applying team settings, please wait');
+    }
+    if (!status.modelSelected) {
+      return L10n.t(
+        '请先在对话页选择模型和推理等级',
+        'Choose a model and reasoning effort in the chat first',
+      );
+    }
+    return null;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ink2 = DshColors.ink2(context);
+    final ink3 = DshColors.ink3(context);
+    final danger = DshColors.danger(context);
+    if (_status == null) {
+      if (_loading) {
+        return const Center(
+          child: SizedBox(
+            width: 20,
+            height: 20,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        );
+      }
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                '${L10n.t('加载失败：', 'Failed to load: ')}$_error',
+                key: const ValueKey('agent-team-error'),
+                style: TextStyle(fontSize: 12.5, color: ink2),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 8),
+              TextButton(onPressed: _load, child: Text(L10n.t('重试', 'Retry'))),
+            ],
+          ),
+        ),
+      );
+    }
+    final status = _status!;
+    final reason = _unavailableReason(status);
+    final canToggle = status.canToggle && !_saving;
+    final normalMembers = status.normalMembers;
+    return RefreshIndicator(
+      onRefresh: _load,
+      child: ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+        children: [
+          _teamSwitchCard(
+            context,
+            status: status,
+            reason: reason,
+            canToggle: canToggle,
+            ink2: ink2,
+            ink3: ink3,
+            danger: danger,
+          ),
+          if (status.supported && status.modeKnown && status.enabled) ...[
+            const SizedBox(height: 14),
+            _teamLeadRow(context, status, ink2, ink3),
+            if (status.membersAvailable || status.tasksAvailable)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(
+                  _summaryText(status),
+                  key: const ValueKey('agent-team-summary'),
+                  style: TextStyle(fontSize: 11.5, color: ink3),
+                ),
+              ),
+            const SizedBox(height: 14),
+            Row(
+              children: [
+                Text(
+                  L10n.t('团队成员', 'Team members'),
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: ink2,
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  '${normalMembers.length}',
+                  style: TextStyle(fontSize: 12, color: ink3),
+                ),
+              ],
+            ),
+            const SizedBox(height: 2),
+            if (!status.membersAvailable)
+              _teamEmptyNote(
+                context,
+                L10n.t(
+                  '当前电脑端未提供成员目录',
+                  'This desktop does not provide a member catalog',
+                ),
+              )
+            else if (normalMembers.isEmpty)
+              _teamEmptyNote(
+                context,
+                L10n.t(
+                  '暂无团队成员；通过对话派生子代理后会显示在这里',
+                  'No team members yet; subagents delegated in the chat will appear here',
+                ),
+              )
+            else
+              for (var i = 0; i < normalMembers.length; i++) ...[
+                if (i > 0) Divider(height: 1, color: DshColors.line(context)),
+                _teamMemberRow(context, normalMembers[i]),
+              ],
+          ] else if (status.supported && status.modeKnown && !status.enabled)
+            Padding(
+              padding: const EdgeInsets.only(top: 12),
+              child: Text(
+                L10n.t(
+                  '团队协作未启用；启用后可在这里查看 Lead 与成员。',
+                  'Agent teamwork is off; enable it to see the Lead and members here.',
+                ),
+                key: const ValueKey('agent-team-off-note'),
+                style: TextStyle(fontSize: 12.5, color: ink3),
+              ),
+            )
+          else if (status.supported && !status.modeKnown)
+            _teamEmptyNote(
+              context,
+              L10n.t(
+                '当前会话未激活，暂无法读取团队状态',
+                'This session is not live; team status is unavailable',
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  String _summaryText(TeamStatus status) {
+    final parts = <String>[];
+    if (status.membersAvailable) {
+      parts.add(
+        L10n.t(
+          '${status.normalMembers.length} 名成员',
+          '${status.normalMembers.length} member${status.normalMembers.length == 1 ? '' : 's'}',
+        ),
+      );
+    }
+    if (status.tasksAvailable) {
+      parts.add(
+        L10n.t(
+          '${status.tasks.total} 个共享任务',
+          '${status.tasks.total} shared task${status.tasks.total == 1 ? '' : 's'}',
+        ),
+      );
+    }
+    return parts.join(' · ');
+  }
+
+  Widget _teamSwitchCard(
+    BuildContext context, {
+    required TeamStatus status,
+    required String? reason,
+    required bool canToggle,
+    required Color ink2,
+    required Color ink3,
+    required Color danger,
+  }) {
+    final surface = DshColors.surface(context);
+    final line = DshColors.line(context);
+    return Container(
+      key: const ValueKey('agent-team-switch-card'),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: surface,
+        border: Border.all(color: line),
+        borderRadius: BorderRadius.circular(DshTheme.radiusMd),
+        boxShadow: Theme.of(context).brightness == Brightness.dark
+            ? DshTheme.shadowDark
+            : DshTheme.shadow,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          ConstrainedBox(
+            constraints: const BoxConstraints(minHeight: 44),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    L10n.t('智能体团队协作', 'Agent teamwork'),
+                    style: const TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+                if (_saving)
+                  const Padding(
+                    padding: EdgeInsets.only(right: 10),
+                    child: SizedBox(
+                      width: 12,
+                      height: 12,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  ),
+                // 旧宿主/非根会话：写操作不适用 → 不渲染开关（只显示原因）；
+                // locked/pending/模型未定/断线仍显示开关但置灰，原因可见。
+                if (status.supported && status.root)
+                  Semantics(
+                    label: L10n.t('智能体团队协作', 'Agent teamwork'),
+                    toggled: status.enabled,
+                    enabled: canToggle,
+                    child: ExcludeSemantics(
+                      child: IgnorePointer(
+                        ignoring: !canToggle,
+                        child: Opacity(
+                          opacity: canToggle ? 1 : 0.55,
+                          child: DshSwitch(
+                            value: status.enabled,
+                            onChanged: canToggle ? _onToggle : (_) {},
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            L10n.t(
+              '启用后可通过共享任务板协调多个智能体，token 开销相应更高',
+              'Coordinate multiple agents through a shared task board; token costs are higher',
+            ),
+            style: TextStyle(fontSize: 11.5, color: ink3),
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          ),
+          if (_saving)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                L10n.t('正在保存…', 'Saving…'),
+                key: const ValueKey('agent-team-saving'),
+                style: TextStyle(fontSize: 12, color: ink2),
+              ),
+            ),
+          if (reason != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(Icons.info_outline, size: 12, color: ink2),
+                  const SizedBox(width: 4),
+                  Expanded(
+                    child: Text(
+                      reason,
+                      key: const ValueKey('agent-team-reason'),
+                      style: TextStyle(fontSize: 12, color: ink2),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          if (_saveError != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                L10n.t(
+                  '无法确认智能体团队协作设置已保存，请重试：$_saveError',
+                  'Could not confirm the agent teamwork setting was saved. Try again: $_saveError',
+                ),
+                key: const ValueKey('agent-team-save-error'),
+                style: TextStyle(fontSize: 12, color: danger),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _teamLeadRow(
+    BuildContext context,
+    TeamStatus status,
+    Color ink2,
+    Color ink3,
+  ) {
+    final ok = DshColors.ok(context);
+    final running = status.leadStatus == 'running';
+    return Row(
+      children: [
+        Icon(
+          running ? Icons.bolt_outlined : Icons.person_outline,
+          size: 18,
+          color: running ? ok : ink2,
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            'Lead · ${status.leadTitle}',
+            key: const ValueKey('agent-team-lead'),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600),
+          ),
+        ),
+        Text(
+          running ? L10n.t('运行中', 'Running') : L10n.t('空闲', 'Idle'),
+          key: const ValueKey('agent-team-lead-status'),
+          style: TextStyle(
+            fontSize: 11.5,
+            fontWeight: FontWeight.w600,
+            color: running ? ok : ink3,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _teamMemberRow(BuildContext context, TeamMember member) {
+    final ink2 = DshColors.ink2(context);
+    final ink3 = DshColors.ink3(context);
+    final ok = DshColors.ok(context);
+    final running = member.isRunning;
+    final unavailable = member.isDiagnostic;
+    final statusText = unavailable
+        ? L10n.t('不可用', 'Unavailable')
+        : (running ? L10n.t('运行中', 'Running') : L10n.t('空闲', 'Idle'));
+    final subtitle = member.name != null && member.name!.isNotEmpty
+        ? member.name!
+        : (member.title != null && member.title!.isNotEmpty
+              ? member.title!
+              : member.id);
+    final factor = MediaQuery.textScalerOf(context).scale(1.0);
+    return SizedBox(
+      key: ValueKey('agent-team-member-${member.id}'),
+      height: 52 + 16 * (factor - 1).clamp(0.0, 1.0),
+      child: Row(
+        children: [
+          Icon(
+            unavailable ? Icons.error_outline : Icons.polyline_outlined,
+            size: 20,
+            color: running ? ok : ink3,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  member.title ?? member.name ?? member.id,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 13.5,
+                    fontWeight: FontWeight.w600,
+                    color: unavailable ? ink3 : ink2,
+                  ),
+                ),
+                Text(
+                  subtitle == member.id
+                      ? member.id
+                      : '$subtitle · ${member.id}',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 11.5, color: ink3),
+                ),
+              ],
+            ),
+          ),
+          Text(
+            statusText,
+            style: TextStyle(
+              fontSize: 11.5,
+              fontWeight: FontWeight.w600,
+              color: running ? ok : ink3,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _teamEmptyNote(BuildContext context, String text) {
+    final ink3 = DshColors.ink3(context);
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Text(text, style: TextStyle(fontSize: 12.5, color: ink3)),
     );
   }
 }
