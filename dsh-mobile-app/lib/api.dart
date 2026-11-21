@@ -10,6 +10,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'agent_tree.dart';
+import 'team.dart';
 import 'download.dart';
 import 'logger.dart';
 import 'models.dart';
@@ -1546,6 +1547,27 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
       'parentSessionId': parentSessionId,
       'childSessionId': childSessionId,
     });
+  }
+
+  /// issue #142：代理面板「团队」只读摘要 + 开关状态。
+  Future<TeamStatus> team(String sessionId) async {
+    final data = await getJson(
+      '/api/team?sessionId=${Uri.encodeQueryComponent(sessionId)}',
+    );
+    return TeamStatus.fromJson(
+      (data['team'] as Map?)?.cast<String, dynamic>() ?? const {},
+    );
+  }
+
+  /// issue #142：切换团队协作开关（服务端成功后返回最新状态）。
+  Future<TeamStatus> setTeamMode(String sessionId, bool enabled) async {
+    final data = await postJson('/api/team', {
+      'sessionId': sessionId,
+      'enabled': enabled,
+    });
+    return TeamStatus.fromJson(
+      (data['team'] as Map?)?.cast<String, dynamic>() ?? const {},
+    );
   }
 
   /// 当前目标。
