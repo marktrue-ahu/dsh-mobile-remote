@@ -146,7 +146,7 @@
 
 | 差异 | `0.1.x` | `0.2.x` | 插件如何判别 | 传错的后果 |
 |---|---|---|---|---|
-| 子代理目录 | `subagents/list` Remote 端点 | **该端点已删除**（内核树内 0 命中；只剩 `subagents/prompt` 与 `subagents/interruptByParent` / rc.2 `interruptByUser`） | rc.1 用 `ctx.subagents.listChildren(parentSessionId)`；rc.2 改为 `ctx.subagents.listDescendants(parentSessionId, signal)`（递归全树，插件按 `depth === 1` 收窄为直接子级，diagnostic 行按 `kind`/`reason` 映射）。两者都是持久目录（**不要求父会话有活跃 Agent**） | 报 `no active Remote method exports this endpoint`，「会话工具 → 子代理」整页打不开；rc.2 若继续调用 `listChildren` 会静默落到持久化/注册表兜底，丢失已释放子代理与 label/mode 元数据 |
+| 子代理目录 | `subagents/list` Remote 端点 | **该端点已删除**（内核树内 0 命中；只剩 `subagents/prompt` 与 `subagents/interruptByParent` / rc.2 `interruptByUser`） | rc.1 用 `ctx.subagents.listChildren(parentSessionId)`；rc.2 改为 `ctx.subagents.listDescendants(parentSessionId, signal)`（递归全树，插件透出整棵树而不再按 `depth === 1` 收窄；旧代/降级标 `multiLevelUnavailable`；diagnostic 行按 `kind`/`reason` 映射）。两者都是持久目录（**不要求父会话有活跃 Agent**） | 报 `no active Remote method exports this endpoint`，「会话工具 → 子代理」整页打不开；rc.2 若继续调用 `listChildren` 会静默落到持久化/注册表兜底，丢失已释放子代理与 label/mode 元数据 |
 | Codex 代理配置 | `settings.get(ns)` | **该方法已移除** | 跨代读取 `readSettingsSectionStrict` | **读不到配置被误判为"用户没开代理"** → 静默改走直连 `chatgpt.com` → 连接超时 → 手机看不到 Codex 余额（桌面网页端正常，因为它用自己的新 API 读同一份设置） |
 
 **"读不到配置"与"未启用"必须分开**：`codexProxyUrl` 返回三态——用户没开代理（走直连是对的）／代理可用／**读不到宿主设置**（`unreadable`，显式失败）。把第三种当成第一种，是 Codex 余额静默消失里最隐蔽的一环。严格读取还会区分「命名空间确实不存在」与「`get()`/`describe()` 抛错、describe 形状漂移、描述符缺 `value`」——后者一律 `unreadable`。
@@ -157,7 +157,7 @@
 
 **rc.2 的两处 subagents 契约漂移（issue #87）**：
 - 中断：rc.1 `subagents/interruptByParent(childSessionId,parentSessionId,mode)` → rc.2 `subagents/interruptByUser(childSessionId)`（参数收窄，多传字段触发 `gateway/arguments-invalid`；返回 `accepted` receipt 表示已受理，不等于目标已静默）。插件按 `typeof interruptByUser === "function"` 选择端点与载荷，`hostCapabilities.subagents.interrupt` 报 `ok`/`drift`/`missing`。
-- 目录：rc.1 `listChildren` → rc.2 `listDescendants`（递归全树、无 `createdAt`、未知 mode 用 `kind:"diagnostic"`+`reason` 表示）。插件优先 `listDescendants` 且只取 `depth===1`；diagnostic 改用 `kind` 判定，reason 透传为 `status` 三枚举 `unsupported`/`corrupt`/`unavailable`；createdAt 回落 `session.header.createdAt`，缺失排末尾。`hostCapabilities.subagents.catalog` 与 `hostGeneration.subagents` 可归因实际走到的代际。
+- 目录：rc.1 `listChildren` → rc.2 `listDescendants`（递归全树、无 `createdAt`、未知 mode 用 `kind:"diagnostic"`+`reason` 表示）。插件优先 `listDescendants` 并透出整棵树；diagnostic 改用 `kind` 判定，reason 透传为 `status` 三枚举 `unsupported`/`corrupt`/`unavailable`；createdAt 回落 `session.header.createdAt`，缺失排末尾。`hostCapabilities.subagents.catalog` 与 `hostGeneration.subagents` 可归因实际走到的代际。
 
 **验证范围（如实标注）**：只对 **`0.2.x` 做真实宿主端到端验证**（本机宿主即 0.2.x）。`0.1.x` 那条路径的真实宿主验不到，**靠两代假宿主夹具保护**（`test/host-compat-020.test.mjs`：按真实签名复刻两代差异，让两条分支都被实际执行到）。因此 0.1.x 一侧属于"夹具已验证、真实宿主未验证"。
 

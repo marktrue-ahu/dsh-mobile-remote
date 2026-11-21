@@ -49,6 +49,7 @@ class _PreviewBackend {
     ..baseUrl = 'http://issue67.test'
     ..path = '/m'
     ..token = ''
+    ..sessionRelativeFilesSupported = true
     ..timelineCapabilities = const TimelineCapabilities(
       version: 1,
       live: true,
@@ -547,7 +548,7 @@ void main() {
       expect(c.previewPath, '/work/src/b.ts');
       expect(c.currentPath, '/work/src');
       expect(b.dirRequests, ['/work/src'], reason: '不先列 root');
-      expect(b.fileRequests, ['/work/src/b.ts']);
+      expect(b.fileRequests, ['src/b.ts']);
     });
 
     test('非法 initialRelativePath：零请求、错误页、不崩', () async {
@@ -579,7 +580,7 @@ void main() {
 
       await c.openRelativeFile('src/b.ts');
       expect(c.previewPath, '/work/src/b.ts');
-      expect(b.fileRequests, ['/work/src/b.ts']);
+      expect(b.fileRequests, ['src/b.ts']);
       expect(
         b.dirRequests.every((path) => isWithinRoot('/work', path)),
         isTrue,
@@ -609,7 +610,7 @@ void main() {
       expect(c.stage, BrowseStage.preview);
       expect(c.previewPath, '/work/src/b.ts');
       expect(c.currentPath, '/work/src');
-      expect(b.fileRequests, ['/work/src/b.ts', '/work/src/b.ts']);
+      expect(b.fileRequests, ['src/b.ts', 'src/b.ts']);
       expect(b.dirRequests, isEmpty, reason: 'refresh 只重取文件，不重列目录');
     });
 
@@ -662,19 +663,18 @@ void main() {
       expect(c.root, '/work');
       expect(c.stage, BrowseStage.preview);
       expect(c.previewPath, '/work/src/a.ts');
-      expect(b.fileRequests, ['/work/src/a.ts']);
+      expect(b.fileRequests, ['src/a.ts']);
       // 只请求定位 a 所需的父目录，不先列 root。
       expect(b.dirRequests, ['/work/src']);
-      final allRequests = [...b.dirRequests, ...b.fileRequests];
-      expect(allRequests, isNotEmpty);
-      for (final path in allRequests) {
-        expect(isWithinRoot('/work', path), isTrue, reason: '请求越界：$path');
+      expect(b.dirRequests, isNotEmpty);
+      for (final path in b.dirRequests) {
+        expect(isWithinRoot('/work', path), isTrue, reason: '目录请求越界：$path');
         expect(path.contains('..'), isFalse);
       }
       expect(
-        b.fileRequests.any((path) => path == '/work/src/a.ts'),
+        b.fileRequests.any((path) => path == 'src/a.ts'),
         isTrue,
-        reason: '必须包含 /files?path=/work/src/a.ts',
+        reason: '文件请求必须是会话 cwd 内相对路径 src/a.ts',
       );
     });
 
@@ -718,7 +718,7 @@ void main() {
       expect(c.previewPath, '/work/src/a.ts');
       expect(
         b.fileRequests,
-        ['/work/src/a.ts'],
+        ['src/a.ts'],
         reason: '显式入口只请求点击目标，不得先读取构造参数 b.ts',
       );
       expect(
@@ -801,12 +801,15 @@ void main() {
 
       expect(find.byType(SessionFilesScreen), findsOneWidget);
       expect(find.byKey(const Key('sf-preview')), findsOneWidget);
-      expect(backend.fileRequests, ['/work/src/b.ts']);
-      final allRequests = [...backend.dirRequests, ...backend.fileRequests];
-      expect(allRequests, isNotEmpty);
-      for (final path in allRequests) {
-        expect(isWithinRoot('/work', path), isTrue, reason: '请求越界：$path');
-        expect(path.contains('..'), isFalse, reason: '请求含 ..：$path');
+      expect(backend.fileRequests, ['src/b.ts']);
+      expect(backend.dirRequests, isNotEmpty);
+      for (final path in backend.dirRequests) {
+        expect(isWithinRoot('/work', path), isTrue, reason: '目录请求越界：$path');
+        expect(path.contains('..'), isFalse, reason: '目录请求含 ..：$path');
+      }
+      for (final path in backend.fileRequests) {
+        expect(path.startsWith('/'), isFalse, reason: '文件请求必须是相对路径：$path');
+        expect(path.contains('..'), isFalse, reason: '文件请求含 ..：$path');
       }
     });
 
@@ -833,7 +836,7 @@ void main() {
         find.byKey(const Key('tool-path-fold:call-write')),
       );
       expect(find.byType(SessionFilesScreen), findsOneWidget);
-      expect(backend.fileRequests, ['/work/src/a.ts']);
+      expect(backend.fileRequests, ['src/a.ts']);
     });
 
     testWidgets('失败态：previewable 卡仍可点，卡片失败样式与默认收起不变', (tester) async {
@@ -850,7 +853,7 @@ void main() {
 
       await _tapFoldPath(tester, find.text('src/d.ts'));
       expect(find.byType(SessionFilesScreen), findsOneWidget);
-      expect(backend.fileRequests, ['/work/src/d.ts']);
+      expect(backend.fileRequests, ['src/d.ts']);
     });
 
     testWidgets('无 cwd 会话：卡片仍可点，预览页显示既有错误，卡片不新增错误', (tester) async {

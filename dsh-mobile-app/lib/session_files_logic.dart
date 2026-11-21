@@ -428,6 +428,26 @@ String? resolveSessionRelativePath(
   return joined;
 }
 
+/// 把 [path] 转成相对于会话浏览根 [root] 的 POSIX 相对路径（供 `/api/files` 使用）。
+///
+/// GitLab #16：服务端文件通道只接受会话 cwd 内的相对路径；本函数是 App 侧唯一的
+/// 「绝对 → 相对」转换点，越界/同一路径/降级失败一律返回 null（调用方 fail-closed）。
+String? relativePathWithinRoot(String root, String path) {
+  if (root.isEmpty || path.isEmpty) return null;
+  if (!isWithinRoot(root, path)) return null;
+  var base = normalizeBrowsePath(root);
+  final child = normalizeBrowsePath(path);
+  while (base.length > 1 && base.endsWith('/')) {
+    base = base.substring(0, base.length - 1);
+  }
+  final baseLower = base.toLowerCase();
+  final childLower = child.toLowerCase();
+  final prefix = base == '/' ? '/' : '$baseLower/';
+  if (!childLower.startsWith(prefix)) return null;
+  final rel = child.substring(prefix.length);
+  return normalizeSessionRelativePath(rel);
+}
+
 /// 路径归一：`\` → `/`，折叠重复分隔符。只用于比较，不用于拼路径。
 String normalizeBrowsePath(String path) {
   var s = path.replaceAll('\\', '/');

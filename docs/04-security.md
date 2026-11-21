@@ -75,17 +75,21 @@
 - `trustedHosts`（v2.4.2+）：隧道/中继类方案（frp/SakuraFrp 托管）下请求 Host 是中继地址，需在此显式放行（配合强口令）；纯虚拟组网/局域网无需配置。
 ## 6. 数据安全
 
-### 文件与工作目录的权限边界（issue #68）
+### 文件与工作目录的权限边界（issue #68 / #16）
 
-`GET /files`、`GET/POST /directories` 允许访问宿主进程有权限的显式路径；空目录路径可列根视图，读取会跟随符号链接。会话文件浏览页面的工作目录边界和隐藏 `.git` 只限制界面导航，不是服务端授权边界。
+文件通道按用途分开，**不能再用一条“任意路径”规则描述**：
 
-同一认证身份还能通过 `POST /sessions {cwd}` 注册新的工作目录。因此仅按“已注册工作区”过滤文件接口无法限制持有口令的客户端：它可以先注册更大的目录。本轮保留任意新目录建会话的行为，不引入可被该入口绕过的访问控制承诺。若要增加受限身份，需要一并设计宿主批准的根目录、`realpath` / 符号链接检查和工作目录注册授权；不能只更改文件下载接口。当前权限上限由宿主操作系统身份、沙箱与可信传输控制。
+- **下载 `GET /m/api/files`（#16 已收紧）**：新调用必须带 `sessionId`，`path` 为会话 cwd 内相对路径；服务端 `realpath` 后做词法包含，再以 `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` 打开、`fstat` 确认普通文件、`/proc/self/fd` 复核实际路径仍在 cwd 内。绝对路径、`..`、symlink 逃逸、目录/设备/FIFO 一律拒绝；旧调用不带 `sessionId` 时只接受绝对路径且必须落在已注册工作区。详见下方「文件下载」条目。
+- **上传 `POST /m/api/files/upload`**：只允许写入 `sessionId` 对应 cwd（缺省首个注册工作区根），文件名拒绝分隔符/NUL/`.`/`..`；当前按目标路径直接写入，**未**采用下载侧的 descriptor-relative 句柄保护（#16 未覆盖上传）。
+- **目录选择器 `GET/POST /m/api/directories`**：仍保留**有意**的任意路径浏览（新建会话需跨盘选工作目录），会跟随符号链接；它不是文件下载授权边界，也不因 #16 收窄。
+
+同一认证身份还能通过 `POST /sessions {cwd}` 注册新的工作目录。因此按“已注册工作区 / 会话 cwd”过滤不能防御“先注册更大目录”的攻击者：它降低的是误用或口令泄露后的**直接任意文件读取面**，不替代宿主 OS 身份、沙箱与可信传输。若要增加受限身份，需要宿主批准的根目录、`realpath` / 符号链接检查和工作目录注册授权一起设计，不能只改下载接口。
 
 ### 工作区图片端点（`/m/api/workspace-image`，issue #95）
 
 该端点比通用文件传输更窄：只允许当前会话 cwd 内、cwd 属于已登记工作区的普通图片，且使用 **fd 绑定**读取：`open(O_RDONLY|O_NOFOLLOW|O_NONBLOCK)` 后以 `fstat` 与 `/proc/self/fd/<fd>` 的实际路径做 cwd/工作区 containment，再 `readSync(fd)` 有界读取并 `finally close`；不再按路径二次 `stat`/`readFileSync`。末级 symlink 被 `O_NOFOLLOW` 拒绝，中间目录换链由 fd 实际路径校验拒绝。非 Linux/无 procfs/无 O_NOFOLLOW 一律 `501 image-verification-unavailable`，**fail-closed，不回退**。
 
-已知/接受边界：hardlink 与 bind-mount 的同用户场景不在本端点威胁模型内；8 MiB/8192px/40MP 上限；HEAD 仍完整读取以生成强 ETag。通用 `/files*` 的既有任意路径/符号链接边界见上节，二者不可混用。
+已知/接受边界：hardlink 与 bind-mount 的同用户场景不在本端点威胁模型内；8 MiB/8192px/40MP 上限；HEAD 仍完整读取以生成强 ETag。通用文件下载 `/files` 已按 #16 收紧；上传与目录选择器的边界见上节，三者不可混用。
 
 ### 持久化与投递
 
@@ -93,10 +97,11 @@
 - 会话内容沿用 dsh 现有策略存储；插件仅在请求处理期间持有内存副本。
 - **二维码数据端点 `/m/api/qr-config` 仅允许 loopback**（TCP socket 来源校验，无法伪造）—— 桌面设置页读取后展示二维码；二维码含地址+口令，请勿截屏转发。
 - **问询/审批应答（`/m/api/respond`）不绕过内核安全**：RC1 路径先在插件侧按原始问题严格校验答案（每项必须有 `selected: string[]`，`custom` 若存在必须为字符串，选项/数量/重复项均校验），再通过 `$events/result` 交给内核；旧 `apiProxy` 路径仍由内核 schema 校验。rpcId 与 sessionId 必须命中对应 pending 表（先到先得，不可伪造待答）。取消操作同样以 `UserQuestionError`/`ASK_CANCELLED` rejection 走内核语义。
-- **文件传输（`/m/api/files*`）**：与目录选择器同信任模型（§2 口令鉴权 + 手机端显式指定路径），**不做工作区包含校验**。下载按给定路径 `resolve` 后 `statSync` 确认为普通文件再流式读取；上传把文件名限制在目标会话工作目录内并拒绝路径分隔符与 NUL。已认证用户本就持有 agent 控制权，故该通道不额外收窄路径范围。
-  - **已知边界**：由于不校验工作区包含、也不使用 `O_NOFOLLOW` / 句柄级复核，工作区内指向外部的符号链接，以及 `statSync → createReadStream` 之间的目标替换，都不受保护；能读到进程有权读取的任意文件。
-  - **边界外的目录选择器**（`/m/api/directories`）同样是**有意保留的任意路径浏览**（新建会话需跨盘选工作目录），不适用工作区包含语义。
-  - **后续**：是否将文件传输收紧到工作区包含 + descriptor-relative 句柄保护，见 GitLab `ahedu/dsh-mobile-remote#16`；在决定前，本文件如实描述当前实现，不描述未落地的保护。
+- **文件下载（`/m/api/files`，GitLab #16 已收紧）**：新调用必须携带 `sessionId`，`path` 为该会话 cwd 内**相对路径**；服务端 `realpath(cwd)` 后做词法包含校验，再 `open(O_RDONLY|O_NOFOLLOW|O_NONBLOCK)` + `fstat` 确认普通文件 + `/proc/self/fd/<fd>` 复核真实路径仍在 cwd 内，读取固定在该句柄。绝对路径、`..`、编码绕过、symlink 逃逸、目录/设备/FIFO 一律拒绝；非 Linux / 无 procfs / 无 `O_NOFOLLOW` 稳定返回 `503 files-unavailable`，不回退为路径读取。
+  - **旧客户端兼容**：不带 `sessionId` 时只接受绝对路径且必须落在**已注册工作区**内（不再允许任意宿主路径）；这是为旧 App 保留的兼容通道，权限仍受已注册工作区约束。
+  - **上传（`/m/api/files/upload`）**：只允许写入 `sessionId` 对应 cwd（缺省首个注册工作区根）并拒绝文件名分隔符/NUL；本次未采用下载侧的 descriptor-relative 句柄保护，属于已知残余边界。
+  - **目录选择器**（`/m/api/directories`）仍保留**任意路径浏览**（新建会话需跨盘选工作目录），不适用工作区包含语义。
+  - **信任边界不变**：已认证用户可以 `POST /sessions {cwd}` 注册新工作目录，因此工作区/会话包含校验不能防御「先注册更大目录」；它降低的是误用/口令泄露后的直接任意文件读取面，不替代宿主 OS 身份、沙箱与可信传输。
 - **第三方推送通道脱敏（v2.6）**：Server酱/ntfy/Bark/generic 等推送默认只收到「事件类型 + 会话短码」（`pushContent: minimal`），会话标题/错误详情等核心内容默认不出本机；仅显式配置 `pushContent: standard` 后外发——第三方服务不可信。
 - **用量与额度投影（v3.1.5）**：`/m/api/account-usage` 只返回成功来源的余额/配额、脱敏 Codex 账户标签和汇总失败数；DeepSeek/OpenCode Go 密钥与 Codex OAuth token 永不进入响应、App 日志或持久化文件。OpenCode Go 只请求固定官方 HTTPS 端点；Codex 启用代理但代理不可用时拒绝直连。服务端只保留 60 秒进程内快照，单来源失败不回退到过期数据。
 - **桌面宠物 overlay 面板脱敏（沿用 ADR 0008）**：桌面宠物是 **`TYPE_APPLICATION_OVERLAY` 系统级浮层**，可能出现在锁屏、他人可见、或覆盖其它应用之上。因此面板的用量与额度区块只展示来源标题、金额文字与配额细条/颜色；**不显示账户身份（displayName/maskedEmail）**、不显示任何聚合或换算数值；配额窗口永不相加。数据仅按需获取（展开面板时，客户端节流）、失败沿用旧值并标注相对时间，不新增后台轮询或持久化。

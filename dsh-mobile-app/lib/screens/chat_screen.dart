@@ -42,6 +42,7 @@ import '../image_gallery.dart';
 import '../git_browser_controller.dart';
 import '../local_notifications.dart';
 import 'git_browser_sheet.dart';
+import 'agent_panel.dart';
 import '../tool_cards.dart';
 import '../tool_images.dart';
 import '../widgets/git_file_viewer.dart';
@@ -466,9 +467,13 @@ class _ConversationActionRailState extends State<_ConversationActionRail> {
         const Icon(Icons.folder_outlined, size: 20),
         L10n.t('文件', 'Files'),
       ),
+      'agents' => (
+        const Icon(Icons.groups_outlined, size: 20),
+        L10n.t('代理', 'Agents'),
+      ),
       'session_tools' => (
         const Icon(Icons.assignment_outlined, size: 20),
-        L10n.t('任务 / 子代理 / 目标', 'Tasks / Subagents / Goals'),
+        L10n.t('任务 / 目标', 'Tasks / Goals'),
       ),
       'copy' => (
         const Icon(Icons.copy_all, size: 20),
@@ -504,6 +509,24 @@ class _WorkspaceImageConsent {
   final DateTime? expiresAt;
 
   bool get expired => expiresAt != null && !DateTime.now().isBefore(expiresAt!);
+}
+
+/// issue #141：子代理会话隐藏「代理」入口时的重排合并。
+///
+/// rail 在子代理会话只渲染可见动作；用户拖动后回调的是**过滤后**的顺序。
+/// 这里把重排结果按原槽位合并回完整顺序，保留被隐藏的 `agents` 位置，
+/// 避免用缺项列表触发 `setConversationActionOrder` 的完整性校验。
+List<String> mergeFilteredConversationOrder(
+  List<String> full,
+  List<String> visibleBefore,
+  List<String> visibleAfter,
+) {
+  final visible = visibleBefore.toSet();
+  final iterator = visibleAfter.iterator;
+  return [
+    for (final id in full)
+      if (visible.contains(id) && iterator.moveNext()) iterator.current else id,
+  ];
 }
 
 class ChatScreen extends StatefulWidget {
@@ -6217,7 +6240,6 @@ class _ChatScreenState extends State<ChatScreen> {
         context,
         widget.store,
         sid,
-        onTitleChanged: widget.onTitleChanged,
         // 与页级动作同一 API 接缝：生产为全局 `api`，测试注入时面板与聊天页共用
         // 同一宿主（issue #128：任务页签的取消入口需要可注入验证）。
         apiClient: widget.apiClient,
@@ -6226,6 +6248,12 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _openConversationActionRail() async {
+    // issue #141：渲染层 gating——子代理会话整项不渲染「代理」（不灰显）。
+    final isSubagent = widget.store.isSubagentSession(_mySessionId);
+    final fullOrder = widget.store.conversationActionOrder;
+    final visibleOrder = isSubagent
+        ? fullOrder.where((id) => id != 'agents').toList(growable: false)
+        : fullOrder;
     final action = await showGeneralDialog<String>(
       context: context,
       barrierDismissible: true,
@@ -6233,9 +6261,14 @@ class _ChatScreenState extends State<ChatScreen> {
       barrierColor: Colors.black54,
       transitionDuration: const Duration(milliseconds: 180),
       pageBuilder: (_, _, _) => _ConversationActionRail(
-        initialOrder: widget.store.conversationActionOrder,
-        onOrderChanged: (order) =>
-            unawaited(widget.store.setConversationActionOrder(order)),
+        initialOrder: visibleOrder,
+        onOrderChanged: (order) => unawaited(
+          widget.store.setConversationActionOrder(
+            isSubagent
+                ? mergeFilteredConversationOrder(fullOrder, visibleOrder, order)
+                : order,
+          ),
+        ),
       ),
       transitionBuilder: (context, animation, secondaryAnimation, child) =>
           SlideTransition(
@@ -6252,6 +6285,19 @@ class _ChatScreenState extends State<ChatScreen> {
         await _openGit();
       case 'files':
         _openSessionFilesFromActionRail();
+      case 'agents':
+        // issue #141：分发层二次 gating——即使持久化顺序残留 agents，
+        // 子代理会话也不能打开代理面板。
+        if (!canOpenAgentPanel(widget.store, _mySessionId)) return;
+        final sid = _mySessionId;
+        if (sid == null) return;
+        await showAgentPanel(
+          context,
+          store: widget.store,
+          sessionId: sid,
+          title: _title ?? L10n.t('会话', 'Session'),
+          apiClient: widget.apiClient,
+        );
       case 'session_tools':
         _openSessionToolsFromActionRail();
       case 'copy':

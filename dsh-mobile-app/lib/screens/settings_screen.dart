@@ -945,8 +945,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     try {
       // 用完整 bootstrap（不是只吸收更新字段）：这样会触发 store 的接续回调，
       // 手机端由本次更新产生的 journal 能在卡片完成时同步推进，而不是等首页刷新。
+      final epoch = store.api.connectionEpoch;
+      final identity = store.api.connectionIdentity;
       final data = await store.api.getJson('/api/bootstrap');
-      store.api.absorbBootstrap(data);
+      store.api.absorbBootstrapIfCurrent(data, epoch: epoch, identity: identity);
     } catch (_) {
       // 宿主重启期间会短暂失败：保留旧状态，等下一次轮询。
     }
@@ -3647,8 +3649,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     // 先把电脑端最新状态与手机端接续记录对齐：否则刚完成插件更新时，
     // 本地 journal 仍停在“未确认”，会把 App 更新挡在门禁外。
     try {
+      final epoch = store.api.connectionEpoch;
+      final identity = store.api.connectionIdentity;
       final data = await store.api.getJson('/api/bootstrap');
-      store.api.absorbBootstrap(data);
+      store.api.absorbBootstrapIfCurrent(data, epoch: epoch, identity: identity);
     } catch (_) {}
     if (store.pluginUpdateJournal != null) {
       try {
@@ -3666,8 +3670,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
       await Future<void>.delayed(const Duration(milliseconds: 500));
       waited++;
       try {
+        final epoch = store.api.connectionEpoch;
+        final identity = store.api.connectionIdentity;
         final data = await store.api.getJson('/api/bootstrap');
-        store.api.absorbBootstrap(data);
+        store.api.absorbBootstrapIfCurrent(data, epoch: epoch, identity: identity);
       } catch (_) {}
     }
     if (!mounted) return;

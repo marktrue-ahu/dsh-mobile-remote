@@ -9,6 +9,8 @@ import 'package:crypto/crypto.dart' as crypto;
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'agent_tree.dart';
+import 'team.dart';
 import 'download.dart';
 import 'logger.dart';
 import 'models.dart';
@@ -287,6 +289,12 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
   /// 预览也不发 Range（由调用方判断）。
   bool fileRangeSupported = false;
 
+  /// GitLab #16：服务端 `/api/files` 是否支持 `sessionId` + 会话 cwd 相对路径。
+  ///
+  /// 旧插件不下发 `capabilities.files.sessionRelative` → false，App 回退旧绝对
+  /// 路径契约（不会把相对路径发进旧实现导致 404/错文件）。
+  bool sessionRelativeFilesSupported = false;
+
   /// issue #53（§6.20）：轮末产出物能力位。旧插件不下发 → 三项皆假，App 隐藏两卡
   /// 与展示模式设置；`changed/changesDiff` 由电脑端按 `workspaceChanges` 服务真实存在判定。
   TurnTailCapabilities turnTailCapabilities = const TurnTailCapabilities();
@@ -352,6 +360,7 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
 
   Future<void> save({required String base, required String token}) async {
     final prefs = await SharedPreferences.getInstance();
+    invalidateConnection();
     baseUrl = _normBase(base);
     path = _pathOf(base);
     await prefs.setString(_kBase, baseUrl);
@@ -413,6 +422,80 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
     ..path = _pathOf(base)
     ..token = token;
 
+  /// 统一应用服务端能力位（bootstrap 与 SSE hello 共用）。
+  ///
+  /// 关键生命周期约束（Reviewer #16 P2）：
+  /// - 能力位只属于**当前连接**；调用方在切换宿主/地址/连接代时必须先
+  ///   [resetCapabilities] 或由新连接的 hello/bootstrap 重新覆盖；
+  /// - 传 null / 字段缺失一律清成 false，不能保留上一个宿主的 true；
+  /// - `files.sessionRelative` 决定 App 是否发送 sessionId + cwd 相对路径，
+  ///   缺失时回退旧绝对路径契约。
+  void applyCapabilities(Object? capabilities) {
+    final c = capabilities is Map ? capabilities : const {};
+    timelineCapabilities = TimelineCapabilities.fromJson(
+      c['eventTimeline'] is Map
+          ? Map<String, dynamic>.from(c['eventTimeline'] as Map)
+          : null,
+    );
+    turnOutlineCapabilities = TurnOutlineCapabilities.fromJson(
+      c['turnOutline'] is Map
+          ? Map<String, dynamic>.from(c['turnOutline'] as Map)
+          : null,
+    );
+    // v3.2.3：普通文件下载是否支持 Range/HEAD/ETag（旧插件不声明 → App 回退整文件）。
+    fileRangeSupported =
+        c['fileRange'] is Map && (c['fileRange'] as Map)['supported'] == true;
+    sessionRelativeFilesSupported =
+        c['files'] is Map && (c['files'] as Map)['sessionRelative'] == true;
+    // issue #53：轮末产出物能力位（旧插件缺失 → available=false，两卡与设置隐藏）。
+    turnTailCapabilities = TurnTailCapabilities.fromJson(
+      c['turnTail'] is Map
+          ? Map<String, dynamic>.from(c['turnTail'] as Map)
+          : null,
+    );
+    // issue #54：工具卡能力位（旧插件缺失 → 全部通用卡）。
+    toolCardsCapabilities = ToolCardsCapabilities.fromJson(
+      c['toolCards'] is Map
+          ? Map<String, dynamic>.from(c['toolCards'] as Map)
+          : null,
+    );
+  }
+
+  /// 连接切换/销毁时清空能力位，避免上一个宿主的 `true` 跨连接残留。
+  void resetCapabilities() => applyCapabilities(null);
+
+  /// 当前连接的单调代号：save/rotate/显式失效都会递增。
+  ///
+  /// bootstrap/hello 的异步回调必须携带请求发起时的代号；迟到的旧响应不得写入
+  /// 当前连接的能力位（Reviewer #16 P2 连接代竞态）。
+  int _connectionEpoch = 0;
+  int get connectionEpoch => _connectionEpoch;
+
+  /// 当前连接身份（地址 + 挂载路径 + 口令）。**只用于比较**，不得写日志/界面。
+  String get connectionIdentity => '$baseUrl\u0000$path\u0000$token';
+
+  /// 连接失效（切地址/关闭 bridge）：递增代号并清空能力位。
+  void invalidateConnection() {
+    _connectionEpoch++;
+    resetCapabilities();
+  }
+
+  /// 只有请求发起时的连接仍是当前连接，才吸收 bootstrap。
+  ///
+  /// 返回 false 表示这次响应已过期：调用方必须跳过 absorb/capability/agent 状态，
+  /// 不得用旧宿主的响应覆盖当前连接。
+  bool absorbBootstrapIfCurrent(
+    Map<String, dynamic> d, {
+    required int epoch,
+    required String identity,
+  }) {
+    if (epoch != _connectionEpoch || identity != connectionIdentity) {
+      return false;
+    }
+    absorbBootstrap(d);
+    return true;
+  }
+
   /// 吸收 bootstrap 响应：合并服务器全部地址 + 记录插件版本（持久化，断线也可见）
   /// + 校正挂载路径（v3.0.0 review：服务端为权威来源）。
   void absorbBootstrap(Map<String, dynamic> d) {
@@ -456,40 +539,7 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
       appVersion: appVersion,
       server: align is Map ? Map<String, dynamic>.from(align) : null,
     );
-    final capabilities = d['capabilities'];
-    timelineCapabilities = capabilities is Map
-        ? TimelineCapabilities.fromJson(
-            capabilities['eventTimeline'] is Map
-                ? Map<String, dynamic>.from(
-                    capabilities['eventTimeline'] as Map,
-                  )
-                : null,
-          )
-        : const TimelineCapabilities();
-    turnOutlineCapabilities = capabilities is Map
-        ? TurnOutlineCapabilities.fromJson(
-            capabilities['turnOutline'] is Map
-                ? Map<String, dynamic>.from(capabilities['turnOutline'] as Map)
-                : null,
-          )
-        : const TurnOutlineCapabilities();
-    // v3.2.3：普通文件下载是否支持 Range/HEAD/ETag（旧插件不声明 → App 回退整文件）。
-    fileRangeSupported =
-        capabilities is Map &&
-        capabilities['fileRange'] is Map &&
-        (capabilities['fileRange'] as Map)['supported'] == true;
-    // issue #53：轮末产出物能力位（旧插件缺失 → available=false，两卡与设置隐藏）。
-    turnTailCapabilities = TurnTailCapabilities.fromJson(
-      capabilities is Map && capabilities['turnTail'] is Map
-          ? Map<String, dynamic>.from(capabilities['turnTail'] as Map)
-          : null,
-    );
-    // issue #54：工具卡能力位（旧插件缺失 → 全部通用卡）。
-    toolCardsCapabilities = ToolCardsCapabilities.fromJson(
-      capabilities is Map && capabilities['toolCards'] is Map
-          ? Map<String, dynamic>.from(capabilities['toolCards'] as Map)
-          : null,
-    );
+    applyCapabilities(d['capabilities']);
     // 正在运行的内容标识 + 插件自更新状态 + 三角色发布快照：接续/门禁/App 安装的依据
     _absorbUpdateFields(d);
     // 统一接续入口：所有吸收 bootstrap 的路径（首连/自动重连/刷新/探测）都走到这里
@@ -543,9 +593,11 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
 
   /// 连接成功后收集电脑全部地址（/api/bootstrap 的 server.urls 含 Tailscale/ZeroTier 等虚拟网段 IP）。
   Future<void> collectUrls() async {
+    final epoch = connectionEpoch;
+    final identity = connectionIdentity;
     try {
       final d = await getJson('/api/bootstrap');
-      absorbBootstrap(d);
+      if (!absorbBootstrapIfCurrent(d, epoch: epoch, identity: identity)) return;
       AppLog.instance.log(
         '地址收集完成：共 ${baseUrls.length} 个 → ${baseUrls.join(' , ')}',
       );
@@ -562,6 +614,7 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
     if (idx < 0) return false;
     final next = baseUrls[(idx + 1) % baseUrls.length];
     if (next == cur) return false;
+    invalidateConnection();
     baseUrl = next;
     // 持久化新活动地址（失败不影响内存态切换）
     unawaited(() async {
@@ -902,14 +955,21 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
   );
 
   /// `/api/files?path=` 的前缀读取入口（保留既有签名/语义）。
+  ///
+  /// [sessionId] 非空时服务端按该会话 cwd 校验相对路径（GitLab #16）；旧调用
+  /// 仍可省略，服务端按已注册工作区做兼容收紧。
   Future<DownloadPrefix> downloadFilePrefix(
     String remotePath,
     int maxBytes, {
+    String? sessionId,
     Duration connectTimeout = const Duration(seconds: 15),
     Duration idleTimeout = const Duration(seconds: 30),
     http.Client? downloadClient,
   }) => _downloadPrefixFrom(
-    _uri('/api/files?path=${Uri.encodeQueryComponent(remotePath)}'),
+    _uri(
+      '/api/files?path=${Uri.encodeQueryComponent(remotePath)}'
+      '${sessionId == null || sessionId.isEmpty ? '' : '&sessionId=${Uri.encodeQueryComponent(sessionId)}'}',
+    ),
     maxBytes,
     connectTimeout: connectTimeout,
     idleTimeout: idleTimeout,
@@ -1510,10 +1570,15 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
 
   /// 子代理列表（按父会话查询，与内核 subagent.list 契约一致）。
   Future<List<Map<String, dynamic>>> subagents(String parentSessionId) async {
+    return (await subagentCatalog(parentSessionId)).rows;
+  }
+
+  /// issue #140/#141：子代理目录 + 树能力标记（catalogDegraded / multiLevelUnavailable）。
+  Future<SubagentCatalog> subagentCatalog(String parentSessionId) async {
     final data = await getJson(
       '/api/subagents?parentSessionId=${Uri.encodeQueryComponent(parentSessionId)}',
     );
-    return (data['subagents'] as List? ?? []).cast<Map<String, dynamic>>();
+    return parseSubagentCatalog(data);
   }
 
   /// 中断子代理（内核契约：parentSessionId + childSessionId + mode=continuable）。
@@ -1525,6 +1590,27 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
       'parentSessionId': parentSessionId,
       'childSessionId': childSessionId,
     });
+  }
+
+  /// issue #142：代理面板「团队」只读摘要 + 开关状态。
+  Future<TeamStatus> team(String sessionId) async {
+    final data = await getJson(
+      '/api/team?sessionId=${Uri.encodeQueryComponent(sessionId)}',
+    );
+    return TeamStatus.fromJson(
+      (data['team'] as Map?)?.cast<String, dynamic>() ?? const {},
+    );
+  }
+
+  /// issue #142：切换团队协作开关（服务端成功后返回最新状态）。
+  Future<TeamStatus> setTeamMode(String sessionId, bool enabled) async {
+    final data = await postJson('/api/team', {
+      'sessionId': sessionId,
+      'enabled': enabled,
+    });
+    return TeamStatus.fromJson(
+      (data['team'] as Map?)?.cast<String, dynamic>() ?? const {},
+    );
   }
 
   /// 当前目标。

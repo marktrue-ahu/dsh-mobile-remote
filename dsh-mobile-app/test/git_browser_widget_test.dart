@@ -703,7 +703,7 @@ void main() {
     await tester.pumpAndSettle();
 
     final git = find.byTooltip('Git');
-    final tools = find.byTooltip('任务 / 子代理 / 目标');
+    final tools = find.byTooltip('任务 / 目标');
     expect(git, findsOneWidget);
     expect(tools, findsOneWidget);
     expect(tester.getTopLeft(git).dy, lessThan(tester.getTopLeft(tools).dy));
@@ -837,6 +837,9 @@ void main() {
     await tester.pumpAndSettle();
     expect(api.previewCalls, 1);
     expect(find.byKey(const Key('git-file-preview')), findsOneWidget);
+    // issue #117：Git 浏览器预览当前只走 diff 模式；按设计 diff 不显示
+    // 自动换行按钮（内容预览入口在轮末/会话文件页）。
+    expect(find.byKey(const Key('git-wrap')), findsNothing);
     expect(find.text('new line'), findsOneWidget);
     expect(find.text('-- source -- marker'), findsOneWidget);
     expect(find.text('++ source ++ marker'), findsOneWidget);

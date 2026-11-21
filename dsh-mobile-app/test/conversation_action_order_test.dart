@@ -19,10 +19,12 @@ void main() {
     expect(store.conversationActionOrder, [
       'git',
       'files',
+      'agents',
       'session_tools',
       'copy',
     ]);
     expect(AppStore.conversationActionIds, contains('files'));
+    expect(AppStore.conversationActionIds, contains('agents'));
   });
 
   test('自定义顺序跨启动持久化', () async {
@@ -31,6 +33,7 @@ void main() {
     await store.setConversationActionOrder([
       'copy',
       'files',
+      'agents',
       'session_tools',
       'git',
     ]);
@@ -41,6 +44,7 @@ void main() {
     expect(restored.conversationActionOrder, [
       'copy',
       'files',
+      'agents',
       'session_tools',
       'git',
     ]);
@@ -58,6 +62,7 @@ void main() {
     expect(store.conversationActionOrder, [
       'git',
       'files',
+      'agents',
       'session_tools',
       'copy',
     ]);
@@ -65,7 +70,7 @@ void main() {
 
   test('未知动作或多/少项都判无效并回退默认', () async {
     for (final raw in [
-      '["git","files","session_tools","unknown"]',
+      '["git","files","agents","session_tools","unknown"]',
       '["git","files"]',
       '["git","files","files","copy"]',
     ]) {
@@ -74,11 +79,13 @@ void main() {
       });
       final store = AppStore();
       await store.loadPrefs();
-      expect(
-        store.conversationActionOrder,
-        ['git', 'files', 'session_tools', 'copy'],
-        reason: '$raw 应回退默认',
-      );
+      expect(store.conversationActionOrder, [
+        'git',
+        'files',
+        'agents',
+        'session_tools',
+        'copy',
+      ], reason: '$raw 应回退默认');
     }
   });
 
@@ -91,7 +98,13 @@ void main() {
       throwsArgumentError,
     );
     await expectLater(
-      store.setConversationActionOrder(['git', 'files', 'session_tools', 'nope']),
+      store.setConversationActionOrder([
+        'git',
+        'files',
+        'agents',
+        'session_tools',
+        'nope',
+      ]),
       throwsArgumentError,
     );
   });
