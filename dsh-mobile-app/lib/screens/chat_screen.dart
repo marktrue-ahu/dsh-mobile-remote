@@ -2350,6 +2350,8 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
               child: _QuestionCard(
                 key: ValueKey<String>('question-sheet:${q.rpcId}'),
+                // issue #125：弹层变体（#120）固定展开，不显示折叠控件。
+                collapsible: false,
                 request: q,
                 onCancel: () {
                   final rpc = q.rpcId;
@@ -6990,6 +6992,7 @@ class _ChatScreenState extends State<ChatScreen> {
                       // 找不到新 id → `_selected[q.id]!` 抛 null-check 异常（整页构建失败）。
                       key: ValueKey<String>(_question!.rpcId),
                       request: _question!,
+                      onLayoutChanged: _onContentLayoutChanged,
                       onCancel: () {
                         // 立即收起卡片（内核 resolved 帧可能因本地状态已清而不再转发）
                         final rpc = _question!.rpcId;
@@ -13953,12 +13956,20 @@ class _QuestionCard extends StatefulWidget {
   final QuestionRequest request;
   final VoidCallback onCancel;
   final Future<void> Function(List<Map<String, dynamic>> answers) onSubmitted;
+
+  /// issue #125：弹层变体（#120 的工具行/通知全屏 sheet）固定展开，不提供折叠控件。
+  final bool collapsible;
+
+  /// issue #125：折叠/展开改变底部控件高度；通知宿主页做一次布局跟随（不抢用户滚动）。
+  final VoidCallback? onLayoutChanged;
   // v3.1.6（app-audit ①5）：支持 key——聊天页按 rpcId 传 ValueKey，换问询时强制新建 State
   const _QuestionCard({
     super.key,
     required this.request,
     required this.onCancel,
     required this.onSubmitted,
+    this.collapsible = true,
+    this.onLayoutChanged,
   });
 
   @override
@@ -13971,6 +13982,18 @@ class _QuestionCardState extends State<_QuestionCard> {
   final Map<String, TextEditingController> _ctrls = {};
   bool _submitting = false;
   String? _hint; // 校验提示
+  // issue #125：默认展开；折叠只切展示，不重建 `_selected/_custom/_ctrls`。
+  bool _collapsed = false;
+
+  @override
+  void didUpdateWidget(covariant _QuestionCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // issue #125：新 rpcId（换问询）/切会话必须复位为展开，不继承上一问的折叠态。
+    if (oldWidget.request.rpcId != widget.request.rpcId ||
+        oldWidget.request.sessionId != widget.request.sessionId) {
+      _collapsed = false;
+    }
+  }
 
   @override
   void initState() {
@@ -14050,156 +14073,308 @@ class _QuestionCardState extends State<_QuestionCard> {
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
+  /// issue #125：折叠只切展示；已选选项、自定义输入与控制器都原样保留。
+  void _toggleCollapsed() {
+    if (!widget.collapsible || _submitting) return;
+    if (!_collapsed) {
+      // 收起时同步收键盘：避免折叠后仍停在输入态，展开时又自动弹键盘。
+      FocusScope.of(context).unfocus();
+    }
+    setState(() => _collapsed = !_collapsed);
+    // 高度变化只通知一次：由聊天页决定是否跟随底部（阅读历史时不抢滚动）。
+    widget.onLayoutChanged?.call();
+  }
+
+  /// issue #125：箭头表达**当前状态**（展开 ⌄ / 收起 ⌃），动作由读屏 label 承载。
+  String get _foldLabel => _collapsed
+      ? L10n.t('已收起，点按展开', 'Collapsed — tap to expand')
+      : L10n.t('已展开，点按收起', 'Expanded — tap to collapse');
+
+  String get _titleText {
+    final header = widget.request.questions.isEmpty
+        ? null
+        : widget.request.questions.first.header?.trim();
+    return header == null || header.isEmpty
+        ? L10n.t('需要你决定', 'Your input needed')
+        : header;
+  }
+
+  String get _firstQuestionSummary {
+    if (widget.request.questions.isEmpty) {
+      return L10n.t('需要你决定', 'Your input needed');
+    }
+    final text = widget.request.questions.first.question.trim();
+    return text.isEmpty ? L10n.t('需要你决定', 'Your input needed') : text;
+  }
+
+  Widget _pendingBadge(Color brand) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+    decoration: BoxDecoration(
+      color: brand.withValues(alpha: 0.12),
+      borderRadius: BorderRadius.circular(6),
+    ),
+    child: Text(
+      L10n.t('待回答', 'Pending'),
+      style: TextStyle(
+        fontSize: 11,
+        fontWeight: FontWeight.w600,
+        color: brand,
+        height: 1.2,
+      ),
+    ),
+  );
+
+  /// issue #125：头部行（≥44 高）。折叠控件与关闭各 44dp 命中；提交中两者都禁用。
+  Widget _buildHeader(BuildContext context) {
     final brand = DshColors.brand(context);
+    final ink3 = DshColors.ink3(context);
+    final rpcId = widget.request.rpcId;
+    final disabled = _submitting;
+    final foldContent = ConstrainedBox(
+      constraints: const BoxConstraints(minHeight: 44),
+      child: Row(
+        children: [
+          Icon(Icons.live_help_outlined, size: 18, color: brand),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              _titleText,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w700,
+                color: brand,
+              ),
+            ),
+          ),
+          const SizedBox(width: 6),
+          _pendingBadge(brand),
+          if (widget.collapsible)
+            SizedBox(
+              width: 44,
+              height: 44,
+              child: Center(
+                // 状态语义：已展开 ⌄ / 已收起 ⌃；不用 ›（chevron_right）。
+                child: Icon(
+                  _collapsed
+                      ? Icons.keyboard_arrow_up
+                      : Icons.keyboard_arrow_down,
+                  size: 22,
+                  color: disabled ? ink3 : brand,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+    return Row(
+      children: [
+        Expanded(
+          child: widget.collapsible
+              ? Semantics(
+                  button: true,
+                  expanded: !_collapsed,
+                  label: _foldLabel,
+                  hint: disabled
+                      ? L10n.t('提交中，暂时不能收起', 'Submitting — cannot collapse')
+                      : null,
+                  child: InkWell(
+                    key: ValueKey<String>('question-fold:$rpcId'),
+                    onTap: disabled ? null : _toggleCollapsed,
+                    borderRadius: BorderRadius.circular(8),
+                    child: foldContent,
+                  ),
+                )
+              : foldContent,
+        ),
+        SizedBox(
+          width: 44,
+          height: 44,
+          child: Semantics(
+            button: true,
+            label: L10n.t('取消问询', 'Cancel question'),
+            child: InkWell(
+              key: ValueKey<String>('question-close:$rpcId'),
+              onTap: disabled ? null : widget.onCancel,
+              borderRadius: BorderRadius.circular(22),
+              child: Center(child: Icon(Icons.close, size: 18, color: ink3)),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// issue #125：折叠态固定结构（标题 + 第一问摘要 + 待回答 + 展开 + 取消），
+  /// 不渲染提交/跳过/选项/输入框，也不做内部滚动。
+  Widget _buildCollapsedContent(BuildContext context) {
+    final ink2 = DshColors.ink2(context);
+    final ink3 = DshColors.ink3(context);
+    final count = widget.request.questions.length;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _buildHeader(context),
+        const SizedBox(height: 4),
+        Row(
+          children: [
+            if (count > 1)
+              Text(
+                '$count ${L10n.t('个问题', 'questions')} · ',
+                style: TextStyle(fontSize: 11.5, color: ink3),
+              ),
+            Expanded(
+              child: Text(
+                _firstQuestionSummary,
+                key: ValueKey<String>(
+                  'question-fold-summary:${widget.request.rpcId}',
+                ),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 12.5, color: ink2, height: 1.3),
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  /// issue #125：展开态保持现有卡片内容与顺序，仅头部换成带折叠控件的版本。
+  Widget _buildExpandedContent(BuildContext context) {
     final ink2 = DshColors.ink2(context);
     final ink3 = DshColors.ink3(context);
     final line = DshColors.line(context);
+    final brand = DshColors.brand(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _buildHeader(context),
+        for (final q in widget.request.questions) ...[
+          if (q.detail != null && q.detail!.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 4, bottom: 2),
+              child: Text(
+                q.detail!,
+                style: TextStyle(fontSize: 11.5, color: ink3, height: 1.4),
+              ),
+            ),
+          Padding(
+            padding: const EdgeInsets.only(top: 6, bottom: 4),
+            child: Text(
+              q.question,
+              style: const TextStyle(
+                fontSize: 14.5,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+          for (final o in q.options)
+            _OptionTile(
+              label: o.label,
+              description: o.description,
+              multi: q.multiSelect,
+              selected: _selected[q.id]!.contains(o.label),
+              onTap: () => _toggle(q, o.label),
+            ),
+          const SizedBox(height: 2),
+          TextField(
+            controller: _ctrls[q.id],
+            onChanged: (v) => _onCustom(q, v),
+            style: const TextStyle(fontSize: 13.5),
+            decoration: InputDecoration(
+              isDense: true,
+              hintText: q.multiSelect
+                  ? L10n.t('补充说明（可选）…', 'Add details (optional)…')
+                  : L10n.t('或输入其他答案…', 'Or type another answer…'),
+              hintStyle: TextStyle(fontSize: 13, color: ink3),
+              filled: true,
+              fillColor: DshColors.surface(context),
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 12,
+                vertical: 9,
+              ),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(10),
+                borderSide: BorderSide(color: line),
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(10),
+                borderSide: BorderSide(color: line),
+              ),
+            ),
+          ),
+        ],
+        if (_hint != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Text(
+              _hint!,
+              style: TextStyle(fontSize: 12, color: DshColors.danger(context)),
+            ),
+          ),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.end,
+          children: [
+            TextButton(
+              onPressed: _submitting ? null : widget.onCancel,
+              child: Text(
+                L10n.t('取消', 'Cancel'),
+                style: TextStyle(fontSize: 13.5, color: ink2),
+              ),
+            ),
+            const SizedBox(width: 4),
+            FilledButton(
+              style: FilledButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 22),
+                backgroundColor: brand,
+              ),
+              onPressed: _submitting ? null : _submit,
+              child: Text(
+                _submitting
+                    ? L10n.t('提交中…', 'Submitting…')
+                    : L10n.t('提交', 'Submit'),
+                style: const TextStyle(fontSize: 13.5),
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final brand = DshColors.brand(context);
     final brandSoft = DshColors.brandSoft(context);
-    final header = widget.request.questions.isEmpty
-        ? null
-        : widget.request.questions.first.header;
     return Container(
       margin: const EdgeInsets.fromLTRB(12, 0, 12, 6),
-      padding: const EdgeInsets.fromLTRB(14, 10, 14, 8),
+      padding: _collapsed
+          ? const EdgeInsets.fromLTRB(12, 10, 12, 10)
+          : const EdgeInsets.fromLTRB(14, 10, 14, 8),
       decoration: BoxDecoration(
         color: brandSoft,
         borderRadius: BorderRadius.circular(14),
         border: Border.all(color: brand.withValues(alpha: 0.55)),
       ),
-      child: ConstrainedBox(
-        // 问询卡片封顶 40% 屏高：问题说明长/选项多时卡片内滚动，不把输入框挤出屏幕
-        constraints: BoxConstraints(
-          maxHeight: MediaQuery.of(context).size.height * 0.4,
-        ),
-        child: SingleChildScrollView(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Row(
-                children: [
-                  Icon(Icons.live_help_outlined, size: 18, color: brand),
-                  const SizedBox(width: 6),
-                  Expanded(
-                    child: Text(
-                      header ?? L10n.t('需要你决定', 'Your input needed'),
-                      style: TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w700,
-                        color: brand,
-                      ),
-                    ),
-                  ),
-                  InkWell(
-                    onTap: _submitting ? null : widget.onCancel,
-                    child: Padding(
-                      padding: const EdgeInsets.all(4),
-                      child: Icon(Icons.close, size: 16, color: ink3),
-                    ),
-                  ),
-                ],
+      child: AnimatedSize(
+        duration: const Duration(milliseconds: 150),
+        curve: Curves.easeOutCubic,
+        alignment: Alignment.topCenter,
+        child: _collapsed
+            ? _buildCollapsedContent(context)
+            : ConstrainedBox(
+                // 问询卡片封顶 40% 屏高：问题说明长/选项多时卡片内滚动，不把输入框挤出屏幕
+                constraints: BoxConstraints(
+                  maxHeight: MediaQuery.sizeOf(context).height * 0.4,
+                ),
+                child: SingleChildScrollView(
+                  child: _buildExpandedContent(context),
+                ),
               ),
-              for (final q in widget.request.questions) ...[
-                if (q.detail != null && q.detail!.isNotEmpty)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 4, bottom: 2),
-                    child: Text(
-                      q.detail!,
-                      style: TextStyle(
-                        fontSize: 11.5,
-                        color: ink3,
-                        height: 1.4,
-                      ),
-                    ),
-                  ),
-                Padding(
-                  padding: const EdgeInsets.only(top: 6, bottom: 4),
-                  child: Text(
-                    q.question,
-                    style: const TextStyle(
-                      fontSize: 14.5,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ),
-                for (final o in q.options)
-                  _OptionTile(
-                    label: o.label,
-                    description: o.description,
-                    multi: q.multiSelect,
-                    selected: _selected[q.id]!.contains(o.label),
-                    onTap: () => _toggle(q, o.label),
-                  ),
-                const SizedBox(height: 2),
-                TextField(
-                  controller: _ctrls[q.id],
-                  onChanged: (v) => _onCustom(q, v),
-                  style: const TextStyle(fontSize: 13.5),
-                  decoration: InputDecoration(
-                    isDense: true,
-                    hintText: q.multiSelect
-                        ? L10n.t('补充说明（可选）…', 'Add details (optional)…')
-                        : L10n.t('或输入其他答案…', 'Or type another answer…'),
-                    hintStyle: TextStyle(fontSize: 13, color: ink3),
-                    filled: true,
-                    fillColor: DshColors.surface(context),
-                    contentPadding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 9,
-                    ),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(10),
-                      borderSide: BorderSide(color: line),
-                    ),
-                    enabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(10),
-                      borderSide: BorderSide(color: line),
-                    ),
-                  ),
-                ),
-              ],
-              if (_hint != null)
-                Padding(
-                  padding: const EdgeInsets.only(top: 6),
-                  child: Text(
-                    _hint!,
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: DshColors.danger(context),
-                    ),
-                  ),
-                ),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.end,
-                children: [
-                  TextButton(
-                    onPressed: _submitting ? null : widget.onCancel,
-                    child: Text(
-                      L10n.t('取消', 'Cancel'),
-                      style: TextStyle(fontSize: 13.5, color: ink2),
-                    ),
-                  ),
-                  const SizedBox(width: 4),
-                  FilledButton(
-                    style: FilledButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(horizontal: 22),
-                      backgroundColor: brand,
-                    ),
-                    onPressed: _submitting ? null : _submit,
-                    child: Text(
-                      _submitting
-                          ? L10n.t('提交中…', 'Submitting…')
-                          : L10n.t('提交', 'Submit'),
-                      style: const TextStyle(fontSize: 13.5),
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
       ),
     );
   }
