@@ -97,6 +97,14 @@ class _Backend {
       interrupts.add(jsonDecode(request.body) as Map<String, dynamic>);
       return _json({'ok': true});
     }
+    if (path == '/m/api/team/tasks') {
+      return _json({
+        'ok': true,
+        'supported': true,
+        'enabled': false,
+        'tasks': <Object>[],
+      });
+    }
     if (path == '/m/api/history') {
       return _json({'ok': true, 'events': <Object>[], 'hasMore': false});
     }
@@ -173,15 +181,23 @@ void main() {
         find.byKey(const ValueKey('agent-team-switch-card')),
         findsOneWidget,
       );
-      for (final key in ['agent-tab-tasks', 'agent-tab-messages']) {
-        await tester.tap(find.byKey(ValueKey<String>(key)));
-        await tester.pumpAndSettle();
-        expect(
-          find.textContaining('将在后续版本并入本面板'),
-          findsOneWidget,
-          reason: '$key 应为说明性占位',
-        );
-      }
+      // #143：任务板已接真实只读端点；团队未启用时显示启用引导，不再是占位。
+      await tester.tap(find.byKey(const ValueKey<String>('agent-tab-tasks')));
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('agent-tasks-disabled')),
+        findsOneWidget,
+      );
+      // issue #144：消息页签已接入真实消息索引；本夹具未注入 loader → 明确降级说明。
+      await tester.tap(
+        find.byKey(const ValueKey<String>('agent-tab-messages')),
+      );
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('message-index-unsupported')),
+        findsOneWidget,
+        reason: '消息页签不再使用说明性占位',
+      );
       expect(tester.takeException(), isNull);
     });
 
