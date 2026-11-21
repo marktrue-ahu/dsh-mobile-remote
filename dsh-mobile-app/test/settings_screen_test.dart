@@ -54,6 +54,27 @@ void main() {
       .map((tile) => (tile.title! as Text).data)
       .toList();
 
+  testWidgets('issue #145：设置页有只读插件管理入口', (tester) async {
+    final store = await makeStore();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SettingsScreen(store: store, onReconfigure: () async {}),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final scrollable = find.byType(Scrollable).first;
+    await tester.scrollUntilVisible(
+      find.text('插件管理'),
+      320,
+      scrollable: scrollable,
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('插件管理'), findsOneWidget);
+    expect(find.textContaining('当前电脑的插件清单、版本与健康（只读）'), findsOneWidget);
+    expect(find.text('查看 ▸'), findsWidgets);
+  });
 
   testWidgets('notification permission recovery opens system settings', (
     tester,

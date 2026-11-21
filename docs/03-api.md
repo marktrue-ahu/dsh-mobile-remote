@@ -1469,3 +1469,36 @@ POST 请求体：`{"sessionId","repositoryId","tips":[...],"limit"?,"snapshotId"
 - **图库增强（issue #69）**：附图全屏查看器、多图分页、尺寸/名称/mediaType 元数据、保存/分享、失败重试；仍使用既有 `images[]` 元数据与 `/m/api/attachment`，服务端契约不变。
 - **实时思维链（issue #70）**：`assistant/chunk` 的 reasoning delta 仅由 App 生成 provisional 过程行并在落定后去重；无新字段/端点。
 - **diff 视图收尾（issue #71）**：整块横向滚动、固定行号列、大 diff 懒构建；`/changes/diff` 契约不变。
+
+### 6.25 GET /m/api/plugin-inventory（当前宿主插件清单/健康，v3.3，issue #145）
+
+只读：返回当前连接宿主的已安装 bundle 清单。事实来自宿主 `pluginManager.listBundles()`（版本/来源/启停/错误）与 `pluginInventory.list()`（运行期 fiber 相位）；App 不自行推断启用/健康/兼容。
+
+```json
+{
+  "ok": true,
+  "supported": true,
+  "complete": true,
+  "degraded": false,
+  "reason": "",
+  "host": { "id": "<宿主稳定身份>", "pluginVersion": "3.3.0" },
+  "plugins": [{
+    "id": "@scope/pkg", "name": "@scope/pkg", "title": { "zh": "显示名", "en": "Display" },
+    "description": null, "packageName": "@scope/pkg", "version": "1.2.3",
+    "source": { "kind": "builtin|local|git|registry|entry|unknown", "label": "内置|本地|Git|配置渠道|配置条目|未知" },
+    "enabled": true, "current": true, "independent": false,
+    "health": { "state": "ok|starting|disabled|failed|unknown", "reasonCode": "runtime-starting|runtime-unknown|runtime-start-failed|…" },
+    "compatibility": { "ok": null, "state": "ok|incompatible|unknown", "requirements": "engines.dsh: >=0.3.0" },
+    "updateAvailable": null,
+    "management": { "readOnly": true }
+  }]
+}
+```
+
+- **清单完整性**：`supported=true` 仅当宿主 `pluginManager.listBundles()` 与 `pluginInventory.list()` **两侧都成功且返回合法形状**（bundle 为数组、snapshot 非 null 且 `entries` 为数组）；`complete` 同义。任一侧缺失/抛错/**malformed**（null、对象、缺 `entries`、非数组）时 `supported=false`、`degraded=true`、`reason` 为 `host-plugin-manager-unavailable|malformed`、`runtime-inventory-unavailable|malformed` 或 `entry-identity-missing`，仍可返回另一侧的部分行，但**不冒充完整清单**。旧插件没有该路由时 App 按 404 整页降级。
+- **bundle 与独立 plugin entry**：bundle 行来自 profile/安装的 bundle 包清单；独立配置/非 bundle-owned 的 plugin entry 来自运行期 snapshot，**按精确 `entryId` 去重**后合并（同 module 的不同 entryId 不合并），`independent=true`、`source.kind="entry"`、无版本。没有可靠 `entryId` 的 entry 无法安全去重：跳过并把清单标为 partial（`entry-identity-missing`）。
+- **启用与健康分离**：`enabled` 保留宿主配置启用事实（即使有兼容/加载错误也不改写为停用）；健康/兼容错误由 `health`/`compatibility` 单独表达。`ok` 仅在**所有 bundle rows 都匹配且 fiberPhase 全为 active**（或独立 entry active）时给出。缺失运行期服务/抛错/空 entries/无匹配（`runtime-unknown`）、`pending|loading|unloading`（`starting`）、`failed`（`failed`）都不得冒充健康。不返回 `diagnostic` 原文。
+- **兼容事实**：只有宿主明确报告 `incompatible-version` 才是 `state:"incompatible"`（`ok:false`，`requirements` ≤4 项）；其余无判定信息一律 `state:"unknown"`、`ok:null`，不得 `ok:true`。
+- **来源本地化**：服务端 `label` 是中文兜底；App 对已知 `kind` 按当前语言映射，未知 kind 才回退 `label`。
+- `current=true` 表示该插件是当前手机连接所依赖的插件；不提供任何安装/升级/卸载/启停/重启字段或方法。
+- `updateAvailable` 固定 `null`：更新候选检查属于 #146/#147，本端点不触网检查 registry。

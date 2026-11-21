@@ -13,6 +13,7 @@ import 'agent_tree.dart';
 import 'download.dart';
 import 'logger.dart';
 import 'models.dart';
+import 'plugin_inventory.dart';
 import 'turn_tail.dart';
 import 'git_models.dart';
 import 'turn_outline.dart';
@@ -1347,6 +1348,23 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
   }) => getJson(
     '/api/plugin-update/log?opId=${Uri.encodeQueryComponent(opId)}&afterSeq=$afterSeq',
   );
+
+  /// issue #145：当前宿主插件清单/健康（只读）。旧插件没有该端点 → unsupported 降级。
+  Future<PluginInventory> pluginInventory() async {
+    try {
+      final data = await getJson(
+        '/api/plugin-inventory',
+        timeout: const Duration(seconds: 8),
+      );
+      return PluginInventory.fromJson(data);
+    } on ApiException catch (e) {
+      // 旧宿主插件没有该路由（404）或方法不被接受（405）：明确降级，不当网络失败。
+      if (e.status == 404 || e.status == 405) {
+        return PluginInventory.unsupported('endpoint-missing');
+      }
+      rethrow;
+    }
+  }
 
   /// Trigger desktop plugin update. Retries retain [opId] and optional prepare proof.
   Future<Map<String, dynamic>> triggerPluginUpdate({
