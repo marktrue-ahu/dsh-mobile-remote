@@ -1,5 +1,20 @@
 # Changelog
 
+## v3.3.0-rc.1（build 62，issues #105/#107/#117/#125/#136/#138/#156）— 3.3.0 发布候选
+
+> 插件 `3.3.0-rc.1` / App `3.3.0+62` / 载体 `3.3.0-rc.1-app`。
+
+### 相对 alpha.1 的修复
+
+- **#156 / alpha 验收 D1**：`/plugin-inventory` 的 `host.restartSupported` 始终下发 bool；App 在 `restartRequired` 时只在宿主支持时渲染「重启电脑端」，不支持时明确提示在电脑端重启。契约测试覆盖 unsupported=false / systemd=true，Widget 覆盖渲染/隐藏。
+- alpha 真机验收：A（代理面板）、C（四项功能）、E（320/深色/1.5x）通过；D（旧宿主/旧插件降级）用户实机通过；B3 重启按钮在 #156 修复后由 rc 补验。
+- 功能范围与 alpha.1 相同：#105/105a/105b、#107、#117、#125、#136、#138，详见下一条 alpha.1 条目。
+
+### 已知未验证 / 风险
+
+- B3 重启按钮真实 `restart-required` 路径需 rc 真机补验；真实 systemd/前台 respawn/容器逐形态未测。
+- #150 脱底空白、#151 手机提问卡偶发缺失仍独立跟踪；#137 上游 PR #98 仍 OPEN，等待 merge。
+
 ## v3.3.0-alpha.1（build 61，issues #105/#107/#117/#125/#136/#138）— 3.3.0 功能候选
 
 > 插件 `3.3.0-alpha.1` / App `3.3.0+61` / 载体 `3.3.0-alpha.1-app`。
