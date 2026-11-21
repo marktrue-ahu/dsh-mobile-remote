@@ -49,7 +49,7 @@ void main() async {
   AppLog.instance.log('main: 启动，baseUrl=${api.baseUrl.isNotEmpty ? "已配置" : "空"}');
   // 全局错误边界：build/布局异常不再白屏或静默闪退，直接显示错误文本（调试用）
   ErrorWidget.builder = (details) {
-    AppLog.instance.log('build 异常: ${details.exceptionAsString()}');
+    AppLog.instance.error('build 异常: ${details.exceptionAsString()}');
     return Material(
       color: const Color(0xFF0E1116),
       child: Center(

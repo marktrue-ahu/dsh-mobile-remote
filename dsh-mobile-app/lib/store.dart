@@ -1527,7 +1527,7 @@ class AppStore extends ChangeNotifier {
       AppLog.instance.log('通知：进入会话 $sessionId，标记 ${ids.length} 条已读');
       await refreshNotifs(notify: false);
     } catch (e) {
-      AppLog.instance.log('通知：标记会话已读失败（$e）');
+      AppLog.instance.warn('通知：标记会话已读失败（$e）');
     }
   }
 
@@ -2273,7 +2273,7 @@ class AppStore extends ChangeNotifier {
       if (!current()) return false;
       // 连接不通：尝试轮换到下一个候选地址（黑洞快速切换）再探测一次
       if (api.rotateBaseUrl()) {
-        AppLog.instance.log('刷新探测失败 → 切换地址 ${api.baseUrl}');
+        AppLog.instance.warn('刷新探测失败 → 切换地址 ${api.baseUrl}');
         final retryEpoch = api.connectionEpoch;
         final retryIdentity = api.connectionIdentity;
         try {
@@ -2656,7 +2656,7 @@ class AppStore extends ChangeNotifier {
         );
         if (notify) notifyListeners();
       } catch (e) {
-        AppLog.instance.log('Sessions: 拉取失败 $e');
+        AppLog.instance.warn('Sessions: 拉取失败 $e');
       }
     } finally {
       // 收尾必须区分**三种**情形（第三轮评审核定）：
@@ -2793,7 +2793,7 @@ class AppStore extends ChangeNotifier {
       if (_sub == null || _connecting) return;
       final stale = DateTime.now().difference(_lastLiveness).inSeconds > 45;
       if (stale) {
-        AppLog.instance.log(
+        AppLog.instance.warn(
           'SSE: 心跳超时（${DateTime.now().difference(_lastLiveness).inSeconds}s），强制重建连接',
         );
         // issue #133：静默断链同样是连接代失效——清掉旧子代理运行数据。
@@ -2831,12 +2831,12 @@ class AppStore extends ChangeNotifier {
       },
       onError: (e) {
         if (!current()) return;
-        AppLog.instance.log('SSE: error $e');
+        AppLog.instance.warn('SSE: error $e');
         if ('$e'.contains('SSE HTTP 503')) _sseBusy = true;
         // 超时 = 黑洞地址（路由不可达，如手机关了组网 VPN）→ 立即轮换候选地址，
         // 不再白等 3×15 秒的重试循环（连接被拒/中断等瞬时错误仍走正常退避）
         if (e is TimeoutException && api.rotateBaseUrl()) {
-          AppLog.instance.log('SSE: 超时视为黑洞 → 立即切换 ${api.baseUrl}');
+          AppLog.instance.warn('SSE: 超时视为黑洞 → 立即切换 ${api.baseUrl}');
           _retry = 0;
         }
         _scheduleReconnect();
@@ -2883,7 +2883,7 @@ class AppStore extends ChangeNotifier {
       // 永远卡在"显示已连接但实际离线"，只能划掉 App 重开。
       final stale = DateTime.now().difference(_lastLiveness).inSeconds > 45;
       if (_sub != null && stale) {
-        AppLog.instance.log(
+        AppLog.instance.warn(
           'SSE: 前台恢复发现旧流已死（${DateTime.now().difference(_lastLiveness).inSeconds}s 无心跳），重建连接',
         );
         _sub!.cancel();
@@ -3234,7 +3234,7 @@ class AppStore extends ChangeNotifier {
           evType != 'assistant/live-chunk' &&
           evType != 'tool/call' &&
           evType != 'tool/result') {
-        AppLog.instance.log(
+        AppLog.instance.debug(
           'SSE: session/event $evType from=$fsid 当前=${sessionId ?? "无"}',
         );
       }
@@ -3353,7 +3353,7 @@ class AppStore extends ChangeNotifier {
       final delay = Duration(seconds: _retry >= 6 ? 10 : 5);
       _retry = _retry >= 6 ? 6 : _retry + 1;
       // 真机诊断（issue #131）：把"被 503 拒绝"与"普通断线重连"在日志里分开。
-      AppLog.instance.log(
+      AppLog.instance.warn(
         'SSE: 服务端连接满（503），${delay.inSeconds}s 后重试（第 $_retry 次退避）',
       );
       _retryTimer = Timer(delay, connect);

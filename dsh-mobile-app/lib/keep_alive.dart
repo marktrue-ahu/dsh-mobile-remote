@@ -128,7 +128,7 @@ class BackgroundKeepAlive {
       if (!ok) {
         _running = false;
         _lastError = err.isEmpty ? 'unknown' : err;
-        AppLog.instance.log('保活：启动失败（$_lastError）');
+        AppLog.instance.warn('保活：启动失败（$_lastError）');
         return false;
       }
       // 原生 ok 只代表 startForegroundService 没抛异常（组件缺失时它也不抛）。
@@ -141,7 +141,7 @@ class BackgroundKeepAlive {
       return real;
     } on PlatformException catch (e) {
       _lastError = '${e.code}: ${e.message}';
-      AppLog.instance.log('保活：启动异常（$_lastError）');
+      AppLog.instance.warn('保活：启动异常（$_lastError）');
       return false;
     }
   }
@@ -151,7 +151,7 @@ class BackgroundKeepAlive {
       // 原生 stop 返回 Map{ok,error}：不要按 bool 解析（真机日志出现过类型错误）。
       await _channel.invokeMethod<Map>('stop');
     } catch (e) {
-      AppLog.instance.log('保活：停止异常（$e）');
+      AppLog.instance.warn('保活：停止异常（$e）');
     }
     _running = false;
   }
