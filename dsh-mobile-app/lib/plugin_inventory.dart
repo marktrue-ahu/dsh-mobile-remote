@@ -121,6 +121,9 @@ class PluginInfo {
   final PluginCompatibility compatibility;
   final String updateKind;
   final bool canUpdate;
+  final bool canUninstall;
+  final bool canToggle;
+  final String toggleReasonCode;
 
   const PluginInfo({
     required this.id,
@@ -135,6 +138,9 @@ class PluginInfo {
     this.compatibility = const PluginCompatibility(),
     this.updateKind = '',
     this.canUpdate = false,
+    this.canUninstall = false,
+    this.canToggle = false,
+    this.toggleReasonCode = '',
   });
 
   factory PluginInfo.fromJson(Object? json) {
@@ -154,6 +160,13 @@ class PluginInfo {
       compatibility: PluginCompatibility.fromJson(json['compatibility']),
       updateKind: (json['updateKind'] as String?)?.trim() ?? '',
       canUpdate: (json['management'] as Map?)?['canUpdate'] == true,
+      canUninstall: (json['management'] as Map?)?['canUninstall'] == true,
+      canToggle: (json['management'] as Map?)?['canToggle'] == true,
+      toggleReasonCode:
+          (json['management'] as Map?)?['toggleReasonCode']
+              ?.toString()
+              .trim() ??
+          '',
     );
   }
 
@@ -174,13 +187,19 @@ class PluginInfo {
 class PluginInventoryHost {
   final String id;
   final String pluginVersion;
-  const PluginInventoryHost({this.id = '', this.pluginVersion = ''});
+  final bool restartSupported;
+  const PluginInventoryHost({
+    this.id = '',
+    this.pluginVersion = '',
+    this.restartSupported = false,
+  });
 
   factory PluginInventoryHost.fromJson(Object? json) {
     if (json is! Map) return const PluginInventoryHost();
     return PluginInventoryHost(
       id: (json['id'] as String?)?.trim() ?? '',
       pluginVersion: (json['pluginVersion'] as String?)?.trim() ?? '',
+      restartSupported: json['restartSupported'] == true,
     );
   }
 

@@ -18,6 +18,9 @@ class PluginInventoryActions {
   final Future<PluginVersionCheck> Function(String name) checkVersions;
   final Future<PluginOperation> Function(String name) install;
   final Future<PluginOperation> Function(String name, String version) upgrade;
+  final Future<PluginOperation> Function(String name) uninstall;
+  final Future<PluginOperation> Function(String name, bool enabled) toggle;
+  final Future<String> Function() restartHost;
   final Future<PluginOperation> Function(String opId) poll;
   final Future<String> Function(String opId) cancel;
 
@@ -25,6 +28,9 @@ class PluginInventoryActions {
     required this.checkVersions,
     required this.install,
     required this.upgrade,
+    required this.uninstall,
+    required this.toggle,
+    required this.restartHost,
     required this.poll,
     required this.cancel,
   });
@@ -33,6 +39,9 @@ class PluginInventoryActions {
     checkVersions: api.pluginVersions,
     install: api.pluginInstall,
     upgrade: api.pluginUpgrade,
+    uninstall: api.pluginUninstall,
+    toggle: api.pluginToggle,
+    restartHost: api.pluginRestartHost,
     poll: api.pluginOperation,
     cancel: api.pluginCancelOperation,
   );
@@ -76,6 +85,23 @@ String pluginOperationErrorText(String code) {
       '读取插件清单失败',
       'Could not read the plugin list',
     ),
+    'management-required' => L10n.t(
+      '插件管理所需，不能停用或卸载',
+      'Required for plugin management; cannot be disabled or removed',
+    ),
+    'not-removable' || 'plugin-not-removable' => L10n.t(
+      '当前插件不可卸载',
+      'This plugin cannot be removed',
+    ),
+    'unaddressable' => L10n.t(
+      '当前插件无法通过配置管理',
+      'This plugin cannot be managed here',
+    ),
+    'stop-profile' => L10n.t(
+      '需要先停止 profile',
+      'The profile must be stopped first',
+    ),
+    'bundle-in-use' => L10n.t('插件正在使用中', 'The plugin is in use'),
     'plugin-install-failed' ||
     'plugin-update-failed' => L10n.t('操作失败', 'Operation failed'),
     _ => key.isEmpty ? L10n.t('操作失败', 'Operation failed') : key,
@@ -108,6 +134,8 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
   Timer? _operationTimer;
   String? _actionError;
   bool _cancelPending = false;
+  bool _restartPending = false;
+  String? _restartError;
 
   PluginInventoryActions get _actions =>
       widget.actions ?? PluginInventoryActions.fromApi(widget.store.api);
@@ -249,6 +277,87 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
     await _runAction(() => _actions.upgrade(plugin.name, version.version));
   }
 
+  Future<void> _startUninstall(PluginInfo plugin) async {
+    final current = plugin.current;
+    final ok = await _confirm(
+      title: L10n.t(
+        '卸载「${plugin.displayName}」？',
+        'Remove “${plugin.displayName}”?',
+      ),
+      body: current
+          ? L10n.t(
+              '这是当前手机连接所依赖的插件：卸载后手机将无法再连接此电脑，除非重新安装。\n'
+                  '卸载由宿主事务执行；若失败请刷新清单核对是否留下半卸载。',
+              'This is the plugin this phone connects through: removing it disconnects the phone until it is installed again.\n'
+                  'The host performs the removal; if it fails, refresh to check for a partial removal.',
+            )
+          : L10n.t(
+              '卸载后该插件提供的功能会消失；宿主事务失败时请刷新清单核对。',
+              'The plugin\'s features disappear after removal; if the host transaction fails, refresh to verify.',
+            ),
+      confirmLabel: L10n.t('卸载', 'Remove'),
+    );
+    if (!ok) return;
+    await _runAction(() => _actions.uninstall(plugin.name));
+  }
+
+  Future<void> _startToggle(PluginInfo plugin, bool enabled) async {
+    if (!plugin.canToggle) return;
+    if (plugin.current) {
+      final ok = await _confirm(
+        title: enabled
+            ? L10n.t('启用当前连接插件？', 'Enable the current-connection plugin?')
+            : L10n.t('停用当前连接插件？', 'Disable the current-connection plugin?'),
+        body: L10n.t(
+          '该插件是当前手机连接所依赖的插件：停用后手机将断开，直到重新启用或重启电脑端。',
+          'This plugin carries the current phone connection: disabling it disconnects the phone until it is enabled again or the desktop restarts.',
+        ),
+        confirmLabel: enabled
+            ? L10n.t('启用', 'Enable')
+            : L10n.t('停用', 'Disable'),
+      );
+      if (!ok) return;
+    }
+    await _runAction(() => _actions.toggle(plugin.name, enabled));
+  }
+
+  Future<void> _restartHost() async {
+    final ok = await _confirm(
+      title: L10n.t('重启电脑端宿主？', 'Restart the desktop host?'),
+      body: L10n.t(
+        '重启期间手机将断开连接；页面会自动重连并刷新插件状态。',
+        'The phone disconnects during the restart; the page reconnects and refreshes plugin state afterwards.',
+      ),
+      confirmLabel: L10n.t('重启', 'Restart'),
+    );
+    if (!ok) return;
+    setState(() {
+      _restartPending = true;
+      _restartError = null;
+    });
+    try {
+      final mode = await _actions.restartHost();
+      if (!mounted) return;
+      setState(() => _restartPending = false);
+      // 重启已受理：SSE/连接看门狗会处理重连；这里只给明确反馈，不轮询进程。
+      setState(
+        () => _actionError = mode.isEmpty
+            ? null
+            : L10n.t(
+                '正在重启电脑端（$mode），等待自动重连…',
+                'Restarting the desktop ($mode); waiting to reconnect…',
+              ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      final code = e is ApiException ? (e.code ?? '') : '';
+      setState(() {
+        _restartPending = false;
+        _restartError = pluginOperationErrorText(code);
+      });
+    }
+  }
+
   Future<void> _runAction(Future<PluginOperation> Function() action) async {
     setState(() => _actionError = null);
     try {
@@ -345,10 +454,17 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
               operation: _operation!,
               cancelPending: _cancelPending,
               onCancel: _cancelOperation,
+              canCancel:
+                  _operation!.action == 'install' ||
+                  _operation!.action == 'update',
             ),
           if (_operation != null && !_operation!.running)
             _OperationResultBanner(
               operation: _operation!,
+              restartSupported:
+                  inventory.host.restartSupported && !_restartPending,
+              onRestart: _restartHost,
+              restartError: _restartError,
               onDismiss: () => setState(() => _operation = null),
             ),
           if (_actionError != null)
@@ -391,6 +507,8 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
                 plugin: plugin,
                 actions: _actions,
                 onUpgrade: _startUpgrade,
+                onToggle: _startToggle,
+                onUninstall: _startUninstall,
               ),
           ],
           if (inventory.installable.isNotEmpty) ...[
@@ -446,15 +564,16 @@ class _OperationBanner extends StatelessWidget {
   final PluginOperation operation;
   final bool cancelPending;
   final VoidCallback onCancel;
+  final bool canCancel;
   const _OperationBanner({
     required this.operation,
     required this.cancelPending,
     required this.onCancel,
+    required this.canCancel,
   });
 
   @override
   Widget build(BuildContext context) {
-    final updating = operation.action == 'update';
     return Container(
       margin: const EdgeInsets.only(top: 10),
       padding: const EdgeInsets.fromLTRB(12, 10, 10, 10),
@@ -476,25 +595,41 @@ class _OperationBanner extends StatelessWidget {
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  updating
-                      ? L10n.t(
-                          '正在升级 ${operation.name}…',
-                          'Updating ${operation.name}…',
-                        )
-                      : L10n.t(
-                          '正在安装 ${operation.name}…',
-                          'Installing ${operation.name}…',
-                        ),
+                  switch (operation.action) {
+                    'update' => L10n.t(
+                      '正在升级 ${operation.name}…',
+                      'Updating ${operation.name}…',
+                    ),
+                    'uninstall' => L10n.t(
+                      '正在卸载 ${operation.name}…',
+                      'Removing ${operation.name}…',
+                    ),
+                    'toggle' =>
+                      operation.targetVersion == 'on'
+                          ? L10n.t(
+                              '正在启用 ${operation.name}…',
+                              'Enabling ${operation.name}…',
+                            )
+                          : L10n.t(
+                              '正在停用 ${operation.name}…',
+                              'Disabling ${operation.name}…',
+                            ),
+                    _ => L10n.t(
+                      '正在安装 ${operation.name}…',
+                      'Installing ${operation.name}…',
+                    ),
+                  },
                   style: const TextStyle(
                     fontSize: 13,
                     fontWeight: FontWeight.w600,
                   ),
                 ),
               ),
-              TextButton(
-                onPressed: cancelPending ? null : onCancel,
-                child: Text(L10n.t('取消', 'Cancel')),
-              ),
+              if (canCancel)
+                TextButton(
+                  onPressed: cancelPending ? null : onCancel,
+                  child: Text(L10n.t('取消', 'Cancel')),
+                ),
             ],
           ),
           Wrap(
@@ -546,9 +681,15 @@ class _OperationStepChip extends StatelessWidget {
 
 class _OperationResultBanner extends StatelessWidget {
   final PluginOperation operation;
+  final bool restartSupported;
+  final VoidCallback onRestart;
+  final String? restartError;
   final VoidCallback onDismiss;
   const _OperationResultBanner({
     required this.operation,
+    required this.restartSupported,
+    required this.onRestart,
+    required this.restartError,
     required this.onDismiss,
   });
 
@@ -558,9 +699,18 @@ class _OperationResultBanner extends StatelessWidget {
     }
     if (operation.succeeded) {
       final version = operation.version.isEmpty ? '' : ' v${operation.version}';
-      final base = operation.action == 'update'
-          ? L10n.t('升级完成$version', 'Updated$version')
-          : L10n.t('安装完成$version', 'Installed$version');
+      final base = switch (operation.action) {
+        'update' => L10n.t('升级完成$version', 'Updated$version'),
+        'uninstall' => L10n.t(
+          '已卸载 ${operation.name}',
+          'Removed ${operation.name}',
+        ),
+        'toggle' =>
+          operation.targetVersion == 'on'
+              ? L10n.t('已启用 ${operation.name}', 'Enabled ${operation.name}')
+              : L10n.t('已停用 ${operation.name}', 'Disabled ${operation.name}'),
+        _ => L10n.t('安装完成$version', 'Installed$version'),
+      };
       return operation.restartRequired
           ? L10n.t(
               '$base，需要重启电脑端宿主后生效（请在电脑端重启 DSH）',
@@ -569,10 +719,15 @@ class _OperationResultBanner extends StatelessWidget {
           : base;
     }
     if (operation.outcomeUnknown) {
-      return L10n.t(
-        '操作失败，结果未知；请刷新清单核对，必要时在电脑端检查',
-        'Operation failed with an unknown outcome; refresh and verify on the desktop',
-      );
+      return operation.action == 'uninstall'
+          ? L10n.t(
+              '卸载失败，是否留下半卸载未知；请刷新清单核对，必要时在电脑端检查',
+              'Removal failed; a partial removal cannot be ruled out. Refresh and verify on the desktop.',
+            )
+          : L10n.t(
+              '操作失败，结果未知；请刷新清单核对，必要时在电脑端检查',
+              'Operation failed with an unknown outcome; refresh and verify on the desktop',
+            );
     }
     if (operation.rollbackFailed) {
       return L10n.t(
@@ -592,10 +747,12 @@ class _OperationResultBanner extends StatelessWidget {
             );
     }
     if (operation.unchanged) {
-      return L10n.t(
-        '升级失败，旧版本未变更',
-        'Update failed; the previous version is unchanged',
-      );
+      return operation.action == 'toggle'
+          ? L10n.t('启停失败，插件状态未变更', 'Toggle failed; plugin state is unchanged')
+          : L10n.t(
+              '升级失败，旧版本未变更',
+              'Update failed; the previous version is unchanged',
+            );
     }
     return L10n.t(
       '操作失败${operation.errorCode.isEmpty ? '' : '（${operation.errorCode}）'}',
@@ -632,13 +789,34 @@ class _OperationResultBanner extends StatelessWidget {
           ),
           const SizedBox(width: 8),
           Expanded(
-            child: Text(
-              _message(),
-              style: TextStyle(
-                fontSize: 12,
-                height: 1.4,
-                color: DshColors.ink2(context),
-              ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  _message(),
+                  style: TextStyle(
+                    fontSize: 12,
+                    height: 1.4,
+                    color: DshColors.ink2(context),
+                  ),
+                ),
+                if (operation.restartRequired && restartSupported)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: OutlinedButton(
+                      onPressed: onRestart,
+                      child: Text(L10n.t('重启电脑端', 'Restart desktop')),
+                    ),
+                  ),
+                if (restartError != null)
+                  Text(
+                    restartError!,
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      color: DshColors.danger(context),
+                    ),
+                  ),
+              ],
             ),
           ),
           IconButton(
@@ -726,15 +904,48 @@ class _InstallableRow extends StatelessWidget {
   }
 }
 
+String pluginManagementReasonText(String code) {
+  return switch (code.trim()) {
+    '' || 'management-required' => L10n.t(
+      '插件管理所需，不能停用或卸载',
+      'Required for plugin management; cannot be disabled or removed',
+    ),
+    'not-removable' => L10n.t('当前插件不可卸载', 'This plugin cannot be removed'),
+    'unaddressable' => L10n.t(
+      '当前插件无法通过配置管理',
+      'This plugin cannot be managed here',
+    ),
+    'entry-managed-desktop' => L10n.t(
+      '独立配置条目请在电脑端管理',
+      'Manage this standalone entry on the desktop',
+    ),
+    'permission' => L10n.t('没有写入权限', 'No write permission'),
+    'stop-profile' => L10n.t(
+      '需要先停止 profile',
+      'The profile must be stopped first',
+    ),
+    'bundle-in-use' => L10n.t('插件正在使用中', 'The plugin is in use'),
+    'stale-approval' => L10n.t('安装脚本授权已过期', 'Install approval has expired'),
+    _ =>
+      code.trim().isEmpty
+          ? L10n.t('当前电脑端不支持该操作', 'This desktop does not support the operation')
+          : code.trim(),
+  };
+}
+
 class _PluginDetailSheet extends StatefulWidget {
   final PluginInfo plugin;
   final PluginInventoryActions actions;
   final Future<void> Function(PluginInfo plugin, PluginVersionInfo version)
   onUpgrade;
+  final Future<void> Function(PluginInfo plugin, bool enabled) onToggle;
+  final Future<void> Function(PluginInfo plugin) onUninstall;
   const _PluginDetailSheet({
     required this.plugin,
     required this.actions,
     required this.onUpgrade,
+    required this.onToggle,
+    required this.onUninstall,
   });
 
   @override
@@ -826,6 +1037,74 @@ class _PluginDetailSheetState extends State<_PluginDetailSheet> {
             L10n.t('当前连接', 'Current connection'),
             L10n.t('是', 'Yes'),
           ),
+        const Divider(height: 18),
+        Row(
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    plugin.enabled
+                        ? L10n.t('已启用', 'Enabled')
+                        : L10n.t('已停用', 'Disabled'),
+                    style: const TextStyle(
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    plugin.canToggle
+                        ? L10n.t(
+                            '切换后由宿主事务生效',
+                            'The host transaction applies the change',
+                          )
+                        : pluginManagementReasonText(plugin.toggleReasonCode),
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      color: plugin.canToggle
+                          ? DshColors.ink3(context)
+                          : DshColors.ink2(context),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            plugin.canToggle
+                ? Semantics(
+                    container: true,
+                    toggled: plugin.enabled,
+                    label: plugin.enabled
+                        ? L10n.t(
+                            '已启用 ${plugin.displayName}',
+                            'Enabled ${plugin.displayName}',
+                          )
+                        : L10n.t(
+                            '已停用 ${plugin.displayName}',
+                            'Disabled ${plugin.displayName}',
+                          ),
+                    child: ExcludeSemantics(
+                      child: DshSwitch(
+                        value: plugin.enabled,
+                        onChanged: (value) {
+                          Navigator.of(context).pop();
+                          unawaited(widget.onToggle(plugin, value));
+                        },
+                      ),
+                    ),
+                  )
+                : Opacity(
+                    opacity: 0.45,
+                    child: IgnorePointer(
+                      child: DshSwitch(
+                        value: plugin.enabled,
+                        onChanged: (_) {},
+                      ),
+                    ),
+                  ),
+          ],
+        ),
         const Divider(height: 18),
         if (plugin.updateKind == 'git')
           Text(
@@ -925,13 +1204,33 @@ class _PluginDetailSheetState extends State<_PluginDetailSheet> {
         const SizedBox(height: 8),
         Text(
           L10n.t(
-            '仅使用电脑端已配置的渠道；失败由宿主自动回滚；不提供卸载/启停/重启。',
-            'Only configured desktop sources are used; the host rolls back failures; remove, enable/disable and restart are not available.',
+            '仅使用电脑端已配置的渠道；失败由宿主事务处理；重启必须显式确认，绝不自动重启。',
+            'Only configured desktop sources are used; the host handles failures; restarts require explicit confirmation and never happen automatically.',
           ),
           style: TextStyle(
             fontSize: 11.5,
             height: 1.4,
             color: DshColors.ink3(context),
+          ),
+        ),
+        const SizedBox(height: 12),
+        TextButton(
+          onPressed: plugin.canUninstall
+              ? () {
+                  Navigator.of(context).pop();
+                  unawaited(widget.onUninstall(plugin));
+                }
+              : null,
+          style: TextButton.styleFrom(
+            foregroundColor: DshColors.danger(context),
+          ),
+          child: Text(
+            plugin.canUninstall
+                ? L10n.t('卸载插件', 'Remove plugin')
+                : L10n.t(
+                    '不可卸载：${pluginManagementReasonText(plugin.toggleReasonCode)}',
+                    'Cannot remove: ${pluginManagementReasonText(plugin.toggleReasonCode)}',
+                  ),
           ),
         ),
       ],
@@ -1075,10 +1374,14 @@ class _PluginRow extends StatelessWidget {
   final PluginInventoryActions actions;
   final Future<void> Function(PluginInfo plugin, PluginVersionInfo version)
   onUpgrade;
+  final Future<void> Function(PluginInfo plugin, bool enabled) onToggle;
+  final Future<void> Function(PluginInfo plugin) onUninstall;
   const _PluginRow({
     required this.plugin,
     required this.actions,
     required this.onUpgrade,
+    required this.onToggle,
+    required this.onUninstall,
   });
 
   String get _versionLabel => plugin.version.isEmpty
@@ -1122,6 +1425,8 @@ class _PluginRow extends StatelessWidget {
         plugin: plugin,
         actions: actions,
         onUpgrade: onUpgrade,
+        onToggle: onToggle,
+        onUninstall: onUninstall,
       ),
     ]);
   }

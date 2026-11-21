@@ -83,6 +83,9 @@ class FakeActions {
       lastUpgradeVersion = version;
       return upgradeOp ?? installOp;
     },
+    uninstall: (_) async => installOp,
+    toggle: (_, _) async => installOp,
+    restartHost: () async => '',
     poll: (_) async => pollOp,
     cancel: (_) async {
       cancelCalls += 1;

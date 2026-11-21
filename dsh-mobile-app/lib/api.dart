@@ -1453,6 +1453,31 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
     return PluginOperation.fromJson(data['operation']);
   }
 
+  /// #147：卸载当前宿主插件（宿主事务；当前连接插件由 UI 强提示）。
+  Future<PluginOperation> pluginUninstall(String name) async {
+    final data = await postJson('/api/plugin-inventory/uninstall', {
+      'name': name,
+    }, timeout: const Duration(seconds: 30));
+    return PluginOperation.fromJson(data['operation']);
+  }
+
+  /// #147：启用/停用 bundle（宿主事务）。
+  Future<PluginOperation> pluginToggle(String name, bool enabled) async {
+    final data = await postJson('/api/plugin-inventory/toggle', {
+      'name': name,
+      'enabled': enabled,
+    }, timeout: const Duration(seconds: 30));
+    return PluginOperation.fromJson(data['operation']);
+  }
+
+  /// #147：显式确认后重启电脑端宿主（不自动重启）。
+  Future<String> pluginRestartHost() async {
+    final data = await postJson('/api/plugin-inventory/restart', {
+      'confirm': true,
+    }, timeout: const Duration(seconds: 20));
+    return (data['mode'] as String?)?.trim() ?? '';
+  }
+
   /// #146：轮询宿主事务进度。
   Future<PluginOperation> pluginOperation(String opId) async {
     final data = await getJson(

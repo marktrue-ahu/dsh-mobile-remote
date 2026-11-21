@@ -174,7 +174,10 @@ void main() {
 
     await tester.tap(find.text('dsh-bad'));
     await tester.pumpAndSettle();
-    expect(find.text('仅使用电脑端已配置的渠道；失败由宿主自动回滚；不提供卸载/启停/重启。'), findsOneWidget);
+    expect(
+      find.text('仅使用电脑端已配置的渠道；失败由宿主事务处理；重启必须显式确认，绝不自动重启。'),
+      findsOneWidget,
+    );
     semantics.dispose();
   });
 

@@ -1586,3 +1586,14 @@ POST 请求体：`{"sessionId","repositoryId","tips":[...],"limit"?,"snapshotId"
 - 安装失败/取消：宿主恢复 profile，`rolledBack:true`；异常逃逸 → `outcomeUnknown:true`（不断言回滚成功）。
 - 升级失败：宿主返回 `restore` 时 `rolledBack/rollbackFailed` 如实投影；未进入安装即失败 → `unchanged:true`；成功且 `application:"restart-required"` → `restartRequired:true`（只提示，重启由 #147）。
 - 禁止卸载/启停/重启端点；操作记录 15 分钟过期，不持久化。
+
+### 6.27 插件卸载/启停/重启（v3.3，issue #147）
+
+在 §6.26 的安装/升级端点之外，补当前宿主的危险写操作收口；仍只操作当前宿主、不接收任意源。
+
+- `POST /m/api/plugin-inventory/uninstall` `{name}`：调用宿主 `removeBundle(name)`；`readOnlyReason`/`removable=false` → 409（`management-required`/`plugin-not-removable`）。返回 `{operation}`；操作记录 `action:"uninstall"`，失败时 `outcomeUnknown:true`（不能断言是否留下半卸载），成功后 `restartRequired` 如实透传。
+- `POST /m/api/plugin-inventory/toggle` `{name,enabled:boolean}`：调用宿主 `setBundleEnabled(name, enabled)`；独立配置条目/`readOnlyReason` 不允许 → 409 并返回原因码。失败按宿主事务保持原状态，操作记录 `unchanged:true`。
+- `POST /m/api/plugin-inventory/restart` `{confirm:true}`：**必须显式 confirm**；未确认 → 400 `restart-confirmation-required`。复用既有重启通道（systemd/前台 respawn），受理后返回 `{accepted:true,mode}`；不自动重启、不在后台静默重试。不可重启形态 → 409 `restart-unsupported`。
+- 清单 `management` 增加 `canUninstall/canToggle/toggleReasonCode`；`host.restartSupported` 表示当前宿主是否允许手机触发重启。
+- 操作进度/取消仍走 `/plugin-inventory/op`；仅 install/update 可取消，卸载/启停对 cancel 返回 409 `plugin-operation-not-cancellable`。
+- UI：当前连接插件停用/卸载强提示断连；重启只从结果横幅的显式按钮进入二次确认。
