@@ -61,6 +61,7 @@
 | POST | `/m/api/jobs/kill` | 取消任务（v2.7，映射 `jobs.kill`） | 是 |
 | GET | `/m/api/subagents` | 子代理列表（v2.7，按父会话 `subagent.list`） | 是 |
 | POST | `/m/api/subagents/interrupt` | 中断子代理（v2.7，`subagent.interrupt`） | 是 |
+| GET | `/m/api/team/tasks` | 只读共享任务板（v3.3，issue #143） | 是 |
 | GET/POST | `/m/api/goal` | 当前目标 / 创建·暂停·继续·完成（v2.7，goal RPC 同源） | 是 |
 | GET/POST | `/m/api/commands` | 斜杠命令目录/执行（v2.8.0；v2.8.2 适配内核 0.1.1-rc.2 四参签名，服务缺失优雅降级） | 是 |
 
@@ -187,6 +188,7 @@
       "lastActivity": 1750000123456,
       "lastMessageAt": 1750000111000,
       "origin": "subagent",
+      "parentSessionId": "session-parent",
       "parentSession": "session-parent",
       "subagentsRunning": true
     }
@@ -207,7 +209,8 @@
 - `lastActivity`：最近活跃时间（ms）。任意会话事件（SSE）与移动端"打开会话"（3.4 touch）都会更新，持久化于 `~/.dsh/mobile-remote/session-activity.json`。保留给旧版 App，且在消息时间缺失时仍作为排序回退值；旧 App 调用 `touch` 或内部事件发生时，这类会话仍可能重排。
 - `lastMessageAt`（规划中，可选）：最近一条用户/助手可见对话消息的时间（ms）；无记录时为 `null`。打开会话不更新，工具活动与生命周期事件也不更新。字段缺失或为 `null` 时，客户端回退 `lastActivity`、再回退 `createdAt`，不提示降级；这项兼容回退不保证打开/内部事件后顺序始终不变。
 - `origin`（规划中，可选）：会话来源，子代理会话为 `"subagent"`；其余会话不返回。客户端据此隐藏子代理会话；字段缺失即不过滤。
-- `parentSession`（规划中，可选）：派生来源会话 id，为将来"折叠到父会话"预留。**不得**用它判定子代理会话——用户主动 fork 的会话只有该字段而没有 `origin`。
+- `parentSessionId`（issue #140，**始终下发**，可空）：派生的直接父会话 id；根会话为 `null`。供 #141 子代理面板按父聚合子节点、判断是否根会话。用户 fork（只有父关系、无 `origin`）同样带此字段。
+- `parentSession`（规划中，可选，兼容保留）：派生来源会话 id；与 `parentSessionId` 同值但保持"可选"的旧语义。**不得**用它判定子代理会话——用户主动 fork 的会话只有该字段而没有 `origin`。
 - `subagentsRunning`（int，**始终下发，0 也表示无**；issue #124/#133）：该会话下**递归**运行中的子代理 descendant 数（不含根自身）。服务端用**空会话过滤前**的原始会话 header 建 `origin=subagent → parentSession` 父子映射，再对 `agents.list()` 中 `status=running` 的子代理一次反向计数到各层祖先，**不**逐会话调用 `/subagents` 或 `listDescendants`（88 会话也只读一次 agent 列表）。用户 fork（只有 `parentSession`、无 `origin`）不计入。客户端优先用 SSE 帧的 `subagentsRunning`，其次本字段，缺失时才按本地树递归聚合——三路取并集，不互相门控。
 
 ### 3.4 归档 / 活跃时间接口
@@ -649,14 +652,21 @@
 
 **GET `/m/api/subagents?parentSessionId=…`** — 子代理列表（按父会话）
 ```json
-{ "ok": true, "parentAvailable": true, "catalogDegraded": true, "subagents": [
-  { "id": "…", "kind": "child", "status": "running", "title": "…", "createdAt": 1730000000000 }
+{ "ok": true, "parentAvailable": true, "catalogDegraded": true, "multiLevelUnavailable": true, "subagents": [
+  { "id": "…", "name": "reviewer", "depth": 1, "parentSessionId": "session-parent",
+    "kind": "child", "status": "running", "title": "…", "createdAt": 1730000000000 }
 ]}
 ```
 - 目录来源按优先级取（能力探测，不看宿主版本号）：
-  ① rc.2+ `ctx.subagents.listDescendants(parentSessionId, signal)`（递归，**只取 `depth===1`**）→
+  ① rc.2+ `ctx.subagents.listDescendants(parentSessionId, signal)`（递归全树；**透出整棵树**，不再按 `depth===1` 收窄）→
   ①' rc.1 `ctx.subagents.listChildren(parentSessionId, signal)` → ② 持久化枚举（父会话休眠/归档时入口不消失）→ ③ 会话注册表派生。
   **不调用 `subagents/list` Remote 端点**——该端点在宿主 0.2.0 已被删除
+- issue #140 树字段（每行）：
+  · `name`（string | null）：代理名（rc.2 目录的 `name`；目录无名字时为 `null`，不伪造）。
+  · `depth`（int | null）：距请求根会话的层数，直接子级为 `1`；只有 rc.2 `listDescendants` 提供，旧代/降级路径为 `null`（不伪造）。
+  · `parentSessionId`（string | null）：**直接父会话 id**；rc.2 合法行用目录行的 `parentId`，`listChildren`/持久化/注册表等直系路径为请求的父会话；递归路径缺/非法 `parentId` 或父子链不一致时为 `null`（不猜、不回填请求根）。
+  · `title`/`kind`/`status`/`createdAt` 语义不变；`title` 仍按目录 label → name → 持久标题 → 短码。
+- `multiLevelUnavailable: true`（issue #140，可选）：rc.1/持久化/注册表回退，或 rc.2 递归行缺/非法 `depth`（负数/小数/缺字段）、缺/非法 `parentId`、父子深度链不一致时显式降级。此时无效行及依赖它的后代的 `depth`/`parentSessionId` 输出 `null`（不伪造层级、不挂请求根）；客户端不得把 `null` 当 0/1 推断多层树。
 - `kind`：`child`（普通子代理）或 `diagnostic`（rc.2 的 `kind:"diagnostic"` / rc.1 的 `mode:"unknown"`）。
   diagnostic 行**没有 `mode`**，客户端不得用 `row.mode` 判分支。
 - `status`：普通行为活 agent 的 AgentStatus 映射（`running`/`inactive`）；diagnostic 行为三枚举原因：
@@ -675,6 +685,38 @@
 - rc.1（仅 `subagents.interruptByParent`）：映射旧端点，payload `{ childSessionId, parentSessionId, mode: "continuable" }`；
   旧宿主无 receipt，响应省略 `accepted`。
 
+**GET `/m/api/team?sessionId=…`** — 代理面板「团队」只读摘要 + 开关状态（issue #142）
+```json
+{ "ok": true, "team": {
+  "sessionId": "…", "supported": true, "root": true, "agentLive": true,
+  "enabled": false, "modeKnown": true, "modelSelected": true,
+  "pending": false, "locked": false, "lockedKnown": true, "canToggle": true, "unavailableReason": null,
+  "lead": { "id": "…", "title": "…", "status": "inactive" },
+  "members": [ { "id": "…", "name": "reviewer", "title": "…", "kind": "child",
+                 "status": "running", "depth": 1, "parentSessionId": "…" } ],
+  "membersAvailable": true, "membersDegraded": false,
+  "tasks": { "total": 3, "completed": 1, "inProgress": 1, "pending": 1 },
+  "tasksAvailable": true
+}}
+```
+- 只读：成员来自 `subagents.listDescendants`（旧代回退 `listChildren` 并标 `membersDegraded`）；任务摘要**只**来自内核 `agentTeams.listTasks`（权威 projection）。**不创建/编辑/删除**团队或成员。
+- `enabled/modeKnown/tasks`：只认 live Session + `agentTeams.isEnabled/listTasks` 的权威 projection。休眠会话没有可投影的 Session 对象，**不手工折叠** `team/mode`/`team/task` 事件（fork 继承事件可能把父会话状态误当本会话）→ `modeKnown:false`、`enabled:false`、`tasksAvailable:false`，由客户端显式降级。
+- `supported`：宿主是否提供 `agentTeams.isEnabled/setEnabled`；旧宿主为 `false`，客户端隐藏/禁用写操作并显示降级提示，**不伪造**成员或任务。
+- `root`：`origin !== "subagent"`；子代理会话不可修改团队设置（POST 返回 `409 team-root-required`）。
+- `canToggle/unavailableReason`：固定优先级 `team-unavailable` → `team-root-required` → `team-lock-unknown` → `team-locked` → `team-session-offline` → `team-model-unselected` → `team-pending`。`modelSelected` 取会话待生效模型（provider+model 均有值）。
+- `lockedKnown/locked`：锁的权威事实源是 `header.locked`（宿主显式提供时）；否则 live agent 表示本进程持有该会话 writer（单写者，可判定未锁）。休眠会话没有 writer 可判定 → `lockedKnown:false`（客户端禁用开关并显示“当前电脑端未提供团队锁状态”），**不伪称未锁**。
+- `members[].status`：活 agent `running`/`inactive`；diagnostic 行为三枚举 `unsupported/corrupt/unavailable`。
+- `tasks` 只给计数（#143 任务板单独定义）；`tasksAvailable:false` 表示宿主无团队任务投影/当前会话未激活，不伪造。
+
+**POST `/m/api/team`** — 切换团队协作开关
+```json
+请求: { "sessionId": "…", "enabled": true }
+响应: { "ok": true, "team": { …同上… } }
+```
+- 映射内核 `agentTeams/setEnabled(rootAgent, enabled)`；成功后返回最新状态（不乐观翻转）。
+- 失败稳定码：`400 bad-request`（缺 sessionId / enabled 非布尔）、`404 session-not-found`、`409 team-root-required`、`409 team-session-offline`（未激活，需先发消息）、`409 team-model-unselected`（先选模型）、`409 team-pending`（上一次切换在途）、`409 team-locked`（`header.locked` 或保存时 writer 被占用/lease 失效；POST 二次校验，不只信 GET/客户端）、`500 team-save-failed`（固定文案，不泄漏原始异常）、`503 team-unavailable`（旧宿主）。GET 的 `team-lock-unknown` 只用于状态呈现；休眠会话 POST 仍返回 `team-session-offline`。
+- 不改变 `/send`、`/stop`、审批/问询语义。
+
 **GET `/m/api/goal?sessionId=…`** — 当前目标（无目标返回 `{ "goal": null }`）
 ```json
 { "ok": true, "goal": { "id": "…", "revision": 1, "objective": "…",
@@ -692,6 +734,39 @@
 ```
 - 映射内核 goal RPC（契约一致：create 需 `sessionId + objective`；pause/resume/complete 需 `sessionId + ref`，ref 由插件经 `goals.get(agent)` 自动取得）
 - 缺参 `400 sessionId-required / objective-required`；无当前目标 `400 no-active-goal`；非法 action `400 bad-action`
+
+### 6.14b GET /m/api/team/tasks（只读任务板，v3.3 issue #143）
+
+**查询参数**：`sessionId`（必填；缺 → `400 bad-request`，未知会话 → `404 session-not-found`）。仅 GET；无任何写操作。
+
+**响应 200**：
+
+```json
+{
+  "ok": true,
+  "supported": true,
+  "enabled": true,
+  "tasks": [
+    {
+      "id": "task-1",
+      "subject": "调查 SSE 泄漏",
+      "status": "pending",
+      "ownerId": "session-abc",
+      "ownerName": "lead",
+      "blockedBy": ["task-0"],
+      "ready": false
+    }
+  ]
+}
+```
+
+- 数据源：宿主 `agentTeams.listTasks(caller)`（TeamTaskView）；`caller` 必须是该会话的 live agent。
+- `status` 只有 `pending` / `in_progress` / `completed`；已删除任务**永不下发**。`ready` 由服务端按 blockedBy 中依赖是否全部 completed 派生；`blocked` 是客户端派生状态（pending && !ready），不是第四种持久状态。
+- 字段白名单：`id/subject/status/ownerId?/ownerName?/blockedBy/ready`；**不返回** `description`、`writeScopes`、`revision`。
+- 旧宿主没有 `agentTeams` 服务 → `{ok:true, supported:false, tasks:[]}`，App 显示“不支持”，不伪造空任务板。
+- 团队未启用 → `enabled:false, tasks:[]`；启用但无任务 → `enabled:true, tasks:[]`。
+- 投影读取失败 → 200 + `failure`（保留 `supported/enabled` 事实，`tasks` 为空）；会话存在但无 live agent → `unavailable:true` 降级，不冒充“无任务”。
+- 该端点是 #143 UI 的唯一数据源；不提供创建/编辑/分配/改状态/删除。
 
 ### 6.15 斜杠命令（v2.8.0 引入 / v2.8.2 适配内核 0.1.1-rc.2）
 
@@ -867,13 +942,16 @@ fetch/push 序列化 common domain，pull/sync/abort 同时序列化 common 与 
 
 ### 6.17 文件传输（v3.1.2，B站 csborbbnc 反馈）
 
-**GET `/m/api/files?path=…`** — 下载电脑文件
-- 响应：`200` 文件流（`content-type` 按扩展名推断、`content-disposition: attachment` 带 UTF-8 文件名）；路径不存在或非文件 → `404 file-not-found`；缺 `path` → `400 bad-request`
-- 与目录选择器（§6.2）同信任模型：口令鉴权 + 现有限流，路径由手机显式指定；服务端先打开句柄、`fstat` 复核为普通文件，再按 descriptor 真实路径做工作区包含校验，符号链接/越界路径一律 `404`
-- 平台范围：descriptor-relative 保护需 procfs/devfs，**仅 Linux/macOS 提供**；Windows 返回 `503 files-unavailable`（安全 fail-closed，见 docs/04 §6）
+**GET `/m/api/files?path=…&sessionId=…`** — 下载会话工作目录内的文件（GitLab #16）
+- 新调用必须带 `sessionId`，`path` 是**该会话 cwd 内的相对路径**：服务端 `realpath` 会话 cwd 后做词法包含校验，再以 `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` 打开句柄、`fstat` 确认普通文件，并用 `/proc/self/fd/<fd>` 的真实路径复核仍在 cwd 内；绝对路径、`..`、symlink 逃逸、目录/设备/FIFO 一律拒绝。读取固定在该 fd 上，`statSync → createReadStream` 之间的换链无法逃出 cwd。
+- **旧调用兼容**：不带 `sessionId` 时只接受**绝对路径**，且必须落在已注册工作区（`workspaceRegistry`）内；不再允许任意宿主路径。新客户端应带 `sessionId` 获得会话级收紧。
+- 稳定错误码：缺 `path`/NUL → `400 bad-request`；相对路径但无 `sessionId` → `400 session-required`；会话不存在 → `404 session-not-found`；会话无 cwd → `404 workspace-not-found`；绝对路径/`..`/编码绕过/symlink 逃逸/越界 → `403 path-outside-workspace`；目标不存在 → `404 file-not-found`；目录/设备/FIFO → `400 not-a-file`；无权限 → `403 file-forbidden`；无工作区可校验 → `403 workspace-not-authorized`。
+- 平台范围：descriptor-relative 保护需 Linux procfs 与 `O_NOFOLLOW`；其它平台一律 `503 files-unavailable`（安全 fail-closed，不回退为路径读取，见 docs/04 §6）
 - 支持 `HEAD`、单区间 `Range`、`ETag`、`If-None-Match`；有效区间返回 `206 + Content-Range`，越界返回 `416`。续传携带 `Range: bytes=N-` 与此前保存的 `If-Range: <ETag>`；只有标记一致才返回区间，不一致、弱标记或日期标记均返回完整 `200`，客户端截断旧文件后从头写。
 - App 侧断点保存在私有支持目录，按地址、API 路径与认证身份摘要隔离（不持久化口令）；恢复时核对 ETag、实际本地长度、完整区间和最终总长度，旧宿主缺标记时从头下载。暂停、断网、锁屏中断与进程退出后可从下载入口继续；保存到系统下载目录失败时保留已下载文件以便重试保存。恢复列表最多八项，七天后清理，可手动删除。
 - Android 用户发起下载后启动专用 `dataSync` 前台服务（通知提供进度与暂停，完成、失败或暂停后退出）；服务不可用或通知关闭时明确退回前台下载。服务与宠物 / 提醒保活开关独立，不传递 URL、口令或远端路径。Android 15+ 累计后台时限由系统管理，`onTimeout` 立即停止服务并通知 Dart 暂停、保留私有断点，不通过重启服务绕过预算。
+
+**能力位 `capabilities.files`（bootstrap 与 SSE hello 同形状）**：`{ "version": 1, "sessionRelative": true }`。新 App 看到 `sessionRelative=true` 才发送 `sessionId` + cwd 相对路径；旧插件缺该能力位时 App 回退旧的绝对路径契约，避免旧服务端把相对路径按宿主 cwd 解析导致 404/错文件。旧 App 忽略该字段，继续走兼容绝对路径通道。
 
 **POST `/m/api/files/upload`** — 上传文件到电脑（写会话工作目录）
 ```json
@@ -881,7 +959,7 @@ fetch/push 序列化 common domain，pull/sync/abort 同时序列化 common 与 
 响应: { "ok": true, "path": "F:\\DSH-Outpost\\README.md", "bytes": 1234 }
 ```
 - 目标目录：`sessionId` 对应 agent 的工作目录 → 缺省回退第一个注册工作区根；无法确定 → `404 workspace-not-found`（不再静默写入其它 workspace）
-- 服务端先打开并校验目录句柄，再通过 descriptor-relative + `O_CREAT|O_EXCL|O_NOFOLLOW` 创建目标，目录替换/符号链接竞态不会越界；当前平台不具备 descriptor fs 时 fail-closed → `503 files-unavailable`
+- 上传目标只允许落在 `sessionId` 对应 cwd（缺省回退首个注册工作区根）；文件名黑名单拒绝分隔符/NUL/`.`/`..`。当前上传路径仍按目标路径直接写入，**未**采用下载侧的 descriptor-relative 句柄保护（不在 #16 本次收口范围，后续另议）。
 - `name` 不合法（含 `\ / : * ? " < > |`、`.`/`..`/超 255）→ `400 invalid-name`；同名已存在 → `409 file-exists`；body 上限 64MB → `413 payload-too-large`
 
 ### 6.18 GET /m/api/turn-outline（轮次大纲，轮次导航）
@@ -1460,3 +1538,36 @@ POST 请求体：`{"sessionId","repositoryId","tips":[...],"limit"?,"snapshotId"
 - **图库增强（issue #69）**：附图全屏查看器、多图分页、尺寸/名称/mediaType 元数据、保存/分享、失败重试；仍使用既有 `images[]` 元数据与 `/m/api/attachment`，服务端契约不变。
 - **实时思维链（issue #70）**：`assistant/chunk` 的 reasoning delta 仅由 App 生成 provisional 过程行并在落定后去重；无新字段/端点。
 - **diff 视图收尾（issue #71）**：整块横向滚动、固定行号列、大 diff 懒构建；`/changes/diff` 契约不变。
+
+### 6.25 GET /m/api/plugin-inventory（当前宿主插件清单/健康，v3.3，issue #145）
+
+只读：返回当前连接宿主的已安装 bundle 清单。事实来自宿主 `pluginManager.listBundles()`（版本/来源/启停/错误）与 `pluginInventory.list()`（运行期 fiber 相位）；App 不自行推断启用/健康/兼容。
+
+```json
+{
+  "ok": true,
+  "supported": true,
+  "complete": true,
+  "degraded": false,
+  "reason": "",
+  "host": { "id": "<宿主稳定身份>", "pluginVersion": "3.3.0" },
+  "plugins": [{
+    "id": "@scope/pkg", "name": "@scope/pkg", "title": { "zh": "显示名", "en": "Display" },
+    "description": null, "packageName": "@scope/pkg", "version": "1.2.3",
+    "source": { "kind": "builtin|local|git|registry|entry|unknown", "label": "内置|本地|Git|配置渠道|配置条目|未知" },
+    "enabled": true, "current": true, "independent": false,
+    "health": { "state": "ok|starting|disabled|failed|unknown", "reasonCode": "runtime-starting|runtime-unknown|runtime-start-failed|…" },
+    "compatibility": { "ok": null, "state": "ok|incompatible|unknown", "requirements": "engines.dsh: >=0.3.0" },
+    "updateAvailable": null,
+    "management": { "readOnly": true }
+  }]
+}
+```
+
+- **清单完整性**：`supported=true` 仅当宿主 `pluginManager.listBundles()` 与 `pluginInventory.list()` **两侧都成功且返回合法形状**（bundle 为数组、snapshot 非 null 且 `entries` 为数组）；`complete` 同义。任一侧缺失/抛错/**malformed**（null、对象、缺 `entries`、非数组）时 `supported=false`、`degraded=true`、`reason` 为 `host-plugin-manager-unavailable|malformed`、`runtime-inventory-unavailable|malformed` 或 `entry-identity-missing`，仍可返回另一侧的部分行，但**不冒充完整清单**。旧插件没有该路由时 App 按 404 整页降级。
+- **bundle 与独立 plugin entry**：bundle 行来自 profile/安装的 bundle 包清单；独立配置/非 bundle-owned 的 plugin entry 来自运行期 snapshot，**按精确 `entryId` 去重**后合并（同 module 的不同 entryId 不合并），`independent=true`、`source.kind="entry"`、无版本。没有可靠 `entryId` 的 entry 无法安全去重：跳过并把清单标为 partial（`entry-identity-missing`）。
+- **启用与健康分离**：`enabled` 保留宿主配置启用事实（即使有兼容/加载错误也不改写为停用）；健康/兼容错误由 `health`/`compatibility` 单独表达。`ok` 仅在**所有 bundle rows 都匹配且 fiberPhase 全为 active**（或独立 entry active）时给出。缺失运行期服务/抛错/空 entries/无匹配（`runtime-unknown`）、`pending|loading|unloading`（`starting`）、`failed`（`failed`）都不得冒充健康。不返回 `diagnostic` 原文。
+- **兼容事实**：只有宿主明确报告 `incompatible-version` 才是 `state:"incompatible"`（`ok:false`，`requirements` ≤4 项）；其余无判定信息一律 `state:"unknown"`、`ok:null`，不得 `ok:true`。
+- **来源本地化**：服务端 `label` 是中文兜底；App 对已知 `kind` 按当前语言映射，未知 kind 才回退 `label`。
+- `current=true` 表示该插件是当前手机连接所依赖的插件；不提供任何安装/升级/卸载/启停/重启字段或方法。
+- `updateAvailable` 固定 `null`：更新候选检查属于 #146/#147，本端点不触网检查 registry。

@@ -270,12 +270,27 @@ class SessionFilesController extends ChangeNotifier {
   /// 打开文件预览。
   Future<void> openFile(String name) async {
     final path = joinBrowsePath(currentPath, name, sep);
+    // GitLab #16 能力协商：新服务端声明 files.sessionRelative 时用
+    // sessionId + cwd 相对路径；旧服务端不认 sessionId，必须回退旧绝对路径契约，
+    // 否则旧实现会从宿主 cwd 解析相对路径 → 404 或错文件。
+    final sessionRelative = _api.sessionRelativeFilesSupported;
+    final relative = sessionRelative ? relativePathWithinRoot(root, path) : null;
+    if (sessionRelative && relative == null) {
+      stage = BrowseStage.error;
+      errorReason = '无法打开文件：路径不在会话工作目录内';
+      notifyListeners();
+      return;
+    }
     stage = BrowseStage.loading;
     // 先发布 previewPath：加载态也要能显示 in-content 返回按钮与历史入口。
     previewPath = path;
     notifyListeners();
     try {
-      final prefix = await _api.downloadFilePrefix(path, kPreviewByteLimit);
+      final prefix = await _api.downloadFilePrefix(
+        sessionRelative ? relative! : path,
+        kPreviewByteLimit,
+        sessionId: sessionRelative ? sessionId : null,
+      );
       final bytes = prefix.bytes;
       final encoding = detectPreviewEncoding(bytes);
       if (encoding == PreviewEncoding.gb18030) {

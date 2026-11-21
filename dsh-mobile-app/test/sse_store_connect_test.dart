@@ -68,6 +68,36 @@ void main() {
     expect(host.sseConnections, 1);
   });
 
+  test('hello 能力位：新→旧清 false、旧→新恢复 true（不跨连接残留）', () async {
+    final store = AppStore(apiClient: api);
+    addTearDown(store.disposeBridge);
+
+    store.injectFrame({
+      'type': 'hello',
+      'capabilities': {
+        'files': {'version': 1, 'sessionRelative': true},
+      },
+    });
+    expect(api.sessionRelativeFilesSupported, isTrue);
+
+    // 连到旧宿主：hello 没有 files 能力位 → 必须清 false（即使 bootstrap 没跑到）。
+    store.injectFrame({'type': 'hello', 'capabilities': {}});
+    expect(api.sessionRelativeFilesSupported, isFalse);
+
+    // 再连回新宿主：hello 重新声明 true。
+    store.injectFrame({
+      'type': 'hello',
+      'capabilities': {
+        'files': {'version': 1, 'sessionRelative': true},
+      },
+    });
+    expect(api.sessionRelativeFilesSupported, isTrue);
+
+    // 连接代切换（disposeBridge）也必须清空，等待新连接重新声明。
+    store.disposeBridge();
+    expect(api.sessionRelativeFilesSupported, isFalse);
+  });
+
   test('connect() 里的帧不会因为 store 未配置 sessionId 而丢', () async {
     final store = AppStore();
     addTearDown(store.disposeBridge);

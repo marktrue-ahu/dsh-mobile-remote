@@ -136,7 +136,8 @@ void main() {
 
     expect(find.byTooltip('Git'), findsOneWidget);
     expect(find.byTooltip('文件'), findsOneWidget);
-    expect(find.byTooltip('任务 / 子代理 / 目标'), findsOneWidget);
+    expect(find.byTooltip('代理'), findsOneWidget);
+    expect(find.byTooltip('任务 / 目标'), findsOneWidget);
     expect(find.byTooltip('复制当前已加载的对话'), findsOneWidget);
 
     await tester.binding.handlePopRoute();
@@ -176,7 +177,7 @@ void main() {
 
     await tester.tap(find.byTooltip('对话操作'));
     await tester.pumpAndSettle();
-    await tester.tap(find.byTooltip('任务 / 子代理 / 目标'));
+    await tester.tap(find.byTooltip('任务 / 目标'));
     await tester.pumpAndSettle();
 
     expect(find.text('会话工具'), findsOneWidget);
@@ -205,7 +206,7 @@ void main() {
     expect(find.byTooltip('对话操作'), findsOneWidget);
     expect(find.byType(TabBar), findsNothing);
 
-    await selectAction('任务 / 子代理 / 目标');
+    await selectAction('任务 / 目标');
     expect(find.byTooltip('对话操作'), findsOneWidget);
     expect(find.byType(TabBar), findsNothing);
 
@@ -243,8 +244,8 @@ void main() {
 
       await pumpScreen(store, 'first-chat');
       await openRail();
-      expect(centerY('Git'), lessThan(centerY('任务 / 子代理 / 目标')));
-      expect(centerY('任务 / 子代理 / 目标'), lessThan(centerY('复制当前已加载的对话')));
+      expect(centerY('Git'), lessThan(centerY('任务 / 目标')));
+      expect(centerY('任务 / 目标'), lessThan(centerY('复制当前已加载的对话')));
 
       final drag = await tester.startGesture(
         tester.getCenter(find.byTooltip('Git')),
@@ -257,7 +258,7 @@ void main() {
       await drag.up();
       await tester.pumpAndSettle();
 
-      expect(centerY('任务 / 子代理 / 目标'), lessThan(centerY('复制当前已加载的对话')));
+      expect(centerY('任务 / 目标'), lessThan(centerY('复制当前已加载的对话')));
       expect(centerY('复制当前已加载的对话'), lessThan(centerY('Git')));
 
       await tester.tapAt(const Offset(20, 100));
@@ -268,7 +269,7 @@ void main() {
       await pumpScreen(restoredStore, 'restored-chat');
       await openRail();
 
-      expect(centerY('任务 / 子代理 / 目标'), lessThan(centerY('复制当前已加载的对话')));
+      expect(centerY('任务 / 目标'), lessThan(centerY('复制当前已加载的对话')));
       expect(centerY('复制当前已加载的对话'), lessThan(centerY('Git')));
     },
   );

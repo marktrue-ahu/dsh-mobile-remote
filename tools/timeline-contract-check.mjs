@@ -1563,5 +1563,89 @@ if (typeof mod.apply === "function" && typeof mod.Config === "function") {
   check("wire harness exports apply/Config", false, "module exports missing");
 }
 
+// issue #144：当前会话消息索引的只读投影。
+// team/message/* 仍是调试可见事件，不进普通时间线渲染；App 索引需要发送方/接收方/
+// 正文与投递身份。这里断言只读字段形状，且不把原始 content 块或详情指针泄露出去。
+const teamQueuedEvent = {
+  seq: 40,
+  type: "team/message/queued",
+  data: {
+    version: 2,
+    teamId: "team-1",
+    message: {
+      id: "tm-1",
+      senderId: "session-a",
+      senderName: "发布协调员",
+      targetId: "session-b",
+      content: [{ type: "text", text: "插件清单第二列改成来源渠道" }],
+    },
+  },
+};
+const teamQueuedSummary = mod.summarizeEvent(teamQueuedEvent);
+check(
+  "team/message/queued 投影出索引字段（messageId/sender/target/text）",
+  teamQueuedSummary.data?.messageId === "tm-1"
+    && teamQueuedSummary.data?.senderId === "session-a"
+    && teamQueuedSummary.data?.senderName === "发布协调员"
+    && teamQueuedSummary.data?.targetId === "session-b"
+    && teamQueuedSummary.data?.text === "插件清单第二列改成来源渠道",
+  JSON.stringify(teamQueuedSummary.data),
+);
+check(
+  "team/message/queued 不泄露原始 content 块/详情指针",
+  teamQueuedSummary.data?.content === undefined && teamQueuedSummary.detail === undefined,
+  JSON.stringify(teamQueuedSummary),
+);
+const teamDeliveredSummary = mod.summarizeEvent({
+  seq: 41,
+  type: "team/message/delivered",
+  data: { version: 2, teamId: "team-1", messageId: "tm-1", targetId: "session-b" },
+});
+check(
+  "team/message/delivered 投影投递身份",
+  teamDeliveredSummary.data?.messageId === "tm-1"
+    && teamDeliveredSummary.data?.targetId === "session-b"
+    && teamDeliveredSummary.detail === undefined,
+  JSON.stringify(teamDeliveredSummary),
+);
+const teamInboundSummary = mod.summarizeEvent({
+  seq: 42,
+  type: "user/message",
+  data: {
+    id: "um-1",
+    content: [{ type: "text", text: "收到，正在补截图" }],
+    source: {
+      kind: "team-message",
+      teamId: "team-1",
+      messageId: "tm-2",
+      senderId: "session-c",
+      senderName: "前端审计",
+    },
+  },
+});
+check(
+  "user/message(team-message) 投影发送方与团队 messageId",
+  teamInboundSummary.data?.sourceKind === "team-message"
+    && teamInboundSummary.data?.sourceSenderName === "前端审计"
+    && teamInboundSummary.data?.sourceSenderId === "session-c"
+    && teamInboundSummary.data?.sourceMessageId === "tm-2",
+  JSON.stringify(teamInboundSummary.data),
+);
+const agentInboundSummary = mod.summarizeEvent({
+  seq: 43,
+  type: "user/message",
+  data: {
+    id: "um-2",
+    content: [{ type: "text", text: "收到，已加入回归清单" }],
+    source: { kind: "agent-message", form: "relay", senderSessionId: "session-d" },
+  },
+});
+check(
+  "user/message(agent-message) 投影发送会话 id",
+  agentInboundSummary.data?.sourceKind === "agent-message"
+    && agentInboundSummary.data?.sourceSenderId === "session-d",
+  JSON.stringify(agentInboundSummary.data),
+);
+
 console.log(`结果：${pass} PASS / ${fail} FAIL`);
 if (fail > 0) process.exit(1);

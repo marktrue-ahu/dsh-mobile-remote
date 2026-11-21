@@ -36,12 +36,14 @@ import '../turn_outline.dart';
 import '../turn_tail.dart';
 import '../turn_file_actions.dart';
 import '../md.dart';
+import '../message_index.dart';
 import '../workspace_image_cache.dart';
 import '../fmt.dart';
 import '../image_gallery.dart';
 import '../git_browser_controller.dart';
 import '../local_notifications.dart';
 import 'git_browser_sheet.dart';
+import 'agent_panel.dart';
 import '../tool_cards.dart';
 import '../tool_images.dart';
 import '../widgets/git_file_viewer.dart';
@@ -466,9 +468,13 @@ class _ConversationActionRailState extends State<_ConversationActionRail> {
         const Icon(Icons.folder_outlined, size: 20),
         L10n.t('文件', 'Files'),
       ),
+      'agents' => (
+        const Icon(Icons.groups_outlined, size: 20),
+        L10n.t('代理', 'Agents'),
+      ),
       'session_tools' => (
         const Icon(Icons.assignment_outlined, size: 20),
-        L10n.t('任务 / 子代理 / 目标', 'Tasks / Subagents / Goals'),
+        L10n.t('任务 / 目标', 'Tasks / Goals'),
       ),
       'copy' => (
         const Icon(Icons.copy_all, size: 20),
@@ -504,6 +510,24 @@ class _WorkspaceImageConsent {
   final DateTime? expiresAt;
 
   bool get expired => expiresAt != null && !DateTime.now().isBefore(expiresAt!);
+}
+
+/// issue #141：子代理会话隐藏「代理」入口时的重排合并。
+///
+/// rail 在子代理会话只渲染可见动作；用户拖动后回调的是**过滤后**的顺序。
+/// 这里把重排结果按原槽位合并回完整顺序，保留被隐藏的 `agents` 位置，
+/// 避免用缺项列表触发 `setConversationActionOrder` 的完整性校验。
+List<String> mergeFilteredConversationOrder(
+  List<String> full,
+  List<String> visibleBefore,
+  List<String> visibleAfter,
+) {
+  final visible = visibleBefore.toSet();
+  final iterator = visibleAfter.iterator;
+  return [
+    for (final id in full)
+      if (visible.contains(id) && iterator.moveNext()) iterator.current else id,
+  ];
 }
 
 class ChatScreen extends StatefulWidget {
@@ -1125,6 +1149,16 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _turnJumpCancelled = false;
   // 导航世代：连续点选时旧操作不得覆盖新操作的落点 / busy / 提示（issue #25 评审 P2）。
   int _turnNavGeneration = 0;
+
+  // ── issue #144：当前会话消息索引（只读、内存派生，不新增持久化）──────────
+  // 面板从当前已加载时间线事件取行；跳转按持久 seq 走同一有界定位器。
+  final MessageIndexBuilder _messageIndex = MessageIndexBuilder();
+  int? _messageJumpSeq; // 目标 seq：构建时据此挂稳定 GlobalKey
+  final GlobalKey _messageJumpKey = GlobalKey();
+  int _messageJumpGeneration = 0;
+  bool _messageJumpBusy = false;
+  int? _highlightMessageSeq;
+  Timer? _highlightMessageTimer;
   // 大纲刷新的请求身份：同一会话/同一历史世代下也会重叠多次刷新，迟到结果不得覆盖新结果。
   int _turnOutlineRefreshId = 0;
   bool _turnOutlineNoticeShown = false;
@@ -1324,6 +1358,7 @@ class _ChatScreenState extends State<ChatScreen> {
   void dispose() {
     _clearImageConsentState();
     _draftTimer?.cancel();
+    _highlightMessageTimer?.cancel();
     _queueRefreshTimer?.cancel();
     _queuePollTimer?.cancel();
     _queueEditCtrl.dispose();
@@ -1552,14 +1587,30 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget _buildItemWithTurnKeyBody(_MsgItem item, {required bool historyView}) {
     final seq = item.seq;
     final turn = seq == null ? null : _turnOfStartSeq[seq];
+    Widget child;
     if (turn == null || seq == null || item.kind != _MsgKind.divider) {
-      return _buildItem(item, historyView: historyView);
+      child = _buildItem(item, historyView: historyView);
+    } else {
+      final key = _turnKeysBySeq.putIfAbsent(seq, () => GlobalKey());
+      child = KeyedSubtree(
+        key: key,
+        child: _buildItem(item, historyView: historyView),
+      );
     }
-    final key = _turnKeysBySeq.putIfAbsent(seq, () => GlobalKey());
-    return KeyedSubtree(
-      key: key,
-      child: _buildItem(item, historyView: historyView),
-    );
+    if (seq != null) {
+      // issue #144：消息索引跳转的临时稳定 key（懒构建下按目标 seq 精调）。
+      if (seq == _messageJumpSeq) {
+        child = KeyedSubtree(key: _messageJumpKey, child: child);
+      }
+      // issue #144：跳转成功后 1.2s 高亮。只换背景，不改高度/内边距。
+      if (seq == _highlightMessageSeq) {
+        child = KeyedSubtree(
+          key: ValueKey<String>('message-highlight:$seq'),
+          child: ColoredBox(color: DshColors.brandSoft(context), child: child),
+        );
+      }
+    }
+    return child;
   }
 
   /// 当前阅读的轮次。
@@ -1729,6 +1780,18 @@ class _ChatScreenState extends State<ChatScreen> {
   @visibleForTesting
   bool get debugOlderLoadingOverlayVisible => _olderLoadingOverlayVisible;
 
+  // issue #144：消息索引测试 seam（与面板接线共用同一 loader / 跳转实现）。
+  @visibleForTesting
+  Future<MessageIndexSnapshot> debugLoadMessageIndex() =>
+      _loadMessageIndexSnapshot();
+
+  @visibleForTesting
+  Future<void> debugJumpToMessageSeq(int seq) => _jumpToMessageSeq(seq);
+
+  @visibleForTesting
+  List<MessageIndexEntry> get debugMessageIndexEntries =>
+      _messageIndex.entries;
+
   /// issue #130 P2：loading 时首 sliver 状态行是否仍不足以承担提示。
   ///
   /// 状态行高 36dp，但“进入视口”不等于“转圈/文案可见”：距顶 9–35px 时只露出
@@ -1811,6 +1874,20 @@ class _ChatScreenState extends State<ChatScreen> {
       contentOrderReversed: false,
     );
     return out;
+  }
+
+  /// 内容索引 → 消息条目（「更早」按钮 / 加载条不是消息，返回 null）。
+  _MsgItem? _itemAtContentIndex(int index) {
+    if (index < 0) return null;
+    if (index < _olderItems.length) {
+      return _olderItems[_olderItems.length - 1 - index];
+    }
+    final base = _olderItems.length + (_olderButtonVisible ? 1 : 0);
+    final local = index - base;
+    if (local < 0) return null;
+    final i = _items.length - 1 - local;
+    if (i >= 0 && i < _items.length) return _items[i];
+    return null;
   }
 
   /// 内容索引 → 该子项的**稳定尺寸缓存 key**（`seq` 优先，工具卡用 `latestSeq`）。
@@ -1979,6 +2056,184 @@ class _ChatScreenState extends State<ChatScreen> {
     } finally {
       if (current()) setState(() => _busyTurn = null);
     }
+  }
+
+  // ── issue #144：当前会话消息索引 → 时间线 seq 定位 ───────────────────────
+
+  /// 会话显示名（团队/代理消息的接收方短 id 能解析时优先显示名称）。
+  String? _sessionNameOf(String sessionId) {
+    for (final session in widget.store.sessions) {
+      if (session.id == sessionId) return session.label;
+    }
+    return null;
+  }
+
+  /// 面板打开/下拉刷新时读取当前已加载窗口的消息索引。
+  Future<MessageIndexSnapshot> _loadMessageIndexSnapshot() async =>
+      MessageIndexSnapshot(
+        entries: _messageIndex.entries,
+        hasEarlierHistory: _historyHasMore,
+      );
+
+  String get _messageNotFoundText => L10n.t(
+    '未找到该消息（可能已被压缩或替换）',
+    'Message not found (it may have been compacted or replaced)',
+  );
+
+  /// 点按消息索引行：关闭面板后按 seq 回到时间线。
+  ///
+  /// 与轮次跳转共用 `TurnPager`（有界翻页）与 `TurnLocator`（按实测几何收敛）：
+  /// 目标未加载时先按 200 条/页向前翻；失败/越界必须明确提示，不能静默不动。
+  Future<void> _jumpToMessageSeq(int seq) async {
+    if (!mounted) return;
+    if (_inHistory) {
+      showToast(
+        context,
+        L10n.t('请回到实时对话后再跳转', 'Return to the live conversation first'),
+      );
+      return;
+    }
+    final token = ++_messageJumpGeneration;
+    bool current() => mounted && token == _messageJumpGeneration;
+    setState(() {
+      _messageJumpBusy = true;
+      _messageJumpSeq = seq;
+    });
+    _scrollFollow.onNavigationStarted();
+    try {
+      if (_contentIndexOfSeq(seq) < 0) {
+        final pager = TurnPager(
+          loadOlder: _loadOlderForTurnJump,
+          snapshot: () =>
+              TurnPageLoad(earliestSeq: _earliestSeq, hasMore: !_noMoreHistory),
+          isCancelled: () => !current(),
+        );
+        final outcome = await pager.jumpTo(targetSeq: seq);
+        if (!current() || !mounted) return;
+        if (outcome != TurnJumpOutcome.covered) {
+          showToast(context, _messageNotFoundText);
+          return;
+        }
+        // 翻页刚 prepend 更早历史：先等一帧让布局/极值稳定，再进入定位。
+        await WidgetsBinding.instance.endOfFrame;
+        if (!current()) return;
+      }
+      if (!mounted) return;
+      final index = _contentIndexOfSeq(seq);
+      final childCount = _contentChildCount;
+      if (index < 0 || childCount <= 0) {
+        showToast(context, _messageNotFoundText);
+        return;
+      }
+      // 普通时间线隐藏的调试事件（team/message/* 等）没有可见行：直接明确失败，
+      // 不把用户丢到一个零高度锚点上（设计：目标不可定位必须有提示）。
+      final targetItem = _itemAtContentIndex(index);
+      final mode = widget.store.timelineDebug
+          ? TimelineMode.debug
+          : TimelineMode.ordinary;
+      if (targetItem != null &&
+          targetItem.kind == _MsgKind.event &&
+          !timelineTypeVisibleIn(mode, targetItem.eventType ?? '')) {
+        showToast(context, _messageNotFoundText);
+        return;
+      }
+      // 让目标行拿到临时 key（已构建时立即可见；未构建时定位循环会在落点后重试）。
+      setState(() {});
+      await WidgetsBinding.instance.endOfFrame;
+      if (!current()) return;
+      final locator = TurnLocator(
+        scrollTo: (offset) {
+          if (current() && _scrollCtrl.hasClients) {
+            _runProgrammaticScroll(() => _scrollCtrl.jumpTo(offset));
+          }
+        },
+        minScrollExtent: () =>
+            _scrollCtrl.hasClients ? _scrollCtrl.position.minScrollExtent : 0,
+        maxScrollExtent: () =>
+            _scrollCtrl.hasClients ? _scrollCtrl.position.maxScrollExtent : 0,
+        currentOffset: () =>
+            _scrollCtrl.hasClients ? _scrollCtrl.position.pixels : 0,
+        viewportExtent: () =>
+            _scrollCtrl.hasClients ? _scrollCtrl.position.viewportDimension : 0,
+        isTargetLoaded: () => _contentIndexOfSeq(seq) >= 0,
+        isTargetBuilt: () => _messageJumpKey.currentContext != null,
+        isTargetInView: () {
+          // 零高度（被普通模式隐藏的事件）不算“看得见”，避免成功跳到不可见锚点。
+          final box =
+              _messageJumpKey.currentContext?.findRenderObject() as RenderBox?;
+          if (box == null || !box.hasSize || box.size.height <= 0) {
+            return false;
+          }
+          return _turnKeyInViewport(_messageJumpKey);
+        },
+        reveal: () => _revealTurnKey(_messageJumpKey),
+        measure: _measureTurnBoundaries,
+        measureBuilt: _measureBuiltChildren,
+        estimateOffsetForIndex: _estimateOffsetForIndex,
+        settle: () => WidgetsBinding.instance.endOfFrame,
+      );
+      // targetTurn 只用于「无尺寸缓存时的轮次估算」兜底：取目标之前最近的轮次边界。
+      final pseudoTurn = _turnAnchors
+          .where((anchor) => anchor.seq <= seq)
+          .fold<int>(0, (turn, anchor) => math.max(turn, anchor.turn));
+      final outcome = await locator.locate(
+        targetTurn: pseudoTurn,
+        targetIndex: index,
+        childCount: childCount,
+      );
+      if (!current() || !mounted) return;
+      if (!outcome.ok) {
+        showToast(context, _messageNotFoundText);
+        return;
+      }
+      // 跳转成功后 1.2s 高亮（只换背景，不改布局）；再次跳转以最后一次为准。
+      setState(() => _highlightMessageSeq = seq);
+      _highlightMessageTimer?.cancel();
+      _highlightMessageTimer = Timer(const Duration(milliseconds: 1200), () {
+        if (mounted) setState(() => _highlightMessageSeq = null);
+      });
+    } catch (e) {
+      if (!current() || !mounted) return;
+      showToast(context, '${L10n.t('跳转失败：', 'Jump failed: ')}$e');
+    } finally {
+      if (current()) {
+        setState(() {
+          _messageJumpBusy = false;
+          _messageJumpSeq = null;
+        });
+      }
+    }
+  }
+
+  /// issue #144：有界加载/定位期间的轻提示（不挡操作，不改变滚动几何）。
+  Widget _buildMessageJumpOverlay() {
+    final surface = DshColors.surface(context);
+    final line = DshColors.line(context);
+    final ink2 = DshColors.ink2(context);
+    return Container(
+      key: const ValueKey<String>('message-jump-locating'),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+      decoration: BoxDecoration(
+        color: surface,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: line),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SizedBox(
+            width: 12,
+            height: 12,
+            child: CircularProgressIndicator(strokeWidth: 2, color: ink2),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            L10n.t('定位中…', 'Locating…'),
+            style: TextStyle(fontSize: 12, color: ink2),
+          ),
+        ],
+      ),
+    );
   }
 
   /// 精调：把已构建的目标边界带进视口（不负责判定成功）。
@@ -2229,6 +2484,8 @@ class _ChatScreenState extends State<ChatScreen> {
         _items.clear();
         _olderItems.clear();
         _histItems.clear();
+        // issue #144：按新快照重建消息索引，不沿用已被替换/压缩的旧行。
+        _messageIndex.clear();
         _turnOfStartSeq.clear(); // issue #24：条目重建后轮次索引一并失效
         _turnKeysBySeq.clear();
         _turnContentOffset.clear();
@@ -2750,11 +3007,19 @@ class _ChatScreenState extends State<ChatScreen> {
     // issue #25 二期：跨页跳转进行中，用户主动滚动 = 取消本次跳转（故事 18）——
     // 只有带 dragDetails 的通知才是用户手势，自动滚动不受影响。
     // 同时作废导航世代：旧的落点/提示/清理一律不得再动（第二轮评审 P2）。
-    if (_busyTurn != null &&
+    if ((_busyTurn != null || _messageJumpBusy) &&
         ((n is ScrollStartNotification && n.dragDetails != null) ||
             (n is ScrollUpdateNotification && n.dragDetails != null))) {
       _turnJumpCancelled = true;
-      _cancelTurnJumpVisual();
+      if (_busyTurn != null) _cancelTurnJumpVisual();
+      if (_messageJumpBusy) {
+        // issue #144：用户主动滚动即取消消息定位，旧世代不得再改落点/弹提示。
+        _messageJumpGeneration++;
+        setState(() {
+          _messageJumpBusy = false;
+          _messageJumpSeq = null;
+        });
+      }
     }
     // issue #77：短内容底部占位的调整会改变 extent，由此产生的位置修正
     // （dragDetails=null 的 ScrollUpdate）不得被当成用户上翻去拉更早历史——
@@ -4669,6 +4934,9 @@ class _ChatScreenState extends State<ChatScreen> {
   }) {
     final d = ev.data;
     if (hiddenTimelineTypes.contains(ev.type)) return;
+    // issue #144：消息索引与时间线共用同一事件源；先观察，再按既有投影渲染。
+    // 团队 queued/delivered 仍是调试可见事件，不因索引进入普通时间线。
+    _messageIndex.observe(ev, sessionNameOf: _sessionNameOf);
     // issue #70（复审 P1）：live 思考缓冲的关闭/推进**只能**由实时/补拉路径触发。
     //
     // `history:true` 是本页的 durable 回放（初始 tail、`_prependOlderPage` 上翻更早页、
@@ -6219,7 +6487,6 @@ class _ChatScreenState extends State<ChatScreen> {
         context,
         widget.store,
         sid,
-        onTitleChanged: widget.onTitleChanged,
         // 与页级动作同一 API 接缝：生产为全局 `api`，测试注入时面板与聊天页共用
         // 同一宿主（issue #128：任务页签的取消入口需要可注入验证）。
         apiClient: widget.apiClient,
@@ -6228,6 +6495,12 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _openConversationActionRail() async {
+    // issue #141：渲染层 gating——子代理会话整项不渲染「代理」（不灰显）。
+    final isSubagent = widget.store.isSubagentSession(_mySessionId);
+    final fullOrder = widget.store.conversationActionOrder;
+    final visibleOrder = isSubagent
+        ? fullOrder.where((id) => id != 'agents').toList(growable: false)
+        : fullOrder;
     final action = await showGeneralDialog<String>(
       context: context,
       barrierDismissible: true,
@@ -6235,9 +6508,14 @@ class _ChatScreenState extends State<ChatScreen> {
       barrierColor: Colors.black54,
       transitionDuration: const Duration(milliseconds: 180),
       pageBuilder: (_, _, _) => _ConversationActionRail(
-        initialOrder: widget.store.conversationActionOrder,
-        onOrderChanged: (order) =>
-            unawaited(widget.store.setConversationActionOrder(order)),
+        initialOrder: visibleOrder,
+        onOrderChanged: (order) => unawaited(
+          widget.store.setConversationActionOrder(
+            isSubagent
+                ? mergeFilteredConversationOrder(fullOrder, visibleOrder, order)
+                : order,
+          ),
+        ),
       ),
       transitionBuilder: (context, animation, secondaryAnimation, child) =>
           SlideTransition(
@@ -6254,6 +6532,21 @@ class _ChatScreenState extends State<ChatScreen> {
         await _openGit();
       case 'files':
         _openSessionFilesFromActionRail();
+      case 'agents':
+        // issue #141：分发层二次 gating——即使持久化顺序残留 agents，
+        // 子代理会话也不能打开代理面板。
+        if (!canOpenAgentPanel(widget.store, _mySessionId)) return;
+        final sid = _mySessionId;
+        if (sid == null) return;
+        await showAgentPanel(
+          context,
+          store: widget.store,
+          sessionId: sid,
+          title: _title ?? L10n.t('会话', 'Session'),
+          apiClient: widget.apiClient,
+          messageIndexLoader: _loadMessageIndexSnapshot,
+          onOpenMessage: _jumpToMessageSeq,
+        );
       case 'session_tools':
         _openSessionToolsFromActionRail();
       case 'copy':
@@ -6655,6 +6948,18 @@ class _ChatScreenState extends State<ChatScreen> {
                             child: Center(
                               child: IgnorePointer(
                                 child: _buildOlderLoadingOverlay(),
+                              ),
+                            ),
+                          ),
+                        // issue #144：消息索引跳转的有界加载反馈（面板已关闭，回聊天页）。
+                        if (_messageJumpBusy)
+                          Positioned(
+                            top: 8,
+                            left: 0,
+                            right: 0,
+                            child: Center(
+                              child: IgnorePointer(
+                                child: _buildMessageJumpOverlay(),
                               ),
                             ),
                           ),
