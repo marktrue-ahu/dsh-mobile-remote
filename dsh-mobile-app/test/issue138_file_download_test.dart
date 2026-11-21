@@ -32,7 +32,8 @@ class _Backend {
   late final Api api = Api(client: client)
     ..baseUrl = 'http://files.test'
     ..path = '/m'
-    ..token = '';
+    ..token = ''
+    ..sessionRelativeFilesSupported = true;
 
   Future<http.Response> _handle(http.Request request) async {
     final path = request.url.path;
@@ -142,6 +143,16 @@ void main() {
     final selectionBackend = _Backend(selectionMode: true);
     final selectionDownloader = await _downloader(selectionBackend, temp);
     await _mount(tester, selectionBackend, selectionDownloader);
+    expect(find.byKey(const ValueKey('sf-download-a.txt')), findsNothing);
+  });
+
+  testWidgets('旧宿主无 session-relative 能力：不显示下载入口', (tester) async {
+    final temp = Directory.systemTemp.createTempSync('issue138-old-');
+    addTearDown(() => temp.deleteSync(recursive: true));
+    final backend = _Backend();
+    backend.api.sessionRelativeFilesSupported = false;
+    final downloader = await _downloader(backend, temp);
+    await _mount(tester, backend, downloader);
     expect(find.byKey(const ValueKey('sf-download-a.txt')), findsNothing);
   });
 

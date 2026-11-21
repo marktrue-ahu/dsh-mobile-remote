@@ -480,7 +480,9 @@ class _SessionFilesScreenState extends State<SessionFilesScreen> {
       children: [
         _rootBar(),
         _breadcrumbBar(),
-        if (_pendingDownloads.isNotEmpty && !widget.selectionMode)
+        if (_pendingDownloads.isNotEmpty &&
+            !widget.selectionMode &&
+            _api.sessionRelativeFilesSupported)
           _pendingDownloadsBanner(),
         if (_c.hiddenCount > 0) _truncationNotice(),
         const Divider(height: 1),
@@ -587,14 +589,18 @@ class _SessionFilesScreenState extends State<SessionFilesScreen> {
   String _filePathOf(String name) => joinBrowsePath(_c.currentPath, name, _c.sep);
 
   Widget? _fileDownloadAction(String name) {
-    if (widget.selectionMode) return null;
+    if (widget.selectionMode || !_api.sessionRelativeFilesSupported) return null;
     final downloader = _downloader;
     if (downloader == null) return null;
     return _downloadActionButton(_filePathOf(name), keyName: name);
   }
 
   List<Widget> _previewDownloadActions() {
-    if (widget.selectionMode || _c.previewPath.isEmpty) return const [];
+    if (widget.selectionMode ||
+        !_api.sessionRelativeFilesSupported ||
+        _c.previewPath.isEmpty) {
+      return const [];
+    }
     final button = _downloadActionButton(
       _c.previewPath,
       keyName: 'preview',
@@ -712,7 +718,7 @@ class _SessionFilesScreenState extends State<SessionFilesScreen> {
   }
 
   Widget? _downloadBar() {
-    if (widget.selectionMode) return null;
+    if (widget.selectionMode || !_api.sessionRelativeFilesSupported) return null;
     final downloader = _downloader;
     if (downloader == null || downloader.phase == SessionFileDownloadPhase.idle) {
       return null;
