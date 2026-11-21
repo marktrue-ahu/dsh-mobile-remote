@@ -913,6 +913,7 @@ fetch/push 序列化 common domain，pull/sync/abort 同时序列化 common 与 
 - **旧调用兼容**：不带 `sessionId` 时只接受**绝对路径**，且必须落在已注册工作区（`workspaceRegistry`）内；不再允许任意宿主路径。新客户端应带 `sessionId` 获得会话级收紧。
 - 稳定错误码：缺 `path`/NUL → `400 bad-request`；相对路径但无 `sessionId` → `400 session-required`；会话不存在 → `404 session-not-found`；会话无 cwd → `404 workspace-not-found`；绝对路径/`..`/编码绕过/symlink 逃逸/越界 → `403 path-outside-workspace`；目标不存在 → `404 file-not-found`；目录/设备/FIFO → `400 not-a-file`；无权限 → `403 file-forbidden`；无工作区可校验 → `403 workspace-not-authorized`。
 - 平台范围：descriptor-relative 保护需 Linux procfs 与 `O_NOFOLLOW`；其它平台一律 `503 files-unavailable`（安全 fail-closed，不回退为路径读取，见 docs/04 §6）
+- 流式下载（App 文件浏览「下载」）与预览使用同一 `sessionId` + cwd 相对路径入口；`Range`/`HEAD`/`ETag` 语义不变（GitLab #138）。
 - 支持 `HEAD`、单区间 `Range`、`ETag`、`If-None-Match`；有效区间返回 `206 + Content-Range`，越界返回 `416`。续传携带 `Range: bytes=N-` 与此前保存的 `If-Range: <ETag>`；只有标记一致才返回区间，不一致、弱标记或日期标记均返回完整 `200`，客户端截断旧文件后从头写。
 - App 侧断点保存在私有支持目录，按地址、API 路径与认证身份摘要隔离（不持久化口令）；恢复时核对 ETag、实际本地长度、完整区间和最终总长度，旧宿主缺标记时从头下载。暂停、断网、锁屏中断与进程退出后可从下载入口继续；保存到系统下载目录失败时保留已下载文件以便重试保存。恢复列表最多八项，七天后清理，可手动删除。
 - Android 用户发起下载后启动专用 `dataSync` 前台服务（通知提供进度与暂停，完成、失败或暂停后退出）；服务不可用或通知关闭时明确退回前台下载。服务与宠物 / 提醒保活开关独立，不传递 URL、口令或远端路径。Android 15+ 累计后台时限由系统管理，`onTimeout` 立即停止服务并通知 Dart 暂停、保留私有断点，不通过重启服务绕过预算。
