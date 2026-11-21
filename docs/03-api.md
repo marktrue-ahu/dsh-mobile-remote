@@ -61,6 +61,7 @@
 | POST | `/m/api/jobs/kill` | 取消任务（v2.7，映射 `jobs.kill`） | 是 |
 | GET | `/m/api/subagents` | 子代理列表（v2.7，按父会话 `subagent.list`） | 是 |
 | POST | `/m/api/subagents/interrupt` | 中断子代理（v2.7，`subagent.interrupt`） | 是 |
+| GET | `/m/api/team/tasks` | 只读共享任务板（v3.3，issue #143） | 是 |
 | GET/POST | `/m/api/goal` | 当前目标 / 创建·暂停·继续·完成（v2.7，goal RPC 同源） | 是 |
 | GET/POST | `/m/api/commands` | 斜杠命令目录/执行（v2.8.0；v2.8.2 适配内核 0.1.1-rc.2 四参签名，服务缺失优雅降级） | 是 |
 
@@ -733,6 +734,39 @@
 ```
 - 映射内核 goal RPC（契约一致：create 需 `sessionId + objective`；pause/resume/complete 需 `sessionId + ref`，ref 由插件经 `goals.get(agent)` 自动取得）
 - 缺参 `400 sessionId-required / objective-required`；无当前目标 `400 no-active-goal`；非法 action `400 bad-action`
+
+### 6.14b GET /m/api/team/tasks（只读任务板，v3.3 issue #143）
+
+**查询参数**：`sessionId`（必填；缺 → `400 bad-request`，未知会话 → `404 session-not-found`）。仅 GET；无任何写操作。
+
+**响应 200**：
+
+```json
+{
+  "ok": true,
+  "supported": true,
+  "enabled": true,
+  "tasks": [
+    {
+      "id": "task-1",
+      "subject": "调查 SSE 泄漏",
+      "status": "pending",
+      "ownerId": "session-abc",
+      "ownerName": "lead",
+      "blockedBy": ["task-0"],
+      "ready": false
+    }
+  ]
+}
+```
+
+- 数据源：宿主 `agentTeams.listTasks(caller)`（TeamTaskView）；`caller` 必须是该会话的 live agent。
+- `status` 只有 `pending` / `in_progress` / `completed`；已删除任务**永不下发**。`ready` 由服务端按 blockedBy 中依赖是否全部 completed 派生；`blocked` 是客户端派生状态（pending && !ready），不是第四种持久状态。
+- 字段白名单：`id/subject/status/ownerId?/ownerName?/blockedBy/ready`；**不返回** `description`、`writeScopes`、`revision`。
+- 旧宿主没有 `agentTeams` 服务 → `{ok:true, supported:false, tasks:[]}`，App 显示“不支持”，不伪造空任务板。
+- 团队未启用 → `enabled:false, tasks:[]`；启用但无任务 → `enabled:true, tasks:[]`。
+- 投影读取失败 → 200 + `failure`（保留 `supported/enabled` 事实，`tasks` 为空）；会话存在但无 live agent → `unavailable:true` 降级，不冒充“无任务”。
+- 该端点是 #143 UI 的唯一数据源；不提供创建/编辑/分配/改状态/删除。
 
 ### 6.15 斜杠命令（v2.8.0 引入 / v2.8.2 适配内核 0.1.1-rc.2）
 
