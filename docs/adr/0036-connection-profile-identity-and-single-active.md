@@ -27,6 +27,8 @@
 1. 用目标档案的独立探测客户端执行 bootstrap，不先改当前 `Api`；
 2. 校验返回的 `hostId`：
    - 与档案已记录值不同 → 提示“宿主身份变化”，不静默继承 token/cache；
+   - **`hostId` 是连接后的宿主身份，不是认证因子，也不能防止 token 发到错误端点**：bootstrap 鉴权发生在比对之前；防护依赖 TLS、`http-private` 显式确认与已保存端点信任。不得把 hostId 检查当作防凭据泄露手段；
+   - 首次连接/端点变化必须由用户确认；不得把已保存 token 自动发给未确认的新端点；
 3. 探测成功后原子替换 `baseUrl/path/token/hostIdentity`；
 4. 递增 `connectionEpoch` 与 `_refreshGeneration`，取消旧 SSE/重连/刷新/超时；
 5. 清空当前会话 UI、能力位、agent 状态、pending 问询/审批、jobs、usage、图片缓存等；
@@ -57,6 +59,16 @@
 - 现有局域网 HTTP 档案迁移为 `http-private` 并保留“未加密”警告。
 - 新建非私有地址默认 HTTPS；不提供全局证书校验绕过；证书 pin 可后续按档案配置。
 
+### 4b. Android 原生服务同源凭据（评审补充）
+
+`FloatingBubbleService.kt` 独立于 Dart `Api` 读取旧 `flutter.dsh_mr_token` 并建立原生 SSE/HTTP。只迁移 Flutter 会导致升级后原生悬浮球/通知失去认证。因此：
+
+- 原生服务必须读取**同一活动档案的 Keystore-backed 凭据**，不得继续读明文 `flutter.dsh_mr_token`，不得保留明文回退；
+- 切换档案时，Dart 必须把 active profileId/hostId/generation 原子同步给原生服务，原生旧 SSE 必须关闭/重建；
+- 旧 token 删除前必须确认 Dart 与原生都已完成迁移并可读新凭据；任一端失败则保留旧值并回滚，不能先删；
+- 原生连接迟到帧同样受 generation/hostId 门禁；
+- 真机验收必须覆盖：升级迁移、后台悬浮球/通知、切换档案后原生连接、删除档案后凭据清理。
+
 ### 5. 宿主侧身份
 
 - SSE hello 增加 `hostId` / `instanceId`；旧插件缺失时 App 用 bootstrap 结果补，不因此断连。
@@ -76,6 +88,8 @@
 - 所有使用 `sessionId` 作为缓存 key 的路径都要审计并迁移；漏一处就会串台。
 - 旧插件无 SSE `hostId` 时需要 bootstrap 兜底；切换期间旧流可能晚到，必须保留 generation 门禁。
 - token 迁移失败不能清旧值，否则会丢连接；迁移需可重试。
+- **hostId 不是防凭据泄露机制**；首次端点信任仍依赖 TLS/用户确认，HTTP 私有地址必须显式承担风险。
+- 原生服务漏迁会直接导致后台悬浮球/通知断供；原生迁移与 Dart 迁移必须在同一发布内完成，并在真机验证。
 - 本版不做多宿主同时在线；通知/审批不跨宿主聚合。
 
 ### 拒绝
