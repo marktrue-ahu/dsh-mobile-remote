@@ -166,15 +166,21 @@ void main() {
         findsOneWidget,
       );
 
-      for (final key in ['agent-tab-team', 'agent-tab-tasks']) {
-        await tester.tap(find.byKey(ValueKey<String>(key)));
-        await tester.pumpAndSettle();
-        expect(
-          find.textContaining('将在后续版本并入本面板'),
-          findsOneWidget,
-          reason: '$key 应为说明性占位',
-        );
-      }
+      // #142：团队页已有真实内容（本 fake 无 team 服务 → 降级提示）。
+      await tester.tap(find.byKey(const ValueKey<String>('agent-tab-team')));
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('agent-team-switch-card')),
+        findsOneWidget,
+      );
+      // 任务页仍是说明性占位。
+      await tester.tap(find.byKey(const ValueKey<String>('agent-tab-tasks')));
+      await tester.pumpAndSettle();
+      expect(
+        find.textContaining('将在后续版本并入本面板'),
+        findsOneWidget,
+        reason: 'agent-tab-tasks 应为说明性占位',
+      );
       // issue #144：消息页签已接入真实消息索引；本夹具未注入 loader → 明确降级说明。
       await tester.tap(
         find.byKey(const ValueKey<String>('agent-tab-messages')),

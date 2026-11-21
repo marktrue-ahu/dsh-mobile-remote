@@ -2,6 +2,7 @@
 // 覆盖：mergeUrls 去重/规范化/排除回环/首位保持、rotateBaseUrl 轮换与单地址不切换。
 import 'package:flutter_test/flutter_test.dart';
 import 'package:dsh_mobile_app/api.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -63,6 +64,47 @@ void main() {
       a.mergeUrls(['http://frp.example.com:3080', 'http://192.168.1.100:3080', 'http://100.64.0.7:3080']);
       expect(a.baseUrls.length, 3);
       expect(a.baseUrls.first, 'http://frp.example.com:3080');
+    });
+
+    test('capabilities.files.sessionRelative：声明为 true；缺省/旧插件为 false', () {
+      final fresh = newApi('http://192.168.1.100:3080');
+      fresh.absorbBootstrap({
+        'ok': true,
+        'capabilities': {
+          'files': {'version': 1, 'sessionRelative': true},
+        },
+      });
+      expect(fresh.sessionRelativeFilesSupported, isTrue);
+
+      final legacy = newApi('http://192.168.1.100:3080');
+      legacy.absorbBootstrap({
+        'ok': true,
+        'capabilities': {'fileRange': {'version': 1, 'supported': true}},
+      });
+      expect(legacy.sessionRelativeFilesSupported, isFalse);
+    });
+
+    test('切换地址/保存连接时清空能力位（不跨连接残留 true）', () async {
+      SharedPreferences.setMockInitialValues({});
+      final a = newApi('http://192.168.1.100:3080');
+      a.absorbBootstrap({
+        'ok': true,
+        'capabilities': {
+          'files': {'version': 1, 'sessionRelative': true},
+        },
+      });
+      expect(a.sessionRelativeFilesSupported, isTrue);
+
+      a.mergeUrls(['http://100.64.0.7:3080']);
+      expect(a.rotateBaseUrl(), isTrue);
+      expect(a.sessionRelativeFilesSupported, isFalse);
+
+      a.applyCapabilities({
+        'files': {'version': 1, 'sessionRelative': true},
+      });
+      expect(a.sessionRelativeFilesSupported, isTrue);
+      await a.save(base: 'http://frp.example.com:3080', token: '');
+      expect(a.sessionRelativeFilesSupported, isFalse);
     });
   });
 }
