@@ -69,6 +69,19 @@
 - 原生连接迟到帧同样受 generation/hostId 门禁；
 - 真机验收必须覆盖：升级迁移、后台悬浮球/通知、切换档案后原生连接、删除档案后凭据清理。
 
+**选择：Kotlin 原生凭据库 + MethodChannel（推荐方案的收敛）**
+
+- Kotlin `CredentialStore` 是唯一凭据所有者：Android Keystore AES-256-GCM，alias `dsh_credentials_v1`，AAD 绑定 profileId，私有 prefs 只存密文；不依赖 `flutter_secure_storage` 的内部文件格式。
+- Dart 通过 `dsh/credentials` channel：`readActive` / `writeToken` / `deleteToken` / `activate` / `deactivate` / `status`；`Api` 内存持有 token，不再读写 `dsh_mr_token`。
+- 非敏感连接描述符由 Dart 写入 `dsh_native_connection`（profileId/hostId/generation/baseUrl/path/tlsPolicy/migrationState），原生只读；`generation` 仅在 active 切换时递增。
+- 激活顺序：writeToken 并 readback 验证 → activate 写 descriptor → 原生关闭旧 SSE/重建 → Dart 更新内存 Api；失败不切换、不删旧 token。
+- 旧 token 只在 `writeToken + activate + 原生 readback` 全部成功、`migration_state=complete` 后才删除；删除后读回确认 null。失败保留旧 key，但原生永不读取。
+- 原生 `startSse` 必须唤醒/重启现有 generation，不能因旧线程存活拒绝新连接；每帧校验 profileId/generation/connectionSeq，可选 hello.hostId；旧帧不得更新 pet/未读/通知/余额。
+- token-bearing 请求禁止跨 origin 重定向；Dart 与原生都校验最终 origin。
+- 迁移失败：不自动回退到明文；前台可保留已加载的内存连接，但后台原生 SSE 暂停并提示重新输入/重试。
+- 旧公网 HTTP 档案：迁移强制 HTTPS 或让用户重新确认；私网 HTTP 必须显式风险确认；新 origin（DHCP/手动改地址）未确认前不发送 token。
+
+
 ### 5. 宿主侧身份
 
 - SSE hello 增加 `hostId` / `instanceId`；旧插件缺失时 App 用 bootstrap 结果补，不因此断连。
