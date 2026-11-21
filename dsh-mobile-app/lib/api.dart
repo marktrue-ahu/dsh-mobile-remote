@@ -930,9 +930,13 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
   }
 
   /// `/api/files?path=` 的流式下载入口（保留既有签名/语义）。
+  ///
+  /// [sessionId] 非空时与 [downloadFilePrefix] 一致：服务端按会话 cwd 校验
+  /// [remotePath]（应为相对路径）；#138 会话文件浏览走这条路径。
   Future<DownloadResult> downloadFileToFile(
     String remotePath,
     File target, {
+    String? sessionId,
     DownloadCancelToken? cancel,
     void Function(DownloadProgress)? onProgress,
     Future<void> Function(DownloadMetadata)? onMetadata,
@@ -943,7 +947,10 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
     Duration idleTimeout = const Duration(seconds: 30),
     http.Client? downloadClient,
   }) => _downloadToFileUri(
-    _uri('/api/files?path=${Uri.encodeQueryComponent(remotePath)}'),
+    _uri(
+      '/api/files?path=${Uri.encodeQueryComponent(remotePath)}'
+      '${sessionId == null || sessionId.isEmpty ? '' : '&sessionId=${Uri.encodeQueryComponent(sessionId)}'}',
+    ),
     target,
     cancel: cancel,
     onProgress: onProgress,

@@ -6,17 +6,27 @@
 // - 隐藏 `.git/` 由服务端过滤点开头条目实现（服务端只回非点开头项）。
 // - 浏览根就是会话工作目录：不提供工作区选择，也不写回全局工作区筛选状态。
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 
 import '../api.dart';
+import '../download_foreground.dart';
 import '../git_browser_controller.dart';
 import '../l10n.dart';
+import '../logger.dart';
+import '../resumable_download.dart';
+import '../session_file_download.dart';
 import '../session_files_controller.dart';
 import '../session_files_logic.dart';
 import '../store.dart';
 import '../theme.dart';
+import '../toast.dart';
+import '../turn_file_actions.dart' show mimeOfTurnFileName;
 import '../widgets/git_file_viewer.dart';
+import 'download_resume_picker.dart';
 import 'git_browser_sheet.dart';
 
 /// 打开「会话文件浏览」全屏只读页。
@@ -57,6 +67,8 @@ class SessionFilesScreen extends StatefulWidget {
     this.selectionMode = false,
     this.initialRelativePath,
     this.apiClient,
+    this.downloader,
+    this.initialPendingDownloads,
   });
 
   final AppStore store;
@@ -79,17 +91,34 @@ class SessionFilesScreen extends StatefulWidget {
   /// 页面自建控制器时注入的 Api（测试用；生产为 null → 全局 [api] 单例）。
   final Api? apiClient;
 
+  /// 测试注入的下载控制器；生产为 null → 页面异步创建（私有断点目录）。
+  final SessionFileDownloadController? downloader;
+
+  /// 测试用：直接注入断点列表，避免 widget 测试 fake async 中等待文件 I/O。
+  final List<PendingDownload>? initialPendingDownloads;
+
   @override
   State<SessionFilesScreen> createState() => _SessionFilesScreenState();
 }
 
 class _SessionFilesScreenState extends State<SessionFilesScreen> {
+  static const MethodChannel _filesChannel = MethodChannel('dsh/files');
+
   late final SessionFilesController _c;
   late final bool _ownsController;
   late final GitReadApi _gitApi;
 
   /// 宿主是否支持文件提交历史（capability `fileHistory` 且会话在仓库内）。
   bool _fileHistoryAvailable = false;
+
+  Api get _api => widget.apiClient ?? api;
+  ResumableDownloads? _downloads;
+  SessionFileDownloadController? _downloader;
+  bool _ownsDownloader = false;
+  late List<PendingDownload> _pendingDownloads =
+      widget.initialPendingDownloads ?? const [];
+  String? _doneDialogFor;
+  String? _failureDialogFor;
 
   @override
   void initState() {
@@ -107,6 +136,177 @@ class _SessionFilesScreenState extends State<SessionFilesScreen> {
     _c.addListener(_onChange);
     _c.open();
     unawaited(_probeFileHistory());
+    if (widget.downloader != null) {
+      _downloader = widget.downloader;
+      _downloader!.addListener(_onDownloadChanged);
+      _downloader!.root = _c.root;
+      _downloads = _downloader!.downloads;
+      unawaited(_refreshPending());
+    } else {
+      unawaited(_initDownloader());
+    }
+  }
+
+  Future<void> _initDownloader() async {
+    try {
+      final support = await getApplicationSupportDirectory();
+      final downloads = ResumableDownloads(
+        Directory('${support.path}/downloads'),
+        _api,
+      );
+      final controller = SessionFileDownloadController(
+        api: _api,
+        sessionId: widget.sessionId,
+        root: _c.root,
+        downloads: downloads,
+        saveFile: _saveFile,
+        foreground: DownloadForeground.instance,
+      )..addListener(_onDownloadChanged);
+      if (!mounted) {
+        controller.dispose();
+        return;
+      }
+      _ownsDownloader = true;
+      setState(() {
+        _downloads = downloads;
+        _downloader = controller;
+      });
+      await _refreshPending();
+    } catch (e) {
+      // 私有目录不可用时仍可浏览；下载入口点击时提示，不阻塞页面。
+      AppLog.instance.log('文件下载初始化失败：$e');
+    }
+  }
+
+  Future<String?> _saveFile(File file, String name) =>
+      _filesChannel.invokeMethod<String>('saveFileFromPath', {
+        'path': file.path,
+        'name': name,
+      });
+
+  Future<void> _refreshPending() async {
+    final downloads = _downloads;
+    if (downloads == null) return;
+    try {
+      final pending = await downloads.pending();
+      if (mounted) setState(() => _pendingDownloads = pending);
+    } catch (_) {
+      // 断点目录不可读时不显示 banner；不影响浏览。
+    }
+  }
+
+  void _onDownloadChanged() {
+    if (!mounted) return;
+    final controller = _downloader;
+    if (controller == null) return;
+    if (controller.root != _c.root && _c.root.isNotEmpty) {
+      controller.root = _c.root;
+    }
+    setState(() {});
+    if (controller.phase == SessionFileDownloadPhase.paused ||
+        controller.phase == SessionFileDownloadPhase.failed) {
+      unawaited(_refreshPending());
+    }
+    if (controller.phase == SessionFileDownloadPhase.done &&
+        controller.absolutePath != null &&
+        _doneDialogFor != controller.absolutePath) {
+      _doneDialogFor = controller.absolutePath;
+      unawaited(_showDoneDialog(controller));
+    } else if (controller.phase == SessionFileDownloadPhase.failed &&
+        controller.failure != null &&
+        controller.absolutePath != null) {
+      final key = '${controller.absolutePath}|${controller.failure!.detail}';
+      if (_failureDialogFor != key) {
+        _failureDialogFor = key;
+        unawaited(_showFailureDialog(controller));
+      }
+    }
+  }
+
+  Future<void> _showDoneDialog(SessionFileDownloadController controller) async {
+    final saved = controller.savedPath;
+    final name = controller.name ?? 'file';
+    final view = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(L10n.t('下载完成', 'Download complete')),
+        content: Text(
+          saved == null
+              ? L10n.t(
+                  '已保存到手机：$name',
+                  'Saved to phone: $name',
+                )
+              : L10n.t(
+                  '已保存到手机：$saved',
+                  'Saved to phone: $saved',
+                ),
+        ),
+        actions: [
+          if (saved != null && saved.startsWith('content://'))
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: Text(L10n.t('查看', 'View')),
+            ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: Text(L10n.t('关闭', 'Close')),
+          ),
+        ],
+      ),
+    );
+    if (view == true && saved != null) {
+      try {
+        await _filesChannel.invokeMethod<dynamic>('openFile', {
+          'uri': saved,
+          'mime': mimeOfTurnFileName(name),
+        });
+      } catch (_) {}
+    }
+    if (!mounted) return;
+    controller.dismissDone();
+    _doneDialogFor = null;
+    await _refreshPending();
+  }
+
+  Future<void> _showFailureDialog(SessionFileDownloadController controller) async {
+    final failure = controller.failure;
+    if (failure == null) return;
+    final retry = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(L10n.t('下载失败', 'Download failed')),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(failure.summary),
+              if (failure.hint != null) ...[
+                const SizedBox(height: 8),
+                Text(failure.hint!, style: const TextStyle(fontSize: 12.5)),
+              ],
+              const SizedBox(height: 8),
+              Text(
+                failure.detail,
+                style: const TextStyle(fontSize: 11.5, color: Colors.grey),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: Text(L10n.t('继续下载', 'Resume')),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: Text(L10n.t('关闭', 'Close')),
+          ),
+        ],
+      ),
+    );
+    _failureDialogFor = null;
+    if (retry == true && mounted) unawaited(controller.retry());
   }
 
   /// 探测 Git 能力：旧宿主 / 非仓库 / 读取失败一律隐藏历史入口。
@@ -177,6 +377,7 @@ class _SessionFilesScreenState extends State<SessionFilesScreen> {
   @override
   void dispose() {
     _c.removeListener(_onChange);
+    if (_ownsDownloader) _downloader?.dispose();
     if (_ownsController) _c.dispose();
     super.dispose();
   }
@@ -229,6 +430,7 @@ class _SessionFilesScreenState extends State<SessionFilesScreen> {
           ],
         ),
         body: SafeArea(child: _body()),
+        bottomNavigationBar: _downloadBar(),
       ),
     );
   }
@@ -255,7 +457,7 @@ class _SessionFilesScreenState extends State<SessionFilesScreen> {
             path: _c.previewPath,
             loading: true,
             leading: _previewBackButton(),
-            topActions: _historyActions(),
+            topActions: [..._historyActions(), ..._previewDownloadActions()],
             keys: const GitFileViewerKeys(
               prefix: 'sf-preview',
               modePrefix: 'sf',
@@ -278,6 +480,10 @@ class _SessionFilesScreenState extends State<SessionFilesScreen> {
       children: [
         _rootBar(),
         _breadcrumbBar(),
+        if (_pendingDownloads.isNotEmpty &&
+            !widget.selectionMode &&
+            _api.sessionRelativeFilesSupported)
+          _pendingDownloadsBanner(),
         if (_c.hiddenCount > 0) _truncationNotice(),
         const Divider(height: 1),
         Expanded(
@@ -295,6 +501,7 @@ class _SessionFilesScreenState extends State<SessionFilesScreen> {
                   key: Key('sf-file-$f'),
                   leading: const Icon(Icons.description_outlined, size: 20),
                   title: Text(f),
+                  trailing: _fileDownloadAction(f),
                   onTap: () => _c.openFile(f),
                 ),
               if (_c.dirs.isEmpty && _c.files.isEmpty)
@@ -377,6 +584,243 @@ class _SessionFilesScreenState extends State<SessionFilesScreen> {
     );
   }
 
+  // ── 下载（#138） ──
+
+  String _filePathOf(String name) => joinBrowsePath(_c.currentPath, name, _c.sep);
+
+  Widget? _fileDownloadAction(String name) {
+    if (widget.selectionMode || !_api.sessionRelativeFilesSupported) return null;
+    final downloader = _downloader;
+    if (downloader == null) return null;
+    return _downloadActionButton(_filePathOf(name), keyName: name);
+  }
+
+  List<Widget> _previewDownloadActions() {
+    if (widget.selectionMode ||
+        !_api.sessionRelativeFilesSupported ||
+        _c.previewPath.isEmpty) {
+      return const [];
+    }
+    final button = _downloadActionButton(
+      _c.previewPath,
+      keyName: 'preview',
+    );
+    return button == null ? const [] : [button];
+  }
+
+  Widget? _downloadActionButton(String path, {required String keyName}) {
+    final downloader = _downloader;
+    if (downloader == null) return null;
+    final current = downloader.isCurrent(path);
+    final phase = current ? downloader.phase : SessionFileDownloadPhase.idle;
+    final Widget icon;
+    VoidCallback? onPressed;
+    switch (phase) {
+      case SessionFileDownloadPhase.downloading:
+      case SessionFileDownloadPhase.saving:
+        icon = const SizedBox(
+          width: 16,
+          height: 16,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        );
+        onPressed = null;
+      case SessionFileDownloadPhase.paused:
+        icon = const Icon(Icons.play_arrow, size: 20);
+        onPressed = () => unawaited(_startDownload(path));
+      case SessionFileDownloadPhase.failed:
+        icon = Icon(Icons.error_outline, size: 20, color: DshColors.warn(context));
+        onPressed = () => unawaited(_startDownload(path));
+      case SessionFileDownloadPhase.done:
+        icon = Icon(Icons.check, size: 20, color: DshColors.ok(context));
+        onPressed = null;
+      case SessionFileDownloadPhase.idle:
+        icon = const Icon(Icons.download_outlined, size: 20);
+        onPressed = () => unawaited(_startDownload(path));
+    }
+    return IconButton(
+      key: ValueKey('sf-download-$keyName'),
+      tooltip: L10n.t('下载文件', 'Download file'),
+      onPressed: onPressed,
+      icon: icon,
+    );
+  }
+
+  Future<void> _startDownload(String path) async {
+    final downloader = _downloader;
+    if (downloader == null) {
+      showToast(context, L10n.t('下载组件尚未就绪', 'Download is not ready yet'));
+      return;
+    }
+    if (downloader.busy && !downloader.isCurrent(path)) {
+      showToast(
+        context,
+        L10n.t(
+          '正在下载 ${downloader.name ?? '另一个文件'}，完成或暂停后可继续',
+          'Downloading ${downloader.name ?? 'another file'}; finish or pause it first',
+        ),
+      );
+      return;
+    }
+    if (downloader.isCurrent(path) &&
+        (downloader.phase == SessionFileDownloadPhase.downloading ||
+            downloader.phase == SessionFileDownloadPhase.saving)) {
+      return;
+    }
+    await downloader.start(
+      path,
+      onBackgroundUnavailable: (message) {
+        if (mounted) showToast(context, message);
+      },
+    );
+  }
+
+  Widget _pendingDownloadsBanner() {
+    return Container(
+      key: const ValueKey('sf-pending-downloads'),
+      width: double.infinity,
+      color: DshColors.brandSoft(context),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              L10n.t(
+                '有 ${_pendingDownloads.length} 个未完成的下载',
+                '${_pendingDownloads.length} unfinished download(s)',
+              ),
+              style: TextStyle(fontSize: 11.5, color: DshColors.ink2(context)),
+            ),
+          ),
+          TextButton(
+            key: const ValueKey('sf-pending-view'),
+            onPressed: () => unawaited(_openPendingPicker()),
+            child: Text(L10n.t('查看', 'View')),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _openPendingPicker() async {
+    final downloads = _downloads;
+    if (downloads == null) return;
+    final path = await showDownloadResumePicker(
+      context,
+      downloads,
+      _pendingDownloads,
+    );
+    if (!mounted || path == null || path.isEmpty) return;
+    if (relativePathWithinRoot(_c.root, path) == null) {
+      showToast(context, L10n.t('该断点不在当前会话工作目录内', 'That partial file is outside this session workspace'));
+      return;
+    }
+    await _startDownload(path);
+  }
+
+  Widget? _downloadBar() {
+    if (widget.selectionMode || !_api.sessionRelativeFilesSupported) return null;
+    final downloader = _downloader;
+    if (downloader == null || downloader.phase == SessionFileDownloadPhase.idle) {
+      return null;
+    }
+    final phase = downloader.phase;
+    final progress = downloader.progress;
+    final fraction = progress.fraction;
+    final status = switch (phase) {
+      SessionFileDownloadPhase.downloading => fraction == null
+          ? _formatBytes(progress.received)
+          : '${(fraction * 100).round()}% · ${_formatBytes(progress.received)}',
+      SessionFileDownloadPhase.paused => L10n.t('已暂停 · 进度已保留', 'Paused · progress kept'),
+      SessionFileDownloadPhase.saving => L10n.t('正在保存…', 'Saving…'),
+      SessionFileDownloadPhase.failed => L10n.t('下载失败', 'Download failed'),
+      SessionFileDownloadPhase.done => L10n.t('已完成', 'Completed'),
+      SessionFileDownloadPhase.idle => '',
+    };
+    return Material(
+      color: DshColors.surface(context),
+      child: SafeArea(
+        top: false,
+        child: Container(
+          key: const ValueKey('sf-download-bar'),
+          padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
+          decoration: BoxDecoration(
+            border: Border(top: BorderSide(color: Theme.of(context).dividerColor.withValues(alpha: 0.5))),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      downloader.name ?? '',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                  Text(
+                    status,
+                    key: const ValueKey('sf-download-status'),
+                    maxLines: 1,
+                    style: TextStyle(fontSize: 11.5, color: DshColors.ink3(context)),
+                  ),
+                  if (phase == SessionFileDownloadPhase.downloading)
+                    IconButton(
+                      key: const ValueKey('sf-download-pause'),
+                      tooltip: L10n.t('暂停', 'Pause'),
+                      onPressed: downloader.pause,
+                      icon: const Icon(Icons.pause, size: 20),
+                    )
+                  else if (phase == SessionFileDownloadPhase.paused ||
+                      phase == SessionFileDownloadPhase.failed)
+                    IconButton(
+                      key: const ValueKey('sf-download-resume'),
+                      tooltip: phase == SessionFileDownloadPhase.failed
+                          ? L10n.t('重试', 'Retry')
+                          : L10n.t('继续', 'Resume'),
+                      onPressed: () => unawaited(downloader.retry()),
+                      icon: Icon(
+                        phase == SessionFileDownloadPhase.failed
+                            ? Icons.refresh
+                            : Icons.play_arrow,
+                        size: 20,
+                      ),
+                    ),
+                  if (phase == SessionFileDownloadPhase.failed)
+                    IconButton(
+                      key: const ValueKey('sf-download-details'),
+                      tooltip: L10n.t('详情', 'Details'),
+                      onPressed: () => unawaited(_showFailureDialog(downloader)),
+                      icon: const Icon(Icons.info_outline, size: 20),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              LinearProgressIndicator(
+                key: const ValueKey('sf-download-progress'),
+                value: phase == SessionFileDownloadPhase.saving
+                    ? null
+                    : fraction,
+                minHeight: 2,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  static String _formatBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KiB';
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MiB';
+    }
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GiB';
+  }
+
   // ── 文件预览 ──
   //
   // 渲染交给统一的 GitFileViewer（issue #42）：本页只保留「取数 + 返回目录」的
@@ -390,7 +834,7 @@ class _SessionFilesScreenState extends State<SessionFilesScreen> {
         path: _c.previewPath,
         notice: v.reason,
         leading: _previewBackButton(),
-        topActions: _historyActions(),
+        topActions: [..._historyActions(), ..._previewDownloadActions()],
         keys: const GitFileViewerKeys(prefix: 'sf-preview', modePrefix: 'sf'),
       );
     }
@@ -409,7 +853,7 @@ class _SessionFilesScreenState extends State<SessionFilesScreen> {
         'File is large: showing first ${v.bytesShown ~/ 1024} KiB',
       ),
       leading: _previewBackButton(),
-      topActions: _historyActions(),
+      topActions: [..._historyActions(), ..._previewDownloadActions()],
       keys: const GitFileViewerKeys(prefix: 'sf-preview', modePrefix: 'sf'),
     );
   }

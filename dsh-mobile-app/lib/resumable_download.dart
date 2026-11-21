@@ -113,8 +113,12 @@ class ResumableDownloads {
     }
   }
 
+  /// [path] 同时作为本地断点存储键；[requestPath]/[sessionId] 只用于构造
+  /// `/api/files` 请求（#138：存绝对路径、传会话 cwd 相对路径 + sessionId）。
   Future<DownloadResult> download(
     String path, {
+    String? requestPath,
+    String? sessionId,
     DownloadCancelToken? cancel,
     void Function(DownloadProgress)? onProgress,
     http.Client? downloadClient,
@@ -150,8 +154,9 @@ class ResumableDownloads {
       for (var attempt = 0; attempt < 2; attempt++) {
         try {
           final result = await api.downloadFileToFile(
-            path,
+            requestPath ?? path,
             target,
+            sessionId: sessionId,
             startOffset: bytes,
             expectedEtag: bytes > 0 ? etag as String : null,
             cancel: cancel,
