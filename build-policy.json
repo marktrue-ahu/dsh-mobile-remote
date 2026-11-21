@@ -380,8 +380,10 @@
       "carrierVersion": "3.3.0-rc.1-app",
       "build": 62,
       "integrity": "sha512-hq2Hz8tfKIi85r/qlEiz1F15egPPXiwcs/IWauHy4lD1BctQV8AdAmq5kSQOhQbkwIk14H+NJAwgJJFh+i0lXA==",
-      "status": "submitted",
-      "createdAt": "2026-11-21T08:36:36.767Z"
+      "status": "published",
+      "createdAt": "2026-11-21T08:36:36.767Z",
+      "note": "dist-tags verified",
+      "updatedAt": "2026-11-21T08:43:22.068Z"
     }
   ]
 }
