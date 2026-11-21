@@ -119,6 +119,8 @@ class PluginInfo {
   final bool current;
   final PluginHealth health;
   final PluginCompatibility compatibility;
+  final String updateKind;
+  final bool canUpdate;
 
   const PluginInfo({
     required this.id,
@@ -131,6 +133,8 @@ class PluginInfo {
     this.current = false,
     this.health = const PluginHealth(),
     this.compatibility = const PluginCompatibility(),
+    this.updateKind = '',
+    this.canUpdate = false,
   });
 
   factory PluginInfo.fromJson(Object? json) {
@@ -148,6 +152,8 @@ class PluginInfo {
       current: json['current'] == true,
       health: PluginHealth.fromJson(json['health']),
       compatibility: PluginCompatibility.fromJson(json['compatibility']),
+      updateKind: (json['updateKind'] as String?)?.trim() ?? '',
+      canUpdate: (json['management'] as Map?)?['canUpdate'] == true,
     );
   }
 
@@ -192,6 +198,7 @@ class PluginInventory {
   final String reason;
   final PluginInventoryHost host;
   final List<PluginInfo> plugins;
+  final List<PluginInstallable> installable;
 
   const PluginInventory({
     this.supported = false,
@@ -200,6 +207,7 @@ class PluginInventory {
     this.reason = '',
     this.host = const PluginInventoryHost(),
     this.plugins = const [],
+    this.installable = const [],
   });
 
   factory PluginInventory.fromJson(Object? json) {
@@ -207,6 +215,10 @@ class PluginInventory {
     final plugins = <PluginInfo>[];
     for (final row in (json['plugins'] as List? ?? const [])) {
       plugins.add(PluginInfo.fromJson(row));
+    }
+    final installable = <PluginInstallable>[];
+    for (final row in (json['installable'] as List? ?? const [])) {
+      installable.add(PluginInstallable.fromJson(row));
     }
     final supported = json['supported'] == true;
     return PluginInventory(
@@ -218,6 +230,7 @@ class PluginInventory {
       reason: (json['reason'] as String?)?.trim() ?? '',
       host: PluginInventoryHost.fromJson(json['host']),
       plugins: plugins,
+      installable: installable,
     );
   }
 
@@ -229,4 +242,206 @@ class PluginInventory {
   int get runningCount =>
       plugins.where((p) => p.enabled && p.health.isOk).length;
   int get attentionCount => plugins.where((p) => p.needsAttention).length;
+}
+
+/// #146：宿主配置渠道给出的可安装候选（App 只传 name，spec 由宿主清单决定）。
+class PluginInstallable {
+  final String id;
+  final String name;
+  final Object? title;
+  final String packageName;
+  final String version;
+  final PluginSource source;
+  final String description;
+
+  const PluginInstallable({
+    required this.id,
+    required this.name,
+    this.title,
+    required this.packageName,
+    required this.version,
+    this.source = const PluginSource(kind: 'registry', label: '配置渠道'),
+    this.description = '',
+  });
+
+  factory PluginInstallable.fromJson(Object? json) {
+    if (json is! Map) {
+      return const PluginInstallable(
+        id: '',
+        name: '',
+        packageName: '',
+        version: '',
+      );
+    }
+    return PluginInstallable(
+      id: (json['id'] as String?)?.trim() ?? '',
+      name: (json['name'] as String?)?.trim() ?? '',
+      title: json['title'],
+      packageName: (json['packageName'] as String?)?.trim() ?? '',
+      version: (json['version'] as String?)?.trim() ?? '',
+      source: PluginSource.fromJson(json['source']),
+      description: (json['description'] as String?)?.trim() ?? '',
+    );
+  }
+
+  String get displayName {
+    final t = title;
+    if (t is String && t.trim().isNotEmpty) return t.trim();
+    if (t is Map) {
+      final value = t[L10n.lang] ?? t['zh'] ?? t['en'];
+      if (value is String && value.trim().isNotEmpty) return value.trim();
+    }
+    return name;
+  }
+}
+
+/// #146：宿主返回的一个可升级版本。
+class PluginVersionInfo {
+  final String version;
+  final bool prerelease;
+  final String deprecated;
+  final bool bundle;
+  final String incompatibleRequirements;
+
+  const PluginVersionInfo({
+    required this.version,
+    this.prerelease = false,
+    this.deprecated = '',
+    this.bundle = true,
+    this.incompatibleRequirements = '',
+  });
+
+  factory PluginVersionInfo.fromJson(Object? json) {
+    if (json is! Map) return const PluginVersionInfo(version: '');
+    return PluginVersionInfo(
+      version: (json['version'] as String?)?.trim() ?? '',
+      prerelease: json['prerelease'] == true,
+      deprecated: (json['deprecated'] as String?)?.trim() ?? '',
+      bundle: json['bundle'] != false,
+      incompatibleRequirements:
+          (json['incompatible'] as Map?)?['requirements']?.toString().trim() ??
+          '',
+    );
+  }
+
+  bool get usable =>
+      version.isNotEmpty && bundle && incompatibleRequirements.isEmpty;
+}
+
+/// #146：检查更新结果。
+class PluginVersionCheck {
+  final String status; // listed | refused | unknown
+  final String problem;
+  final String reason;
+  final String installedVersion;
+  final List<PluginVersionInfo> versions;
+
+  const PluginVersionCheck({
+    this.status = 'unknown',
+    this.problem = '',
+    this.reason = '',
+    this.installedVersion = '',
+    this.versions = const [],
+  });
+
+  factory PluginVersionCheck.fromJson(Object? json) {
+    if (json is! Map) return const PluginVersionCheck();
+    return PluginVersionCheck(
+      status: (json['status'] as String?)?.trim() ?? 'unknown',
+      problem: (json['problem'] as String?)?.trim() ?? '',
+      reason: (json['reason'] as String?)?.trim() ?? '',
+      installedVersion: (json['installedVersion'] as String?)?.trim() ?? '',
+      versions: (json['versions'] as List? ?? const [])
+          .map(PluginVersionInfo.fromJson)
+          .toList(),
+    );
+  }
+
+  List<PluginVersionInfo> get usableVersions =>
+      versions.where((v) => v.usable).toList();
+}
+
+class PluginOperationStep {
+  final String key;
+  final String state;
+  const PluginOperationStep({required this.key, required this.state});
+
+  factory PluginOperationStep.fromJson(Object? json) {
+    if (json is! Map)
+      return const PluginOperationStep(key: '', state: 'pending');
+    return PluginOperationStep(
+      key: (json['key'] as String?)?.trim() ?? '',
+      state: (json['state'] as String?)?.trim() ?? 'pending',
+    );
+  }
+}
+
+/// #146：宿主安装/升级操作快照（由后端轮询宿主事务得到）。
+class PluginOperation {
+  final String opId;
+  final String action; // install | update
+  final String name;
+  final String targetVersion;
+  final String status; // running | succeeded | failed | cancelled
+  final String phase;
+  final List<PluginOperationStep> steps;
+  final String version;
+  final String fromVersion;
+  final bool restartRequired;
+  final bool rolledBack;
+  final bool rollbackFailed;
+  final bool unchanged;
+  final bool outcomeUnknown;
+  final bool cancelled;
+  final String errorCode;
+
+  const PluginOperation({
+    required this.opId,
+    required this.action,
+    required this.name,
+    this.targetVersion = '',
+    this.status = 'running',
+    this.phase = '',
+    this.steps = const [],
+    this.version = '',
+    this.fromVersion = '',
+    this.restartRequired = false,
+    this.rolledBack = false,
+    this.rollbackFailed = false,
+    this.unchanged = false,
+    this.outcomeUnknown = false,
+    this.cancelled = false,
+    this.errorCode = '',
+  });
+
+  factory PluginOperation.fromJson(Object? json) {
+    if (json is! Map) {
+      return const PluginOperation(opId: '', action: '', name: '');
+    }
+    return PluginOperation(
+      opId: (json['opId'] as String?)?.trim() ?? '',
+      action: (json['action'] as String?)?.trim() ?? '',
+      name: (json['name'] as String?)?.trim() ?? '',
+      targetVersion: (json['targetVersion'] as String?)?.trim() ?? '',
+      status: (json['status'] as String?)?.trim() ?? 'running',
+      phase: (json['phase'] as String?)?.trim() ?? '',
+      steps: (json['steps'] as List? ?? const [])
+          .map(PluginOperationStep.fromJson)
+          .toList(),
+      version: (json['version'] as String?)?.trim() ?? '',
+      fromVersion: (json['fromVersion'] as String?)?.trim() ?? '',
+      restartRequired: json['restartRequired'] == true,
+      rolledBack: json['rolledBack'] == true,
+      rollbackFailed: json['rollbackFailed'] == true,
+      unchanged: json['unchanged'] == true,
+      outcomeUnknown: json['outcomeUnknown'] == true,
+      cancelled: json['cancelled'] == true,
+      errorCode: (json['errorCode'] as String?)?.trim() ?? '',
+    );
+  }
+
+  bool get running => status == 'running';
+  bool get succeeded => status == 'succeeded';
+  bool get failed => status == 'failed';
+  bool get wasCancelled => status == 'cancelled';
 }

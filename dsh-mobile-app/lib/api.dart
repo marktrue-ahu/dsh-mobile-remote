@@ -1427,6 +1427,49 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
     }
   }
 
+  /// #146：检查某个已安装 registry bundle 的可用新版本（只读；不触发安装）。
+  Future<PluginVersionCheck> pluginVersions(String name) async {
+    final data = await getJson(
+      '/api/plugin-inventory/versions?name=${Uri.encodeQueryComponent(name)}',
+      timeout: const Duration(seconds: 30),
+    );
+    return PluginVersionCheck.fromJson(data);
+  }
+
+  /// #146：从宿主配置渠道安装一个 bundle（spec 由宿主清单决定，App 只传 name）。
+  Future<PluginOperation> pluginInstall(String name) async {
+    final data = await postJson('/api/plugin-inventory/install', {
+      'name': name,
+    }, timeout: const Duration(seconds: 30));
+    return PluginOperation.fromJson(data['operation']);
+  }
+
+  /// #146：升级一个 registry 来源 bundle 到宿主确认的精确版本。
+  Future<PluginOperation> pluginUpgrade(String name, String version) async {
+    final data = await postJson('/api/plugin-inventory/update', {
+      'name': name,
+      'version': version,
+    }, timeout: const Duration(seconds: 30));
+    return PluginOperation.fromJson(data['operation']);
+  }
+
+  /// #146：轮询宿主事务进度。
+  Future<PluginOperation> pluginOperation(String opId) async {
+    final data = await getJson(
+      '/api/plugin-inventory/op?opId=${Uri.encodeQueryComponent(opId)}',
+      timeout: const Duration(seconds: 15),
+    );
+    return PluginOperation.fromJson(data['operation']);
+  }
+
+  /// #146：取消正在进行的安装/升级（宿主确认是否已太晚）。
+  Future<String> pluginCancelOperation(String opId) async {
+    final data = await postJson('/api/plugin-inventory/op/cancel', {
+      'opId': opId,
+    }, timeout: const Duration(seconds: 20));
+    return (data['cancel'] as String?)?.trim() ?? 'unknown';
+  }
+
   /// Trigger desktop plugin update. Retries retain [opId] and optional prepare proof.
   Future<Map<String, dynamic>> triggerPluginUpdate({
     String opId = '',

@@ -1571,3 +1571,18 @@ POST 请求体：`{"sessionId","repositoryId","tips":[...],"limit"?,"snapshotId"
 - **来源本地化**：服务端 `label` 是中文兜底；App 对已知 `kind` 按当前语言映射，未知 kind 才回退 `label`。
 - `current=true` 表示该插件是当前手机连接所依赖的插件；不提供任何安装/升级/卸载/启停/重启字段或方法。
 - `updateAvailable` 固定 `null`：更新候选检查属于 #146/#147，本端点不触网检查 registry。
+
+### 6.26 插件安装/升级（v3.3，issue #146）
+
+只使用宿主**已配置渠道**：App 不传任意 registry/Git/路径；安装候选与升级目标均来自宿主 `listBundles()/listVersions()`。宿主 `installBundle/updateBundle` 负责事务与失败回滚；本插件只做参数校验、同插件互斥、进度投影与结果归一，不自行改 profile。
+
+- `GET /m/api/plugin-inventory/versions?name=<name>`：检查已安装 registry bundle 的更新。返回 `{status:"listed",installedVersion,versions:[{version,prerelease,deprecated,bundle,incompatible:{requirements}}],omitted}` 或 `{status:"refused",problem,reason}`；Git/内置/不可升级 → 409（稳定码 `git-update-desktop-required`/`plugin-not-updatable`）。
+- `POST /m/api/plugin-inventory/install` `{name}`：仅接受宿主清单里带 `installTarget` 的候选；spec 由宿主决定，`expected` 固定目标版本。返回 `{ok,operation}`。
+- `POST /m/api/plugin-inventory/update` `{name,version}`：仅接受 `update:"registry"` 的已安装 bundle；App 不能传 `spec`。返回 `{ok,operation}`。
+- `GET /m/api/plugin-inventory/op?opId=`：轮询操作快照：`status(running|succeeded|failed|cancelled)`、`steps[{key,state}]`、`version/fromVersion`、`restartRequired`、`rolledBack`、`rollbackFailed`、`unchanged`、`outcomeUnknown`、`cancelled`、`errorCode`。
+- `POST /m/api/plugin-inventory/op/cancel` `{opId}`：委托宿主 `cancelInstall`；返回 `{cancel:"cancelled|too-late|not-running",operation}`。
+
+口径：
+- 安装失败/取消：宿主恢复 profile，`rolledBack:true`；异常逃逸 → `outcomeUnknown:true`（不断言回滚成功）。
+- 升级失败：宿主返回 `restore` 时 `rolledBack/rollbackFailed` 如实投影；未进入安装即失败 → `unchanged:true`；成功且 `application:"restart-required"` → `restartRequired:true`（只提示，重启由 #147）。
+- 禁止卸载/启停/重启端点；操作记录 15 分钟过期，不持久化。
