@@ -262,6 +262,22 @@ void main() {
     });
   });
 
+  group('relativePathWithinRoot（#16：绝对路径 → 会话 cwd 相对路径）', () {
+    test('工作区内文件/子目录返回 POSIX 相对路径', () {
+      expect(relativePathWithinRoot('/home/mark/proj', '/home/mark/proj/README.md'), 'README.md');
+      expect(relativePathWithinRoot('/home/mark/proj', '/home/mark/proj/src/a.dart'), 'src/a.dart');
+      expect(relativePathWithinRoot('/home/mark/proj/', '/home/mark/proj/src/a.dart'), 'src/a.dart');
+    });
+
+    test('根目录、越界、同路径、Windows 盘符', () {
+      expect(relativePathWithinRoot('/home/mark/proj', '/home/mark/proj'), isNull);
+      expect(relativePathWithinRoot('/home/mark/proj', '/home/mark/proj2/a'), isNull);
+      expect(relativePathWithinRoot('/home/mark/proj', '/etc/passwd'), isNull);
+      expect(relativePathWithinRoot(r'E:\Work\proj', r'E:\Work\proj\src\a.dart'), 'src/a.dart');
+      expect(relativePathWithinRoot(r'E:\Work\proj', r'e:\work\PROJ\src\a.dart'), 'src/a.dart');
+    });
+  });
+
   group('isWithinRoot（夹在会话工作目录内）', () {
     test('根本身算在内', () {
       expect(isWithinRoot('/home/mark', '/home/mark'), isTrue);

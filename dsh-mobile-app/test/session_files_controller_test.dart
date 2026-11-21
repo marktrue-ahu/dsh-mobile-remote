@@ -16,15 +16,19 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 /// 假服务端：记录请求，按路径返回预设目录或文件内容。
 class _Backend {
-  _Backend() {
+  _Backend({bool sessionRelativeFiles = true, this.strictAbsolute = false}) {
     api = Api(client: MockClient(_handle))
       ..baseUrl = 'http://sf.test'
       ..path = '/m'
-      ..token = '';
+      ..token = ''
+      ..sessionRelativeFilesSupported = sessionRelativeFiles;
   }
 
   /// 置 true 后所有列目录请求都失败（测试里按需切换）。
   bool failDirs = false;
+
+  /// 模拟旧服务端：相对路径按宿主 cwd 而非会话 cwd 解析（夹具直接 404）。
+  final bool strictAbsolute;
   final List<String> dirRequests = [];
   final List<String> fileRequests = [];
 
@@ -69,7 +73,11 @@ class _Backend {
     }
     if (request.url.path == '/m/api/files') {
       fileRequests.add(path);
-      final bytes = contents[path];
+      // GitLab #16：新调用传会话 cwd 相对路径；夹具内容仍按 /work 绝对路径存储。
+      final resolved = path.startsWith('/')
+          ? path
+          : (strictAbsolute ? path : '/work/$path');
+      final bytes = contents[resolved];
       if (bytes == null) return http.Response('not found', 404);
       return http.Response.bytes(bytes, 200);
     }
@@ -240,6 +248,19 @@ void main() {
     expect(c.previewPath, isEmpty);
   });
 
+  test('旧服务端无 session-relative 能力：回退绝对路径，不发送 sessionId', () async {
+    final b = _Backend(sessionRelativeFiles: false, strictAbsolute: true);
+    final store = _storeWithSession('s1', '/work');
+    final c = SessionFilesController(store: store, sessionId: 's1', apiClient: b.api);
+    await c.open();
+
+    await c.openFile('README.md');
+
+    expect(c.stage, BrowseStage.preview);
+    expect((c.preview! as PreviewText).text, '第一行\n第二行\n');
+    expect(b.fileRequests.last, '/work/README.md');
+  });
+
   test('二进制文件预览给出不可预览原因', () async {
     final b = _Backend();
     final store = _storeWithSession('s1', '/work');
@@ -295,7 +316,7 @@ void main() {
 
     expect(c.stage, BrowseStage.preview);
     expect(b.fileRequests.length, before + 1);
-    expect(b.fileRequests.last, '/work/README.md');
+    expect(b.fileRequests.last, 'README.md');
   });
 
   test('文件不存在时给出原因且不崩', () async {

@@ -876,13 +876,16 @@ fetch/push 序列化 common domain，pull/sync/abort 同时序列化 common 与 
 
 ### 6.17 文件传输（v3.1.2，B站 csborbbnc 反馈）
 
-**GET `/m/api/files?path=…`** — 下载电脑文件
-- 响应：`200` 文件流（`content-type` 按扩展名推断、`content-disposition: attachment` 带 UTF-8 文件名）；路径不存在或非文件 → `404 file-not-found`；缺 `path` → `400 bad-request`
-- 与目录选择器（§6.2）同信任模型：口令鉴权 + 现有限流，路径由手机显式指定；服务端先打开句柄、`fstat` 复核为普通文件，再按 descriptor 真实路径做工作区包含校验，符号链接/越界路径一律 `404`
-- 平台范围：descriptor-relative 保护需 procfs/devfs，**仅 Linux/macOS 提供**；Windows 返回 `503 files-unavailable`（安全 fail-closed，见 docs/04 §6）
+**GET `/m/api/files?path=…&sessionId=…`** — 下载会话工作目录内的文件（GitLab #16）
+- 新调用必须带 `sessionId`，`path` 是**该会话 cwd 内的相对路径**：服务端 `realpath` 会话 cwd 后做词法包含校验，再以 `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` 打开句柄、`fstat` 确认普通文件，并用 `/proc/self/fd/<fd>` 的真实路径复核仍在 cwd 内；绝对路径、`..`、symlink 逃逸、目录/设备/FIFO 一律拒绝。读取固定在该 fd 上，`statSync → createReadStream` 之间的换链无法逃出 cwd。
+- **旧调用兼容**：不带 `sessionId` 时只接受**绝对路径**，且必须落在已注册工作区（`workspaceRegistry`）内；不再允许任意宿主路径。新客户端应带 `sessionId` 获得会话级收紧。
+- 稳定错误码：缺 `path`/NUL → `400 bad-request`；相对路径但无 `sessionId` → `400 session-required`；会话不存在 → `404 session-not-found`；会话无 cwd → `404 workspace-not-found`；绝对路径/`..`/编码绕过/symlink 逃逸/越界 → `403 path-outside-workspace`；目标不存在 → `404 file-not-found`；目录/设备/FIFO → `400 not-a-file`；无权限 → `403 file-forbidden`；无工作区可校验 → `403 workspace-not-authorized`。
+- 平台范围：descriptor-relative 保护需 Linux procfs 与 `O_NOFOLLOW`；其它平台一律 `503 files-unavailable`（安全 fail-closed，不回退为路径读取，见 docs/04 §6）
 - 支持 `HEAD`、单区间 `Range`、`ETag`、`If-None-Match`；有效区间返回 `206 + Content-Range`，越界返回 `416`。续传携带 `Range: bytes=N-` 与此前保存的 `If-Range: <ETag>`；只有标记一致才返回区间，不一致、弱标记或日期标记均返回完整 `200`，客户端截断旧文件后从头写。
 - App 侧断点保存在私有支持目录，按地址、API 路径与认证身份摘要隔离（不持久化口令）；恢复时核对 ETag、实际本地长度、完整区间和最终总长度，旧宿主缺标记时从头下载。暂停、断网、锁屏中断与进程退出后可从下载入口继续；保存到系统下载目录失败时保留已下载文件以便重试保存。恢复列表最多八项，七天后清理，可手动删除。
 - Android 用户发起下载后启动专用 `dataSync` 前台服务（通知提供进度与暂停，完成、失败或暂停后退出）；服务不可用或通知关闭时明确退回前台下载。服务与宠物 / 提醒保活开关独立，不传递 URL、口令或远端路径。Android 15+ 累计后台时限由系统管理，`onTimeout` 立即停止服务并通知 Dart 暂停、保留私有断点，不通过重启服务绕过预算。
+
+**能力位 `capabilities.files`（bootstrap 与 SSE hello 同形状）**：`{ "version": 1, "sessionRelative": true }`。新 App 看到 `sessionRelative=true` 才发送 `sessionId` + cwd 相对路径；旧插件缺该能力位时 App 回退旧的绝对路径契约，避免旧服务端把相对路径按宿主 cwd 解析导致 404/错文件。旧 App 忽略该字段，继续走兼容绝对路径通道。
 
 **POST `/m/api/files/upload`** — 上传文件到电脑（写会话工作目录）
 ```json
@@ -890,7 +893,7 @@ fetch/push 序列化 common domain，pull/sync/abort 同时序列化 common 与 
 响应: { "ok": true, "path": "F:\\DSH-Outpost\\README.md", "bytes": 1234 }
 ```
 - 目标目录：`sessionId` 对应 agent 的工作目录 → 缺省回退第一个注册工作区根；无法确定 → `404 workspace-not-found`（不再静默写入其它 workspace）
-- 服务端先打开并校验目录句柄，再通过 descriptor-relative + `O_CREAT|O_EXCL|O_NOFOLLOW` 创建目标，目录替换/符号链接竞态不会越界；当前平台不具备 descriptor fs 时 fail-closed → `503 files-unavailable`
+- 上传目标只允许落在 `sessionId` 对应 cwd（缺省回退首个注册工作区根）；文件名黑名单拒绝分隔符/NUL/`.`/`..`。当前上传路径仍按目标路径直接写入，**未**采用下载侧的 descriptor-relative 句柄保护（不在 #16 本次收口范围，后续另议）。
 - `name` 不合法（含 `\ / : * ? " < > |`、`.`/`..`/超 255）→ `400 invalid-name`；同名已存在 → `409 file-exists`；body 上限 64MB → `413 payload-too-large`
 
 ### 6.18 GET /m/api/turn-outline（轮次大纲，轮次导航）
