@@ -174,6 +174,43 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('320 / 2.0× + 多工作区：抽屉可滚到连接/设置且无 overflow', (
+    tester,
+  ) async {
+    final store = await _store(withHost: false);
+    addTearDown(store.disposeBridge);
+    store.workspaces = [
+      {'path': '/work/one', 'title': '项目一'},
+      {'path': '/work/two', 'title': '项目二'},
+      {'path': '/work/three', 'title': '项目三'},
+    ];
+    await _pumpDrawer(
+      tester,
+      store,
+      size: const Size(320, 640),
+      textScaler: const TextScaler.linear(2.0),
+      theme: DshTheme.dark(),
+    );
+    final scrollable = find.descendant(
+      of: find.byType(Drawer),
+      matching: find.byType(Scrollable),
+    );
+    expect(scrollable, findsOneWidget);
+    await tester.scrollUntilVisible(
+      find.byKey(const ValueKey('drawer-connection')),
+      120,
+      scrollable: scrollable,
+    );
+    expect(find.byKey(const ValueKey('drawer-connection')), findsOneWidget);
+    await tester.scrollUntilVisible(
+      find.text('设置'),
+      120,
+      scrollable: scrollable,
+    );
+    expect(find.text('设置'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('320 / 2.0× Drawer 不溢出', (tester) async {
     final store = await _store(withHost: false);
     addTearDown(store.disposeBridge);

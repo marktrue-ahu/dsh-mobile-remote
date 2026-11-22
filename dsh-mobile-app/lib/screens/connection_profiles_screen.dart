@@ -374,7 +374,7 @@ class _ConnectionProfileEditorScreenState
     _base.addListener(_onEndpointChanged);
   }
 
-  /// 与 ConnectionSheet/store 一致：没写 scheme 时按 http 处理，再去尾斜杠。
+  /// 与 store/Api 归一一致：没写 scheme 时按 http 处理，再去尾斜杠。
   String get _normalizedBase {
     var base = _base.text.trim();
     if (base.isEmpty) return '';

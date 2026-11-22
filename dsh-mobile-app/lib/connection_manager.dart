@@ -778,7 +778,8 @@ class ConnectionManager {
     return profile;
   }
 
-  /// 首次配置/重新配置当前连接（ConnectionSheet）。已存在档案时原地更新，不新增副本。
+  /// 旧版单连接入口（无档案名）的兼容路径；新 UI 统一走 ConnectionProfileEditorScreen。
+  /// 已存在档案时原地更新，不新增副本。
   Future<void> connectManual({
     required String baseUrl,
     required String token,
