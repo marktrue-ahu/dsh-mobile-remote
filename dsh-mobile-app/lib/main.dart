@@ -1,5 +1,5 @@
 // DSH Remote — 手机远程操作 DeepSeek Harness
-// 原生 App：抽屉导航（首页/会话/设置）+ 通知 + 连接配置 + 扫码连接。
+// 原生 App：抽屉导航（连接/首页/会话/设置）+ 通知 + 连接配置 + 扫码连接。
 // 界面与功能对齐网页端 dsh-mobile-remote（DeepSeek 配色，Claude 式布局）。
 import 'dart:async';
 import 'package:flutter/material.dart';
@@ -27,6 +27,7 @@ import 'screens/chat_screen.dart';
 import 'screens/home_screen.dart';
 import 'screens/sessions_screen.dart';
 import 'screens/settings_screen.dart';
+import 'screens/connection_profiles_screen.dart';
 import 'screens/notifications_screen.dart';
 import 'screens/sheets.dart';
 import 'screens/usage_screen.dart';
@@ -755,6 +756,10 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
     setState(() => _reconfiguring = true);
   }
 
+  void _openConnections() {
+    unawaited(showConnectionProfilesScreen(context, store));
+  }
+
   void _openNewSession() {
     showNewSessionSheet(context, store, (id) async {
       // Phase 2(A4)：openChat 内统一 setSession+refreshSessionConfig+push，这里只刷列表
@@ -863,67 +868,12 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
           const SizedBox(width: 8),
         ],
       ),
-      drawer: Drawer(
-        backgroundColor: Theme.of(context).scaffoldBackgroundColor,
-        child: SafeArea(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(20, 20, 20, 12),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('DSH', style: TextStyle(fontSize: 26, fontWeight: FontWeight.w700, fontFamily: 'Georgia')),
-                    const SizedBox(height: 12),
-                    FilledButton(
-                      style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(42)),
-                      onPressed: () {
-                        Navigator.of(context).pop();
-                        _openNewSession();
-                      },
-                      child: Text(L10n.t('＋ 新建会话', '+ New Session')),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 4),
-              // 工作区快速切换（对齐 PC 端 workspace 切换；≥2 个工作区时显示）
-              // 封顶 35% 屏高 + 可滚动：工作区再多也不会把下方导航挤出屏幕
-              if (store.workspaces.length >= 2) ...[
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(20, 8, 20, 4),
-                  child: Text(
-                    L10n.t('工作区', 'Workspaces'),
-                    style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, letterSpacing: 0.5, color: DshColors.ink3(context)),
-                  ),
-                ),
-                ConstrainedBox(
-                  constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.35),
-                  child: ListView(
-                    shrinkWrap: true,
-                    children: [
-                      _workspaceItem(null),
-                      for (final w in store.workspaces) _workspaceItem(w),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 8),
-              ],
-              _drawerItem(Icons.home_outlined, L10n.t('首页', 'Home'), 0),
-              _drawerItem(Icons.history, L10n.t('会话', 'Sessions'), 1),
-              _drawerItem(Icons.settings_outlined, L10n.t('设置', 'Settings'), 2),
-              const Spacer(),
-              Padding(
-                padding: const EdgeInsets.all(16),
-                child: Text(
-                  L10n.t('本机直连 · DeepSeek Harness', 'Direct connection · DeepSeek Harness'),
-                  style: TextStyle(fontSize: 12, color: DshColors.ink3(context)),
-                ),
-              ),
-            ],
-          ),
-        ),
+      drawer: AppDrawer(
+        store: store,
+        selectedIndex: _index,
+        onSelect: (index) => setState(() => _index = index),
+        onNewSession: _openNewSession,
+        onOpenConnections: _openConnections,
       ),
       body: IndexedStack(
         index: _index,
@@ -951,18 +901,178 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
     );
   }
 
-  Widget _drawerItem(IconData icon, String label, int index) {
+}
+
+/// 首页抽屉：新建会话、工作区、连接入口（仅文字，始终显示）与主导航。
+///
+/// 「连接」是独立入口而不是主 Tab：点击关抽屉后由 RootScreen push
+/// ConnectionProfilesScreen；无活动主机时也显示，用户可进入添加电脑。
+class AppDrawer extends StatelessWidget {
+  const AppDrawer({
+    super.key,
+    required this.store,
+    required this.selectedIndex,
+    required this.onSelect,
+    required this.onNewSession,
+    required this.onOpenConnections,
+  });
+
+  final AppStore store;
+  final int selectedIndex;
+  final ValueChanged<int> onSelect;
+  final VoidCallback onNewSession;
+  final VoidCallback onOpenConnections;
+
+  @override
+  Widget build(BuildContext context) {
+    return Drawer(
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+      child: SafeArea(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 20, 20, 12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'DSH',
+                    style: TextStyle(
+                      fontSize: 26,
+                      fontWeight: FontWeight.w700,
+                      fontFamily: 'Georgia',
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  FilledButton(
+                    style: FilledButton.styleFrom(
+                      minimumSize: const Size.fromHeight(42),
+                    ),
+                    onPressed: () {
+                      Navigator.of(context).pop();
+                      onNewSession();
+                    },
+                    child: Text(L10n.t('＋ 新建会话', '+ New Session')),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 4),
+            // 工作区快速切换（对齐 PC 端 workspace 切换；≥2 个工作区时显示）
+            // 封顶 35% 屏高 + 可滚动：工作区再多也不会把下方导航挤出屏幕
+            if (store.workspaces.length >= 2) ...[
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 8, 20, 4),
+                child: Text(
+                  L10n.t('工作区', 'Workspaces'),
+                  style: TextStyle(
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 0.5,
+                    color: DshColors.ink3(context),
+                  ),
+                ),
+              ),
+              ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxHeight: MediaQuery.of(context).size.height * 0.35,
+                ),
+                child: ListView(
+                  shrinkWrap: true,
+                  children: [
+                    _workspaceItem(context, null),
+                    for (final w in store.workspaces)
+                      _workspaceItem(context, w),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 8),
+            ],
+            _connectionItem(context),
+            _drawerItem(context, Icons.home_outlined, L10n.t('首页', 'Home'), 0),
+            _drawerItem(
+              context,
+              Icons.history,
+              L10n.t('会话', 'Sessions'),
+              1,
+            ),
+            _drawerItem(
+              context,
+              Icons.settings_outlined,
+              L10n.t('设置', 'Settings'),
+              2,
+            ),
+            const Spacer(),
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(
+                L10n.t(
+                  '本机直连 · DeepSeek Harness',
+                  'Direct connection · DeepSeek Harness',
+                ),
+                style: TextStyle(
+                  fontSize: 12,
+                  color: DshColors.ink3(context),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 仅文字「连接」入口；不根据主机/连接状态隐藏（无主机时也能进入添加页）。
+  Widget _connectionItem(BuildContext context) {
+    final ink2 = DshColors.ink2(context);
+    void open() {
+      Navigator.of(context).pop();
+      onOpenConnections();
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 1),
+      child: Semantics(
+        button: true,
+        excludeSemantics: true,
+        label: L10n.t('连接', 'Connections'),
+        onTap: open,
+        child: InkWell(
+          key: const ValueKey('drawer-connection'),
+          borderRadius: BorderRadius.circular(10),
+          onTap: open,
+          child: Container(
+            constraints: const BoxConstraints(minHeight: 44),
+            alignment: Alignment.centerLeft,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
+            child: Text(
+              L10n.t('连接', 'Connections'),
+              style: TextStyle(fontSize: 14.5, color: ink2),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _drawerItem(
+    BuildContext context,
+    IconData icon,
+    String label,
+    int index,
+  ) {
     final brand = DshColors.brand(context);
     final brandSoft = DshColors.brandSoft(context);
     final ink2 = DshColors.ink2(context);
-    final selected = _index == index;
+    final selected = selectedIndex == index;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 1),
       child: InkWell(
         borderRadius: BorderRadius.circular(10),
         onTap: () {
-          setState(() => _index = index);
           Navigator.of(context).pop();
+          onSelect(index);
         },
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
@@ -988,17 +1098,22 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
       ),
     );
   }
+
   /// 工作区切换项（null = 全部工作区）。
-  Widget _workspaceItem(Map<String, dynamic>? w) {
+  Widget _workspaceItem(BuildContext context, Map<String, dynamic>? w) {
     final brand = DshColors.brand(context);
     final brandSoft = DshColors.brandSoft(context);
     final ink2 = DshColors.ink2(context);
     final ink3 = DshColors.ink3(context);
     final isAll = w == null;
     final path = w?['path'] as String? ?? '';
-    final title = isAll ? L10n.t('全部工作区', 'All Workspaces') : ((w['title'] as String?) ?? path);
+    final title = isAll
+        ? L10n.t('全部工作区', 'All Workspaces')
+        : ((w['title'] as String?) ?? path);
     // v3.1.1(issue #5)：原始路径做展示，规范化后与 workspacePath（归一存储）匹配
-    final selected = isAll ? store.workspacePath == null : store.workspacePath == AppStore.normPath(path);
+    final selected = isAll
+        ? store.workspacePath == null
+        : store.workspacePath == AppStore.normPath(path);
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 1),
       child: InkWell(
@@ -1015,18 +1130,33 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
           ),
           child: Row(
             children: [
-              Icon(isAll ? Icons.folder_open_outlined : Icons.folder_outlined, size: 18, color: selected ? brand : ink2),
+              Icon(
+                isAll ? Icons.folder_open_outlined : Icons.folder_outlined,
+                size: 18,
+                color: selected ? brand : ink2,
+              ),
               const SizedBox(width: 12),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(title, maxLines: 1, overflow: TextOverflow.ellipsis,
-                        style: TextStyle(fontSize: 13.5, color: selected ? brand : ink2,
-                            fontWeight: selected ? FontWeight.w600 : FontWeight.w400)),
+                    Text(
+                      title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 13.5,
+                        color: selected ? brand : ink2,
+                        fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                      ),
+                    ),
                     if (!isAll)
-                      Text(path, maxLines: 1, overflow: TextOverflow.ellipsis,
-                          style: TextStyle(fontSize: 10.5, color: ink3)),
+                      Text(
+                        path,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: 10.5, color: ink3),
+                      ),
                   ],
                 ),
               ),

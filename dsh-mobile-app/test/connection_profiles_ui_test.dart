@@ -26,6 +26,17 @@ class _FakeSwitchStore extends AppStore {
     return null;
   }
 
+  String? lastAddedName;
+  String? lastAddedBase;
+  String? lastAddedToken;
+  String? lastAddedPath;
+  String? lastEditedName;
+  String? lastEditedBase;
+  String? lastEditedToken;
+  String? addError;
+  String? editError;
+  Completer<String?>? addGate;
+
   @override
   Future<String?> addAndSwitchProfile({
     required String displayName,
@@ -33,10 +44,15 @@ class _FakeSwitchStore extends AppStore {
     required String token,
     bool allowInsecure = false,
     String? path,
-  }) async => null;
-
-  String? lastEditedBase;
-  Completer<String?>? addGate;
+  }) async {
+    lastAddedName = displayName;
+    lastAddedBase = baseUrl;
+    lastAddedToken = token;
+    lastAddedPath = path;
+    final gate = addGate;
+    if (gate != null) return gate.future;
+    return addError;
+  }
 
   @override
   Future<String?> editAndSwitchProfile(
@@ -47,7 +63,9 @@ class _FakeSwitchStore extends AppStore {
     bool allowInsecure = false,
   }) async {
     lastEditedBase = baseUrl;
-    return null;
+    lastEditedToken = token;
+    lastEditedName = displayName;
+    return editError;
   }
 }
 
@@ -133,17 +151,6 @@ void main() {
     expect(find.byKey(const ValueKey('connection-add')), findsOneWidget);
   });
 
-  testWidgets('设置页可直接嵌入的自包含连接区块', (tester) async {
-    await tester.pumpWidget(
-      MaterialApp(
-        home: Scaffold(body: ConnectionSettingsSection(store: store)),
-      ),
-    );
-    await tester.pumpAndSettle();
-    expect(find.byKey(const ValueKey('connection-settings-section')), findsOneWidget);
-    expect(find.text('家里'), findsOneWidget);
-  });
-
   testWidgets('320 / 1.5× / 深色：sheet 不溢出', (tester) async {
     await tester.binding.setSurfaceSize(const Size(320, 640));
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -202,11 +209,23 @@ void main() {
         ),
       ),
     );
-    expect(find.byKey(const ValueKey('connection-allow-insecure')), findsNothing);
-    expect(find.byKey(const ValueKey('connection-profile-scan')), findsOneWidget);
-    await tester.enterText(find.byType(TextField).at(1), 'http://192.168.1.2:3080');
+    expect(
+      find.byKey(const ValueKey('connection-allow-insecure')),
+      findsNothing,
+    );
+    expect(
+      find.byKey(const ValueKey('connection-profile-scan')),
+      findsOneWidget,
+    );
+    await tester.enterText(
+      find.byType(TextField).at(1),
+      'http://192.168.1.2:3080',
+    );
     await tester.pump();
-    expect(find.byKey(const ValueKey('connection-allow-insecure')), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('connection-allow-insecure')),
+      findsOneWidget,
+    );
 
     await tester.pumpWidget(
       MaterialApp(
@@ -219,7 +238,19 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
-    expect(tester.widget<TextField>(find.byType(TextField).at(1)).controller?.text, a.primaryBase);
+    expect(
+      tester.widget<TextField>(find.byType(TextField).at(0)).controller?.text,
+      a.displayName,
+    );
+    expect(
+      tester.widget<TextField>(find.byType(TextField).at(1)).controller?.text,
+      a.primaryBase,
+    );
+    expect(
+      tester.widget<TextField>(find.byType(TextField).at(2)).controller?.text,
+      isEmpty,
+      reason: '编辑页不回显明文口令',
+    );
     expect(find.byKey(const ValueKey('connection-profile-scan')), findsNothing);
   });
 
@@ -243,12 +274,157 @@ void main() {
         ),
       ),
     );
-    expect(tester.widget<TextField>(find.byType(TextField).at(1)).controller?.text,
-        'https://c.example.com/mobile-remote');
+    expect(
+      tester.widget<TextField>(find.byType(TextField).at(1)).controller?.text,
+      'https://c.example.com/mobile-remote',
+    );
     await tester.enterText(find.byType(TextField).at(0), '改名');
     await tester.tap(find.byKey(const ValueKey('connection-profile-save')));
     await tester.pumpAndSettle();
     expect(fake.lastEditedBase, contains('/mobile-remote'));
+  });
+
+  testWidgets('添加表单：名称必填/去空白/长度/重名就地报错，不提交', (tester) async {
+    final fake = store as _FakeSwitchStore;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ConnectionProfileEditorScreen(store: store, manager: manager),
+      ),
+    );
+    final name = find.byKey(const ValueKey('connection-profile-name'));
+    final base = find.byKey(const ValueKey('connection-profile-base'));
+    final token = find.byKey(const ValueKey('connection-profile-token'));
+    final save = find.byKey(const ValueKey('connection-profile-save'));
+    await tester.enterText(base, 'https://new.example.com');
+    await tester.enterText(token, 'token');
+    await tester.tap(save);
+    await tester.pumpAndSettle();
+    expect(find.text('请填写主机名称'), findsOneWidget);
+    expect(fake.lastAddedName, isNull);
+
+    await tester.enterText(name, '   ');
+    await tester.tap(save);
+    await tester.pumpAndSettle();
+    expect(find.text('请填写主机名称'), findsOneWidget);
+
+    await tester.enterText(name, '名' * 33);
+    await tester.tap(save);
+    await tester.pumpAndSettle();
+    expect(find.text('主机名称最多 32 个字符'), findsOneWidget);
+
+    await tester.enterText(name, '家里');
+    await tester.tap(save);
+    await tester.pumpAndSettle();
+    expect(find.text('该主机名称已存在，请换一个名称'), findsOneWidget);
+    expect(fake.lastAddedName, isNull);
+
+    await tester.enterText(name, '  新电脑  ');
+    await tester.tap(save);
+    await tester.pumpAndSettle();
+    expect(fake.lastAddedName, '新电脑');
+    expect(fake.lastAddedBase, 'https://new.example.com');
+    expect(find.text('添加电脑'), findsNothing);
+  });
+
+  testWidgets('编辑表单：口令留空不修改，输入新口令才替换；名称可改', (tester) async {
+    final fake = store as _FakeSwitchStore;
+    Future<void> pumpEditor() async {
+      await tester.pumpWidget(const SizedBox());
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ConnectionProfileEditorScreen(
+            key: ValueKey('edit-${DateTime.now().microsecondsSinceEpoch}'),
+            store: store,
+            manager: manager,
+            profile: a,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+    }
+
+    await pumpEditor();
+    // 只改名称、口令留空：token 传 null（由 manager 读取旧 Keystore 凭据）。
+    await tester.enterText(find.byType(TextField).at(0), '家里-新名');
+    await tester.tap(find.byKey(const ValueKey('connection-profile-save')));
+    await tester.pumpAndSettle();
+    expect(fake.lastEditedToken, isNull);
+    expect(fake.lastEditedName, '家里-新名');
+    expect(fake.lastEditedBase, contains(a.primaryBase));
+
+    await pumpEditor();
+    await tester.enterText(find.byType(TextField).at(0), '家里-再改名');
+    await tester.enterText(find.byType(TextField).at(2), 'new-token');
+    await tester.tap(find.byKey(const ValueKey('connection-profile-save')));
+    await tester.pumpAndSettle();
+    expect(fake.lastEditedToken, 'new-token');
+    expect(fake.lastEditedName, '家里-再改名');
+  });
+
+  testWidgets('保存失败留在表单并显示错误，不改变旧档案', (tester) async {
+    final fake = store as _FakeSwitchStore;
+    fake.editError = '切换失败：目标不可达';
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ConnectionProfileEditorScreen(
+          store: store,
+          manager: manager,
+          profile: a,
+        ),
+      ),
+    );
+    await tester.enterText(find.byType(TextField).at(0), '失败试用');
+    await tester.tap(find.byKey(const ValueKey('connection-profile-save')));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('切换失败'), findsOneWidget);
+    expect(find.text('编辑电脑'), findsOneWidget);
+    expect(a.displayName, '家里');
+    expect(fake.lastEditedName, '失败试用');
+  });
+
+  testWidgets('取消编辑不提交；系统返回不触发保存', (tester) async {
+    final fake = store as _FakeSwitchStore;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ConnectionProfileEditorScreen(
+          store: store,
+          manager: manager,
+          profile: a,
+        ),
+      ),
+    );
+    await tester.enterText(find.byType(TextField).at(0), '不应保存');
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+    expect(fake.lastEditedName, isNull);
+    expect(a.displayName, '家里');
+  });
+
+  testWidgets('320 / 2.0× / 深色：添加/编辑表单不溢出', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(320, 640));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: ThemeData.dark(),
+        home: MediaQuery(
+          data: const MediaQueryData(
+            size: Size(320, 640),
+            textScaler: TextScaler.linear(2.0),
+          ),
+          child: ConnectionProfileEditorScreen(
+            store: store,
+            manager: manager,
+            profile: a,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('connection-profile-name')),
+      findsOneWidget,
+    );
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('添加页保存中系统返回被阻止；取消后不提交', (tester) async {
@@ -263,7 +439,11 @@ void main() {
         ),
       ),
     );
-    await tester.enterText(find.byType(TextField).at(1), 'https://new.example.com');
+    await tester.enterText(find.byType(TextField).at(0), '新电脑');
+    await tester.enterText(
+      find.byType(TextField).at(1),
+      'https://new.example.com',
+    );
     await tester.enterText(find.byType(TextField).at(2), 'token');
     await tester.tap(find.byKey(const ValueKey('connection-profile-save')));
     await tester.pump();
