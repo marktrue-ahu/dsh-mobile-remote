@@ -27,6 +27,37 @@ data class NativeConnection(
             ""
         }
 
+    /** 单次读取的 descriptor+token 快照；请求必须从它构造，禁止二次独立读 base/path。 */
+    data class Snapshot(val connection: NativeConnection, val token: String) {
+        fun isStillCurrent(fresh: NativeConnection?, activeProfileId: String): Boolean =
+            fresh != null &&
+                fresh.isSameConnection(connection) &&
+                fresh.profileId == activeProfileId
+
+        fun requestUrl(apiPath: String): String {
+            var base = connection.baseUrl.trim()
+            if (base.endsWith("/")) base = base.dropLast(1)
+            if (base.endsWith("/m")) base = base.dropLast(2)
+            return "$base${connection.path}/api/$apiPath"
+        }
+    }
+
+    object Access {
+        /** 一次读取 descriptor/token/active；任何不一致返回 null（fail-closed）。 */
+        fun snapshot(context: Context): Snapshot? {
+            val descriptor = read(context) ?: return null
+            if (CredentialStore.activeProfileId(context) != descriptor.profileId) {
+                return null
+            }
+            val token = CredentialStore.readToken(context, descriptor.profileId)
+                ?: return null
+            return Snapshot(descriptor, token)
+        }
+
+        fun isCurrent(context: Context, snapshot: Snapshot): Boolean =
+            snapshot.isStillCurrent(read(context), CredentialStore.activeProfileId(context))
+    }
+
     companion object {
         private const val PREFS = "FlutterSharedPreferences"
         private const val KEY = "flutter.dsh_native_connection"

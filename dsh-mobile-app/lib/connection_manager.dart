@@ -7,6 +7,8 @@
 // - 失败保留旧 active/旧 Api/旧 token，不进入半切换状态。
 import 'dart:convert';
 
+import 'package:http/http.dart' as http;
+
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'api.dart';
@@ -20,13 +22,21 @@ class ConnectionManager {
     required this.credentials,
     SharedPreferences? prefs,
     Future<Map<String, dynamic>> Function(Api probe)? probeBootstrap,
+    this.probeClient,
   }) : _prefs = prefs,
        _probeBootstrap = probeBootstrap;
 
   final Api api;
   final CredentialStore credentials;
   final Future<Map<String, dynamic>> Function(Api probe)? _probeBootstrap;
+  final http.Client? probeClient;
   SharedPreferences? _prefs;
+
+  /// 测试注入：模拟 prefs 写入失败；生产为 null → [_saveProfiles]。
+  Future<void> Function()? persistOverride;
+
+  /// 启动校验失败时给 UI 的明确原因；不把 token 套到错误 endpoint。
+  String connectionStateError = '';
 
   final List<ConnectionProfile> profiles = [];
   String activeProfileId = '';
@@ -84,15 +94,35 @@ class ConnectionManager {
       }
       return;
     }
-    ProfileNamespace.setScope(profileScope);
+    // #152 P1：启动必须核对 persisted active / Keystore active / descriptor / token
+    // 四者一致；任一不匹配即 fail-closed，绝不把 B 的 token 套到 A 的 endpoint。
     try {
-      final token = await credentials.readActiveToken() ??
-          await credentials.readToken(current.id);
-      if (token == null || token.isEmpty) {
-        migrationState = 'credential-missing';
+      final status = await credentials.status();
+      final descriptor = _readNativeDescriptor(prefs);
+      final expectedGeneration = prefs.getInt(_kGeneration) ?? 0;
+      final reason = _startupMismatchReason(
+        profile: current,
+        persistedActive: activeProfileId,
+        credentialActive: status.activeProfileId,
+        hasToken: status.hasToken,
+        descriptor: descriptor,
+        persistedGeneration: expectedGeneration,
+      );
+      if (reason != null) {
+        connectionStateError = reason;
+        migrationState = 'connection-state-mismatch';
         api.token = '';
         return;
       }
+      // 只显式读 current.id 的 token；不再 readActiveToken() 盲套。
+      final token = await credentials.readToken(current.id);
+      if (token == null || token.isEmpty) {
+        migrationState = 'credential-missing';
+        connectionStateError = '该连接的凭据不可读，请重新输入口令';
+        api.token = '';
+        return;
+      }
+      ProfileNamespace.setScope(profileScope);
       api.applyConnection(
         base: current.primaryBase,
         connectionPath: current.path,
@@ -102,10 +132,50 @@ class ConnectionManager {
         urls: current.baseUrls,
       );
       migrationState = 'complete';
+      connectionStateError = '';
+      _installCandidateGuards();
     } catch (e) {
       migrationState = 'credential-unavailable';
+      connectionStateError = '无法读取安全凭据，请重新输入口令';
       api.token = '';
     }
+  }
+
+  Map<String, dynamic>? _readNativeDescriptor(SharedPreferences prefs) {
+    final raw = prefs.getString(_kNativeDescriptor);
+    if (raw == null || raw.isEmpty) return null;
+    try {
+      final value = jsonDecode(raw);
+      return value is Map ? Map<String, dynamic>.from(value) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  String? _startupMismatchReason({
+    required ConnectionProfile profile,
+    required String persistedActive,
+    required String credentialActive,
+    required bool hasToken,
+    required Map<String, dynamic>? descriptor,
+    required int persistedGeneration,
+  }) {
+    if (persistedActive != profile.id) return '活动档案记录不一致';
+    if (credentialActive != profile.id) return '安全存储的活动档案与设置不一致';
+    if (!hasToken) return '活动凭据缺失';
+    if (descriptor == null) return '原生连接描述符缺失';
+    if (descriptor['profileId'] != profile.id) return '原生连接描述符指向其他档案';
+    if (descriptor['baseUrl'] != profile.primaryBase) return '原生连接地址与档案不一致';
+    if (descriptor['path'] != profile.path) return '原生连接路径与档案不一致';
+    if (generation != persistedGeneration) return '连接代记录不一致';
+    if (descriptor['generation'] != persistedGeneration) return '原生连接代不一致';
+    final descriptorHost = descriptor['hostId']?.toString() ?? '';
+    if (descriptorHost.isNotEmpty &&
+        profile.hostId.isNotEmpty &&
+        descriptorHost != profile.hostId) {
+      return '原生宿主身份与档案不一致';
+    }
+    return null;
   }
 
   List<ConnectionProfile> _readProfiles(SharedPreferences prefs) {
@@ -221,7 +291,13 @@ class ConnectionManager {
     final base = profile.primaryBase;
     Map<String, dynamic> bootstrap;
     try {
-      final probe = Api.forProbe(base, token);
+      // base 已被 _normBase 去掉路径；必须把 profile.path 拼回 probe，
+      // 否则自定义挂载（如 /mobile-remote）会错误探测 /m。
+      final probe = Api.forProbe(
+        '$base${profile.path == '/' ? '' : profile.path}',
+        token,
+        client: probeClient,
+      );
       bootstrap = await (_probeBootstrap?.call(probe) ??
           probe.getJson(
             '/api/bootstrap',
@@ -231,50 +307,88 @@ class ConnectionManager {
       throw ConnectionSwitchException('probe-failed', '连接失败：$e');
     }
     final plugin = bootstrap['plugin'];
-    final hostId = plugin is Map
+    final reportedHostId = plugin is Map
         ? (plugin['hostId']?.toString().trim() ?? '')
         : (bootstrap['hostId']?.toString().trim() ?? '');
     final instanceId = plugin is Map
         ? (plugin['instanceId']?.toString().trim() ?? '')
         : '';
-    if (profile.hostId.isNotEmpty &&
-        hostId.isNotEmpty &&
-        profile.hostId != hostId &&
+    final uri = Uri.tryParse(base);
+    final legacyIdentity = 'legacy:${uri?.origin ?? base}';
+    String resolvedHostId;
+    if (reportedHostId.isEmpty) {
+      // 空/缺失 hostId 不等于匹配。已绑定真实身份的档案必须显式确认，
+      // 且确认后使用**隔离身份**，绝不沿用 A 的 hostId/缓存。
+      final alreadyLegacy = profile.hostId.startsWith('legacy:');
+      if (profile.hostId.isEmpty) {
+        resolvedHostId = legacyIdentity;
+      } else if (alreadyLegacy) {
+        if (profile.hostId != legacyIdentity && !allowHostChange) {
+          throw ConnectionSwitchException(
+            'host-identity-missing',
+            '目标未提供宿主身份，且与旧降级身份不一致；确认后将使用隔离身份（不继承旧缓存）',
+          );
+        }
+        resolvedHostId = legacyIdentity;
+      } else if (allowHostChange) {
+        resolvedHostId = legacyIdentity;
+      } else {
+        throw const ConnectionSwitchException(
+          'host-identity-missing',
+          '目标未提供宿主身份；未确认前不会沿用旧宿主的身份或缓存（hostId 不是认证/TLS 证明）',
+        );
+      }
+    } else if (profile.hostId.isNotEmpty &&
+        profile.hostId != reportedHostId &&
         !allowHostChange) {
       throw ConnectionSwitchException(
         'host-identity-changed',
-        '宿主身份已变化：档案记录 ${_short(profile.hostId)}，实际 ${_short(hostId)}',
+        '宿主身份已变化：档案记录 ${_short(profile.hostId)}，实际 ${_short(reportedHostId)}',
       );
+    } else {
+      resolvedHostId = reportedHostId;
     }
     return StagedConnectionSwitch(
       profile: profile,
       token: token,
-      hostId: hostId.isNotEmpty ? hostId : profile.hostId,
+      hostId: resolvedHostId,
       instanceId: instanceId,
       generation: generation + 1,
       bootstrap: bootstrap,
     );
   }
 
-  void _checkTransport(ConnectionProfile profile, {required bool allowInsecure}) {
-    final uri = Uri.tryParse(profile.primaryBase);
+  /// 统一 URL/传输策略；**不携带 token、不发请求**，供 UI 预检与 probe 前共享。
+  static void validateEndpoint(
+    String baseUrl, {
+    bool insecureConfirmed = false,
+    bool allowInsecure = false,
+  }) {
+    final uri = Uri.tryParse(baseUrl.trim());
     if (uri == null || uri.host.isEmpty) {
       throw const ConnectionSwitchException('invalid-endpoint', '地址无效');
     }
     if (uri.scheme == 'https') return;
-    final private = _isPrivateHost(uri.host);
-    if (!private) {
+    if (!_isPrivateHost(uri.host)) {
       throw const ConnectionSwitchException(
         'https-required',
         '公网地址必须使用 HTTPS；请改用加密地址',
       );
     }
-    if (!profile.insecureConfirmed && !allowInsecure) {
+    if (!insecureConfirmed && !allowInsecure) {
       throw const ConnectionSwitchException(
         'http-requires-confirmation',
         '该地址未加密，需要确认后才能发送口令',
       );
     }
+  }
+
+  void _checkTransport(ConnectionProfile profile, {required bool allowInsecure}) {
+    validateEndpoint(
+      profile.primaryBase,
+      insecureConfirmed: profile.insecureConfirmed,
+      allowInsecure: allowInsecure,
+    );
   }
 
   static bool _isPrivateHost(String host) {
@@ -294,14 +408,26 @@ class ConnectionManager {
 
   static String _short(String id) => id.length <= 8 ? id : id.substring(0, 8);
 
-  /// 提交切换：凭据 readback → descriptor → 原生 activate/readback → Api 原子替换。
-  /// 任一步失败抛异常；调用方保留旧连接。
+  /// 提交切换：凭据 readback → descriptor → 原生 activate/readback → profiles → Api。
+  ///
+  /// 可恢复事务：任一步失败都回滚 target token、Keystore active、descriptor、
+  /// profiles/activeProfileId/generation/ProfileNamespace；不允许留下
+  /// “descriptor A + native token B”或“current A + token B”。
   Future<void> commitSwitch(StagedConnectionSwitch stage) async {
     final profile = stage.profile;
     final prefs = await _store;
     final oldDescriptor = prefs.getString(_kNativeDescriptor);
+    final oldProfiles = List<ConnectionProfile>.of(profiles);
+    final oldActive = activeProfileId;
+    final oldGeneration = generation;
+    final oldScope = ProfileNamespace.scope;
+    final index = profiles.indexWhere((p) => p.id == profile.id);
+    final oldToken = await credentials.readToken(profile.id);
+    var applied = false;
+    var credentialsMutated = false;
     try {
       await credentials.writeToken(profile.id, stage.token);
+      credentialsMutated = true;
       if (await credentials.readToken(profile.id) != stage.token) {
         throw StateError('token-readback-mismatch');
       }
@@ -315,12 +441,15 @@ class ConnectionManager {
         hostId: stage.hostId,
         lastSeen: DateTime.now().millisecondsSinceEpoch,
       );
-      final index = profiles.indexWhere((p) => p.id == profile.id);
-      if (index >= 0) profiles[index] = updated;
+      if (index >= 0) {
+        profiles[index] = updated;
+      } else {
+        profiles.add(updated);
+      }
       activeProfileId = profile.id;
       generation = stage.generation;
       ProfileNamespace.setScope(profileScope);
-      await _saveProfiles();
+      await (persistOverride ?? _saveProfiles)();
       api.applyConnection(
         base: updated.primaryBase,
         connectionPath: updated.path,
@@ -329,15 +458,134 @@ class ConnectionManager {
         hostIdentity: updated.hostId,
         urls: updated.baseUrls,
       );
+      applied = true;
       migrationState = 'complete';
+      connectionStateError = '';
+      _installCandidateGuards();
     } catch (e) {
-      // descriptor/active 可能已部分写入：恢复旧 descriptor，原生按 active 校验会暂停。
-      if (oldDescriptor != null) {
-        await prefs.setString(_kNativeDescriptor, oldDescriptor);
-      } else {
-        await prefs.remove(_kNativeDescriptor);
+      // 1) 先恢复 target 的旧 token（若 target 就是旧 active，也恢复旧 token）。
+      if (credentialsMutated) {
+        try {
+          if (oldToken == null || oldToken.isEmpty) {
+            await credentials.deleteToken(profile.id);
+          } else {
+            await credentials.writeToken(profile.id, oldToken);
+          }
+        } catch (_) {}
+      }
+      // 2) 恢复 Keystore active（旧 active 的 token 必须仍可读；否则 deactivate）。
+      var activeRestored = false;
+      try {
+        if (oldActive.isNotEmpty &&
+            await credentials.readToken(oldActive) != null) {
+          await credentials.activate(oldActive);
+          final status = await credentials.status();
+          activeRestored =
+              status.activeProfileId == oldActive && status.hasToken;
+        } else {
+          await credentials.deactivate();
+          activeRestored = true;
+        }
+      } catch (_) {
+        activeRestored = false;
+      }
+      // 3) 恢复 descriptor 与 Dart 内存/持久状态。
+      try {
+        if (oldDescriptor != null) {
+          await prefs.setString(_kNativeDescriptor, oldDescriptor);
+        } else {
+          await prefs.remove(_kNativeDescriptor);
+        }
+      } catch (_) {}
+      profiles
+        ..clear()
+        ..addAll(oldProfiles);
+      activeProfileId = oldActive;
+      generation = oldGeneration;
+      ProfileNamespace.setScope(oldScope);
+      try {
+        await _saveProfiles();
+      } catch (_) {}
+      if (!activeRestored) {
+        // 无法恢复一致状态：fail-closed，不允许继续用旧 Api 发请求。
+        api.token = '';
+        connectionStateError = '切换失败且无法恢复安全凭据，请重新输入口令';
+        migrationState = 'switch-rollback-failed';
+        throw const ConnectionSwitchException(
+          'switch-rollback-failed',
+          '切换失败且无法恢复安全凭据，请重新输入口令',
+        );
+      }
+      connectionStateError = '切换失败，已保留原连接';
+      // 未提交 Api 时旧 Api 保持不变；若 Api 已被替换（理论上 apply 不抛），
+      // 用旧档案重新应用一次，保证“current A + token A”。
+      if (applied) {
+        final restored = profiles.where((p) => p.id == oldActive).firstOrNull;
+        final restoredToken = oldActive.isEmpty
+            ? null
+            : await credentials.readToken(oldActive);
+        if (restored == null || restoredToken == null) {
+          api.token = '';
+        } else {
+          api.applyConnection(
+            base: restored.primaryBase,
+            connectionPath: restored.path,
+            connectionToken: restoredToken,
+            profile: restored.id,
+            hostIdentity: restored.hostId,
+            urls: restored.baseUrls,
+          );
+        }
       }
       rethrow;
+    }
+  }
+
+  void _installCandidateGuards() {
+    api.candidateAdmission = (candidate) {
+      final current = active;
+      if (current == null) return false;
+      final normalized = Api.forProbe(candidate, '').baseUrl;
+      return current.baseUrls.any(
+        (value) => Api.forProbe(value, '').baseUrl == normalized,
+      );
+    };
+    api.candidateVerifier = verifyCandidate;
+  }
+
+  /// 自动轮换候选：必须是档案已确认地址 + 传输策略允许 + hostId 与绑定身份一致。
+  Future<bool> verifyCandidate(String candidate) async {
+    final current = active;
+    if (current == null) return false;
+    final normalized = Api.forProbe(candidate, '').baseUrl;
+    if (!current.baseUrls.any((value) => Api.forProbe(value, '').baseUrl == normalized)) {
+      return false;
+    }
+    try {
+      validateEndpoint(candidate, insecureConfirmed: current.insecureConfirmed);
+    } catch (_) {
+      return false;
+    }
+    if (current.hostId.isEmpty) return false;
+    final token = await credentials.readToken(current.id);
+    if (token == null || token.isEmpty) return false;
+    try {
+      final probe = Api.forProbe(
+        '$normalized${current.path == '/' ? '' : current.path}',
+        token,
+        client: probeClient,
+      );
+      final bootstrap = await probe.getJson(
+        '/api/bootstrap',
+        timeout: const Duration(seconds: 6),
+      );
+      final plugin = bootstrap['plugin'];
+      final hostId = plugin is Map
+          ? (plugin['hostId']?.toString().trim() ?? '')
+          : (bootstrap['hostId']?.toString().trim() ?? '');
+      return hostId.isNotEmpty && hostId == current.hostId;
+    } catch (_) {
+      return false;
     }
   }
 
@@ -362,7 +610,7 @@ class ConnectionManager {
     String path = '/m',
     ProfileTlsPolicy tlsPolicy = ProfileTlsPolicy.https,
     bool insecureConfirmed = false,
-    bool switchNow = true,
+    bool switchNow = false,
   }) async {
     final normalized = Api.forProbe(baseUrl, '').baseUrl;
     final profile = ConnectionProfile(
@@ -401,15 +649,21 @@ class ConnectionManager {
     final secure = normalized.startsWith('https://');
     final current = active;
     if (current == null) {
-      await addProfile(
+      final created = await addProfile(
         displayName: _legacyName(normalized),
         baseUrl: normalized,
         token: token,
         path: path,
         tlsPolicy: secure ? ProfileTlsPolicy.https : ProfileTlsPolicy.httpPrivate,
         insecureConfirmed: !secure && allowInsecure,
-        switchNow: true,
+        switchNow: false,
       );
+      final staged = await stageSwitch(
+        created.id,
+        allowInsecure: allowInsecure,
+        tokenOverride: token,
+      );
+      await commitSwitch(staged);
       return;
     }
     final updated = current.copyWith(
@@ -418,21 +672,21 @@ class ConnectionManager {
       tlsPolicy: secure ? ProfileTlsPolicy.https : ProfileTlsPolicy.httpPrivate,
       insecureConfirmed: !secure && allowInsecure,
     );
-    // 先按新 token 探测，失败时旧 token/旧档案/Api 完全不动。
+    // 先按新 token 探测，失败时旧档案/Api/token 完全不动；临时副本必须 finally 还原。
     final index = profiles.indexWhere((p) => p.id == current.id);
-    if (index >= 0) profiles[index] = updated;
-    final stageRepo = await stageSwitch(
-      current.id,
-      allowInsecure: allowInsecure,
-      tokenOverride: token,
-    );
-    if (index >= 0) profiles[index] = current;
-    await credentials.writeToken(current.id, token);
-    if (await credentials.readToken(current.id) != token) {
-      throw const ConnectionSwitchException('credential-write-failed', '口令写入安全存储失败');
+    final StagedConnectionSwitch staged;
+    try {
+      if (index >= 0) profiles[index] = updated;
+      staged = await stageSwitch(
+        current.id,
+        allowInsecure: allowInsecure,
+        tokenOverride: token,
+      );
+    } finally {
+      if (index >= 0) profiles[index] = current;
     }
-    await updateProfile(updated);
-    await commitSwitch(stageRepo);
+    // token/profile 的持久化与回滚统一交给 commitSwitch，失败不覆盖旧 token。
+    await commitSwitch(staged);
   }
 
   /// 地址候选切换（非档案切换）后同步 active 档案，避免重启回到旧地址。
@@ -448,6 +702,47 @@ class ConnectionManager {
     if (index >= 0) profiles[index] = updated;
     await _saveProfiles();
     await _writeNativeDescriptor(updated, updated.hostId, generation);
+  }
+
+  /// 编辑现有档案 endpoint/token：临时副本探测/提交，失败保留旧档案/旧 token/旧缓存身份。
+  Future<void> editProfile(
+    ConnectionProfile oldProfile, {
+    required String baseUrl,
+    String? token,
+    String? displayName,
+    bool allowInsecure = false,
+  }) async {
+    final normalized = Api.forProbe(baseUrl, '').baseUrl;
+    final path = Api.forProbe(baseUrl, '').path;
+    final secure = normalized.startsWith('https://');
+    final tokenValue = (token == null || token.isEmpty)
+        ? await credentials.readToken(oldProfile.id)
+        : token;
+    if (tokenValue == null || tokenValue.isEmpty) {
+      throw const ConnectionSwitchException('credential-missing', '该连接的口令不可读，请重新输入');
+    }
+    final updated = oldProfile.copyWith(
+      displayName: (displayName ?? '').trim().isEmpty
+          ? oldProfile.displayName
+          : displayName!.trim(),
+      baseUrls: [normalized],
+      path: path,
+      tlsPolicy: secure ? ProfileTlsPolicy.https : ProfileTlsPolicy.httpPrivate,
+      insecureConfirmed: !secure && allowInsecure,
+    );
+    final index = profiles.indexWhere((p) => p.id == oldProfile.id);
+    final StagedConnectionSwitch staged;
+    try {
+      if (index >= 0) profiles[index] = updated;
+      staged = await stageSwitch(
+        oldProfile.id,
+        allowInsecure: allowInsecure,
+        tokenOverride: tokenValue,
+      );
+    } finally {
+      if (index >= 0) profiles[index] = oldProfile;
+    }
+    await commitSwitch(staged);
   }
 
   Future<void> updateProfile(ConnectionProfile profile) async {

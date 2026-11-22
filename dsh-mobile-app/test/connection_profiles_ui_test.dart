@@ -25,6 +25,24 @@ class _FakeSwitchStore extends AppStore {
     connections!.activeProfileId = profileId;
     return null;
   }
+
+  @override
+  Future<String?> addAndSwitchProfile({
+    required String displayName,
+    required String baseUrl,
+    required String token,
+    bool allowInsecure = false,
+    String? path,
+  }) async => null;
+
+  @override
+  Future<String?> editAndSwitchProfile(
+    ConnectionProfile profile, {
+    required String baseUrl,
+    String? token,
+    String? displayName,
+    bool allowInsecure = false,
+  }) async => null;
 }
 
 class _NoopApi extends Api {
@@ -166,5 +184,36 @@ void main() {
     expect(manager.activeProfileId, b.id);
     // sheet 已关闭（open 按钮是根页唯一文本）
     expect(find.byKey(const ValueKey('connection-add')), findsNothing);
+  });
+
+  testWidgets('添加页：输入 HTTP 才显示未加密确认；编辑页预填现有档案', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ConnectionProfileEditorScreen(
+          key: const ValueKey('editor-add'),
+          store: store,
+          manager: manager,
+        ),
+      ),
+    );
+    expect(find.byKey(const ValueKey('connection-allow-insecure')), findsNothing);
+    expect(find.byKey(const ValueKey('connection-profile-scan')), findsOneWidget);
+    await tester.enterText(find.byType(TextField).at(1), 'http://192.168.1.2:3080');
+    await tester.pump();
+    expect(find.byKey(const ValueKey('connection-allow-insecure')), findsOneWidget);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ConnectionProfileEditorScreen(
+          key: const ValueKey('editor-edit'),
+          store: store,
+          manager: manager,
+          profile: a,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(tester.widget<TextField>(find.byType(TextField).at(1)).controller?.text, a.primaryBase);
+    expect(find.byKey(const ValueKey('connection-profile-scan')), findsNothing);
   });
 }

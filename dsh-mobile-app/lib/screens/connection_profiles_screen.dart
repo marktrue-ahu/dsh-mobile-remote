@@ -9,6 +9,7 @@ import '../connection_manager.dart';
 import '../connection_profile.dart';
 import '../l10n.dart';
 import '../store.dart';
+import '../scan_screen.dart';
 import '../theme.dart';
 
 Future<bool> showConnectionProfilesScreen(
@@ -195,6 +196,23 @@ class _ConnectionProfilesScreenState extends State<ConnectionProfilesScreen> {
     if (mounted) setState(() {});
   }
 
+  Future<void> _edit(ConnectionProfile profile) async {
+    final changed = await Navigator.of(context).push<bool>(
+      MaterialPageRoute<bool>(
+        builder: (_) => ConnectionProfileEditorScreen(
+          store: widget.store,
+          manager: _manager!,
+          profile: profile,
+        ),
+      ),
+    );
+    if (!mounted) return;
+    if (changed == true) {
+      _changed = true;
+      setState(() {});
+    }
+  }
+
   Future<void> _delete(ConnectionProfile profile) async {
     final manager = _manager!;
     final confirmed = await showDialog<bool>(
@@ -311,8 +329,13 @@ class _ConnectionProfilesScreenState extends State<ConnectionProfilesScreen> {
                                 onSelected: (value) {
                                   if (value == 'delete') _delete(profile);
                                   if (value == 'rename') _rename(profile);
+                                  if (value == 'edit') _edit(profile);
                                 },
                                 itemBuilder: (_) => [
+                                  PopupMenuItem(
+                                    value: 'edit',
+                                    child: Text(L10n.t('编辑地址/口令', 'Edit address/token')),
+                                  ),
                                   PopupMenuItem(
                                     value: 'rename',
                                     child: Text(L10n.t('重命名', 'Rename')),
@@ -359,10 +382,14 @@ class ConnectionProfileEditorScreen extends StatefulWidget {
     super.key,
     required this.store,
     required this.manager,
+    this.profile,
   });
 
   final AppStore store;
   final ConnectionManager manager;
+
+  /// 非空表示编辑现有档案；空表示添加。
+  final ConnectionProfile? profile;
 
   @override
   State<ConnectionProfileEditorScreen> createState() =>
@@ -378,8 +405,28 @@ class _ConnectionProfileEditorScreenState
   bool _busy = false;
   String? _error;
 
+  bool get _editing => widget.profile != null;
+
+  @override
+  void initState() {
+    super.initState();
+    final profile = widget.profile;
+    if (profile != null) {
+      _name.text = profile.displayName;
+      _base.text = profile.primaryBase;
+      _allowInsecure = profile.insecureConfirmed;
+    }
+    _base.addListener(_onEndpointChanged);
+  }
+
+  void _onEndpointChanged() {
+    if (!mounted) return;
+    setState(() {});
+  }
+
   @override
   void dispose() {
+    _base.removeListener(_onEndpointChanged);
     _name.dispose();
     _base.dispose();
     _token.dispose();
@@ -389,7 +436,7 @@ class _ConnectionProfileEditorScreenState
   Future<void> _save() async {
     final base = _base.text.trim();
     final token = _token.text.trim();
-    if (base.isEmpty || token.isEmpty) {
+    if (base.isEmpty || (!_editing && token.isEmpty)) {
       setState(() => _error = L10n.t('请填写地址和访问口令', 'Enter address and access token'));
       return;
     }
@@ -405,17 +452,28 @@ class _ConnectionProfileEditorScreenState
       _error = null;
     });
     try {
-      await widget.manager.addProfile(
-        displayName: _name.text,
-        baseUrl: base,
-        token: token,
-        tlsPolicy: base.startsWith('https://')
-            ? ProfileTlsPolicy.https
-            : ProfileTlsPolicy.httpPrivate,
-        insecureConfirmed: _allowInsecure,
-        switchNow: true,
-      );
+      final error = _editing
+          ? await widget.store.editAndSwitchProfile(
+              widget.profile!,
+              baseUrl: base,
+              token: token.isEmpty ? null : token,
+              displayName: _name.text,
+              allowInsecure: _allowInsecure,
+            )
+          : await widget.store.addAndSwitchProfile(
+              displayName: _name.text,
+              baseUrl: base,
+              token: token,
+              allowInsecure: _allowInsecure,
+            );
       if (!mounted) return;
+      if (error != null) {
+        setState(() {
+          _busy = false;
+          _error = error;
+        });
+        return;
+      }
       Navigator.of(context).pop(true);
     } catch (e) {
       if (!mounted) return;
@@ -426,12 +484,26 @@ class _ConnectionProfileEditorScreenState
     }
   }
 
+  Future<void> _scan() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => ScanScreen(
+          onScanned: (base, token) {
+            _base.text = base;
+            _token.text = token;
+            if (mounted) Navigator.of(context).pop();
+          },
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final ink3 = DshColors.ink3(context);
     return Scaffold(
       appBar: AppBar(
-        title: Text(L10n.t('添加电脑', 'Add computer')),
+        title: Text(_editing ? L10n.t('编辑电脑', 'Edit computer') : L10n.t('添加电脑', 'Add computer')),
         actions: [
           TextButton(
             key: const ValueKey('connection-profile-save'),
@@ -470,8 +542,20 @@ class _ConnectionProfileEditorScreenState
             obscureText: true,
             decoration: InputDecoration(
               labelText: L10n.t('访问口令', 'Access token'),
+              hintText: _editing
+                  ? L10n.t('已保存 · 输入新口令可替换', 'Saved · enter a new token to replace')
+                  : null,
             ),
           ),
+          if (!_editing) ...[
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              key: const ValueKey('connection-profile-scan'),
+              onPressed: _busy ? null : _scan,
+              icon: const Icon(Icons.qr_code_scanner),
+              label: Text(L10n.t('扫码添加', 'Scan to add')),
+            ),
+          ],
           if (_base.text.startsWith('http://')) ...[
             const SizedBox(height: 8),
             CheckboxListTile(

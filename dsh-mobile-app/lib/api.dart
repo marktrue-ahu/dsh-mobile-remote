@@ -326,6 +326,11 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
   /// 电脑的全部候选地址（局域网 IP / Tailscale IP / 127.0.0.1）。
   /// 连接失败时按顺序轮换（外出自动切 Tailscale，回家自动切回局域网）。
   List<String> baseUrls = [];
+
+  /// #152：自动轮换/地址广告的端点信任钩子（ConnectionManager 安装）。
+  /// 返回 false 的候选不得进入 baseUrls 或承载 token。
+  bool Function(String candidate)? candidateAdmission;
+  Future<bool> Function(String candidate)? candidateVerifier;
   static const _kBase = 'dsh_mr_base';
   static const _kPath = 'dsh_mr_path';
   static const _kToken = 'dsh_mr_token';
@@ -431,6 +436,31 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
     baseUrls = merged;
   }
 
+  /// #152：带 staged hostId 校验的候选轮换；未确认/身份不符的候选直接跳过。
+  Future<bool> rotateBaseUrlVerified() async {
+    if (baseUrls.length < 2) return false;
+    final cur = _normBase(baseUrl);
+    final idx = baseUrls.indexOf(cur);
+    if (idx < 0) return false;
+    for (var step = 1; step < baseUrls.length; step++) {
+      final next = baseUrls[(idx + step) % baseUrls.length];
+      if (next == cur) continue;
+      if (candidateAdmission?.call(next) == false) continue;
+      final verify = candidateVerifier;
+      if (verify != null && !await verify(next)) continue;
+      invalidateConnection();
+      baseUrl = next;
+      unawaited(() async {
+        try {
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setString(_kBase, baseUrl);
+        } catch (_) {}
+      }());
+      return true;
+    }
+    return false;
+  }
+
   /// 合并新收集到的地址（去重、去回环置后、上限裁剪），当前可用地址保持第一位。
   void mergeUrls(List<String> urls) {
     final seen = <String>{};
@@ -443,6 +473,8 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
       final host = Uri.tryParse(n)?.host ?? '';
       if (host == '127.0.0.1' || host == 'localhost' || host == '::1') continue;
       if (host.startsWith('169.254.')) continue;
+      // #152：bootstrap 广告不等于信任；未通过档案端点策略不得并入候选。
+      if (candidateAdmission?.call(n) == false) continue;
       if (seen.add(n)) merged.add(n);
     }
     if (merged.length > _maxUrls) merged.removeRange(_maxUrls, merged.length);
@@ -468,7 +500,9 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
 
   /// v3.0.0：构造只读探测客户端——地址/路径规范化和 save() 同源逻辑，
   /// 避免"地址含 /m、路径默认 /m"拼接成 `/m/m/...` 而 404。
-  static Api forProbe(String base, String token) => Api()
+  static Api forProbe(String base, String token, {http.Client? client}) => Api(
+    client: client,
+  )
     ..baseUrl = _normBase(base)
     ..path = _pathOf(base)
     ..token = token;

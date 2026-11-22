@@ -19,6 +19,18 @@ class NativeConnectionTest {
     }
 
     @Test
+    fun snapshotPinsUrlAndTokenToSameProfile() {
+        val snapshot = NativeConnection.Snapshot(connection(), "token-a")
+        val freshA = connection()
+        val freshB = connection(profile = "profile-b", generation = 4, base = "https://10.0.0.2:3080")
+        assertTrue(snapshot.isStillCurrent(freshA, "profile-a"))
+        assertFalse(snapshot.isStillCurrent(freshB, "profile-b"))
+        // A 的 URL/token 只能成对出现；fresh B 下不得继续发送该快照。
+        assertEquals("https://192.168.1.20:3080/m/api/balance", snapshot.requestUrl("balance"))
+        assertEquals("token-a", snapshot.token)
+    }
+
+    @Test
     fun generationAndProfileGateOldFrames() {
         val current = connection()
         assertTrue(current.isSameConnection(connection()))

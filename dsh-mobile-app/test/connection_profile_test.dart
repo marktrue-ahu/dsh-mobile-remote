@@ -1,7 +1,11 @@
 // GitLab #152：连接档案迁移、staged 切换、失败保留旧连接、hostId 绑定、
 // (profileId,hostId) 命名空间与凭据清理。
+import 'dart:async';
+import 'dart:convert';
+
 import 'package:dsh_mobile_app/api.dart';
 import 'package:dsh_mobile_app/connection_manager.dart';
+import 'package:dsh_mobile_app/models.dart';
 import 'package:dsh_mobile_app/connection_profile.dart';
 import 'package:dsh_mobile_app/credential_store.dart';
 import 'package:dsh_mobile_app/attention_storage.dart';
@@ -11,6 +15,26 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+class _StoreApi extends Api {
+  final controller = StreamController<Map<String, dynamic>>.broadcast();
+
+  @override
+  Stream<Map<String, dynamic>> eventsRaw() => controller.stream;
+}
+
+class _FailAfterActivateStore extends MemoryCredentialStore {
+  bool failNext = false;
+
+  @override
+  Future<void> activate(String profileId) async {
+    await super.activate(profileId);
+    if (failNext) {
+      failNext = false;
+      throw StateError('activate-committed-then-failed');
+    }
+  }
+}
 
 class _FailingActivateStore extends MemoryCredentialStore {
   @override
@@ -358,5 +382,381 @@ void main() {
     await manager.deleteProfile(other.id);
     expect(manager.profiles.where((p) => p.id == other.id), isEmpty);
     expect(await creds.readToken(other.id), isNull);
+  });
+
+  test('commit 在 activate 后失败：回滚 active/token/descriptor/profiles/Api', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    final creds = _FailAfterActivateStore();
+    final api = Api()..baseUrl = '';
+    final manager = ConnectionManager(
+      api: api,
+      credentials: creds,
+      probeBootstrap: (_) async => {'plugin': {'hostId': 'host-b'}},
+    );
+    await manager.load();
+    creds.failNext = true;
+    final a = manager.profiles.single;
+    final oldGeneration = manager.generation;
+    final b = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: 'B',
+      baseUrls: ['https://b.example.com/m'],
+      hostId: 'host-b',
+    );
+    manager.profiles.add(b);
+    await creds.writeToken(b.id, 'b-token');
+    final stage = await manager.stageSwitch(b.id);
+    await expectLater(manager.commitSwitch(stage), throwsA(anything));
+
+    expect(manager.activeProfileId, a.id);
+    expect(manager.generation, oldGeneration);
+    expect(api.token, 'a-token');
+    expect(api.baseUrl, 'https://a.example.com');
+    expect(await creds.status().then((s) => s.activeProfileId), a.id);
+    final prefs = await SharedPreferences.getInstance();
+    expect((jsonDecode(prefs.getString('dsh_native_connection')!) as Map)['profileId'], a.id);
+    expect(manager.profileScope, contains(a.id));
+  });
+
+  test('commit 在 profiles 持久化失败：回滚 descriptor/active/token/Api', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    final creds = MemoryCredentialStore();
+    final api = Api()..baseUrl = '';
+    final manager = ConnectionManager(
+      api: api,
+      credentials: creds,
+      probeBootstrap: (_) async => {'plugin': {'hostId': 'host-b'}},
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    final b = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: 'B',
+      baseUrls: ['https://b.example.com/m'],
+      hostId: 'host-b',
+    );
+    manager.profiles.add(b);
+    await creds.writeToken(b.id, 'b-token');
+    final stage = await manager.stageSwitch(b.id);
+    manager.persistOverride = () async => throw StateError('prefs-full');
+    await expectLater(manager.commitSwitch(stage), throwsA(anything));
+
+    expect(manager.activeProfileId, a.id);
+    expect(api.token, 'a-token');
+    expect(await creds.status().then((s) => s.activeProfileId), a.id);
+    final prefs = await SharedPreferences.getInstance();
+    expect((jsonDecode(prefs.getString('dsh_native_connection')!) as Map)['profileId'], a.id);
+    expect(await creds.readToken(b.id), 'b-token', reason: 'target 旧 token 必须恢复');
+  });
+
+  test('启动检测 active A + token B / descriptor B：fail-closed 不套 token', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    final creds = MemoryCredentialStore();
+    final manager = ConnectionManager(api: Api()..baseUrl = '', credentials: creds);
+    await manager.load();
+    final a = manager.profiles.single;
+    final b = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: 'B',
+      baseUrls: ['https://b.example.com/m'],
+      hostId: 'host-b',
+    );
+    manager.profiles.add(b);
+    await creds.writeToken(b.id, 'b-token');
+    await creds.activate(b.id);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      'dsh_native_connection',
+      jsonEncode({
+        'profileId': b.id,
+        'hostId': 'host-b',
+        'generation': manager.generation,
+        'baseUrl': 'https://b.example.com',
+        'path': '/m',
+      }),
+    );
+
+    final restarted = ConnectionManager(api: Api()..baseUrl = '', credentials: creds);
+    await restarted.load();
+    expect(restarted.activeProfileId, a.id);
+    expect(restarted.migrationState, 'connection-state-mismatch');
+    expect(restarted.api.token, isEmpty);
+    expect(restarted.connectionStateError, isNotEmpty);
+  });
+
+  test('connectManual probe 失败：旧档案 endpoint/token 不变', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    final creds = MemoryCredentialStore();
+    final manager = ConnectionManager(
+      api: Api()..baseUrl = '',
+      credentials: creds,
+      probeBootstrap: (_) async => throw StateError('offline'),
+    );
+    await manager.load();
+    final before = manager.active!.toJson();
+    await expectLater(
+      manager.connectManual(
+        baseUrl: 'https://changed.example.com/m',
+        token: 'new-token',
+      ),
+      throwsA(isA<ConnectionSwitchException>()),
+    );
+    expect(manager.active!.toJson(), before);
+    expect(await creds.readToken(manager.active!.id), 'a-token');
+    expect(manager.api.baseUrl, 'https://a.example.com');
+  });
+
+  test('自定义挂载路径 probe 使用 /mobile-remote，且公网 HTTP 0 请求', () async {
+    SharedPreferences.setMockInitialValues({});
+    final seen = <String>[];
+    final client = MockClient((request) async {
+      seen.add(request.url.path);
+      return http.Response(
+        '{"ok":true,"plugin":{"hostId":"host-x"}}',
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+    final manager = ConnectionManager(
+      api: Api()..baseUrl = '',
+      credentials: MemoryCredentialStore(),
+      probeClient: client,
+    );
+    final p = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: '自定义',
+      baseUrls: ['https://host.example.com'],
+      path: '/mobile-remote',
+      tlsPolicy: ProfileTlsPolicy.https,
+    );
+    manager.profiles.add(p);
+    await manager.credentials.writeToken(p.id, 't');
+    final stage = await manager.stageSwitch(p.id);
+    expect(stage.hostId, 'host-x');
+    expect(seen, ['/mobile-remote/api/bootstrap']);
+
+    final publicHttp = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: '公网 HTTP',
+      baseUrls: ['http://8.8.8.8:3080'],
+      tlsPolicy: ProfileTlsPolicy.httpPrivate,
+      insecureConfirmed: true,
+    );
+    manager.profiles.add(publicHttp);
+    await manager.credentials.writeToken(publicHttp.id, 't');
+    seen.clear();
+    await expectLater(
+      manager.stageSwitch(publicHttp.id, allowInsecure: true),
+      throwsA(isA<ConnectionSwitchException>()),
+    );
+    expect(seen, isEmpty, reason: '公网 HTTP 必须在 probe 前拒绝，0 token/0 请求');
+  });
+
+  test('旧未命名空间缓存只一次性迁移到首个档案', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+      'dsh_mr_session': 'session-a',
+      'dsh_mr_sessions_cache': 'cache-a',
+      'dsh_mr_plugin_update_journal': '{"opId":"op-a"}',
+    });
+    final manager = ConnectionManager(
+      api: Api()..baseUrl = '',
+      credentials: MemoryCredentialStore(),
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    final b = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: 'B',
+      baseUrls: ['https://b.example.com/m'],
+      hostId: 'host-b',
+    );
+    manager.profiles.add(b);
+    final prefs = await SharedPreferences.getInstance();
+
+    final storeA = AppStore(apiClient: Api())..attachConnections(manager);
+    await storeA.loadPrefs();
+    final scopeA = '${a.id}:${a.hostId}';
+    expect(prefs.getString('dsh_mr_session.$scopeA'), 'session-a');
+    expect(prefs.getString('dsh_mr_sessions_cache.$scopeA'), 'cache-a');
+    expect(prefs.getBool('dsh_mr_profile_cache_migrated_v1'), isTrue);
+    expect(prefs.getString('dsh_mr_session'), isNull);
+
+    manager.activeProfileId = b.id;
+    final storeB = AppStore(apiClient: Api())..attachConnections(manager);
+    await storeB.loadPrefs();
+    expect(storeB.sessionId, isNull, reason: 'B 不得借 A 的旧 session');
+    expect(storeB.pluginUpdateJournal, isNull, reason: 'B 不得恢复 A 的插件事务');
+    // marker 后新出现的全局旧 key 也不会被再次迁移。
+    await prefs.setString('dsh_mr_session', 'late-global');
+    final storeBAgain = AppStore(apiClient: Api())..attachConnections(manager);
+    await storeBAgain.loadPrefs();
+    expect(storeBAgain.sessionId, isNull);
+
+    // 切回 A（模拟重启）：scoped 缓存仍在，恢复 A 的会话。
+    manager.activeProfileId = a.id;
+    final storeA2 = AppStore(apiClient: Api())..attachConnections(manager);
+    await storeA2.loadPrefs();
+    expect(storeA2.sessionId, 'session-a');
+  });
+
+  test('自动轮换：公网 HTTP 0 请求；hostId 变化拒绝；确认候选才允许', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    final seen = <String>[];
+    var probeHost = 'host-a';
+    final client = MockClient((request) async {
+      seen.add(request.url.path);
+      return http.Response(
+        '{"ok":true,"plugin":{"hostId":"$probeHost"}}',
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+    final api = Api()..baseUrl = '';
+    final manager = ConnectionManager(
+      api: api,
+      credentials: MemoryCredentialStore(),
+      probeClient: client,
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    a.hostId = 'host-a';
+    manager.profiles[0] = a;
+    await manager.credentials.writeToken(a.id, 'a-token');
+    api.baseUrls = [
+      'https://a.example.com',
+      'http://8.8.8.8:3080',
+    ];
+    api.baseUrl = 'https://a.example.com';
+    a.baseUrls = ['https://a.example.com'];
+    manager.profiles[0] = a;
+
+    // 广告/候选中的公网 HTTP：admission/verify 均拒绝，0 请求。
+    seen.clear();
+    expect(await api.rotateBaseUrlVerified(), isFalse);
+    expect(seen, isEmpty);
+
+    // 加入已确认 HTTPS 候选；hostId 变化拒绝。
+    api.baseUrls = [
+      'https://a.example.com',
+      'https://c.example.com',
+      'https://d.example.com',
+    ];
+    a.baseUrls = [
+      'https://a.example.com',
+      'https://c.example.com',
+      'https://d.example.com',
+    ];
+    manager.profiles[0] = a;
+    seen.clear();
+    probeHost = 'host-b';
+    expect(await api.rotateBaseUrlVerified(), isFalse);
+    expect(seen, isNotEmpty);
+    expect(api.baseUrl, 'https://a.example.com');
+
+    // 确认且 hostId 一致：允许且只切该候选。
+    seen.clear();
+    probeHost = 'host-a';
+    expect(await api.rotateBaseUrlVerified(), isTrue);
+    expect(api.baseUrl, 'https://c.example.com');
+    expect(seen, ['/m/api/bootstrap']);
+  });
+
+  test('切 B 清空全部宿主投影（running/jobs/queue/pending/未读）', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    final api = _StoreApi();
+    final manager = ConnectionManager(
+      api: api,
+      credentials: MemoryCredentialStore(),
+      probeBootstrap: (_) async => {'plugin': {'hostId': 'host-b'}},
+    );
+    await manager.load();
+    final b = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: 'B',
+      baseUrls: ['https://b.example.com/m'],
+      hostId: 'host-b',
+    );
+    manager.profiles.add(b);
+    await manager.credentials.writeToken(b.id, 'b-token');
+    final store = AppStore(apiClient: api)..attachConnections(manager);
+    addTearDown(store.disposeBridge);
+
+    store.agentStatus = 'running';
+    store.agentStatusMap['a'] = 'running';
+    store.sessionAgentStatus['same-session'] = 'running';
+    store.jobsBySession['same-session'] = [
+      {'id': 'job-a', 'status': 'running'},
+    ];
+    store.queueBySession['same-session'] = [
+      {'id': 'queue-a'},
+    ];
+    store.unread = 5;
+    store.pendingQuestion = QuestionRequest(
+      sessionId: 'same-session',
+      rpcId: 'q-a',
+      questions: const [],
+    );
+
+    final error = await store.switchProfile(b.id);
+    expect(error, isNull);
+    expect(store.agentStatus, 'idle');
+    expect(store.agentStatusMap, isEmpty);
+    expect(store.sessionAgentStatus, isEmpty);
+    expect(store.jobsBySession, isEmpty);
+    expect(store.queueBySession, isEmpty);
+    expect(store.unread, 0);
+    expect(store.pendingQuestion, isNull);
+    expect(api.token, 'b-token');
+    expect(api.hostIdentity, 'host-b');
+  });
+
+  test('已绑定 hostId → 探测缺失：fail-closed；确认后使用隔离身份', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    final manager = ConnectionManager(
+      api: Api()..baseUrl = '',
+      credentials: MemoryCredentialStore(),
+      probeBootstrap: (_) async => {'plugin': <String, dynamic>{}},
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    a.hostId = 'host-a';
+    manager.profiles[0] = a;
+
+    await expectLater(
+      manager.stageSwitch(a.id),
+      throwsA(
+        isA<ConnectionSwitchException>().having(
+          (e) => e.code,
+          'code',
+          'host-identity-missing',
+        ),
+      ),
+    );
+    final confirmed = await manager.stageSwitch(a.id, allowHostChange: true);
+    expect(confirmed.hostId, isNot('host-a'));
+    expect(confirmed.hostId, startsWith('legacy:'));
   });
 }

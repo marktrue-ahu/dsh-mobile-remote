@@ -1579,6 +1579,35 @@ class AppStore extends ChangeNotifier {
   static const _kSkin = 'dsh_mr_skin';
   static const _kAppIcon = 'dsh_mr_app_icon';
 
+  /// #152 P1：旧未命名空间全局缓存**只一次性**迁移到确定的首个档案并写 marker。
+  /// 迁移完成后/其他档案绝不 fallback 到全局旧 key；失败不写 marker，下次重试。
+  Future<void> _migrateLegacyProfileCache(SharedPreferences prefs) async {
+    final manager = connections;
+    if (manager == null) return;
+    if (prefs.getBool(_kProfileCacheMigrated) == true) return;
+    final target = manager.profiles.isEmpty ? null : manager.profiles.first;
+    if (target == null) return;
+    final scope = '${target.id}:${target.hostId}';
+    try {
+      for (final base in _profileScopedKeys) {
+        final legacy = prefs.getString(base);
+        if (legacy == null) continue;
+        final scoped = '$base.$scope';
+        if (prefs.getString(scoped) == null) {
+          await prefs.setString(scoped, legacy);
+        }
+      }
+      // 全部写入成功后才删除旧 key 并写 marker；任何失败保留旧数据供下次迁移。
+      for (final base in _profileScopedKeys) {
+        await prefs.remove(base);
+      }
+      await prefs.setBool(_kProfileCacheMigrated, true);
+      await prefs.setString(_kProfileCacheTarget, target.id);
+    } catch (_) {
+      // 不冒充完成：不写 marker，不回退使用旧全局 key。
+    }
+  }
+
   void attachConnections(ConnectionManager manager) {
     connections = manager;
     _profileScope = manager.profileScope;
@@ -1587,7 +1616,8 @@ class AppStore extends ChangeNotifier {
 
   Future<void> loadPrefs() async {
     final prefs = await SharedPreferences.getInstance();
-    sessionId = (prefs.getString(_scopedKey(_kSession)) ?? prefs.getString(_kSession));
+    await _migrateLegacyProfileCache(prefs);
+    sessionId = prefs.getString(_scopedKey(_kSession));
     darkMode = prefs.getString(_kDark) ?? 'system';
     skin = DshSkin.fromId(prefs.getString(_kSkin));
     appIcon = prefs.getString(_kAppIcon) ?? 'default';
@@ -1626,9 +1656,9 @@ class AppStore extends ChangeNotifier {
     balanceThreshold = prefs.getDouble(_kBalanceThreshold) ?? 10;
     floatingEnabled = prefs.getBool(_kFloating) ?? false;
     // 进行中的插件自更新记录（跨断线/跨进程）：宿主重启会断线，重连后据此接续
-    lastPluginUpdateOpId = (prefs.getString(_scopedKey(_kLastPluginUpdateOpId)) ?? prefs.getString(_kLastPluginUpdateOpId)) ?? '';
+    lastPluginUpdateOpId = prefs.getString(_scopedKey(_kLastPluginUpdateOpId)) ?? '';
     try {
-      final rawJournal = (prefs.getString(_scopedKey(_kPluginUpdateJournal)) ?? prefs.getString(_kPluginUpdateJournal));
+      final rawJournal = prefs.getString(_scopedKey(_kPluginUpdateJournal));
       pluginUpdateJournal = (rawJournal == null || rawJournal.isEmpty)
           ? null
           : PluginUpdateJournal.fromJson(
@@ -1690,11 +1720,11 @@ class AppStore extends ChangeNotifier {
         _defaultConversationActionOrder,
       );
     }
-    final savedWs = (prefs.getString(_scopedKey(_kWorkspace)) ?? prefs.getString(_kWorkspace));
+    final savedWs = prefs.getString(_scopedKey(_kWorkspace));
     workspacePath = savedWs == null ? null : _normPath(savedWs);
     // 会话本地缓存：App 打开瞬间先显示上次的列表，后台静默刷新（解决"进去要等一会才有数据"）
     try {
-      final raw = (prefs.getString(_scopedKey(_kSessCache)) ?? prefs.getString(_kSessCache));
+      final raw = prefs.getString(_scopedKey(_kSessCache));
       if (raw != null && raw.isNotEmpty) {
         final list = jsonDecode(raw) as List;
         sessions = list
@@ -1785,6 +1815,9 @@ class AppStore extends ChangeNotifier {
   }
 
   /// 单值持久化（Phase 0 收敛：原各 setter 的 getInstance+setX 样板统一；null = 删除键）。
+  static const _kProfileCacheMigrated = 'dsh_mr_profile_cache_migrated_v1';
+  static const _kProfileCacheTarget = 'dsh_mr_profile_cache_migrated_target';
+
   static const Set<String> _profileScopedKeys = {
     _kSession,
     _kWorkspace,
@@ -2305,7 +2338,7 @@ class AppStore extends ChangeNotifier {
       // 旧连接代的失败不得轮换/影响新连接（Reviewer #16 P2 失败路径）。
       if (!current()) return false;
       // 连接不通：尝试轮换到下一个候选地址（黑洞快速切换）再探测一次
-      if (api.rotateBaseUrl()) {
+      if (await api.rotateBaseUrlVerified()) {
         AppLog.instance.warn('刷新探测失败 → 切换地址 ${api.baseUrl}');
         final retryEpoch = api.connectionEpoch;
         final retryIdentity = api.connectionIdentity;
@@ -2605,6 +2638,41 @@ class AppStore extends ChangeNotifier {
     if (hadState) notifyListeners();
   }
 
+  /// #152 P1：切宿主清空全部宿主投影；disposeBridge 会刻意保留根 running，不能复用。
+  void _clearHostProjection() {
+    agentStatus = 'idle';
+    agentStatusMap.clear();
+    sessionAgentStatus.clear();
+    jobsBySession.clear();
+    queueBySession.clear();
+    _queueFramed.clear();
+    _pendingQuestionsBySession.clear();
+    _pendingApprovalsBySession.clear();
+    pendingQuestion = null;
+    pendingApproval = null;
+    unread = 0;
+    _sseBusy = false;
+    _retry = 0;
+  }
+
+  /// #152：staged 切换连接档案。失败时旧连接/旧页面状态保持不变。
+  /// 所有激活入口（首次手动/扫码、设置添加/切换）的统一收口。
+  Future<void> _finishActivation(ConnectionManager manager) async {
+    // Api 已经是新宿主；再销毁旧 SSE/重连/刷新代并清宿主态。
+    disposeBridge();
+    sessionId = null;
+    sessions = [];
+    workspaces = [];
+    workspacePath = null;
+    _clearHostProjection();
+    _profileScope = manager.profileScope;
+    ProfileNamespace.setScope(_profileScope);
+    notifyListeners();
+    await onConnectionSwitched?.call();
+    connect();
+    unawaited(refreshAll());
+  }
+
   /// #152：staged 切换连接档案。失败时旧连接/旧页面状态保持不变。
   Future<String?> switchProfile(
     String profileId, {
@@ -2620,27 +2688,92 @@ class AppStore extends ChangeNotifier {
         allowInsecure: allowInsecure,
       );
       await manager.commitSwitch(stage);
-      // Api 已经是新宿主；再销毁旧 SSE/重连/刷新代并清宿主态。
-      disposeBridge();
-      sessionId = null;
-      sessions = [];
-      workspaces = [];
-      workspacePath = null;
-      pendingQuestion = null;
-      pendingApproval = null;
-      _pendingQuestionsBySession.clear();
-      _pendingApprovalsBySession.clear();
-      _profileScope = manager.profileScope;
-      ProfileNamespace.setScope(_profileScope);
-      notifyListeners();
-      await onConnectionSwitched?.call();
-      connect();
-      unawaited(refreshAll());
+      await _finishActivation(manager);
       return null;
     } on ConnectionSwitchException catch (e) {
       return e.message;
     } catch (e) {
       return '切换失败：$e';
+    }
+  }
+
+  /// 首次配置/重配置当前连接：manager 负责 staged 事务，store 负责统一清态/重连。
+  Future<String?> connectManualProfile({
+    required String baseUrl,
+    required String token,
+    bool allowInsecure = false,
+  }) async {
+    final manager = connections;
+    if (manager == null) return '连接档案未初始化';
+    try {
+      await manager.connectManual(
+        baseUrl: baseUrl,
+        token: token,
+        allowInsecure: allowInsecure,
+      );
+      await _finishActivation(manager);
+      return null;
+    } on ConnectionSwitchException catch (e) {
+      return e.message;
+    } catch (e) {
+      return '连接失败：$e';
+    }
+  }
+
+  /// 编辑现有档案并激活；失败保留旧档案/旧 token/Api。
+  Future<String?> editAndSwitchProfile(
+    ConnectionProfile profile, {
+    required String baseUrl,
+    String? token,
+    String? displayName,
+    bool allowInsecure = false,
+  }) async {
+    final manager = connections;
+    if (manager == null) return '连接档案未初始化';
+    try {
+      await manager.editProfile(
+        profile,
+        baseUrl: baseUrl,
+        token: token,
+        displayName: displayName,
+        allowInsecure: allowInsecure,
+      );
+      await _finishActivation(manager);
+      return null;
+    } on ConnectionSwitchException catch (e) {
+      return e.message;
+    } catch (e) {
+      return '保存失败：$e';
+    }
+  }
+
+  /// 添加并立即激活：先落档案（非 active），再走统一 staged switch。
+  Future<String?> addAndSwitchProfile({
+    required String displayName,
+    required String baseUrl,
+    required String token,
+    bool allowInsecure = false,
+    String? path,
+  }) async {
+    final manager = connections;
+    if (manager == null) return '连接档案未初始化';
+    try {
+      final profile = await manager.addProfile(
+        displayName: displayName,
+        baseUrl: baseUrl,
+        token: token,
+        path: path ?? Api.forProbe(baseUrl, '').path,
+        tlsPolicy: baseUrl.startsWith('https://')
+            ? ProfileTlsPolicy.https
+            : ProfileTlsPolicy.httpPrivate,
+        insecureConfirmed: allowInsecure,
+        switchNow: false,
+      );
+      return await switchProfile(profile.id, allowInsecure: allowInsecure);
+    } on ConnectionSwitchException catch (e) {
+      return e.message;
+    } catch (e) {
+      return '添加失败：$e';
     }
   }
 
@@ -2907,11 +3040,11 @@ class AppStore extends ChangeNotifier {
         if ('$e'.contains('SSE HTTP 503')) _sseBusy = true;
         // 超时 = 黑洞地址（路由不可达，如手机关了组网 VPN）→ 立即轮换候选地址，
         // 不再白等 3×15 秒的重试循环（连接被拒/中断等瞬时错误仍走正常退避）
-        if (e is TimeoutException && api.rotateBaseUrl()) {
-          AppLog.instance.warn('SSE: 超时视为黑洞 → 立即切换 ${api.baseUrl}');
-          _retry = 0;
+        if (e is TimeoutException) {
+          unawaited(_rotateVerifiedThenSchedule());
+        } else {
+          _scheduleReconnect();
         }
-        _scheduleReconnect();
       },
       onDone: () {
         if (!current()) return;
@@ -2920,6 +3053,14 @@ class AppStore extends ChangeNotifier {
       },
       cancelOnError: true,
     );
+  }
+
+  Future<void> _rotateVerifiedThenSchedule() async {
+    if (await api.rotateBaseUrlVerified()) {
+      AppLog.instance.warn('SSE: 超时视为黑洞 → 立即切换 ${api.baseUrl}');
+      _retry = 0;
+    }
+    _scheduleReconnect();
   }
 
   /// App 回到前台时调用：探测电脑端在线状态，SSE 断开则立即重连，并刷新数据。
@@ -3458,8 +3599,8 @@ class AppStore extends ChangeNotifier {
               identity != api.connectionIdentity) {
             return;
           }
-          // 当前地址连续失败：轮换到下一个候选地址（外出自动切 Tailscale）
-          if (api.rotateBaseUrl()) {
+          // 当前地址连续失败：轮换到下一个已确认且 hostId 校验通过的候选。
+          if (await api.rotateBaseUrlVerified()) {
             AppLog.instance.log('连接切换地址 → ${api.baseUrl}');
             _retry = 0; // 新地址重新开始退避
           } else {

@@ -1211,12 +1211,15 @@ class FloatingBubbleService : Service() {
 
     private fun refreshPanelData() {
         Thread({
+            // #152 P1：一次刷新捕获同一 profileId+generation+token 快照；
+            // 任一响应返回或主线程 apply 前都校验仍是当前连接，A/B 不得混合渲染。
+            val snapshot = NativeConnection.Access.snapshot(this) ?: return@Thread
             // v2.8.0 review：三段独立 runCatching——任一段畸形响应只跳过该段，
             // 不牵连后续请求与 renderPanel（旧单 try 会在解析异常时整轮跳过面板刷新）
             // 运行中会话（bootstrap agents）
             val running = mutableListOf<Triple<String, String, String>>() // (id, status, title)
             runCatching {
-                httpGet("bootstrap")?.let { txt ->
+                httpGet(snapshot, "bootstrap")?.let { txt ->
                     val agents = JSONObject(txt).optJSONArray("agents") ?: JSONArray()
                     for (i in 0 until agents.length()) {
                         val a = agents.optJSONObject(i) ?: continue
@@ -1236,7 +1239,7 @@ class FloatingBubbleService : Service() {
             val notifs = mutableListOf<Map<String, Any>>()
             var unreadCount = 0
             runCatching {
-                httpGet("notifications")?.let { txt ->
+                httpGet(snapshot, "notifications")?.let { txt ->
                     val j = JSONObject(txt)
                     val list = j.optJSONArray("items") ?: JSONArray()
                     unreadCount = j.optInt("unread")
@@ -1253,7 +1256,7 @@ class FloatingBubbleService : Service() {
 
             // 余额（面板打开时顺带刷新常驻余额行，静默不弹提示；金额取 CNY 优先，与详情页同口径）
             runCatching {
-                httpGet("balance")?.let { txt ->
+                httpGet(snapshot, "balance")?.let { txt ->
                     UsagePanelModel.deepseekBalanceFromBalancePayload(txt)?.let { v ->
                         if (v > 0) applyBalance(v, tip = false)
                     }
@@ -1261,6 +1264,7 @@ class FloatingBubbleService : Service() {
             }
 
             mainHandler.post {
+                if (!NativeConnection.Access.isCurrent(this, snapshot)) return@post
                 // 面板打开 = 已看：更新未读基线（下次增量从当前起算）
                 applyUnreadSnapshot(unreadCount)
                 renderPanel(running, notifs, unreadCount)
@@ -1602,6 +1606,20 @@ class FloatingBubbleService : Service() {
 
     /** issue #152：档案/generation 变化时强制关闭旧流，不能因旧线程存活拒绝新连接。 */
     private fun restartSseForConnection() {
+        // #152 P1：切换即丢弃旧刷新结果与未读/余额基线，清除面板缓存。
+        notifCount = 0
+        lastUnreadCount = 0
+        firstUnreadCheck = true
+        agentsRunning = false
+        balanceTotal = null
+        lowBalance = false
+        latestSessionTitle = null
+        panel?.let { p ->
+            mainHandler.post {
+                if (!panelVisible) return@post
+                renderPanel(emptyList(), emptyList(), 0)
+            }
+        }
         synchronized(sseLock) {
             sseAlive = false
             closeSseConn()
@@ -1619,14 +1637,13 @@ class FloatingBubbleService : Service() {
      * 现在用 try/finally 保证任何退出路径都 disconnect 并清 `sseConn`，且重连前先关旧连接。
      */
     private fun connectSse(): Boolean {
-        // #152：原生只读 Dart 描述符 + Keystore 活动 token；明文 prefs 永不回退。
-        val descriptor = NativeConnection.read(this) ?: return true
-        if (CredentialStore.activeProfileId(this) != descriptor.profileId) return true
-        val token = CredentialStore.readToken(this, descriptor.profileId) ?: return true
+        // #152：一次读取 descriptor+token 快照；明文 prefs 永不回退。
+        val snapshot = NativeConnection.Access.snapshot(this) ?: return true
+        val descriptor = snapshot.connection
         if (!sseAlive) return true
         // 防御：上一轮异常退出可能没走到 cleanup；重连前兜底释放旧连接。
         closeSseConn()
-        val url = URL("${descriptor.baseUrl}${descriptor.path}/api/events")
+        val url = URL(snapshot.requestUrl("events"))
         val conn = url.openConnection() as HttpURLConnection
         conn.instanceFollowRedirects = false
         sseConn = conn // v2.7.2 review(FS2)：onDestroy 时 disconnect 解除 readLine 阻塞
@@ -1636,7 +1653,7 @@ class FloatingBubbleService : Service() {
             // 静默死链（TCP 已死但无 FIN/RST：切网/路由器丢连接/PC 休眠）时触发 IOException，
             // 让重连循环兜底；此前 0=无限阻塞，死链后通知断供且永不恢复
             conn.readTimeout = 50_000
-            conn.setRequestProperty("x-mobile-token", token)
+            conn.setRequestProperty("x-mobile-token", snapshot.token)
             conn.setRequestProperty("Accept", "text/event-stream")
             // issue #131：原生 SSE 与 Flutter 一样上报 App 版本；此前缺失导致诊断 appVersion=null。
             conn.setRequestProperty(
@@ -1657,7 +1674,7 @@ class FloatingBubbleService : Service() {
                     }
                     if (!line.startsWith("data: ")) continue
                     // #152：旧档案/旧 generation 的迟到帧不得更新 pet/未读/通知/余额。
-                    if (!isNativeConnectionCurrent(descriptor)) break
+                    if (!NativeConnection.Access.isCurrent(this, snapshot)) break
                     val data = line.removePrefix("data: ")
                     try {
                         handleFrame(JSONObject(data))
@@ -2054,26 +2071,33 @@ class FloatingBubbleService : Service() {
 
     /** GET 一个 /m/api 端点；非 200 或异常返回 null（各调用点语义一致：失败静默）。 */
     private fun httpGet(path: String, timeoutMs: Int = 5000): String? {
-        val descriptor = NativeConnection.read(this) ?: return null
-        if (CredentialStore.activeProfileId(this) != descriptor.profileId) return null
-        val base = baseUrl() ?: return null
-        val token = CredentialStore.readToken(this, descriptor.profileId) ?: return null
+        val snapshot = NativeConnection.Access.snapshot(this) ?: return null
+        return httpGet(snapshot, path, timeoutMs)
+    }
+
+    /** #152 P1：整次刷新共用同一快照；响应回来仍校验 generation/active。 */
+    private fun httpGet(
+        snapshot: NativeConnection.Snapshot,
+        path: String,
+        timeoutMs: Int = 5000,
+    ): String? {
+        val conn = URL(snapshot.requestUrl(path)).openConnection() as HttpURLConnection
+        conn.instanceFollowRedirects = false
+        conn.connectTimeout = timeoutMs
+        // v2.9.0 review(A3)：读超时补齐（默认 0=无限——服务端接受连接但慢回 body 时
+        // 后台线程永久阻塞、inflight 累积；SSE 的 connectSse readTimeout=0 是刻意保留长连）
+        conn.readTimeout = timeoutMs
+        conn.setRequestProperty("x-mobile-token", snapshot.token)
         return try {
-            val conn = URL("$base${descriptor.path}/api/$path").openConnection() as HttpURLConnection
-            conn.instanceFollowRedirects = false
-            conn.connectTimeout = timeoutMs
-            // v2.9.0 review(A3)：读超时补齐（默认 0=无限——服务端接受连接但慢回 body 时
-            // 后台线程永久阻塞、inflight 累积；SSE 的 connectSse readTimeout=0 是刻意保留长连）
-            conn.readTimeout = timeoutMs
-            conn.setRequestProperty("x-mobile-token", token)
-            try {
-                if (conn.responseCode != 200) return null
-                conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-            } finally {
-                conn.disconnect()
-            }
+            if (!NativeConnection.Access.isCurrent(this, snapshot)) return null
+            if (conn.responseCode != 200) return null
+            val body = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            if (!NativeConnection.Access.isCurrent(this, snapshot)) return null
+            body
         } catch (_: Exception) {
             null
+        } finally {
+            conn.disconnect()
         }
     }
 
