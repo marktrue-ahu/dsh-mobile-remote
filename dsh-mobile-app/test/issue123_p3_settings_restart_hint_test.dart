@@ -27,6 +27,9 @@ import 'package:dsh_mobile_app/store.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+import 'settings_tabs_helper.dart';
+
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -53,9 +56,7 @@ Map<String, dynamic> _installingBootstrap() => {
 };
 
 /// 首个轮询返回的失败事务：host 拒绝并要求先重启 DSH。
-Map<String, dynamic> _failedBootstrap({
-  bool includeNextAction = true,
-}) => {
+Map<String, dynamic> _failedBootstrap({bool includeNextAction = true}) => {
   'pluginUpdate': {
     'state': 'update-failed',
     'reason': 'host-manager-rejected',
@@ -104,12 +105,17 @@ Future<AppStore> _pumpSettings(
   await store.loadPrefs();
   addTearDown(store.dispose);
   await tester.pumpWidget(
-    MaterialApp(home: Scaffold(body: SettingsScreen(store: store, onReconfigure: () async {}))),
+    MaterialApp(
+      home: Scaffold(
+        body: SettingsScreen(store: store, onReconfigure: () async {}),
+      ),
+    ),
   );
   // initState 立即触发一次 _pollUpdateProgress；两帧让 setState 落地。
   await tester.pump();
   await tester.pump(const Duration(milliseconds: 50));
   await tester.pumpAndSettle();
+  await selectSettingsTab(tester, '通用');
   return store;
 }
 
@@ -129,38 +135,37 @@ void main() {
         );
   });
 
-  testWidgets('P3 首次轮询即 failed：失败卡主行必须是「先重启 DSH」，英文日志降为次级', (
-    tester,
-  ) async {
+  testWidgets('P3 首次轮询即 failed：失败卡主行必须是「先重启 DSH」，英文日志降为次级', (tester) async {
     final recorder = _Recorder();
-    final api = Api(
-      client: MockClient((request) async {
-        recorder.calls.add('${request.method} ${request.url.path}');
-        final path = request.url.path;
-        if (path.endsWith('/api/bootstrap')) {
-          return _json(_failedBootstrap());
-        }
-        if (path.endsWith('/api/plugin-update/log')) {
-          return _json({
-            'ok': true,
-            'opId': _opId,
-            'phase': 'failed',
-            'events': [
-              {
-                'seq': 1,
-                'stage': 'failed',
-                'stream': 'stderr',
-                'text': _logLine,
-              },
-            ],
-          });
-        }
-        return _json({'ok': true});
-      }),
-    )
-      ..baseUrl = 'http://host:3080'
-      ..path = '/m'
-      ..token = 'tok';
+    final api =
+        Api(
+            client: MockClient((request) async {
+              recorder.calls.add('${request.method} ${request.url.path}');
+              final path = request.url.path;
+              if (path.endsWith('/api/bootstrap')) {
+                return _json(_failedBootstrap());
+              }
+              if (path.endsWith('/api/plugin-update/log')) {
+                return _json({
+                  'ok': true,
+                  'opId': _opId,
+                  'phase': 'failed',
+                  'events': [
+                    {
+                      'seq': 1,
+                      'stage': 'failed',
+                      'stream': 'stderr',
+                      'text': _logLine,
+                    },
+                  ],
+                });
+              }
+              return _json({'ok': true});
+            }),
+          )
+          ..baseUrl = 'http://host:3080'
+          ..path = '/m'
+          ..token = 'tok';
     // 关键前提：SettingsScreen 初始状态是 installing（在飞事务）。
     api.absorbBootstrap(_installingBootstrap());
     expect(
@@ -183,7 +188,8 @@ void main() {
     expect(
       _restartHint,
       findsOneWidget,
-      reason: '失败卡必须直接显示「先重启 DSH」：nextAction=restart-host 是唯一可执行动作，'
+      reason:
+          '失败卡必须直接显示「先重启 DSH」：nextAction=restart-host 是唯一可执行动作，'
           '不能要求用户先点详情/等 toast',
     );
 
@@ -212,33 +218,34 @@ void main() {
   testWidgets('P3 兼容：旧插件无 nextAction/hostErrorCode → 失败卡仍显示既有 reason 文案', (
     tester,
   ) async {
-    final api = Api(
-      client: MockClient((request) async {
-        final path = request.url.path;
-        if (path.endsWith('/api/bootstrap')) {
-          return _json(_failedBootstrap(includeNextAction: false));
-        }
-        if (path.endsWith('/api/plugin-update/log')) {
-          return _json({
-            'ok': true,
-            'opId': _opId,
-            'phase': 'failed',
-            'events': [
-              {
-                'seq': 1,
-                'stage': 'failed',
-                'stream': 'stderr',
-                'text': _logLine,
-              },
-            ],
-          });
-        }
-        return _json({'ok': true});
-      }),
-    )
-      ..baseUrl = 'http://host:3080'
-      ..path = '/m'
-      ..token = 'tok';
+    final api =
+        Api(
+            client: MockClient((request) async {
+              final path = request.url.path;
+              if (path.endsWith('/api/bootstrap')) {
+                return _json(_failedBootstrap(includeNextAction: false));
+              }
+              if (path.endsWith('/api/plugin-update/log')) {
+                return _json({
+                  'ok': true,
+                  'opId': _opId,
+                  'phase': 'failed',
+                  'events': [
+                    {
+                      'seq': 1,
+                      'stage': 'failed',
+                      'stream': 'stderr',
+                      'text': _logLine,
+                    },
+                  ],
+                });
+              }
+              return _json({'ok': true});
+            }),
+          )
+          ..baseUrl = 'http://host:3080'
+          ..path = '/m'
+          ..token = 'tok';
     api.absorbBootstrap(_installingBootstrap());
     await _pumpSettings(tester, api);
 

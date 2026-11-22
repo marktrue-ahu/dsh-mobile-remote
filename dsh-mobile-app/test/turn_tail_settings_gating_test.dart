@@ -6,6 +6,9 @@ import 'package:dsh_mobile_app/screens/settings_screen.dart';
 import 'package:dsh_mobile_app/store.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+import 'settings_tabs_helper.dart';
+
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
@@ -35,6 +38,7 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
+    await selectSettingsTab(tester, '对话');
   }
 
   testWidgets('旧插件（无能力位）不显示展示模式/收起时机设置', (tester) async {
