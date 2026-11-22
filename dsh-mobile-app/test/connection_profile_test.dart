@@ -12,6 +12,7 @@ import 'package:dsh_mobile_app/attention_storage.dart';
 import 'package:dsh_mobile_app/git_file_history_controller.dart';
 import 'package:dsh_mobile_app/store.dart';
 import 'package:dsh_mobile_app/plugin_update_resume.dart';
+import 'package:dsh_mobile_app/update_core.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -22,6 +23,19 @@ class _StoreApi extends Api {
 
   @override
   Stream<Map<String, dynamic>> eventsRaw() => controller.stream;
+}
+
+class _CountingStoreApi extends _StoreApi {
+  int requests = 0;
+
+  @override
+  Future<Map<String, dynamic>> getJson(
+    String path, {
+    Duration timeout = const Duration(seconds: 15),
+  }) {
+    requests++;
+    return super.getJson(path, timeout: timeout);
+  }
 }
 
 class _FailAfterActivateStore extends MemoryCredentialStore {
@@ -1004,8 +1018,9 @@ void main() {
       'dsh_mr_token': 'a-token',
     });
     var host = 'host-a';
+    final api = _CountingStoreApi();
     final manager = ConnectionManager(
-      api: Api()..baseUrl = '',
+      api: api,
       credentials: MemoryCredentialStore(),
       probeBootstrap: (_) async => {'plugin': {'hostId': host}},
     );
@@ -1021,7 +1036,6 @@ void main() {
     );
     manager.profiles.add(b);
     await manager.credentials.writeToken(b.id, 'b-token');
-    final api = _StoreApi();
     final store = AppStore(apiClient: api)..attachConnections(manager);
     addTearDown(store.disposeBridge);
     store.pluginUpdateJournal = PluginUpdateJournal(
@@ -1044,10 +1058,29 @@ void main() {
     expect(entered, isTrue);
     host = 'host-b';
     expect(await store.switchProfile(b.id), isNull);
+    // B 设置非空 sentinel，区分“旧 A 动态 ctx 误清”与真正的隔离。
+    final sentinelJournal = PluginUpdateJournal(
+      opId: 'op-b',
+      targetVersion: '3.3.1',
+      targetContentSha256: 'b' * 64,
+      startedAt: DateTime.now().toUtc(),
+      phase: UpdatePhase.pluginRetry,
+    );
+    const sentinelCandidate = UpdateCandidate(
+      version: '3.3.1+70',
+      downloadUrl: 'https://b.example.com/app.apk',
+      source: 'host',
+    );
+    store.pluginUpdateJournal = sentinelJournal;
+    store.pluginUpdateNotice = 'B sentinel notice';
+    store.updateCandidate = sentinelCandidate;
+    final requestsAfterB = api.requests;
     gate.complete();
     await resume;
-    expect(store.pluginUpdateJournal, isNull, reason: 'B 不得恢复 A 的未完成 journal');
-    expect(store.updateCandidate, isNull);
+    expect(identical(store.pluginUpdateJournal, sentinelJournal), isTrue);
+    expect(store.pluginUpdateNotice, 'B sentinel notice');
+    expect(identical(store.updateCandidate, sentinelCandidate), isTrue);
+    expect(api.requests, requestsAfterB, reason: '旧 A continuation 不得额外请求 B');
   });
 
   test('A resume 停在首次 journal 持久化→切 B：B prefs/journal 不变', () async {
