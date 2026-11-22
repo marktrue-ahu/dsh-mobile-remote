@@ -15,7 +15,7 @@ const CONFIG = {
 const header = (id) => ({ id, version: 1, createdAt: 1, cwd: "/tmp", isSeeded: false });
 const pick = (provider, model, effort) => ({ provider, model, ...(effort ? { reasoningEffort: effort } : {}) });
 
-function harness({ live = false, events = [], noQuery = false, seeded = false, cache, surface } = {}) {
+function harness({ live = false, events = [], noQuery = false, seeded = false, omitHeader = false, cache, surface } = {}) {
   const routes = [];
   const cacheCalls = [];
   const resumeCalls = [];
@@ -54,7 +54,7 @@ function harness({ live = false, events = [], noQuery = false, seeded = false, c
     services.set("sessionQuery", {
       async readSession(id) {
         if (seeded) throw new Error("seeded session constructor seed must equal its inherited prefix");
-        return { session: header(id), events };
+        return omitHeader ? { events } : { session: header(id), events };
       },
       async readSurface(id) {
         if (surface === undefined) return { session: header(id), events: [] };
@@ -142,6 +142,25 @@ test("dormant：cache 覆盖最新事件时 pending B 优先于事件 A", async 
     const res = await request(h.route, "/m/api/session-config?sessionId=dormant-cache-fresh");
     assert.deepEqual([res.body.config.provider, res.body.config.model, res.body.config.reasoningEffort], ["b", "model-b", "max"]);
     assert.equal(res.body.config.configDegraded, undefined);
+  } finally { h.dispose?.(); }
+});
+
+test("P2 普通 readSession 缺 header：config/resume 都标降级，不读 cache、不伪造默认模型", async () => {
+  const h = harness({
+    events: [],
+    omitHeader: true,
+    cache: projection(pick("seed", "seed-model", "max"), pick("seed", "seed-model", "max"), 7),
+  });
+  try {
+    const res = await request(h.route, "/m/api/session-config?sessionId=normal-no-header");
+    assert.equal(res.body.config.model, undefined);
+    assert.equal(res.body.configDegraded, true, "普通 readSession 缺 header 也必须降级");
+    assert.equal(h.cacheCalls.length, 0);
+
+    const send = await request(h.route, "/m/api/send", { sessionId: "normal-no-header", text: "hi" });
+    assert.equal(send.status, 200);
+    assert.equal(send.body.configDegraded, true, "resume 响应必须带同一降级标记");
+    assert.equal(h.resumeCalls[0].agentOptions, undefined, "不能把默认模型当已知配置");
   } finally { h.dispose?.(); }
 });
 
