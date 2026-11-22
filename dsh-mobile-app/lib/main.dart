@@ -10,7 +10,6 @@ import 'package:package_info_plus/package_info_plus.dart';
 import 'l10n.dart';
 import 'api.dart';
 import 'connection_manager.dart';
-import 'screens/connection_profiles_sheet.dart';
 import 'app_icon_switcher.dart';
 import 'store.dart';
 import 'attention.dart';
@@ -837,37 +836,6 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
                         _openNewSession();
                       },
                       child: Text(L10n.t('＋ 新建会话', '+ New Session')),
-                    ),
-                    const SizedBox(height: 12),
-                    // #152：全局连接切换入口（主/次入口分工：这里快速切换，设置页做管理）。
-                    InkWell(
-                      key: const ValueKey('drawer-current-computer'),
-                      borderRadius: BorderRadius.circular(10),
-                      onTap: () async {
-                        Navigator.of(context).pop();
-                        await showConnectionProfilesSheet(context, store);
-                      },
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 6),
-                        child: Row(
-                          children: [
-                            Icon(Icons.computer, size: 16, color: DshColors.ink3(context)),
-                            const SizedBox(width: 6),
-                            Expanded(
-                              child: Text(
-                                L10n.t(
-                                  '当前电脑 · ${store.connections?.active?.displayName ?? '未连接'}',
-                                  'Current computer · ${store.connections?.active?.displayName ?? 'Not connected'}',
-                                ),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(fontSize: 12, color: DshColors.ink2(context)),
-                              ),
-                            ),
-                            Icon(Icons.expand_more, size: 16, color: DshColors.ink3(context)),
-                          ],
-                        ),
-                      ),
                     ),
                   ],
                 ),

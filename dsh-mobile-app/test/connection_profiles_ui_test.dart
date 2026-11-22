@@ -5,7 +5,7 @@ import 'package:dsh_mobile_app/api.dart';
 import 'package:dsh_mobile_app/connection_manager.dart';
 import 'package:dsh_mobile_app/connection_profile.dart';
 import 'package:dsh_mobile_app/credential_store.dart';
-import 'package:dsh_mobile_app/screens/connection_profiles_sheet.dart';
+import 'package:dsh_mobile_app/screens/connection_profiles_screen.dart';
 import 'package:dsh_mobile_app/store.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -95,7 +95,7 @@ void main() {
       MaterialApp(
         home: Builder(
           builder: (context) => TextButton(
-            onPressed: () => showConnectionProfilesSheet(context, store),
+            onPressed: () => showConnectionProfilesScreen(context, store),
             child: const Text('open'),
           ),
         ),
@@ -103,39 +103,21 @@ void main() {
     );
     await tester.tap(find.text('open'));
     await tester.pumpAndSettle();
-    expect(find.byKey(const ValueKey('connection-current-name')), findsOneWidget);
+    expect(find.text('连接档案'), findsOneWidget);
     expect(find.text('家里'), findsWidgets);
     expect(find.text('公司'), findsOneWidget);
     expect(find.byKey(const ValueKey('connection-add')), findsOneWidget);
   });
 
-  testWidgets('聊天页来源：先确认，取消不切换', (tester) async {
+  testWidgets('设置页可直接嵌入的自包含连接区块', (tester) async {
     await tester.pumpWidget(
       MaterialApp(
-        home: Builder(
-          builder: (context) => TextButton(
-            onPressed: () => showConnectionProfilesSheet(
-              context,
-              store,
-              fromChat: true,
-              chatTitle: '会话 X',
-              hasDraft: true,
-            ),
-            child: const Text('open'),
-          ),
-        ),
+        home: Scaffold(body: ConnectionSettingsSection(store: store)),
       ),
     );
-    await tester.tap(find.text('open'));
     await tester.pumpAndSettle();
-    await tester.tap(find.byKey(ValueKey('connection-profile-${b.id}')));
-    await tester.pumpAndSettle();
-    expect(find.text('切换电脑？'), findsOneWidget);
-    expect(find.textContaining('当前输入尚未发送'), findsOneWidget);
-    await tester.tap(find.text('取消'));
-    await tester.pumpAndSettle();
-    expect(manager.activeProfileId, a.id);
-    expect(find.text('切换电脑？'), findsNothing);
+    expect(find.byKey(const ValueKey('connection-settings-section')), findsOneWidget);
+    expect(find.text('家里'), findsOneWidget);
   });
 
   testWidgets('320 / 1.5× / 深色：sheet 不溢出', (tester) async {
@@ -151,7 +133,7 @@ void main() {
           ),
           child: Builder(
             builder: (context) => TextButton(
-              onPressed: () => showConnectionProfilesSheet(context, store),
+              onPressed: () => showConnectionProfilesScreen(context, store),
               child: const Text('open'),
             ),
           ),
@@ -169,7 +151,7 @@ void main() {
       MaterialApp(
         home: Builder(
           builder: (context) => TextButton(
-            onPressed: () => showConnectionProfilesSheet(context, store),
+            onPressed: () => showConnectionProfilesScreen(context, store),
             child: const Text('open'),
           ),
         ),

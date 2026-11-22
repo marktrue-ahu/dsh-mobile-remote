@@ -32,7 +32,6 @@ import '../update_flow.dart';
 import '../updater.dart';
 import '../version_alignment.dart';
 import 'sheets.dart';
-import 'connection_profiles_sheet.dart';
 import 'log_sheet.dart';
 import 'providers_screen.dart';
 import 'plugin_inventory_screen.dart';
@@ -2259,20 +2258,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
               style: TextStyle(fontSize: 12, color: brand),
             ),
             onTap: () => widget.onReconfigure(),
-          ),
-          _row(
-            leading: const Icon(Icons.computer),
-            title: L10n.t('管理连接档案', 'Manage connections'),
-            sub: store.connections?.active?.displayName ??
-                L10n.t('保存多台电脑并切换', 'Save and switch between computers'),
-            trailing: Text(
-              L10n.t('管理 ▸', 'Manage ▸'),
-              style: TextStyle(fontSize: 12, color: brand),
-            ),
-            onTap: () async {
-              await showConnectionProfilesSheet(context, store);
-              if (mounted) setState(() {});
-            },
           ),
         ]),
         // v3.1.2：推送通道自检（配置在电脑端 cordis.patch.yml 的 pushUrls）
