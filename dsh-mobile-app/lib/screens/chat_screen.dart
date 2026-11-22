@@ -47,6 +47,7 @@ import 'git_browser_sheet.dart';
 import 'agent_panel.dart';
 import '../tool_cards.dart';
 import '../tool_images.dart';
+import '../widgets/context_stats_sheet.dart';
 import '../widgets/git_file_viewer.dart';
 import '../widgets/git_logo.dart';
 import '../widgets/turn_navigator_rail.dart';
@@ -1836,8 +1837,7 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> debugJumpToMessageSeq(int seq) => _jumpToMessageSeq(seq);
 
   @visibleForTesting
-  List<MessageIndexEntry> get debugMessageIndexEntries =>
-      _messageIndex.entries;
+  List<MessageIndexEntry> get debugMessageIndexEntries => _messageIndex.entries;
 
   /// issue #130 P2：loading 时首 sliver 状态行是否仍不足以承担提示。
   ///
@@ -7238,11 +7238,13 @@ class _ChatScreenState extends State<ChatScreen> {
                                       ],
                                     ),
                                   ),
-                                  const SizedBox(width: 8),
+                                  const SizedBox(width: 4),
                                   // 上下文窗口占用圆环（对齐 PC 端；数据齐全时才显示）——组外固定
+                                  // issue #158：44dp 命中区 → 上下文统计三 Tab 抽屉。
+                                  // 44dp 命中区比原视觉宽 4dp，前后间距各收 4dp，保持行不溢出。
                                   if (_contextRatio != null) ...[
-                                    _ContextRing(ratio: _contextRatio!),
-                                    const SizedBox(width: 8),
+                                    _buildContextStatsTrigger(),
+                                    const SizedBox(width: 4),
                                   ],
                                   // v2.7.2：发送按钮恢复原设计——运行中=停止（对齐 PC 端），空闲=发送；
                                   // 长按=插队发送；运行中普通发送走「排队发送」胶囊——组外固定
@@ -8015,6 +8017,48 @@ class _ChatScreenState extends State<ChatScreen> {
               '已填入输入框：补参数后点发送才会执行（用法 $usage）',
               'Inserted — add arguments, then send to run (usage: $usage)',
             ),
+    );
+  }
+
+  /// issue #158：输入区上下文圆环触发器（44dp 命中区，视觉保持现有圆环）。
+  Widget _buildContextStatsTrigger() {
+    final percent = (_contextRatio! * 100).round();
+    return Semantics(
+      button: true,
+      label: L10n.t(
+        '上下文用量 $percent%，点按查看明细',
+        'Context usage $percent%, tap for details',
+      ),
+      child: InkWell(
+        key: const ValueKey<String>('context-stats-trigger'),
+        onTap: _openContextStats,
+        customBorder: const CircleBorder(),
+        child: SizedBox(
+          width: 44,
+          height: 44,
+          child: Center(
+            // 测试字体/超大字号下圆环文本可能略宽于 44dp：缩放而不是溢出。
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              child: _ContextRing(ratio: _contextRatio!),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// issue #158：打开上下文统计抽屉。session id 在此绑定，切会话由 sheet 监听关闭。
+  void _openContextStats() {
+    final sid = _mySessionId ?? widget.store.sessionId;
+    if (sid == null || sid.isEmpty) return;
+    showContextStatsSheet(
+      context,
+      api: _api,
+      store: widget.store,
+      sessionId: sid,
+      model: widget.store.sessionConfig.model ?? '',
+      fallbackUsage: Map<String, dynamic>.from(_usage),
     );
   }
 

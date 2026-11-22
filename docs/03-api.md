@@ -43,6 +43,7 @@
 | GET | `/m/api/actions` | 插件动作清单 | 是 |
 | POST | `/m/api/actions/:id/invoke` | 执行插件动作 | 是 |
 | GET | `/m/api/usage` | 会话 token 用量 | 是 |
+| GET | `/m/api/context-stats` | 当前会话上下文四量统计（只读，issue #158） | 是 |
 | GET | `/m/api/workspaces` | 已注册工作区 | 是 |
 | GET/POST | `/m/api/directories` | 目录浏览/新建文件夹 | 是 |
 | GET | `/m/api/diagnostics` | 环境诊断（插件运行时、services、checks） | 是 |
@@ -375,6 +376,7 @@
 | GET | `/m/api/actions` | 插件动作清单（实时） |
 | POST | `/m/api/actions/:id/invoke` | 执行插件动作 |
 | GET | `/m/api/usage` | 会话 token 用量统计（v2.1） |
+| GET | `/m/api/context-stats` | 会话上下文统计：pressure / breakdown / tokenUsage / timing（只读，issue #158） |
 | GET | `/m/api/workspaces` | 已注册工作区（新建会话默认目录，v2.1） |
 | GET | `/m/api/directories` | 目录浏览（盘符/子目录，v2.1；v3.1.1 根视图响应新增 `sep` 字段；issue #45 可选 `includeHidden=1` 显示点开头条目，`.git` 永不返回） |
 | POST | `/m/api/directories` | 新建文件夹（v2.1） |
@@ -939,6 +941,34 @@ fetch/push 序列化 common domain，pull/sync/abort 同时序列化 common 与 
 - HTTP 错误只返回通用 `502 account-usage-failed`（单来源失败不会使整体请求失败）。
 
 **桌面宠物面板消费语义（沿用 v3.1.5 的 ADR 0008）**：原生桌面宠物面板把本端点当作「展开时按需读取」的快照——每次展开面板最多触发一次查询（客户端 2 分钟节流，不并入面板打开期间的 5 秒轮询，也不做后台周期轮询）；成功快照在进程内保留，失败时沿用旧值并标注相对时间；投影不可用（旧插件 404 / 未配置 / 全部失败）时，面板整体降级为原有的单行 DeepSeek 余额。面板按「一个来源一行」渲染：金额来源保留文字（CNY 优先），配额来源只显示主 bucket 窗口的细条与颜色、不出百分比数字，每个进度条上方居中显示窗口短标签（5h / 每周 / 每月，与详情页窗口语义一致）；附加 bucket（服务端命名的 `名称 · 5h`）与账户身份不出现 overlay 面板，详情页仍是完整信息入口（`displayName`/`maskedEmail`、Credits、个人消费上限、重置时间）。
+
+### 6.16.1 GET /m/api/context-stats（上下文统计，issue #158）
+
+只读端点：把宿主 `sessionProjections` 的四个**语义不同**的投影薄透出给手机端（ADR 0038）。
+插件只读投影并稳定字段形状，不自行把 breakdown 相加成占用、不返回 prompt/正文/工具定义。
+
+**查询参数**：`sessionId`（必填；缺 → `400 bad-request`；不存在 → `404 session-not-found`）。
+
+```json
+{
+  "ok": true,
+  "sessionId": "…",
+  "pressure": { "pressureTokens": 1000, "projectedTokens": 1200, "contextWindow": 8000, "percent": 15 },
+  "breakdown": { "systemTokens": 400, "toolsTokens": 600, "messageTokens": 800, "estimated": true },
+  "tokenUsage": { "uncachedInput": 100, "output": 50, "cacheRead": 300, "cacheWrite": 100, "cacheHitRate": 0.6 },
+  "timing": { "turns": 2, "steps": 4, "llmMs": 1000, "toolMs": 500, "ttftMs": 400, "decodeMs": 2000, "avgTtftMs": 200, "tps": 50 },
+  "sources": { "pressure": "provider", "breakdown": "heuristic", "tokenUsage": "provider", "timing": "session-stats" },
+  "asOfSeq": 42
+}
+```
+
+- `pressure`：`projectedTokens ?? pressureTokens` 为占用锚点；`percent` 仅在窗口与锚点都存在时计算，上限 100。`pressure`/`projected` 可能来自不同时刻，切换模型时短暂错配是已知边界。
+- `breakdown`：三项是**相互独立的启发式估算**，不保证相加等于 `pressure`，不得归一化成占用；`estimated` 固定为 `true`。
+- `tokenUsage`：本会话累计 provider 桶；`cacheHitRate = cacheRead / (uncachedInput + cacheRead + cacheWrite)`，分母为 0 时省略。
+- `timing`：整份会话累计（不是每轮）；`avgTtftMs = ttftMs / ttftSteps`（仅 `ttftSteps > 0`），`tps = decodeTokens / (decodeMs / 1000)`（仅 `decodeMs > 0`）。
+- 任一块的宿主投影缺失时**省略该块**（不返回 0 冒充）；四块都缺失时仅返回 `ok/sessionId`。
+- `sources` 只列出实际返回的块；`asOfSeq` 为当前事件末序号。
+- 旧宿主没有该端点（404）：App 回退现有 `/m/api/usage` + `contextWindow`，breakdown/timing 明确降级。
 
 ### 6.17 文件传输（v3.1.2，B站 csborbbnc 反馈）
 

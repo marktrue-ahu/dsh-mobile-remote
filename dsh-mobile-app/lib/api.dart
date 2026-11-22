@@ -13,6 +13,7 @@ import 'agent_tree.dart';
 import 'team.dart';
 import 'download.dart';
 import 'logger.dart';
+import 'context_stats.dart';
 import 'models.dart';
 import 'team_tasks.dart';
 import 'plugin_inventory.dart';
@@ -361,7 +362,8 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi, GitTagsApi {
     String expectedProfileId,
     String expectedHostId,
     int expectedGeneration,
-  )? candidateCommitter;
+  )?
+  candidateCommitter;
   static const _kBase = 'dsh_mr_base';
   static const _kPath = 'dsh_mr_path';
   static const _kToken = 'dsh_mr_token';
@@ -586,12 +588,11 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi, GitTagsApi {
 
   /// v3.0.0：构造只读探测客户端——地址/路径规范化和 save() 同源逻辑，
   /// 避免"地址含 /m、路径默认 /m"拼接成 `/m/m/...` 而 404。
-  static Api forProbe(String base, String token, {http.Client? client}) => Api(
-    client: client,
-  )
-    ..baseUrl = _normBase(base)
-    ..path = _pathOf(base)
-    ..token = token;
+  static Api forProbe(String base, String token, {http.Client? client}) =>
+      Api(client: client)
+        ..baseUrl = _normBase(base)
+        ..path = _pathOf(base)
+        ..token = token;
 
   /// 统一应用服务端能力位（bootstrap 与 SSE hello 共用）。
   ///
@@ -648,7 +649,9 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi, GitTagsApi {
   /// 连接失效（切地址/关闭 bridge）：递增代号并清空能力位。
   void invalidateConnection() {
     _connectionEpoch++;
-    AppLog.instance.debug('连接代递增 epoch=$_connectionEpoch base=${baseUrl.isNotEmpty ? '已配置' : '空'}');
+    AppLog.instance.debug(
+      '连接代递增 epoch=$_connectionEpoch base=${baseUrl.isNotEmpty ? '已配置' : '空'}',
+    );
     resetCapabilities();
   }
 
@@ -2316,6 +2319,15 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi, GitTagsApi {
       ...(data['usage'] as Map<String, dynamic>? ?? {}),
       if (data['contextWindow'] != null) 'contextWindow': data['contextWindow'],
     };
+  }
+
+  /// issue #158：上下文统计四量分离（只读投影）。
+  /// 旧宿主没有该端点时抛出 ApiException(404/not-found)，由 UI 回退 `/usage`。
+  Future<ContextStatsSnapshot> contextStats(String sessionId) async {
+    final data = await getJson(
+      '/api/context-stats?sessionId=${Uri.encodeQueryComponent(sessionId)}',
+    );
+    return ContextStatsSnapshot.fromJson(data);
   }
 
   /// 移动端动作注册表（插件提供）。
