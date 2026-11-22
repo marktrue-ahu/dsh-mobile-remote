@@ -16,6 +16,7 @@ import 'package:path_provider/path_provider.dart';
 import '../toast.dart';
 import '../api.dart';
 import '../chat_copy.dart';
+import '../context_stats.dart';
 import '../download.dart';
 import '../download_error.dart';
 import '../download_foreground.dart';
@@ -47,6 +48,7 @@ import 'git_browser_sheet.dart';
 import 'agent_panel.dart';
 import '../tool_cards.dart';
 import '../tool_images.dart';
+import '../widgets/context_stats_sheet.dart';
 import '../widgets/git_file_viewer.dart';
 import '../widgets/git_logo.dart';
 import '../widgets/turn_navigator_rail.dart';
@@ -1179,6 +1181,11 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _usageLoaded = false;
   int _usageVersion = 0;
   int _usageRequest = 0;
+  DateTime? _usageUpdatedAt;
+  // issue #158：新宿主上下文四量投影（pressure 同时供圆环与抽屉；缺失时显示未知）。
+  ContextStatsSnapshot? _contextStats;
+  bool _contextStatsUnsupported = false;
+  int _contextStatsRequest = 0;
   Timer? _draftTimer; // 流式草稿节流刷新（chunk 合并，避免每帧全量重建）
   int _lastLoggedCount = -1; // 排障：itemCount 变化时打日志
   // ADR 0035 真机排障：布局几何快照（只在布局/滚动结束时打，节流 400ms）。
@@ -1836,8 +1843,7 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> debugJumpToMessageSeq(int seq) => _jumpToMessageSeq(seq);
 
   @visibleForTesting
-  List<MessageIndexEntry> get debugMessageIndexEntries =>
-      _messageIndex.entries;
+  List<MessageIndexEntry> get debugMessageIndexEntries => _messageIndex.entries;
 
   /// issue #130 P2：loading 时首 sliver 状态行是否仍不足以承担提示。
   ///
@@ -2673,6 +2679,8 @@ class _ChatScreenState extends State<ChatScreen> {
       // 保证长会话首屏真正落底；ADR 0035 的顶对齐/高度规则不变。
       _requestInitialFollowAfterMount();
       _refreshUsage();
+      _contextStatsUnsupported = false;
+      unawaited(_refreshContextStats());
       widget.store.refreshSessionConfig();
       if (!reset) _scheduleAutoFillFirstScreen();
       // issue #25 二期：会话打开后拉一次轮次大纲（能力缺失/读取失败都退回一期行为）。
@@ -3833,6 +3841,7 @@ class _ChatScreenState extends State<ChatScreen> {
         setState(() {
           _usage = u;
           _usageLoaded = true;
+          _usageUpdatedAt = DateTime.now();
         });
       }
     } catch (_) {}
@@ -4181,6 +4190,10 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     }
     // 每轮完成：用该轮的 usage 样本更新上下文压力（PC 端同口径）与累计用量条
+    if (ev.type == 'turn/end') {
+      // issue #158：每轮结束刷新上下文投影（projected/breakdown/token 会随轮次变化）。
+      unawaited(_refreshContextStats());
+    }
     if (ev.type == 'assistant/message') {
       final u = ev.data?['usage'] as Map<String, dynamic>?;
       if (u != null) {
@@ -4199,6 +4212,7 @@ class _ChatScreenState extends State<ChatScreen> {
           _usage[key] = ((_usage[key] as num?) ?? 0) + ((u[key] as num?) ?? 0);
         }
         _usageLoaded = true;
+        _usageUpdatedAt = DateTime.now();
       }
     }
     setState(() => _appendEvent(ev));
@@ -7135,166 +7149,194 @@ class _ChatScreenState extends State<ChatScreen> {
                                 ? DshTheme.shadowDark
                                 : DshTheme.shadow,
                           ),
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
+                          child: Stack(
+                            clipBehavior: Clip.none,
                             children: [
-                              // 第一层：输入框（独占最宽）
-                              Row(
+                              Column(
+                                mainAxisSize: MainAxisSize.min,
                                 children: [
-                                  Expanded(
-                                    child: TextField(
-                                      controller: _inputCtrl,
-                                      minLines: 1,
-                                      maxLines: 4,
-                                      style: const TextStyle(fontSize: 14.5),
-                                      decoration: InputDecoration(
-                                        hintText: L10n.t(
-                                          '回复 agent…',
-                                          'Reply to agent…',
+                                  // 第一层：输入框（独占最宽）
+                                  Row(
+                                    children: [
+                                      Expanded(
+                                        child: TextField(
+                                          controller: _inputCtrl,
+                                          minLines: 1,
+                                          maxLines: 4,
+                                          style: const TextStyle(
+                                            fontSize: 14.5,
+                                          ),
+                                          decoration: InputDecoration(
+                                            hintText: L10n.t(
+                                              '回复 agent…',
+                                              'Reply to agent…',
+                                            ),
+                                            hintStyle: TextStyle(color: ink3),
+                                            filled: false,
+                                            border: InputBorder.none,
+                                            enabledBorder: InputBorder.none,
+                                            focusedBorder: InputBorder.none,
+                                            contentPadding:
+                                                const EdgeInsets.symmetric(
+                                                  vertical: 8,
+                                                ),
+                                          ),
+                                          onSubmitted: (_) => _send(),
+                                          onTap: _refreshSlashToken,
                                         ),
-                                        hintStyle: TextStyle(color: ink3),
-                                        filled: false,
-                                        border: InputBorder.none,
-                                        enabledBorder: InputBorder.none,
-                                        focusedBorder: InputBorder.none,
-                                        contentPadding:
-                                            const EdgeInsets.symmetric(
-                                              vertical: 8,
-                                            ),
                                       ),
-                                      onSubmitted: (_) => _send(),
-                                      onTap: _refreshSlashToken,
-                                    ),
+                                    ],
                                   ),
-                                ],
-                              ),
-                              const SizedBox(height: 8),
-                              // 第二层：⊕命令入口 + 模型/权限胶囊（省略显示）+ 排队发送 + 上下文圆环 + 发送
-                              Row(
-                                children: [
-                                  // v2.8.0：命令入口——浅灰圆 +（对齐 PC 端 command）
-                                  // v3.0.0 图像链路：⊕ = 更多（拍照 / 从相册选择 / 命令）
-                                  InkWell(
-                                    onTap: _showComposerMenu,
-                                    borderRadius: BorderRadius.circular(16),
-                                    child: Container(
-                                      width: 28,
-                                      height: 28,
-                                      decoration: BoxDecoration(
-                                        color: DshColors.line(context),
-                                        shape: BoxShape.circle,
-                                      ),
-                                      // v2.8.0 review(P2-3)：图标用 ink3 主题自适应（深色下不再黑压黑）
-                                      child: Icon(
-                                        Icons.add,
-                                        size: 17,
-                                        color: DshColors.ink3(context),
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  // 左侧弹性组：⊕ + 模型/权限（可收缩省略）+ 排队（固定）——
-                                  // 整体包 Expanded，剩余空间在组内消化；右侧圆环/发送在组外固定，永不挤出
-                                  Expanded(
-                                    child: Row(
-                                      children: [
-                                        // 模型胶囊：名称省略；Flexible 空间不足时收缩（省略号），充足时自然宽
-                                        Flexible(
-                                          child: _Pill(
-                                            label: _shortModel(
-                                              store.sessionConfig.model,
-                                            ),
-                                            onTap: () =>
-                                                showModelSheet(context, store),
+                                  const SizedBox(height: 8),
+                                  // 第二层：⊕命令入口 + 模型/权限胶囊（省略显示）+ 排队发送 + 上下文圆环 + 发送
+                                  Row(
+                                    children: [
+                                      // v2.8.0：命令入口——浅灰圆 +（对齐 PC 端 command）
+                                      // v3.0.0 图像链路：⊕ = 更多（拍照 / 从相册选择 / 命令）
+                                      InkWell(
+                                        onTap: _showComposerMenu,
+                                        borderRadius: BorderRadius.circular(16),
+                                        child: Container(
+                                          width: 28,
+                                          height: 28,
+                                          decoration: BoxDecoration(
+                                            color: DshColors.line(context),
+                                            shape: BoxShape.circle,
+                                          ),
+                                          // v2.8.0 review(P2-3)：图标用 ink3 主题自适应（深色下不再黑压黑）
+                                          child: Icon(
+                                            Icons.add,
+                                            size: 17,
+                                            color: DshColors.ink3(context),
                                           ),
                                         ),
-                                        const SizedBox(width: 6),
-                                        // 权限胶囊：同上
-                                        Flexible(
-                                          child: _Pill(
-                                            label: _shortPerm(
-                                              _permName(
-                                                store
-                                                    .sessionConfig
-                                                    .permissionPreset,
+                                      ),
+                                      const SizedBox(width: 8),
+                                      // 左侧弹性组：⊕ + 模型/权限（可收缩省略）+ 排队（固定）——
+                                      // 整体包 Expanded，剩余空间在组内消化；右侧圆环/发送在组外固定，永不挤出
+                                      Expanded(
+                                        child: Row(
+                                          children: [
+                                            // 模型胶囊：名称省略；Flexible 空间不足时收缩（省略号），充足时自然宽
+                                            Flexible(
+                                              child: _Pill(
+                                                label: _shortModel(
+                                                  store.sessionConfig.model,
+                                                ),
+                                                onTap: () => showModelSheet(
+                                                  context,
+                                                  store,
+                                                ),
                                               ),
                                             ),
-                                            onTap: () =>
-                                                showPermSheet(context, store),
-                                          ),
+                                            const SizedBox(width: 6),
+                                            // 权限胶囊：同上
+                                            Flexible(
+                                              child: _Pill(
+                                                label: _shortPerm(
+                                                  _permName(
+                                                    store
+                                                        .sessionConfig
+                                                        .permissionPreset,
+                                                  ),
+                                                ),
+                                                onTap: () => showPermSheet(
+                                                  context,
+                                                  store,
+                                                ),
+                                              ),
+                                            ),
+                                            // 运行中且输入非空 → 「排队发送」胶囊（点击=普通发送，运行中自动排队）；
+                                            // 固定宽度（不参与收缩，始终完整显示）
+                                            if (_pageAgentStatus == 'running' &&
+                                                _inputCtrl.text
+                                                    .trim()
+                                                    .isNotEmpty) ...[
+                                              const SizedBox(width: 6),
+                                              _Pill(
+                                                label: L10n.t(
+                                                  '排队发送',
+                                                  'Queue send',
+                                                ),
+                                                onTap: () => _send(),
+                                              ),
+                                            ],
+                                          ],
                                         ),
-                                        // 运行中且输入非空 → 「排队发送」胶囊（点击=普通发送，运行中自动排队）；
-                                        // 固定宽度（不参与收缩，始终完整显示）
-                                        if (_pageAgentStatus == 'running' &&
-                                            _inputCtrl.text
-                                                .trim()
-                                                .isNotEmpty) ...[
-                                          const SizedBox(width: 6),
-                                          _Pill(
-                                            label: L10n.t('排队发送', 'Queue send'),
-                                            onTap: () => _send(),
-                                          ),
-                                        ],
-                                      ],
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  // 上下文窗口占用圆环（对齐 PC 端；数据齐全时才显示）——组外固定
-                                  if (_contextRatio != null) ...[
-                                    _ContextRing(ratio: _contextRatio!),
-                                    const SizedBox(width: 8),
-                                  ],
-                                  // v2.7.2：发送按钮恢复原设计——运行中=停止（对齐 PC 端），空闲=发送；
-                                  // 长按=插队发送；运行中普通发送走「排队发送」胶囊——组外固定
-                                  GestureDetector(
-                                    onTap: _sending
-                                        ? null
-                                        : (_pageAgentStatus == 'running'
-                                              ? _stop
-                                              : _send),
-                                    onLongPress: _sending
-                                        ? null
-                                        : () => _send(null, 'steer'),
-                                    child: Container(
-                                      width: 32,
-                                      height: 32,
-                                      decoration: BoxDecoration(
-                                        color: brand,
-                                        borderRadius: BorderRadius.circular(9),
                                       ),
-                                      child: _pageAgentStatus == 'running'
-                                          ? Center(
-                                              child: Container(
-                                                width: 10,
-                                                height: 10,
-                                                decoration: BoxDecoration(
+                                      const SizedBox(width: 4),
+                                      // issue #158：44dp 命中区 → 上下文统计三 Tab 抽屉。
+                                      // pressure 缺失也保留「上下文 --」可发现入口；绝不拿累计量冒充占用。
+                                      _buildContextStatsVisual(),
+                                      const SizedBox(width: 4),
+                                      // v2.7.2：发送按钮恢复原设计——运行中=停止（对齐 PC 端），空闲=发送；
+                                      // 长按=插队发送；运行中普通发送走「排队发送」胶囊——组外固定
+                                      GestureDetector(
+                                        onTap: _sending
+                                            ? null
+                                            : (_pageAgentStatus == 'running'
+                                                  ? _stop
+                                                  : _send),
+                                        onLongPress: _sending
+                                            ? null
+                                            : () => _send(null, 'steer'),
+                                        child: Container(
+                                          width: 32,
+                                          height: 32,
+                                          decoration: BoxDecoration(
+                                            color: brand,
+                                            borderRadius: BorderRadius.circular(
+                                              9,
+                                            ),
+                                          ),
+                                          child: _pageAgentStatus == 'running'
+                                              ? Center(
+                                                  child: Container(
+                                                    width: 10,
+                                                    height: 10,
+                                                    decoration: BoxDecoration(
+                                                      color: DshColors.onBrand(
+                                                        context,
+                                                      ),
+                                                      borderRadius:
+                                                          BorderRadius.circular(
+                                                            2,
+                                                          ),
+                                                    ),
+                                                  ),
+                                                )
+                                              : _sending
+                                              ? SizedBox(
+                                                  width: 15,
+                                                  height: 15,
+                                                  child:
+                                                      CircularProgressIndicator(
+                                                        strokeWidth: 2,
+                                                        color:
+                                                            DshColors.onBrand(
+                                                              context,
+                                                            ),
+                                                      ),
+                                                )
+                                              : Icon(
+                                                  Icons.arrow_upward,
+                                                  size: 17,
                                                   color: DshColors.onBrand(
                                                     context,
                                                   ),
-                                                  borderRadius:
-                                                      BorderRadius.circular(2),
                                                 ),
-                                              ),
-                                            )
-                                          : _sending
-                                          ? SizedBox(
-                                              width: 15,
-                                              height: 15,
-                                              child: CircularProgressIndicator(
-                                                strokeWidth: 2,
-                                                color: DshColors.onBrand(
-                                                  context,
-                                                ),
-                                              ),
-                                            )
-                                          : Icon(
-                                              Icons.arrow_upward,
-                                              size: 17,
-                                              color: DshColors.onBrand(context),
-                                            ),
-                                    ),
+                                        ),
+                                      ),
+                                    ],
                                   ),
                                 ],
+                              ),
+                              Positioned(
+                                right: 36,
+                                bottom: 0,
+                                width: 44,
+                                height: 44,
+                                child: _buildContextStatsHitTarget(),
                               ),
                             ],
                           ),
@@ -8018,21 +8060,124 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  /// 上下文占用比例（已用 tokens / 模型上下文窗口），数据缺失时为 null。
-  /// 上下文窗口来自服务端 usage 接口（request/context 事件捕获，与 PC 端圆环同源）。
-  /// 口径与 PC 端一致：最近一次请求的 prompt 侧 token（pressureTokens），
-  /// 而非历史累计总量（旧版服务端无该字段时回退累计和）。
-  double? get _contextRatio {
-    if (_usage.isEmpty) return null;
+  /// issue #158：输入区上下文视觉（32dp 行高内保持 44dp 宽占位）。
+  ///
+  /// 命中区由 composer 卡片的 Stack 覆盖层提供（44×44），避免把整行撑到 44dp。
+  Widget _buildContextStatsVisual() {
+    final percent = _ringPressure?.effectivePercent;
+    final ink3 = DshColors.ink3(context);
+    return ExcludeSemantics(
+      child: SizedBox(
+        key: const ValueKey<String>('context-stats-visual'),
+        width: 44,
+        child: Center(
+          child: FittedBox(
+            fit: BoxFit.scaleDown,
+            child: percent == null
+                ? Text(
+                    L10n.t('上下文 --', 'Context --'),
+                    key: const ValueKey<String>('context-stats-unknown'),
+                    style: TextStyle(
+                      fontSize: 10,
+                      fontWeight: FontWeight.w600,
+                      color: ink3,
+                    ),
+                  )
+                : _ContextRing(ratio: percent / 100),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// issue #158：覆盖在圆环视觉上的 44×44 命中区（不改变 composer 行高）。
+  Widget _buildContextStatsHitTarget() {
+    final percent = _ringPressure?.effectivePercent;
+    final label = percent != null
+        ? L10n.t(
+            '上下文用量 $percent%，点按查看明细',
+            'Context usage $percent%, tap for details',
+          )
+        : L10n.t('上下文用量未知，点按查看明细', 'Context usage unknown, tap for details');
+    return Semantics(
+      key: const ValueKey<String>('context-stats-trigger'),
+      button: true,
+      label: label,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: _openContextStats,
+        child: const SizedBox.expand(),
+      ),
+    );
+  }
+
+  /// 环与抽屉共享的占用来源：新宿主 pressure（projected 优先）；旧宿主只用
+  /// 最近一次请求的 pressureTokens。**绝不回退会话累计 input/cache 之和**。
+  ContextPressureStats? get _ringPressure {
+    final fromStats = _contextStats?.pressure;
+    if (fromStats != null) return fromStats;
     final window = (_usage['contextWindow'] as num?)?.toInt();
-    if (window == null || window <= 0) return null;
-    final used =
-        (_usage['pressureTokens'] as num?)?.toDouble() ??
-        ((_usage['inputTokens'] as num?)?.toDouble() ?? 0) +
-            ((_usage['cacheReadTokens'] as num?)?.toDouble() ?? 0) +
-            ((_usage['cacheWriteTokens'] as num?)?.toDouble() ?? 0);
-    if (used <= 0) return null;
-    return (used / window).clamp(0.0, 1.0);
+    final pressure = (_usage['pressureTokens'] as num?)?.toInt();
+    if (window == null && pressure == null) return null;
+    return ContextPressureStats(
+      pressureTokens: pressure,
+      contextWindow: window,
+    );
+  }
+
+  /// issue #158：打开上下文统计抽屉。session id 在此绑定，切会话由 sheet 监听关闭。
+  void _openContextStats() {
+    final sid = _mySessionId ?? widget.store.sessionId;
+    if (sid == null || sid.isEmpty) return;
+    showContextStatsSheet(
+      context,
+      api: _api,
+      store: widget.store,
+      sessionId: sid,
+      model: widget.store.sessionConfig.model ?? '',
+      fallbackUsage: Map<String, dynamic>.from(_usage),
+      fallbackCapturedAt: _usageUpdatedAt,
+      initialSnapshot: _contextStats,
+      onSnapshot: (snapshot) {
+        if (mounted) setState(() => _contextStats = snapshot);
+      },
+    );
+  }
+
+  /// issue #158：读取宿主 context-stats 快照（失败保留旧快照，不把累计量当占用）。
+  Future<void> _refreshContextStats() async {
+    final id = _mySessionId ?? widget.store.sessionId;
+    if (id == null || id.isEmpty) return;
+    // 已确认旧宿主且没有旧快照：无需每轮重复 404；重进会话时 _load 会重置该标记。
+    if (_contextStatsUnsupported && _contextStats == null) return;
+    final request = ++_contextStatsRequest;
+    final generation = _loadGeneration;
+    try {
+      final snapshot = await _api.contextStats(id);
+      if (!mounted ||
+          request != _contextStatsRequest ||
+          generation != _loadGeneration ||
+          id != _mySessionId) {
+        return;
+      }
+      // 空投影不改变任何视觉（圆环仍显示未知）；跳过这次 setState，避免在滚动/布局
+      // 关键帧上无意义重建（issue #130 的 extent 稳定性也依赖减少这类噪声重建）。
+      if (snapshot.isEmpty && _contextStats == null) {
+        _contextStatsUnsupported = false;
+        return;
+      }
+      setState(() {
+        _contextStats = snapshot;
+        _contextStatsUnsupported = false;
+      });
+    } catch (e) {
+      if (!mounted || request != _contextStatsRequest) return;
+      // 旧宿主/端点缺失：圆环继续回退 /usage 的 pressureTokens；
+      // 其他失败保留旧快照，等下次轮末再试，不永久标记 unsupported。
+      final unsupported =
+          e is ApiException && (e.status == 404 || e.code == 'not-found');
+      if (unsupported) setState(() => _contextStatsUnsupported = true);
+    }
   }
 
   /// v3.0.0 图像链路：事件摘要/无损详情里的图片元数据 [{attachmentId, mediaType, width?, height?}]。
