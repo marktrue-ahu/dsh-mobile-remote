@@ -24,6 +24,7 @@ import '../scroll_follow.dart';
 import '../logger.dart';
 import '../l10n.dart';
 import '../models.dart';
+import '../profile_namespace.dart';
 import '../slash_input.dart';
 import '../store.dart';
 import '../timeline.dart';
@@ -744,7 +745,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   String _imageConsentKey(String sessionId, String source) =>
-      '$sessionId|$source';
+      ProfileNamespace.key('$sessionId|$source');
 
   String _requestDir(String source) {
     final normalized = source.replaceAll('\\', '/');

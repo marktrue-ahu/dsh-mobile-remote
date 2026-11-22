@@ -26,6 +26,7 @@ class MainActivity : FlutterActivity() {
     private var filesChannel: MethodChannel? = null
     private var iconChannel: MethodChannel? = null
     private var keepAliveChannel: MethodChannel? = null
+    private var credentialsChannel: MethodChannel? = null
     private var downloadBridge: DownloadBridge? = null
     // v3.1.2（csborbbnc 反馈）：系统文件选择器（ACTION_OPEN_DOCUMENT）结果回传暂存
     private var pendingPick: MethodChannel.Result? = null
@@ -110,6 +111,46 @@ class MainActivity : FlutterActivity() {
                     }
                 }
                 else -> result.notImplemented()
+            }
+        }
+        // issue #152：Android Keystore 凭据桥（唯一 token 所有者）
+        credentialsChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "dsh/credentials")
+        credentialsChannel?.setMethodCallHandler { call, result ->
+            try {
+                when (call.method) {
+                    "readToken" -> {
+                        val profileId = call.argument<String>("profileId") ?: ""
+                        result.success(CredentialStore.readToken(this, profileId))
+                    }
+                    "readActive" -> result.success(CredentialStore.readActiveToken(this))
+                    "writeToken" -> {
+                        val profileId = call.argument<String>("profileId") ?: ""
+                        val token = call.argument<String>("token") ?: ""
+                        CredentialStore.writeToken(this, profileId, token)
+                        result.success(true)
+                    }
+                    "deleteToken" -> {
+                        val profileId = call.argument<String>("profileId") ?: ""
+                        CredentialStore.deleteToken(this, profileId)
+                        result.success(true)
+                    }
+                    "activate" -> {
+                        val profileId = call.argument<String>("profileId") ?: ""
+                        CredentialStore.activate(this, profileId)
+                        // descriptor 已由 Dart 写入；通知原生关闭旧 SSE 并按新代重建。
+                        FloatingBubbleService.onConnectionChanged(this)
+                        result.success(CredentialStore.status(this))
+                    }
+                    "deactivate" -> {
+                        CredentialStore.deactivate(this)
+                        FloatingBubbleService.onConnectionChanged(this)
+                        result.success(true)
+                    }
+                    "status" -> result.success(CredentialStore.status(this))
+                    else -> result.notImplemented()
+                }
+            } catch (e: Exception) {
+                result.error("credential-error", e.message ?: "credential failure", null)
             }
         }
         // v3.3.0：桌面图标切换（activity-alias）

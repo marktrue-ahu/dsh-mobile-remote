@@ -9,9 +9,11 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'l10n.dart';
 import 'api.dart';
+import 'connection_manager.dart';
 import 'app_icon_switcher.dart';
 import 'store.dart';
 import 'attention.dart';
+import 'attention_write_queue.dart';
 import 'attention_storage.dart';
 import 'floating.dart';
 import 'keep_alive.dart';
@@ -19,6 +21,7 @@ import 'local_notifications.dart';
 import 'notify_diag.dart';
 import 'theme.dart';
 import 'logger.dart';
+import 'profile_namespace.dart';
 import 'scan_screen.dart';
 import 'screens/chat_screen.dart';
 import 'screens/home_screen.dart';
@@ -64,6 +67,8 @@ void main() async {
     );
   };
   await api.load();
+  await appConnections.load();
+  store.attachConnections(appConnections);
   // 自身版本：随每个请求上报给电脑端（两端对齐判定的依据）。取不到就按"无法判定"处理，
   // 不影响任何功能。
   try {
@@ -119,11 +124,12 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
   final AttentionStorage _attentionStorage = AttentionStorage();
   late final Future<void> _attentionReady;
   Future<void> _attentionQueue = Future<void>.value();
+  final AttentionWriteQueue _attentionWrites = AttentionWriteQueue();
 
   /// 通知初始化：恢复按宿主隔离的账本，并补上系统里仍在但本地没记录的活跃行。
   Future<void> _initNotifications() async {
     await LocalNotifier.instance.init();
-    await _attentionStorage.restore(_ledger);
+    await _attentionStorage.restore(_ledger, scope: ProfileNamespace.scope);
     final saved = _ledger.toJson();
     final keys = saved.map((r) => r['key']).toSet();
     final active = await LocalNotifier.instance.activeLedgerRows();
@@ -133,20 +139,46 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
     ]);
   }
 
+  Future<void> _reloadAttentionForProfile() async {
+    final scope = ProfileNamespace.scope;
+    // 入同一写者队列，避免与旧宿主已排队的 handle/save 并发；旧任务在队列里
+    // 按捕获 scope 自行丢弃。reload 不阻塞切换提交。
+    unawaited(
+      _queueAttention(() async {
+        final ids = _ledger.entries
+            .map((entry) => entry.id)
+            .toList(growable: false);
+        for (final id in ids) {
+          await LocalNotifier.instance.cancel(id);
+        }
+        _ledger.clear();
+        await _attentionStorage.restore(_ledger, scope: scope);
+      }, scope: scope),
+    );
+  }
+
   /// 通知账本的单写者队列：restore → event → persist（回放、结算、快照对账都串行）。
-  void _queueAttention(Future<void> Function() action) {
-    _attentionQueue = _attentionQueue
-        .then((_) async {
-          await _attentionReady;
-          if (!mounted) return;
-          await action();
-          await _attentionStorage.save(_ledger);
-        })
-        .catchError((Object error) {
-          AppLog.instance.log(
-            '通知：处理未完成，等待下一次宿主对账（${error.runtimeType}）',
-          );
-        });
+  Future<void> _queueAttention(
+    Future<void> Function() action, {
+    String? scope,
+  }) {
+    final captured = scope ?? ProfileNamespace.scope;
+    final task = _attentionWrites.enqueue(
+      scope: captured,
+      currentScope: () => ProfileNamespace.scope,
+      action: () async {
+        await _attentionReady;
+        if (!mounted) return;
+        await action();
+      },
+      save: (savedScope) => _attentionStorage.save(_ledger, scope: savedScope),
+    );
+    _attentionQueue = task.catchError((Object error) {
+      AppLog.instance.log(
+        '通知：处理未完成，等待下一次宿主对账（${error.runtimeType}）',
+      );
+    });
+    return _attentionQueue;
   }
 
   /// 当前是否在前台（判据输入之一）。
@@ -162,6 +194,8 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
     // 只在 App 不在前台时真正弹出；点击通知走统一 openChat 入口。
     WidgetsBinding.instance.addObserver(this);
     _attentionReady = _initNotifications();
+    // #152：切换宿主后通知账本按新 (profileId,hostId) 命名空间重载。
+    store.onConnectionSwitched = _reloadAttentionForProfile;
     // M2：后台保活（默认关；开启后 onResume 会拉起前台服务）。
     unawaited(_initKeepAlive());
     LocalNotifier.instance.onOpenSession = (id) =>
@@ -175,8 +209,10 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
       });
     }
     // v3.3（吸收上游 #64）：通知账本单写者——恢复 → 事件 → 持久化；回放与结算同样串行。
-    store.onAttentionEvent = (event) =>
-        _queueAttention(() => _handleAttention(event));
+    store.onAttentionEvent = (event) {
+      final scope = ProfileNamespace.scope;
+      _queueAttention(() => _handleAttention(event, scope), scope: scope);
+    };
     store.onAttentionResolved = (identity) {
       final source = api.notificationScope;
       _queueAttention(() async {
@@ -367,7 +403,8 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
   }
 
   /// M1a：一条审批/问询事件的完整处理链路（判据 → 去重 → 展示 → 回写 ledger）。
-  Future<void> _handleAttention(AttentionEvent event) async {
+  Future<void> _handleAttention(AttentionEvent event, String scope) async {
+    if (ProfileNamespace.scope != scope) return;
     final available = await LocalNotifier.instance.availability();
     final snapshot = AttentionSnapshot(
       phase: _resumed ? AppPhase.foreground : AppPhase.background,
@@ -399,6 +436,7 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
       return;
     }
     if (!reserved && entry?.status != AttentionStatus.blocked) return;
+    if (ProfileNamespace.scope != scope) return;
     String? title;
     for (final s in store.sessions) {
       if (s.id == event.sessionId) {
@@ -418,6 +456,10 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
       prompt: event.kind == AttentionKind.question ? event.summary : null,
       sessionTitle: title,
     );
+    if (ProfileNamespace.scope != scope) {
+      await LocalNotifier.instance.cancel(event.notificationId);
+      return;
+    }
     final status = switch (result) {
       AttentionShowResult.shown => AttentionStatus.active,
       AttentionShowResult.blocked => AttentionStatus.blocked,
@@ -694,7 +736,7 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
     setState(() {
       _configured = api.baseUrl.isNotEmpty && api.token.isNotEmpty;
       _reconfiguring = false;
-      if (_configured) _boot();
+      // AppStore.connectManualProfile 已完成 dispose/清态/SSE 重连，不能再次 _boot。
     });
   }
 
@@ -720,6 +762,7 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
     if (!_configured || _reconfiguring) {
       return Scaffold(
         body: ConnectionSheet(
+          store: store,
           onConnected: _recheck,
           // 重新配置时允许放弃：保留旧配置返回主界面
           onCancel: _reconfiguring
@@ -991,10 +1034,16 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
 
 /// 连接设置（首次进入/重新配置时显示）
 class ConnectionSheet extends StatefulWidget {
+  final AppStore store;
   final VoidCallback onConnected;
   /// 非空时显示「返回」按钮：放弃重新配置、保留旧配置返回主界面。
   final VoidCallback? onCancel;
-  const ConnectionSheet({super.key, required this.onConnected, this.onCancel});
+  const ConnectionSheet({
+    super.key,
+    required this.store,
+    required this.onConnected,
+    this.onCancel,
+  });
 
   @override
   State<ConnectionSheet> createState() => _ConnectionSheetState();
@@ -1005,12 +1054,26 @@ class _ConnectionSheetState extends State<ConnectionSheet> {
   final _tokenCtrl = TextEditingController();
   String _status = '';
   bool _busy = false;
+  bool _allowInsecure = false;
 
   @override
   void initState() {
     super.initState();
     if (api.baseUrl.isNotEmpty) _baseCtrl.text = api.baseUrl;
     if (api.token.isNotEmpty) _tokenCtrl.text = api.token;
+    _baseCtrl.addListener(_onEndpointChanged);
+  }
+
+  void _onEndpointChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _baseCtrl.removeListener(_onEndpointChanged);
+    _baseCtrl.dispose();
+    _tokenCtrl.dispose();
+    super.dispose();
   }
 
   Future<void> _connect() async {
@@ -1022,12 +1085,36 @@ class _ConnectionSheetState extends State<ConnectionSheet> {
       _busy = true;
       _status = L10n.t('连接中…', 'Connecting…');
     });
+    if (base.startsWith('http://') && !_allowInsecure) {
+      setState(() {
+        _busy = false;
+        _status = L10n.t(
+          'HTTP 地址需要勾选“允许未加密连接”',
+          'HTTP requires allowing an unencrypted connection',
+        );
+      });
+      return;
+    }
     try {
-      // v3.0.0：探测客户端与 save() 同源的地址/路径规范化（防 /m 重复拼接 404）
-      final probe = Api.forProbe(base, _tokenCtrl.text.trim());
-      await probe.getJson('/api/bootstrap');
-      await api.save(base: base, token: _tokenCtrl.text.trim());
+      // #152：先做**不带 token、不发请求**的 URL/传输策略校验；真正的 token probe
+      // 统一在 ConnectionManager.stageSwitch 的 _checkTransport 之后。
+      ConnectionManager.validateEndpoint(
+        base,
+        insecureConfirmed: _allowInsecure,
+        allowInsecure: _allowInsecure,
+      );
+      // #152：所有激活动作统一经 AppStore 的 staged commit + 清态/ledger/重连；
+      // manager 只做底层事务，UI 不直接改 Api/Keystore 后返回。
+      final error = await widget.store.connectManualProfile(
+        baseUrl: base,
+        token: _tokenCtrl.text.trim(),
+        allowInsecure: _allowInsecure,
+      );
       if (!mounted) return;
+      if (error != null) {
+        setState(() => _status = '${L10n.t('连接失败：', 'Connection failed:')}$error');
+        return;
+      }
       setState(() => _status = L10n.t('✅ 已连接', '✅ Connected'));
       widget.onConnected();
     } catch (e) {
@@ -1132,6 +1219,17 @@ class _ConnectionSheetState extends State<ConnectionSheet> {
                 border: const OutlineInputBorder(),
               ),
             ),
+            if (_baseCtrl.text.startsWith('http://'))
+              CheckboxListTile(
+                key: const ValueKey('connection-sheet-allow-insecure'),
+                value: _allowInsecure,
+                onChanged: (value) => setState(() => _allowInsecure = value == true),
+                title: Text(L10n.t('允许未加密连接', 'Allow unencrypted connection')),
+                subtitle: Text(
+                  L10n.t('仅在你信任当前网络时使用', 'Use only on a network you trust'),
+                  style: const TextStyle(fontSize: 11.5),
+                ),
+              ),
             const SizedBox(height: 20),
             FilledButton(
               onPressed: _busy ? null : _connect,
