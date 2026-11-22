@@ -2982,8 +2982,9 @@ class AppStore extends ChangeNotifier {
   }) async {
     final manager = connections;
     if (manager == null) return '连接档案未初始化';
+    ConnectionProfile? created;
     try {
-      final profile = await manager.addProfile(
+      created = await manager.addProfile(
         displayName: displayName,
         baseUrl: baseUrl,
         token: token,
@@ -2994,11 +2995,33 @@ class AppStore extends ChangeNotifier {
         insecureConfirmed: allowInsecure,
         switchNow: false,
       );
-      return await switchProfile(profile.id, allowInsecure: allowInsecure);
+      final error = await switchProfile(
+        created.id,
+        allowInsecure: allowInsecure,
+      );
+      if (error != null) {
+        await _discardUnactivatedProfile(manager, created);
+      }
+      return error;
     } on ConnectionSwitchException catch (e) {
+      if (created != null) await _discardUnactivatedProfile(manager, created);
       return e.message;
     } catch (e) {
+      if (created != null) await _discardUnactivatedProfile(manager, created);
       return '添加失败：$e';
+    }
+  }
+
+  /// 首次添加失败时不要留下半成品档案/口令：只有已激活的档案才保留。
+  Future<void> _discardUnactivatedProfile(
+    ConnectionManager manager,
+    ConnectionProfile profile,
+  ) async {
+    if (manager.activeProfileId == profile.id) return;
+    try {
+      await manager.deleteProfile(profile.id);
+    } catch (_) {
+      // 清理失败不覆盖原始连接错误；下次仍可在档案页手动删除。
     }
   }
 

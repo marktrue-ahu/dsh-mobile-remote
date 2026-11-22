@@ -1,8 +1,7 @@
-// GitLab #152 / ADR 0036：连接档案管理（自包含页面/区块）。
+// GitLab #152 / ADR 0036：连接档案管理页面。
 //
-// UI 决策（用户 2026-11-22）：连接切换/管理只放设置页；最终由 #155 五 Tab 壳嵌入。
-// 本文件不依赖 Drawer/聊天页，也不直接改 settings_screen 的布局；#155 只需挂载
-// [ConnectionSettingsSection] 或 push [ConnectionProfilesScreen]。
+// UI 决策（用户 2026-11-22）：连接入口移到首页 Drawer「首页」上方；设置页不再
+// 保留连接卡/Tab。本页面由 Drawer 入口 push，添加/编辑共用下方编辑器。
 import 'package:flutter/material.dart';
 
 import '../connection_manager.dart';
@@ -25,46 +24,6 @@ Future<bool> showConnectionProfilesScreen(
   return changed == true;
 }
 
-/// #155 可直接嵌入「连接」Tab 的自包含区块；当前版本也可从设置页 push 整页。
-class ConnectionSettingsSection extends StatelessWidget {
-  const ConnectionSettingsSection({super.key, required this.store});
-
-  final AppStore store;
-
-  @override
-  Widget build(BuildContext context) {
-    final manager = store.connections;
-    final active = manager?.active;
-    final ink3 = DshColors.ink3(context);
-    return Card(
-      margin: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-      child: ListTile(
-        key: const ValueKey('connection-settings-section'),
-        leading: Icon(
-          Icons.computer,
-          color: active == null ? ink3 : DshColors.brand(context),
-        ),
-        title: Text(
-          active?.displayName ?? L10n.t('未连接电脑', 'No computer connected'),
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-        ),
-        subtitle: Text(
-          active?.primaryBase ?? L10n.t('添加电脑连接', 'Add a computer connection'),
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: TextStyle(fontSize: 11.5, color: ink3),
-        ),
-        trailing: Text(
-          L10n.t('管理 ▸', 'Manage ▸'),
-          style: TextStyle(fontSize: 12, color: DshColors.brand(context)),
-        ),
-        onTap: () => showConnectionProfilesScreen(context, store),
-      ),
-    );
-  }
-}
-
 class ConnectionProfilesScreen extends StatefulWidget {
   const ConnectionProfilesScreen({super.key, required this.store});
 
@@ -78,8 +37,27 @@ class _ConnectionProfilesScreenState extends State<ConnectionProfilesScreen> {
   String? _switching;
   String? _error;
   bool _changed = false;
+  bool _retryingCredentials = false;
+  String? _credentialRetryError;
 
   ConnectionManager? get _manager => widget.store.connections;
+
+  Future<void> _retryCredentials() async {
+    final msgr = ScaffoldMessenger.of(context);
+    setState(() {
+      _retryingCredentials = true;
+      _credentialRetryError = null;
+    });
+    final error = await widget.store.retryConnectionLoad();
+    if (!mounted) return;
+    setState(() {
+      _retryingCredentials = false;
+      _credentialRetryError = error;
+    });
+    if (error == null) {
+      showToastAt(msgr, L10n.t('已恢复连接', 'Connection recovered'));
+    }
+  }
 
   Future<void> _switch(ConnectionProfile profile) async {
     final manager = _manager;
@@ -168,35 +146,6 @@ class _ConnectionProfilesScreenState extends State<ConnectionProfilesScreen> {
     }
   }
 
-  Future<void> _rename(ConnectionProfile profile) async {
-    final controller = TextEditingController(text: profile.displayName);
-    final name = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text(L10n.t('重命名连接', 'Rename connection')),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          decoration: InputDecoration(labelText: L10n.t('名称', 'Name')),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: Text(L10n.t('取消', 'Cancel')),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.of(ctx).pop(controller.text.trim()),
-            child: Text(L10n.t('保存', 'Save')),
-          ),
-        ],
-      ),
-    );
-    controller.dispose();
-    if (!mounted || name == null || name.isEmpty) return;
-    await _manager!.updateProfile(profile.copyWith(displayName: name));
-    if (mounted) setState(() {});
-  }
-
   Future<void> _edit(ConnectionProfile profile) async {
     final changed = await Navigator.of(context).push<bool>(
       MaterialPageRoute<bool>(
@@ -283,6 +232,98 @@ class _ConnectionProfilesScreenState extends State<ConnectionProfilesScreen> {
                         style: TextStyle(fontSize: 11, color: ink3),
                       ),
                     ),
+                    if (manager.connectionStateError.isNotEmpty ||
+                        _credentialRetryError != null)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                        child: Container(
+                          key: const ValueKey('connection-credential-error'),
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: DshColors.brandSoft(context),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: DshColors.line(context)),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Icon(
+                                    Icons.warning_amber_rounded,
+                                    size: 18,
+                                    color: DshColors.warn(context),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: Text(
+                                      L10n.t(
+                                        '连接凭据需要恢复：${manager.connectionStateError}',
+                                        'Connection credential needs recovery: ${manager.connectionStateError}',
+                                      ),
+                                      key: const ValueKey(
+                                        'connection-credential-reason',
+                                      ),
+                                      style: const TextStyle(
+                                        fontSize: 12,
+                                        height: 1.5,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 6),
+                              Text(
+                                L10n.t(
+                                  '旧凭据仍保留；重试不会删除。',
+                                  'The old credential is kept; retry never deletes it.',
+                                ),
+                                style: TextStyle(fontSize: 11, color: ink3),
+                              ),
+                              if (_credentialRetryError != null) ...[
+                                const SizedBox(height: 6),
+                                Text(
+                                  L10n.t(
+                                    '重试失败：$_credentialRetryError',
+                                    'Retry failed: $_credentialRetryError',
+                                  ),
+                                  key: const ValueKey(
+                                    'connection-credential-retry-error',
+                                  ),
+                                  style: TextStyle(
+                                    fontSize: 11.5,
+                                    color: DshColors.danger(context),
+                                  ),
+                                ),
+                              ],
+                              const SizedBox(height: 8),
+                              OutlinedButton(
+                                key: const ValueKey(
+                                  'connection-retry-credentials',
+                                ),
+                                onPressed: _retryingCredentials
+                                    ? null
+                                    : _retryCredentials,
+                                child: _retryingCredentials
+                                    ? const SizedBox(
+                                        width: 16,
+                                        height: 16,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                        ),
+                                      )
+                                    : Text(
+                                        L10n.t(
+                                          '重试恢复凭据',
+                                          'Retry credential recovery',
+                                        ),
+                                      ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
                     if (_error != null)
                       Padding(
                         padding: const EdgeInsets.symmetric(
@@ -338,17 +379,14 @@ class _ConnectionProfilesScreenState extends State<ConnectionProfilesScreen> {
                                 enabled: _switching == null,
                                 onSelected: (value) {
                                   if (value == 'delete') _delete(profile);
-                                  if (value == 'rename') _rename(profile);
                                   if (value == 'edit') _edit(profile);
                                 },
                                 itemBuilder: (_) => [
                                   PopupMenuItem(
                                     value: 'edit',
-                                    child: Text(L10n.t('编辑地址/口令', 'Edit address/token')),
-                                  ),
-                                  PopupMenuItem(
-                                    value: 'rename',
-                                    child: Text(L10n.t('重命名', 'Rename')),
+                                    child: Text(
+                                      L10n.t('编辑名称/地址/口令', 'Edit name/address/token'),
+                                    ),
                                   ),
                                   PopupMenuItem(
                                     value: 'delete',
@@ -359,6 +397,18 @@ class _ConnectionProfilesScreenState extends State<ConnectionProfilesScreen> {
                         onTap: _switching == null
                             ? () => _switch(profile)
                             : null,
+                      ),
+                    if (manager.profiles.isEmpty)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(20, 8, 20, 0),
+                        child: Text(
+                          L10n.t(
+                            '还没有连接电脑，点击下方添加',
+                            'No computer connected yet. Add one below.',
+                          ),
+                          key: const ValueKey('connection-empty'),
+                          style: TextStyle(fontSize: 12, color: ink3),
+                        ),
                       ),
                     Padding(
                       padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
@@ -414,6 +464,9 @@ class _ConnectionProfileEditorScreenState
   bool _allowInsecure = false;
   bool _busy = false;
   String? _error;
+  String? _nameError;
+  String? _baseError;
+  String? _tokenError;
 
   bool get _editing => widget.profile != null;
 
@@ -432,9 +485,23 @@ class _ConnectionProfileEditorScreenState
     _base.addListener(_onEndpointChanged);
   }
 
+  /// 与 store/Api 归一一致：没写 scheme 时按 http 处理，再去尾斜杠。
+  String get _normalizedBase {
+    var base = _base.text.trim();
+    if (base.isEmpty) return '';
+    if (!base.startsWith('http://') && !base.startsWith('https://')) {
+      base = 'http://$base';
+    }
+    return base.replaceAll(RegExp(r'/+$'), '');
+  }
+
+  bool get _showInsecure => _normalizedBase.startsWith('http://');
+
   void _onEndpointChanged() {
     if (!mounted) return;
-    setState(() {});
+    setState(() {
+      _baseError = null;
+    });
   }
 
   @override
@@ -447,22 +514,43 @@ class _ConnectionProfileEditorScreenState
   }
 
   Future<void> _save() async {
-    final base = _base.text.trim();
+    final name = _name.text.trim();
+    final base = _normalizedBase;
     final token = _token.text.trim();
-    if (base.isEmpty || (!_editing && token.isEmpty)) {
-      setState(() => _error = L10n.t('请填写地址和访问口令', 'Enter address and access token'));
-      return;
+    var nameError = _validateName(name);
+    String? baseError;
+    String? tokenError;
+    if (base.isEmpty) {
+      baseError = L10n.t('请填写电脑地址', 'Enter the computer address');
+    } else {
+      try {
+        ConnectionManager.validateEndpoint(
+          base,
+          insecureConfirmed: _allowInsecure,
+          allowInsecure: _allowInsecure,
+        );
+      } on ConnectionSwitchException catch (e) {
+        baseError = e.message;
+      }
     }
-    if (base.startsWith('http://') && !_allowInsecure) {
-      setState(() => _error = L10n.t(
-        'HTTP 地址必须勾选“允许未加密连接”',
-        'HTTP requires allowing an unencrypted connection',
-      ));
+    if (!_editing && token.isEmpty) {
+      tokenError = L10n.t('请填写访问口令', 'Enter the access token');
+    }
+    if (nameError != null || baseError != null || tokenError != null) {
+      setState(() {
+        _nameError = nameError;
+        _baseError = baseError;
+        _tokenError = tokenError;
+        _error = null;
+      });
       return;
     }
     setState(() {
       _busy = true;
       _error = null;
+      _nameError = null;
+      _baseError = null;
+      _tokenError = null;
     });
     try {
       final error = _editing
@@ -470,11 +558,11 @@ class _ConnectionProfileEditorScreenState
               widget.profile!,
               baseUrl: base,
               token: token.isEmpty ? null : token,
-              displayName: _name.text,
+              displayName: name,
               allowInsecure: _allowInsecure,
             )
           : await widget.store.addAndSwitchProfile(
-              displayName: _name.text,
+              displayName: name,
               baseUrl: base,
               token: token,
               allowInsecure: _allowInsecure,
@@ -497,6 +585,24 @@ class _ConnectionProfileEditorScreenState
     }
   }
 
+  /// 主机名称：非空、去首尾空白、最多 32 个字符、不能与其他档案重名。
+  String? _validateName(String name) {
+    if (name.isEmpty) {
+      return L10n.t('请填写主机名称', 'Enter a computer name');
+    }
+    if (name.runes.length > 32) {
+      return L10n.t('主机名称最多 32 个字符', 'Computer name must be at most 32 characters');
+    }
+    final lower = name.toLowerCase();
+    final duplicate = widget.manager.profiles.any(
+      (p) => p.id != widget.profile?.id && p.displayName.trim().toLowerCase() == lower,
+    );
+    if (duplicate) {
+      return L10n.t('该主机名称已存在，请换一个名称', 'That computer name already exists');
+    }
+    return null;
+  }
+
   Future<void> _scan() async {
     await Navigator.of(context).push(
       MaterialPageRoute<void>(
@@ -504,6 +610,10 @@ class _ConnectionProfileEditorScreenState
           onScanned: (base, token) {
             _base.text = base;
             _token.text = token;
+            if (_name.text.trim().isEmpty) {
+              final host = Uri.tryParse(base)?.host ?? '';
+              if (host.isNotEmpty) _name.text = host;
+            }
             if (mounted) Navigator.of(context).pop();
           },
         ),
@@ -546,29 +656,44 @@ class _ConnectionProfileEditorScreenState
         padding: const EdgeInsets.all(20),
         children: [
           TextField(
+            key: const ValueKey('connection-profile-name'),
             controller: _name,
+            textInputAction: TextInputAction.next,
+            onChanged: (_) {
+              if (_nameError != null) setState(() => _nameError = null);
+            },
             decoration: InputDecoration(
-              labelText: L10n.t('名称（可选）', 'Name (optional)'),
+              labelText: L10n.t('主机名称', 'Computer name'),
+              hintText: L10n.t('例如：家里电脑', 'e.g. Home PC'),
+              errorText: _nameError,
             ),
           ),
           const SizedBox(height: 12),
           TextField(
+            key: const ValueKey('connection-profile-base'),
             controller: _base,
             keyboardType: TextInputType.url,
+            textInputAction: TextInputAction.next,
             decoration: InputDecoration(
-              labelText: L10n.t('地址', 'Address'),
+              labelText: L10n.t('电脑地址', 'Computer address'),
               hintText: 'https://192.168.1.10:3080/m',
+              errorText: _baseError,
             ),
           ),
           const SizedBox(height: 12),
           TextField(
+            key: const ValueKey('connection-profile-token'),
             controller: _token,
             obscureText: true,
+            onChanged: (_) {
+              if (_tokenError != null) setState(() => _tokenError = null);
+            },
             decoration: InputDecoration(
               labelText: L10n.t('访问口令', 'Access token'),
               hintText: _editing
-                  ? L10n.t('已保存 · 输入新口令可替换', 'Saved · enter a new token to replace')
+                  ? L10n.t('留空则不修改已保存口令', 'Leave blank to keep the saved token')
                   : null,
+              errorText: _tokenError,
             ),
           ),
           if (!_editing) ...[
@@ -580,7 +705,7 @@ class _ConnectionProfileEditorScreenState
               label: Text(L10n.t('扫码添加', 'Scan to add')),
             ),
           ],
-          if (_base.text.startsWith('http://')) ...[
+          if (_showInsecure) ...[
             const SizedBox(height: 8),
             CheckboxListTile(
               key: const ValueKey('connection-allow-insecure'),

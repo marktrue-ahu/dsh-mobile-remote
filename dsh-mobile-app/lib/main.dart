@@ -1,5 +1,5 @@
 // DSH Remote — 手机远程操作 DeepSeek Harness
-// 原生 App：抽屉导航（首页/会话/设置）+ 通知 + 连接配置 + 扫码连接。
+// 原生 App：抽屉导航（连接/首页/会话/设置）+ 通知 + 连接配置 + 扫码连接。
 // 界面与功能对齐网页端 dsh-mobile-remote（DeepSeek 配色，Claude 式布局）。
 import 'dart:async';
 import 'package:flutter/material.dart';
@@ -22,11 +22,11 @@ import 'notify_diag.dart';
 import 'theme.dart';
 import 'logger.dart';
 import 'profile_namespace.dart';
-import 'scan_screen.dart';
 import 'screens/chat_screen.dart';
 import 'screens/home_screen.dart';
 import 'screens/sessions_screen.dart';
 import 'screens/settings_screen.dart';
+import 'screens/connection_profiles_screen.dart';
 import 'screens/notifications_screen.dart';
 import 'screens/sheets.dart';
 import 'screens/usage_screen.dart';
@@ -643,7 +643,11 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
 }
 
 class RootScreen extends StatefulWidget {
-  const RootScreen({super.key});
+  const RootScreen({super.key, this.storeOverride, this.apiOverride});
+
+  /// 测试注入；生产为 null → 使用全局 [store]/[api]。
+  final AppStore? storeOverride;
+  final Api? apiOverride;
 
   @override
   State<RootScreen> createState() => _RootScreenState();
@@ -652,8 +656,15 @@ class RootScreen extends StatefulWidget {
 class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
   bool _configured = false;
   int _index = 0;
-  bool _reconfiguring = false; // 重新配置进行中：显示连接页但保留旧配置，取消可回退
+  bool _retryingCredentials = false;
+  String? _credentialRetryError;
   final _drawerKey = GlobalKey<ScaffoldState>();
+
+  AppStore get _store => widget.storeOverride ?? store;
+  Api get _api => widget.apiOverride ?? api;
+
+  /// “已配置”以当前 Api 是否拿到地址+口令为准；不能在首装时假设有连接。
+  bool get _hasConnection => _api.baseUrl.isNotEmpty && _api.token.isNotEmpty;
 
   @override
   void initState() {
@@ -661,8 +672,13 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     // 全局状态变化（工作区切换、未读数、连接状态等）→ 重建自身（含抽屉），
     // 否则 const RootScreen 会被父级重建跳过，抽屉里的工作区选中态不会跟着变。
-    store.addListener(_onStore);
-    _configured = api.baseUrl.isNotEmpty && api.token.isNotEmpty;
+    _store.addListener(_onStore);
+    // 首页/会话变化回调与“是否已连接”解耦：连接成功后激活流程自己会重连，
+    // RootScreen 只需要在 store 通知时切换到已配置壳层。
+    _store.onSessionsChanged = () {
+      if (mounted) setState(() {});
+    };
+    _configured = _hasConnection;
     if (_configured) {
       _boot();
     }
@@ -673,10 +689,10 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
 
   /// 首次启动弹一次图标入口迁移说明；已提示过则直接返回。
   Future<void> _maybeShowIconMigrationTip() async {
-    if (store.iconMigrationTipShown) return;
+    if (_store.iconMigrationTipShown) return;
     // 只在支持切换图标的平台提示（Android）；其它平台不涉及 alias 迁移
     if (!AppIconSwitcher.supported) {
-      await store.markIconMigrationTipShown();
+      await _store.markIconMigrationTipShown();
       return;
     }
     if (!mounted) return;
@@ -703,16 +719,22 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
         ],
       ),
     );
-    await store.markIconMigrationTipShown();
+    await _store.markIconMigrationTipShown();
   }
 
   void _onStore() {
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    final configured = _hasConnection;
+    if (configured != _configured) {
+      setState(() => _configured = configured);
+    } else {
+      setState(() {});
+    }
   }
 
   @override
   void dispose() {
-    store.removeListener(_onStore);
+    _store.removeListener(_onStore);
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -721,63 +743,174 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     // App 回到前台：主动探测电脑端在线状态（PC 退出/恢复实时反映，无需清后台重进）
     if (state == AppLifecycleState.resumed && _configured) {
-      store.resume().then((_) {
+      _store.resume().then((_) {
         // v2.7.1：错过的也提醒——悬浮球跳转/切回 App 时若有未读（后台期间错过的），
         // 强制弹横幅（绕过防抖；后台时横幅已触发过但用户没看到，基线已同步所以增量不触发）
-        if (store.unread > 0) {
-          store.onNewNotifications?.call(store.unread, force: true);
+        if (_store.unread > 0) {
+          _store.onNewNotifications?.call(_store.unread, force: true);
         }
       });
     }
   }
 
   void _boot() {
-    store.connect();
-    store.refreshAll();
-    store.onSessionsChanged = () {
-      if (mounted) setState(() {});
-    };
+    _store.connect();
+    _store.refreshAll();
   }
 
-  void _recheck() {
+  /// 首装/无有效主机时的根壳内容：保留 AppBar/Drawer，用户能通过 Drawer
+  /// 「连接」或本按钮进入统一的连接档案添加表单（不再只剩旧单连接页）。
+  Widget _unconfiguredBody(BuildContext context) {
+    final ink3 = DshColors.ink3(context);
+    final brand = DshColors.brand(context);
+    final manager = _store.connections;
+    // 迁移/Keystore/descriptor 失败时只显示 manager 的脱敏原因，不透传异常。
+    final securityError = manager?.connectionStateError ?? '';
+    return Center(
+      key: const ValueKey('root-unconfigured'),
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.computer_outlined, size: 42, color: ink3),
+            const SizedBox(height: 12),
+            Text(
+              L10n.t('尚未连接电脑', 'No computer connected'),
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              L10n.t(
+                '通过左上角菜单的「连接」或下方按钮添加电脑；添加成功后会自动进入首页。',
+                'Open “Connections” from the menu or use the button below to add a computer; the app opens Home after connecting.',
+              ),
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 12.5, height: 1.5, color: ink3),
+            ),
+            if (securityError.isNotEmpty) ...[
+              const SizedBox(height: 16),
+              Container(
+                key: const ValueKey('root-credential-error'),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: DshColors.brandSoft(context),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: DshColors.line(context)),
+                ),
+                child: Column(
+                  children: [
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Icon(
+                          Icons.warning_amber_rounded,
+                          size: 18,
+                          color: DshColors.warn(context),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            L10n.t(
+                              '连接凭据需要恢复：$securityError',
+                              'Connection credential needs recovery: $securityError',
+                            ),
+                            key: const ValueKey('root-credential-reason'),
+                            style: const TextStyle(fontSize: 12, height: 1.5),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      L10n.t(
+                        '旧凭据仍保留；重试不会删除。',
+                        'The old credential is kept; retry never deletes it.',
+                      ),
+                      style: TextStyle(fontSize: 11, color: ink3),
+                    ),
+                    if (_credentialRetryError != null) ...[
+                      const SizedBox(height: 6),
+                      Text(
+                        L10n.t(
+                          '重试失败：$_credentialRetryError',
+                          'Retry failed: $_credentialRetryError',
+                        ),
+                        key: const ValueKey('root-credential-retry-error'),
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          color: DshColors.danger(context),
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 8),
+                    OutlinedButton(
+                      key: const ValueKey('root-retry-credentials'),
+                      onPressed: _retryingCredentials
+                          ? null
+                          : _retryConnectionCredentials,
+                      child: _retryingCredentials
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : Text(
+                              L10n.t('重试恢复凭据', 'Retry credential recovery'),
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+            const SizedBox(height: 20),
+            FilledButton.icon(
+              key: const ValueKey('root-add-computer'),
+              onPressed: _openConnections,
+              icon: const Icon(Icons.add, size: 18),
+              label: Text(L10n.t('添加电脑', 'Add computer')),
+              style: FilledButton.styleFrom(
+                backgroundColor: brand,
+                minimumSize: const Size(180, 44),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _retryConnectionCredentials() async {
     setState(() {
-      _configured = api.baseUrl.isNotEmpty && api.token.isNotEmpty;
-      _reconfiguring = false;
-      // AppStore.connectManualProfile 已完成 dispose/清态/SSE 重连，不能再次 _boot。
+      _retryingCredentials = true;
+      _credentialRetryError = null;
     });
+    final error = await _store.retryConnectionLoad();
+    if (!mounted) return;
+    setState(() {
+      _retryingCredentials = false;
+      _credentialRetryError = error;
+    });
+    if (error == null) {
+      showToast(context, L10n.t('已恢复连接', 'Connection recovered'));
+    }
   }
 
-  Future<void> _reconfigure() async {
-    // 修复：旧版在此立即清空已保存的连接信息，若用户未完成新配置就退出，
-    // App 变成空配置永远连不上。现改为：进入连接页时保留旧配置，
-    // 只有新配置保存成功才覆盖（连接页提供「返回」放弃操作）。
-    store.disposeBridge();
-    setState(() => _reconfiguring = true);
+  void _openConnections() {
+    unawaited(showConnectionProfilesScreen(context, _store));
   }
 
   void _openNewSession() {
-    showNewSessionSheet(context, store, (id) async {
+    showNewSessionSheet(context, _store, (id) async {
       // Phase 2(A4)：openChat 内统一 setSession+refreshSessionConfig+push，这里只刷列表
-      store.refreshSessions();
+      _store.refreshSessions();
       if (!mounted) return;
-      await openChat(context, store, id);
+      await openChat(context, _store, id);
     });
   }
 
   @override
   Widget build(BuildContext context) {
-    if (!_configured || _reconfiguring) {
-      return Scaffold(
-        body: ConnectionSheet(
-          store: store,
-          onConnected: _recheck,
-          // 重新配置时允许放弃：保留旧配置返回主界面
-          onCancel: _reconfiguring
-              ? () => setState(() => _reconfiguring = false)
-              : null,
-        ),
-      );
-    }
     final titles = ['DSH', L10n.t('会话', 'Sessions'), L10n.t('设置', 'Settings')];
     // 返回键：非首页 tab 按返回 → 先回首页；首页再按返回 → 退出 App
     return PopScope(
@@ -803,21 +936,21 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
             Transform.translate(
               offset: const Offset(-6, 0), // 再向抽屉菜单靠近一点
               child: Tooltip(
-                message: switch (store.connState) {
+                message: switch (_store.connState) {
                   'connected' => L10n.t('电脑在线', 'PC online'),
                   'connecting' => L10n.t('连接中…', 'Connecting…'),
                   _ => L10n.t('电脑离线 · 点按重连', 'PC offline · tap to reconnect'),
                 },
                 child: InkWell(
                   customBorder: const CircleBorder(),
-                  onTap: () => store.resume(),
+                  onTap: () => _store.resume(),
                   child: Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 4),
                     child: Container(
                       width: 10,
                       height: 10,
                       decoration: BoxDecoration(
-                        color: switch (store.connState) {
+                        color: switch (_store.connState) {
                           'connected' => DshColors.ok(context),
                           'connecting' => DshColors.warn(context),
                           _ => DshColors.ink3(context),
@@ -832,7 +965,7 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
             ),
             const SizedBox(width: 5),
             Text(
-              titles[_index],
+              _configured ? titles[_index] : titles[0],
               style: TextStyle(
                 fontSize: _index == 0 ? 20 : 17,
                 fontWeight: FontWeight.w700,
@@ -847,10 +980,10 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
         actions: [
           IconButton(
             icon: Badge(
-              isLabelVisible: store.unread > 0,
+              isLabelVisible: _store.unread > 0,
               backgroundColor: DshColors.danger(context),
               label: Text(
-                '${store.unread}',
+                '${_store.unread}',
                 style: const TextStyle(fontSize: 9, fontWeight: FontWeight.w700, color: Colors.white),
               ),
               child: const Icon(Icons.notifications_none, size: 20),
@@ -863,106 +996,203 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
           const SizedBox(width: 8),
         ],
       ),
-      drawer: Drawer(
-        backgroundColor: Theme.of(context).scaffoldBackgroundColor,
-        child: SafeArea(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(20, 20, 20, 12),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('DSH', style: TextStyle(fontSize: 26, fontWeight: FontWeight.w700, fontFamily: 'Georgia')),
-                    const SizedBox(height: 12),
-                    FilledButton(
-                      style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(42)),
-                      onPressed: () {
-                        Navigator.of(context).pop();
-                        _openNewSession();
-                      },
-                      child: Text(L10n.t('＋ 新建会话', '+ New Session')),
-                    ),
-                  ],
+      drawer: AppDrawer(
+        store: _store,
+        selectedIndex: _index,
+        onSelect: (index) => setState(() => _index = index),
+        onNewSession: _openNewSession,
+        onOpenConnections: _openConnections,
+      ),
+      body: _configured
+          ? IndexedStack(
+              index: _index,
+              children: [
+                // v3.1.6（issue #14）：IndexedStack 让三个页面同时活着，所以"本页是否可见"
+                // 必须显式告知——列表页据此暂停状态标识的旋转动效（页面不可见不耗电）。
+                HomeScreen(
+                  store: _store,
+                  visible: _index == 0,
+                  onOpenSession: () {
+                    if (mounted) setState(() {});
+                  },
                 ),
-              ),
-              const SizedBox(height: 4),
-              // 工作区快速切换（对齐 PC 端 workspace 切换；≥2 个工作区时显示）
-              // 封顶 35% 屏高 + 可滚动：工作区再多也不会把下方导航挤出屏幕
-              if (store.workspaces.length >= 2) ...[
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(20, 8, 20, 4),
-                  child: Text(
-                    L10n.t('工作区', 'Workspaces'),
-                    style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, letterSpacing: 0.5, color: DshColors.ink3(context)),
-                  ),
+                SessionsScreen(
+                  store: _store,
+                  visible: _index == 1,
+                  onOpenSession: () {
+                    if (mounted) setState(() {});
+                  },
                 ),
-                ConstrainedBox(
-                  constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.35),
-                  child: ListView(
-                    shrinkWrap: true,
-                    children: [
-                      _workspaceItem(null),
-                      for (final w in store.workspaces) _workspaceItem(w),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 8),
+                SettingsScreen(store: _store, onReconfigure: () async {}),
               ],
-              _drawerItem(Icons.home_outlined, L10n.t('首页', 'Home'), 0),
-              _drawerItem(Icons.history, L10n.t('会话', 'Sessions'), 1),
-              _drawerItem(Icons.settings_outlined, L10n.t('设置', 'Settings'), 2),
-              const Spacer(),
-              Padding(
-                padding: const EdgeInsets.all(16),
-                child: Text(
-                  L10n.t('本机直连 · DeepSeek Harness', 'Direct connection · DeepSeek Harness'),
-                  style: TextStyle(fontSize: 12, color: DshColors.ink3(context)),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-      body: IndexedStack(
-        index: _index,
-        children: [
-          // v3.1.6（issue #14）：IndexedStack 让三个页面同时活着，所以"本页是否可见"
-          // 必须显式告知——列表页据此暂停状态标识的旋转动效（页面不可见不耗电）。
-          HomeScreen(
-            store: store,
-            visible: _index == 0,
-            onOpenSession: () {
-              if (mounted) setState(() {});
-            },
-          ),
-          SessionsScreen(
-            store: store,
-            visible: _index == 1,
-            onOpenSession: () {
-              if (mounted) setState(() {});
-            },
-          ),
-          SettingsScreen(store: store, onReconfigure: _reconfigure),
-        ],
-      ),
+            )
+          : _unconfiguredBody(context),
       ),
     );
   }
 
-  Widget _drawerItem(IconData icon, String label, int index) {
+}
+
+/// 首页抽屉：新建会话、工作区、连接入口（仅文字，始终显示）与主导航。
+///
+/// 「连接」是独立入口而不是主 Tab：点击关抽屉后由 RootScreen push
+/// ConnectionProfilesScreen；无活动主机时也显示，用户可进入添加电脑。
+class AppDrawer extends StatelessWidget {
+  const AppDrawer({
+    super.key,
+    required this.store,
+    required this.selectedIndex,
+    required this.onSelect,
+    required this.onNewSession,
+    required this.onOpenConnections,
+  });
+
+  final AppStore store;
+  final int selectedIndex;
+  final ValueChanged<int> onSelect;
+  final VoidCallback onNewSession;
+  final VoidCallback onOpenConnections;
+
+  @override
+  Widget build(BuildContext context) {
+    return Drawer(
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+      child: SafeArea(
+        // 整体可滚：320dp/2.0x + 多工作区时，连接与底部设置仍然可达，不靠 Spacer 硬撑。
+        child: ListView(
+          padding: EdgeInsets.zero,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 20, 20, 12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'DSH',
+                    style: TextStyle(
+                      fontSize: 26,
+                      fontWeight: FontWeight.w700,
+                      fontFamily: 'Georgia',
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  FilledButton(
+                    style: FilledButton.styleFrom(
+                      minimumSize: const Size.fromHeight(42),
+                    ),
+                    onPressed: () {
+                      Navigator.of(context).pop();
+                      onNewSession();
+                    },
+                    child: Text(L10n.t('＋ 新建会话', '+ New Session')),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 4),
+            // 工作区快速切换（对齐 PC 端 workspace 切换；≥2 个工作区时显示）。
+            // 不再嵌套 35% 高 ListView：所有工作区随抽屉一起滚动，避免大字号下
+            // 固定高度 + Spacer 把连接/设置挤出屏幕。
+            if (store.workspaces.length >= 2) ...[
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 8, 20, 4),
+                child: Text(
+                  L10n.t('工作区', 'Workspaces'),
+                  style: TextStyle(
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 0.5,
+                    color: DshColors.ink3(context),
+                  ),
+                ),
+              ),
+              _workspaceItem(context, null),
+              for (final w in store.workspaces) _workspaceItem(context, w),
+              const SizedBox(height: 8),
+            ],
+            _connectionItem(context),
+            _drawerItem(context, Icons.home_outlined, L10n.t('首页', 'Home'), 0),
+            _drawerItem(
+              context,
+              Icons.history,
+              L10n.t('会话', 'Sessions'),
+              1,
+            ),
+            _drawerItem(
+              context,
+              Icons.settings_outlined,
+              L10n.t('设置', 'Settings'),
+              2,
+            ),
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(
+                L10n.t(
+                  '本机直连 · DeepSeek Harness',
+                  'Direct connection · DeepSeek Harness',
+                ),
+                style: TextStyle(
+                  fontSize: 12,
+                  color: DshColors.ink3(context),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 仅文字「连接」入口；不根据主机/连接状态隐藏（无主机时也能进入添加页）。
+  Widget _connectionItem(BuildContext context) {
+    final ink2 = DshColors.ink2(context);
+    void open() {
+      Navigator.of(context).pop();
+      onOpenConnections();
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 1),
+      child: Semantics(
+        button: true,
+        excludeSemantics: true,
+        label: L10n.t('连接', 'Connections'),
+        onTap: open,
+        child: InkWell(
+          key: const ValueKey('drawer-connection'),
+          borderRadius: BorderRadius.circular(10),
+          onTap: open,
+          child: Container(
+            constraints: const BoxConstraints(minHeight: 44),
+            alignment: Alignment.centerLeft,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
+            child: Text(
+              L10n.t('连接', 'Connections'),
+              style: TextStyle(fontSize: 14.5, color: ink2),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _drawerItem(
+    BuildContext context,
+    IconData icon,
+    String label,
+    int index,
+  ) {
     final brand = DshColors.brand(context);
     final brandSoft = DshColors.brandSoft(context);
     final ink2 = DshColors.ink2(context);
-    final selected = _index == index;
+    final selected = selectedIndex == index;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 1),
       child: InkWell(
         borderRadius: BorderRadius.circular(10),
         onTap: () {
-          setState(() => _index = index);
           Navigator.of(context).pop();
+          onSelect(index);
         },
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
@@ -988,17 +1218,22 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
       ),
     );
   }
+
   /// 工作区切换项（null = 全部工作区）。
-  Widget _workspaceItem(Map<String, dynamic>? w) {
+  Widget _workspaceItem(BuildContext context, Map<String, dynamic>? w) {
     final brand = DshColors.brand(context);
     final brandSoft = DshColors.brandSoft(context);
     final ink2 = DshColors.ink2(context);
     final ink3 = DshColors.ink3(context);
     final isAll = w == null;
     final path = w?['path'] as String? ?? '';
-    final title = isAll ? L10n.t('全部工作区', 'All Workspaces') : ((w['title'] as String?) ?? path);
+    final title = isAll
+        ? L10n.t('全部工作区', 'All Workspaces')
+        : ((w['title'] as String?) ?? path);
     // v3.1.1(issue #5)：原始路径做展示，规范化后与 workspacePath（归一存储）匹配
-    final selected = isAll ? store.workspacePath == null : store.workspacePath == AppStore.normPath(path);
+    final selected = isAll
+        ? store.workspacePath == null
+        : store.workspacePath == AppStore.normPath(path);
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 1),
       child: InkWell(
@@ -1015,18 +1250,33 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
           ),
           child: Row(
             children: [
-              Icon(isAll ? Icons.folder_open_outlined : Icons.folder_outlined, size: 18, color: selected ? brand : ink2),
+              Icon(
+                isAll ? Icons.folder_open_outlined : Icons.folder_outlined,
+                size: 18,
+                color: selected ? brand : ink2,
+              ),
               const SizedBox(width: 12),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(title, maxLines: 1, overflow: TextOverflow.ellipsis,
-                        style: TextStyle(fontSize: 13.5, color: selected ? brand : ink2,
-                            fontWeight: selected ? FontWeight.w600 : FontWeight.w400)),
+                    Text(
+                      title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 13.5,
+                        color: selected ? brand : ink2,
+                        fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                      ),
+                    ),
                     if (!isAll)
-                      Text(path, maxLines: 1, overflow: TextOverflow.ellipsis,
-                          style: TextStyle(fontSize: 10.5, color: ink3)),
+                      Text(
+                        path,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: 10.5, color: ink3),
+                      ),
                   ],
                 ),
               ),
@@ -1034,256 +1284,6 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
             ],
           ),
         ),
-      ),
-    );
-  }
-}
-
-/// 连接设置（首次进入/重新配置时显示）
-class ConnectionSheet extends StatefulWidget {
-  final AppStore store;
-  final VoidCallback onConnected;
-  /// 非空时显示「返回」按钮：放弃重新配置、保留旧配置返回主界面。
-  final VoidCallback? onCancel;
-  const ConnectionSheet({
-    super.key,
-    required this.store,
-    required this.onConnected,
-    this.onCancel,
-  });
-
-  @override
-  State<ConnectionSheet> createState() => _ConnectionSheetState();
-}
-
-class _ConnectionSheetState extends State<ConnectionSheet> {
-  final _baseCtrl = TextEditingController();
-  final _tokenCtrl = TextEditingController();
-  String _status = '';
-  bool _busy = false;
-  bool _allowInsecure = false;
-
-  @override
-  void initState() {
-    super.initState();
-    if (api.baseUrl.isNotEmpty) _baseCtrl.text = api.baseUrl;
-    if (api.token.isNotEmpty) _tokenCtrl.text = api.token;
-    _baseCtrl.addListener(_onEndpointChanged);
-    final securityError = widget.store.connections?.connectionStateError ?? '';
-    if (securityError.isNotEmpty) {
-      _status = L10n.t('安全凭据不可用：$securityError', 'Secure credential unavailable: $securityError');
-    }
-  }
-
-  void _onEndpointChanged() {
-    if (mounted) setState(() {});
-  }
-
-  @override
-  void dispose() {
-    _baseCtrl.removeListener(_onEndpointChanged);
-    _baseCtrl.dispose();
-    _tokenCtrl.dispose();
-    super.dispose();
-  }
-
-  Future<void> _retrySecurity() async {
-    setState(() {
-      _busy = true;
-      _status = L10n.t('正在重试安全凭据…', 'Retrying secure credential…');
-    });
-    final error = await widget.store.retryConnectionLoad();
-    if (!mounted) return;
-    setState(() {
-      _busy = false;
-      _status = error == null
-          ? L10n.t('✅ 已恢复', '✅ Recovered')
-          : '${L10n.t('恢复失败：', 'Recovery failed:')}$error';
-    });
-    if (error == null) widget.onConnected();
-  }
-
-  Future<void> _connect() async {
-    var base = _baseCtrl.text.trim();
-    if (!base.startsWith('http')) base = 'http://$base';
-    base = base.replaceAll(RegExp(r'/+$'), '');
-    if (base.endsWith('/m')) base = base.substring(0, base.length - 2);
-    setState(() {
-      _busy = true;
-      _status = L10n.t('连接中…', 'Connecting…');
-    });
-    if (base.startsWith('http://') && !_allowInsecure) {
-      setState(() {
-        _busy = false;
-        _status = L10n.t(
-          'HTTP 地址需要勾选“允许未加密连接”',
-          'HTTP requires allowing an unencrypted connection',
-        );
-      });
-      return;
-    }
-    try {
-      // #152：先做**不带 token、不发请求**的 URL/传输策略校验；真正的 token probe
-      // 统一在 ConnectionManager.stageSwitch 的 _checkTransport 之后。
-      ConnectionManager.validateEndpoint(
-        base,
-        insecureConfirmed: _allowInsecure,
-        allowInsecure: _allowInsecure,
-      );
-      // #152：所有激活动作统一经 AppStore 的 staged commit + 清态/ledger/重连；
-      // manager 只做底层事务，UI 不直接改 Api/Keystore 后返回。
-      final error = await widget.store.connectManualProfile(
-        baseUrl: base,
-        token: _tokenCtrl.text.trim(),
-        allowInsecure: _allowInsecure,
-      );
-      if (!mounted) return;
-      if (error != null) {
-        setState(() => _status = '${L10n.t('连接失败：', 'Connection failed:')}$error');
-        return;
-      }
-      setState(() => _status = L10n.t('✅ 已连接', '✅ Connected'));
-      widget.onConnected();
-    } catch (e) {
-      if (!mounted) return;
-      // F21：认证未配置/口令错误要给专门、可执行的文案（重扫一次二维码），
-      // 不能显示成通用网络错误。
-      final authHint = authFixHint(e);
-      if (authHint != null) {
-        setState(() => _status = '${L10n.t('连接失败：', 'Connection failed:')}$authHint');
-        return;
-      }
-      // v3.0.0：网络原因引导（MiUI 智能网络/蜂窝把局域网流量分流时会表现为超时或 404）
-      final hint = L10n.t(
-          '；请确认手机与电脑在同一 Wi-Fi，并关闭手机流量/智能网络后重试',
-          '; make sure the phone is on the same Wi-Fi as the PC, and turn off mobile data / smart network switch');
-      setState(() => _status = '${L10n.t('连接失败：', 'Connection failed:')}$e$hint');
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  Future<void> _onScanned(String base, String token) async {
-    _baseCtrl.text = base;
-    _tokenCtrl.text = token;
-    if (mounted) Navigator.of(context).pop();
-    await _connect();
-  }
-
-  Future<void> _scan() async {
-    await Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => ScanScreen(onScanned: _onScanned)),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return PopScope(
-      canPop: !_busy,
-      onPopInvokedWithResult: (didPop, _) {
-        if (!didPop && _busy && mounted) {
-          showToast(context, L10n.t('正在连接，请等待完成', 'Connecting; please wait'));
-        }
-      },
-      child: SafeArea(
-      child: Column(
-        children: [
-          // 返回按钮固定在左上角（重新配置时可见，放弃保留原配置）
-          if (widget.onCancel != null)
-            Align(
-              alignment: Alignment.centerLeft,
-              child: Padding(
-                padding: const EdgeInsets.only(left: 4, top: 4),
-                child: IconButton(
-                  onPressed: widget.onCancel,
-                  icon: const Icon(Icons.arrow_back, size: 22),
-                  tooltip: L10n.t('返回（保留原配置）', 'Back (keep current settings)'),
-                ),
-              ),
-            ),
-          Expanded(
-            child: Center(
-              child: SingleChildScrollView(
-                // 键盘弹出/小屏时表单可滚动，避免连接页溢出
-                padding: const EdgeInsets.all(20),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-            Text('DSH Remote',
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 30, fontWeight: FontWeight.w800, color: scheme.primary)),
-            const SizedBox(height: 6),
-            Text(L10n.t('手机远程操作 DeepSeek Harness', 'Control DeepSeek Harness from your phone'), textAlign: TextAlign.center, style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant)),
-            const SizedBox(height: 28),
-            FilledButton.icon(
-              onPressed: _busy ? null : _scan,
-              icon: const Icon(Icons.qr_code_scanner),
-              label: Text(L10n.t('扫码连接', 'Scan to Connect')),
-              style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(46)),
-            ),
-            const SizedBox(height: 16),
-            Row(
-              children: [
-                Expanded(child: Divider(color: scheme.outlineVariant)),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 10),
-                  child: Text(L10n.t('或手动输入', 'Or enter manually'), style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
-                ),
-                Expanded(child: Divider(color: scheme.outlineVariant)),
-              ],
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _baseCtrl,
-              keyboardType: TextInputType.url,
-              decoration: InputDecoration(
-                labelText: L10n.t('电脑地址', 'Computer Address'),
-                hintText: 'http://192.168.x.x:3080',
-                border: const OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _tokenCtrl,
-              obscureText: true,
-              decoration: InputDecoration(
-                labelText: L10n.t('访问口令', 'Token'),
-                border: const OutlineInputBorder(),
-              ),
-            ),
-            if (_baseCtrl.text.startsWith('http://'))
-              CheckboxListTile(
-                key: const ValueKey('connection-sheet-allow-insecure'),
-                value: _allowInsecure,
-                onChanged: (value) => setState(() => _allowInsecure = value == true),
-                title: Text(L10n.t('允许未加密连接', 'Allow unencrypted connection')),
-                subtitle: Text(
-                  L10n.t('仅在你信任当前网络时使用', 'Use only on a network you trust'),
-                  style: const TextStyle(fontSize: 11.5),
-                ),
-              ),
-            const SizedBox(height: 20),
-            FilledButton(
-              onPressed: _busy ? null : _connect,
-              child: Text(_busy ? L10n.t('连接中…', 'Connecting…') : L10n.t('连接', 'Connect')),
-            ),
-            const SizedBox(height: 12),
-            Text(_status, textAlign: TextAlign.center, style: const TextStyle(fontSize: 12)),
-            if ((widget.store.connections?.connectionStateError ?? '').isNotEmpty)
-              TextButton(
-                key: const ValueKey('connection-retry-security'),
-                onPressed: _busy ? null : _retrySecurity,
-                child: Text(L10n.t('重试迁移/凭据', 'Retry migration/credential')),
-              ),
-          ],
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
       ),
     );
   }
