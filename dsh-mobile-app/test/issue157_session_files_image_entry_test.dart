@@ -381,14 +381,23 @@ void main() {
   });
 
   group('下载与选择模式', () {
-    testWidgets('生产路径（无注入 downloader）：查看器下载按钮隐藏，不崩', (tester) async {
+    testWidgets('生产路径（无注入 downloader）：下载按钮可见，未就绪时给明确提示', (
+      tester,
+    ) async {
       final backend = _Backend(files: ['photo.png']);
       await _pump(tester, backend);
       await tester.tap(find.byKey(const Key('sf-file-photo.png')));
       await _settle(tester);
-      // widget 测试里 path_provider 不可用 → 下载组件未就绪 → 按钮隐藏。
       expect(find.byKey(const Key('sf-image-preview')), findsOneWidget);
+      // widget 测试里 path_provider 不可用 → 下载组件未初始化；按钮仍可见（不制造
+      // 「先进查看器就永远没有下载入口」的时序坑），点按给明确提示而不是静默失败。
+      expect(find.byKey(const Key('sf-image-download')), findsOneWidget);
+      await tester.tap(find.byKey(const Key('sf-image-download')));
+      await _settle(tester);
       expect(tester.takeException(), isNull);
+      // 组件未就绪：只给「下载失败：下载组件尚未就绪」，不谎报「已开始下载原图」。
+      expect(find.textContaining('下载组件尚未就绪'), findsOneWidget);
+      expect(find.textContaining('已开始下载原图'), findsNothing);
     });
 
     testWidgets('注入 downloader：查看器下载按钮复用 #138 流程', (tester) async {

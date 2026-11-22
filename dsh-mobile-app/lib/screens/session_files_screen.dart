@@ -651,11 +651,19 @@ class _SessionFilesScreenState extends State<SessionFilesScreen> {
   }
 
   /// 查看器内的下载回调：复用 #138 的 [_startDownload]（同一控制器/进度条）。
+  ///
+  /// 不做「控制器还没就绪就隐藏按钮」的时序判断——那会让先进查看器的用户永远
+  /// 看不到下载入口。未就绪时抛错，由查看器统一提示「下载失败：…」，避免
+  /// 外层再叠一句「已开始下载原图」的错误成功提示。
   Future<void> Function()? _imageDownloadAction(String path) {
     if (widget.selectionMode) return null;
     if (!_api.sessionRelativeFilesSupported) return null;
-    if (_downloader == null) return null;
-    return () => _startDownload(path);
+    return () async {
+      if (_downloader == null) {
+        throw StateError(L10n.t('下载组件尚未就绪', 'Download is not ready yet'));
+      }
+      await _startDownload(path);
+    };
   }
 
   // ── 下载（#138） ──
