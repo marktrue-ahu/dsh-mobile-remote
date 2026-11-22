@@ -580,6 +580,43 @@ class Truncated5002TagApi extends TagWidgetApi {
       );
 }
 
+class TagRaceApi extends TagWidgetApi {
+  final pageGate = Completer<GitGraphPage>();
+  int allCalls = 0;
+
+  @override
+  Future<GitGraphPage> graphAll(
+    String sessionId,
+    String repositoryId, {
+    required bool all,
+    String? focus,
+    String? snapshotId,
+    String? cursor,
+    int limit = 16,
+    Duration timeout = const Duration(seconds: 35),
+  }) {
+    allCalls++;
+    if (allCalls == 1) {
+      return Future.value(GitGraphPage(
+        snapshotId: 'snap-b',
+        focusOid: 'b',
+        pageStart: 0,
+        nextCursor: 'next-b',
+        tips: const [],
+        commits: const [GitCommitSummary(oid: 'b', subject: 'B')],
+      ));
+    }
+    if (allCalls == 2) return pageGate.future; // 旧分页在途
+    return Future.value(GitGraphPage(
+      snapshotId: 'snap-c',
+      focusOid: 'c',
+      pageStart: 0,
+      tips: const [],
+      commits: const [GitCommitSummary(oid: 'c', subject: 'C')],
+    ));
+  }
+}
+
 class PagingGateTagApi extends TagWidgetApi {
   final pageGate = Completer<GitGraphPage>();
   int allCalls = 0;
@@ -1690,5 +1727,31 @@ void main() {
     expect(controller.state.tagFocusOid, 'main-oid');
     expect(find.textContaining('Could not locate this tag'), findsNothing);
     expect(find.textContaining('无法定位该标签'), findsNothing);
+  });
+
+  testWidgets('#159 窗口外 tag 成功提交新图：旧分页迟到不混入新 snapshot', (tester) async {
+    final api = TagRaceApi();
+    final controller = await mountSheet(tester, api);
+    addTearDown(controller.dispose);
+    await controller.openTagFocus('b');
+    expect(controller.state.snapshotId, 'snap-b');
+    final paging = controller.loadNextGraphPage();
+    await tester.pump();
+    expect(controller.state.loadingGraphPage, isTrue);
+    await controller.openTagFocus('c');
+    expect(controller.state.snapshotId, 'snap-c');
+    expect(controller.state.commits.map((c) => c.oid), ['c']);
+    api.pageGate.complete(const GitGraphPage(
+      snapshotId: 'snap-b',
+      tips: const [],
+      nextCursor: 'old-next',
+      commits: [GitCommitSummary(oid: 'old-page', subject: 'Old')],
+    ));
+    await paging;
+    await tester.pumpAndSettle();
+    expect(controller.state.snapshotId, 'snap-c');
+    expect(controller.state.commits.map((c) => c.oid), ['c']);
+    expect(controller.state.graphNextCursor, isNull);
+    expect(controller.state.loadingGraphPage, isFalse);
   });
 }

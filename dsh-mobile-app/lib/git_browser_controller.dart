@@ -805,11 +805,16 @@ class GitBrowserController extends ChangeNotifier {
         return;
       }
       _cancelGraphTimeout();
+      // 成功提交新图才推进图代：作废旧分页/预取，防止旧 snapshot 页 append 到新图。
+      _graphGeneration++;
+      _graphPageRequest = null;
+      _resetPendingPrev();
       _applyAllGraphPage(page, initial: true, newer: false);
       _emit(_state.copyWith(
         tagFocusOid: focus,
         tagFocusSeq: _state.tagFocusSeq + 1,
         tagFocusError: null,
+        loadingGraphPage: false,
       ));
     } catch (error) {
       if (generation != _generation ||
