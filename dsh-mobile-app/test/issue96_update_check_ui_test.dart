@@ -10,17 +10,16 @@ import 'package:dsh_mobile_app/store.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+import 'settings_tabs_helper.dart';
+
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class _ResumeApi extends Api {
   _ResumeApi()
-      : super(
-          client: MockClient(
-            (request) async => http.Response('{}', 200),
-          ),
-        );
+    : super(client: MockClient((request) async => http.Response('{}', 200)));
 
   int posts = 0;
   int resumes = 0;
@@ -70,9 +69,9 @@ void main() {
     NotifyDiag.notificationsEnabled = true;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(
-      const MethodChannel('dsh/floating'),
-      (call) async => false,
-    );
+          const MethodChannel('dsh/floating'),
+          (call) async => false,
+        );
   });
 
   Future<AppStore> pumpSettings(
@@ -81,7 +80,8 @@ void main() {
     Duration checkTimeout = const Duration(seconds: 35),
     Api? apiOverride,
   }) async {
-    final api = apiOverride ??
+    final api =
+        apiOverride ??
         (Api(client: client)
           ..baseUrl = 'http://host:3080'
           ..path = '/m'
@@ -101,6 +101,7 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
+    await selectSettingsTab(tester, '通用');
     final title = find.text('更新电脑端插件');
     await tester.scrollUntilVisible(
       title,
@@ -215,5 +216,4 @@ void main() {
     expect(fake.posts, 2, reason: '410 后应自动重启检查');
     expect(find.text('继续检查 ▸'), findsNothing);
   });
-
 }
