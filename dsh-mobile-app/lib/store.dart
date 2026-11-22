@@ -425,6 +425,13 @@ class AppStore extends ChangeNotifier {
   /// 进行中的**两端更新**记录（跨断线、跨进程持久化，见 CONTEXT「更新接续」）。
   PluginUpdateJournal? pluginUpdateJournal;
 
+  /// #152：更新操作的连接代；切换时递增，迟到 continuation 必须丢弃。
+  int _updateEpoch = 0;
+  Future<void> Function()? updateResumeGate;
+
+  bool _updateStillCurrent(int epoch, String scope) =>
+      epoch == _updateEpoch && scope == ProfileNamespace.scope;
+
   /// 一次性提示（更新完成/失败/结果待确认），由界面消费后清空。
   String? pluginUpdateNotice;
   String lastPluginUpdateOpId = '';
@@ -870,6 +877,9 @@ class AppStore extends ChangeNotifier {
           .whenComplete(() => _resumingUpdate = null);
 
   Future<void> _resumePluginUpdate({required bool connected}) async {
+    final updateEpoch = _updateEpoch;
+    final updateScope = ProfileNamespace.scope;
+    bool stillCurrent() => _updateStillCurrent(updateEpoch, updateScope);
     final journal = pluginUpdateJournal;
     if (journal == null) {
       _pluginUpdateTimer?.cancel();
@@ -883,6 +893,8 @@ class AppStore extends ChangeNotifier {
       _pluginUpdateTimer = null;
       return;
     }
+    await updateResumeGate?.call();
+    if (!stillCurrent()) return;
     if (journal.phase == UpdatePhase.appPending ||
         journal.phase == UpdatePhase.pluginConfirmed) {
       if (!connected && journal.release == null) {
@@ -910,6 +922,7 @@ class AppStore extends ChangeNotifier {
           targetContentSha256: release.plugin.contentSha256,
           appVersion: journal.appVersion.isEmpty ? release.app.version : null,
         );
+        if (!stillCurrent()) return;
         pluginUpdateJournal = current;
         await _persistPrefs(
           _kPluginUpdateJournal,
@@ -965,6 +978,7 @@ class AppStore extends ChangeNotifier {
           jsonEncode(pluginUpdateJournal!.toJson()),
         );
         pluginUpdateNotice = '电脑端插件已更新到 v$target';
+        if (!stillCurrent()) return;
         await _continueAppUpdateAfterPlugin();
       case ResumeAction.rolledBack:
       case ResumeAction.failed:
@@ -1056,8 +1070,11 @@ class AppStore extends ChangeNotifier {
   /// - `plugin-confirmed`：插件健康后第一次确定 App 目标；
   /// - `app-pending`：安装器返回后的**首次启动复核**（§5.9）：核对真实安装版本/构建号与配对。
   Future<void> _continueAppUpdateAfterPlugin() async {
+    final updateEpoch = _updateEpoch;
+    final updateScope = ProfileNamespace.scope;
+    bool current() => _updateStillCurrent(updateEpoch, updateScope);
     var journal = pluginUpdateJournal;
-    if (journal == null) return;
+    if (journal == null || !current()) return;
     var release = journal.release;
     if (release == null) {
       final transaction = api.pluginUpdate.transaction;
@@ -1123,7 +1140,7 @@ class AppStore extends ChangeNotifier {
     }
     final candidate = release.candidate;
     final outcome = await checkFixedAppUpdate(release);
-    if (_disposed || pluginUpdateJournal?.opId != journal.opId) return;
+    if (!current() || _disposed || pluginUpdateJournal?.opId != journal.opId) return;
     if (outcome.error != null || outcome.candidate == null) {
       if (_isTransientCheckError(outcome.error)) {
         pluginUpdateNotice = '${outcome.error ?? '无法确认 App 目标'}，请重试检查；更新记录已保留';
@@ -2339,7 +2356,8 @@ class AppStore extends ChangeNotifier {
       if (!current()) return false;
       // 连接不通：尝试轮换到下一个候选地址（黑洞快速切换）再探测一次
       final rotation = await api.rotateBaseUrlVerified();
-      if (rotation.epoch != api.connectionEpoch ||
+      if (rotation.stale ||
+          rotation.epoch != api.connectionEpoch ||
           rotation.identity != api.connectionIdentity) {
         return false;
       }
@@ -2650,6 +2668,8 @@ class AppStore extends ChangeNotifier {
     actions = [];
     pluginUpdateJournal = null;
     lastPluginUpdateOpId = '';
+    _updateEpoch++;
+    _resumingUpdate = null;
     _pluginUpdateTimer?.cancel();
     _pluginUpdateTimer = null;
     updateChecking = false;
@@ -3139,9 +3159,10 @@ class AppStore extends ChangeNotifier {
 
   Future<void> _rotateVerifiedThenSchedule() async {
     final rotation = await api.rotateBaseUrlVerified();
-    if (rotation.epoch != api.connectionEpoch ||
+    if (rotation.stale ||
+        rotation.epoch != api.connectionEpoch ||
         rotation.identity != api.connectionIdentity) {
-      return; // 旧 A 的任务已被其他切档取代。
+      return; // stale：不得取消/重连当前 B。
     }
     if (rotation.rotated) {
       // 轮换提交会改变 base/epoch；旧 SSE 必须取消并复位守卫，否则 connect 永远被挡。
@@ -3698,7 +3719,8 @@ class AppStore extends ChangeNotifier {
           }
           // 当前地址连续失败：轮换到下一个已确认且 hostId 校验通过的候选。
           final rotation = await api.rotateBaseUrlVerified();
-          if (rotation.epoch != api.connectionEpoch ||
+          if (rotation.stale ||
+              rotation.epoch != api.connectionEpoch ||
               rotation.identity != api.connectionIdentity) {
             return;
           }

@@ -141,6 +141,7 @@ class ConnectionManager {
         profile: current.id,
         hostIdentity: current.hostId,
         urls: current.baseUrls,
+        generation: generation,
       );
       migrationState = 'complete';
       connectionStateError = '';
@@ -474,6 +475,7 @@ class ConnectionManager {
         profile: updated.id,
         hostIdentity: updated.hostId,
         urls: updated.baseUrls,
+        generation: generation,
       );
       applied = true;
       await (persistOverride ?? _saveProfiles)();
@@ -575,17 +577,43 @@ class ConnectionManager {
       );
     };
     api.candidateVerifier = verifyCandidate;
-    api.candidateCommitter = commitActiveBase;
+    api.candidateCommitter = (base, profile, host, generation) =>
+        commitActiveBase(
+          base,
+          expectedProfileId: profile,
+          expectedHostId: host,
+          expectedGeneration: generation,
+        );
   }
 
   /// 同 host 的已确认候选轮换：原子更新 active profile base + generation + descriptor，
   /// 再通知原生重建；失败回滚档案/descriptor/generation，不返回成功。
-  Future<bool> commitActiveBase(String base) =>
-      _serialized(() => _commitActiveBaseUnlocked(base));
+  Future<bool> commitActiveBase(
+    String base, {
+    String? expectedProfileId,
+    String? expectedHostId,
+    int? expectedGeneration,
+  }) => _serialized(
+    () => _commitActiveBaseUnlocked(
+      base,
+      expectedProfileId: expectedProfileId,
+      expectedHostId: expectedHostId,
+      expectedGeneration: expectedGeneration,
+    ),
+  );
 
-  Future<bool> _commitActiveBaseUnlocked(String base) async {
+  Future<bool> _commitActiveBaseUnlocked(
+    String base, {
+    String? expectedProfileId,
+    String? expectedHostId,
+    int? expectedGeneration,
+  }) async {
     final current = active;
     if (current == null) return false;
+    // 锁内第一式 CAS：验证时的档案/宿主/generation 必须仍是当前事务目标。
+    if (expectedProfileId != null && current.id != expectedProfileId) return false;
+    if (expectedHostId != null && current.hostId != expectedHostId) return false;
+    if (expectedGeneration != null && generation != expectedGeneration) return false;
     final normalized = Api.forProbe(base, '').baseUrl;
     final prefs = await _store;
     final oldDescriptor = prefs.getString(_kNativeDescriptor);
@@ -600,11 +628,19 @@ class ConnectionManager {
     final updated = current.copyWith(baseUrls: urls);
     try {
       if (index >= 0) profiles[index] = updated;
+      if (expectedProfileId != null && profiles[index].id != expectedProfileId) {
+        return false;
+      }
       generation = generation + 1;
       await _writeNativeDescriptor(updated, updated.hostId, generation);
       await activeBaseGate?.call();
+      // gate/await 后仍必须属于同一档案代；B 已提交则不再写。
+      if (activeProfileId != updated.id || generation != oldGeneration + 1) {
+        return false;
+      }
       await _saveProfiles();
       await credentials.refreshNative();
+      api.connectionGeneration = generation;
       return true;
     } catch (_) {
       if (index >= 0) profiles[index] = oldProfile;

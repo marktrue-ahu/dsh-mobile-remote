@@ -215,10 +215,14 @@ class _NoRedirectClient extends http.BaseClient {
 class BaseRotationResult {
   const BaseRotationResult({
     required this.rotated,
+    required this.stale,
     required this.epoch,
     required this.identity,
   });
   final bool rotated;
+
+  /// await 期间连接代/profile 已变化：调用方绝不能调度/取消当前连接。
+  final bool stale;
   final int epoch;
   final String identity;
 }
@@ -234,6 +238,9 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
 
   /// #152：当前活动档案 id（仅内存；token 不进 prefs/身份字符串）。
   String profileId = '';
+
+  /// 连接档案的 generation（与 descriptor/原生门禁同源；用于候选提交 CAS）。
+  int connectionGeneration = 0;
 
   /// 宿主稳定身份（bootstrap `plugin.hostId`，issue #60 R15）：同一宿主跨地址轮换
   /// 保持不变，不同宿主即使口令/挂载路径相同也不同；旧插件不下发时为空。
@@ -345,7 +352,12 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
   Future<bool> Function(String candidate)? candidateVerifier;
 
   /// #152 P2：已验证候选的档案/descriptor 原子提交；false 表示不采用。
-  Future<bool> Function(String candidate)? candidateCommitter;
+  Future<bool> Function(
+    String candidate,
+    String expectedProfileId,
+    String expectedHostId,
+    int expectedGeneration,
+  )? candidateCommitter;
   static const _kBase = 'dsh_mr_base';
   static const _kPath = 'dsh_mr_path';
   static const _kToken = 'dsh_mr_token';
@@ -431,6 +443,7 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
     required String profile,
     required String hostIdentity,
     List<String>? urls,
+    int? generation,
   }) {
     invalidateConnection();
     baseUrl = _normBase(base);
@@ -438,6 +451,7 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
     token = connectionToken;
     profileId = profile;
     this.hostIdentity = hostIdentity;
+    if (generation != null) connectionGeneration = generation;
     final merged = <String>[_normBase(base)];
     for (final value in urls ?? const <String>[]) {
       final normalized = _normBase(value);
@@ -453,11 +467,16 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
 
   /// #152：带 staged hostId 校验的候选轮换；未确认/身份不符的候选直接跳过。
   Future<BaseRotationResult> rotateBaseUrlVerified() async {
-    BaseRotationResult noRotation() => BaseRotationResult(
+    final startEpoch = connectionEpoch;
+    final startIdentity = connectionIdentity;
+    BaseRotationResult noRotation({bool stale = false}) => BaseRotationResult(
       rotated: false,
-      epoch: connectionEpoch,
-      identity: connectionIdentity,
+      stale: stale,
+      epoch: startEpoch,
+      identity: startIdentity,
     );
+    bool sameStart() =>
+        startEpoch == connectionEpoch && startIdentity == connectionIdentity;
     if (baseUrls.length < 2) return noRotation();
     final cur = _normBase(baseUrl);
     final idx = baseUrls.indexOf(cur);
@@ -472,6 +491,7 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
         final identity = connectionIdentity;
         final profile = profileId;
         final host = hostIdentity;
+        final expectedGeneration = connectionGeneration;
         bool same() =>
             epoch == connectionEpoch &&
             identity == connectionIdentity &&
@@ -479,13 +499,18 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
             host == hostIdentity;
         final verified = await verify(next);
         // await 期间连接可能已切 B：旧 A 候选无论结果如何都不得改当前连接。
-        if (!same()) return noRotation();
+        if (!same()) return noRotation(stale: true);
         if (!verified) continue;
-        if (!same()) return noRotation();
+        if (!same()) return noRotation(stale: true);
         final commit = candidateCommitter;
         if (commit != null) {
-          final committed = await commit(next);
-          if (!same()) return noRotation();
+          final committed = await commit(
+            next,
+            profile,
+            host,
+            expectedGeneration,
+          );
+          if (!same()) return noRotation(stale: true);
           if (!committed) continue;
         }
       }
@@ -499,10 +524,12 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
       }());
       return BaseRotationResult(
         rotated: true,
+        stale: false,
         epoch: connectionEpoch,
         identity: connectionIdentity,
       );
     }
+    if (!sameStart()) return noRotation(stale: true);
     return noRotation();
   }
 

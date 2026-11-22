@@ -11,6 +11,7 @@ import 'package:dsh_mobile_app/credential_store.dart';
 import 'package:dsh_mobile_app/attention_storage.dart';
 import 'package:dsh_mobile_app/git_file_history_controller.dart';
 import 'package:dsh_mobile_app/store.dart';
+import 'package:dsh_mobile_app/plugin_update_resume.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -638,6 +639,7 @@ void main() {
     final a = manager.profiles.single;
     a.hostId = 'host-a';
     manager.profiles[0] = a;
+    if (a.hostId.isNotEmpty) api.hostIdentity = a.hostId;
     await manager.credentials.writeToken(a.id, 'a-token');
     api.baseUrls = [
       'https://a.example.com',
@@ -646,6 +648,7 @@ void main() {
     api.baseUrl = 'https://a.example.com';
     a.baseUrls = ['https://a.example.com'];
     manager.profiles[0] = a;
+    if (a.hostId.isNotEmpty) api.hostIdentity = a.hostId;
 
     // 广告/候选中的公网 HTTP：admission/verify 均拒绝，0 请求。
     seen.clear();
@@ -664,6 +667,7 @@ void main() {
       'https://d.example.com',
     ];
     manager.profiles[0] = a;
+    if (a.hostId.isNotEmpty) api.hostIdentity = a.hostId;
     seen.clear();
     probeHost = 'host-b';
     expect((await api.rotateBaseUrlVerified()).rotated, isFalse);
@@ -744,6 +748,7 @@ void main() {
     final a = manager.profiles.single;
     a.hostId = 'host-a';
     manager.profiles[0] = a;
+    if (a.hostId.isNotEmpty) api.hostIdentity = a.hostId;
 
     await expectLater(
       manager.stageSwitch(a.id),
@@ -782,6 +787,7 @@ void main() {
     a.hostId = 'host-a';
     a.baseUrls = ['https://a.example.com', 'https://a2.example.com'];
     manager.profiles[0] = a;
+    if (a.hostId.isNotEmpty) api.hostIdentity = a.hostId;
     api.baseUrls = ['https://a.example.com', 'https://a2.example.com'];
     api.baseUrl = 'https://a.example.com';
 
@@ -873,6 +879,7 @@ void main() {
     a.hostId = 'host-a';
     a.baseUrls = ['https://a1.example.com', 'https://a2.example.com'];
     manager.profiles[0] = a;
+    if (a.hostId.isNotEmpty) api.hostIdentity = a.hostId;
     api.baseUrls = ['https://a1.example.com', 'https://a2.example.com'];
     api.baseUrl = 'https://a1.example.com';
     final oldGeneration = manager.generation;
@@ -910,6 +917,7 @@ void main() {
     final a = manager.profiles.single;
     a.hostId = 'host-a';
     manager.profiles[0] = a;
+    if (a.hostId.isNotEmpty) api.hostIdentity = a.hostId;
     final b = ConnectionProfile(
       id: ConnectionProfile.newId(),
       displayName: 'B',
@@ -952,6 +960,7 @@ void main() {
     a.hostId = 'host-a';
     a.baseUrls = ['https://a1.example.com', 'https://a2.example.com'];
     manager.profiles[0] = a;
+    if (a.hostId.isNotEmpty) api.hostIdentity = a.hostId;
     api.baseUrls = ['https://a1.example.com', 'https://a2.example.com'];
     api.baseUrl = 'https://a1.example.com';
     final gate = Completer<void>();
@@ -987,5 +996,57 @@ void main() {
     expect((jsonDecode(prefs.getString('dsh_native_connection')!) as Map)['baseUrl'], 'https://b.example.com/m');
     expect(prefs.getString('dsh_mr_active_profile'), b.id);
     expect(await manager.credentials.status().then((s) => s.activeProfileId), b.id);
+  });
+
+  test('A update resume 挂起切 B：旧 continuation 不写 B journal/候选', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    var host = 'host-a';
+    final manager = ConnectionManager(
+      api: Api()..baseUrl = '',
+      credentials: MemoryCredentialStore(),
+      probeBootstrap: (_) async => {'plugin': {'hostId': host}},
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    a.hostId = 'host-a';
+    manager.profiles[0] = a;
+    final b = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: 'B',
+      baseUrls: ['https://b.example.com/m'],
+      hostId: 'host-b',
+    );
+    manager.profiles.add(b);
+    await manager.credentials.writeToken(b.id, 'b-token');
+    final api = _StoreApi();
+    final store = AppStore(apiClient: api)..attachConnections(manager);
+    addTearDown(store.disposeBridge);
+    store.pluginUpdateJournal = PluginUpdateJournal(
+      opId: 'op-a',
+      targetVersion: '3.3.0',
+      targetContentSha256: 'a' * 64,
+      startedAt: DateTime.now().toUtc(),
+      phase: UpdatePhase.pluginConfirmed,
+    );
+    final gate = Completer<void>();
+    var entered = false;
+    store.updateResumeGate = () {
+      entered = true;
+      return gate.future;
+    };
+    final resume = store.resumePluginUpdate();
+    for (var i = 0; i < 100 && !entered; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+    expect(entered, isTrue);
+    host = 'host-b';
+    expect(await store.switchProfile(b.id), isNull);
+    gate.complete();
+    await resume;
+    expect(store.pluginUpdateJournal, isNull, reason: 'B 不得恢复 A 的未完成 journal');
+    expect(store.updateCandidate, isNull);
   });
 }
