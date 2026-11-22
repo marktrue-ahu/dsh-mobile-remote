@@ -1268,144 +1268,197 @@ class _AgentTreeRow extends StatelessWidget {
     required this.danger,
   });
 
+  /// 所有尺寸/字号统一 cap 3；level>3 仅用 L{n} 注记 + rail 缺口表达真实深度。
+  int get _cappedLevel => math.min(level, 3);
+  bool get _capped => level > 3;
+  double get _indent => (_cappedLevel - 1) * 14.0;
+
   @override
   Widget build(BuildContext context) {
     final ink2 = DshColors.ink2(context);
     final ink3 = DshColors.ink3(context);
     final brand = DshColors.brand(context);
     final rail = DshColors.ink2(context).withValues(alpha: 0.78);
-    final cappedLevel = math.min(level, 3);
-    final indent = (cappedLevel - 1) * 14.0;
     final released = !node.isRunning && !node.isDiagnostic;
-    // 行高随字号自适应：1.5x/2.0x 下两行副文本不溢出（设计：不回归行高）。
     final factor = MediaQuery.textScalerOf(context).scale(1.0);
     final rowHeight = 54 + 20 * (factor - 1).clamp(0.0, 1.2);
+    final statusText = _statusText(node);
+    final levelHint = _capped
+        ? L10n.t(
+            '第 $level 层（显示封顶在第三级）',
+            'Level $level (display capped at level 3)',
+          )
+        : L10n.t('第 $level 层', 'Level $level');
+    final canExpand =
+        !degraded && !node.isDiagnostic && node.children.isNotEmpty;
+    final expandLabel = expanded
+        ? L10n.t(
+            '收起 ${node.children.length} 个子代理',
+            'Collapse ${node.children.length} subagents',
+          )
+        : L10n.t(
+            '展开 ${node.children.length} 个子代理',
+            'Expand ${node.children.length} subagents',
+          );
+
+    // 三段独立命中：展开 44｜正文打开｜中断 44（仅 running）。树轨不响应手势。
     return Semantics(
-      button: !node.isDiagnostic,
-      label: node.isDiagnostic
-          ? _diagnosticText(node.status)
-          : '${node.title}，${_rowAgentName(node)}',
-      child: InkWell(
-        onTap: node.isDiagnostic ? null : onOpen,
-        child: SizedBox(
-          height: rowHeight,
-          child: Row(
-            children: [
-              SizedBox(
-                width: indent + 4,
-                height: double.infinity,
-                child: CustomPaint(
-                  painter: _TreeRailPainter(
-                    levels: cappedLevel - 1,
-                    color: rail,
-                  ),
+      container: true,
+      child: SizedBox(
+        height: rowHeight,
+        child: Row(
+          children: [
+            SizedBox(
+              width: _indent + 4,
+              height: double.infinity,
+              child: CustomPaint(
+                painter: _TreeRailPainter(
+                  levels: _cappedLevel - 1,
+                  color: rail,
+                  capped: _capped,
                 ),
               ),
-              if (!degraded && node.children.isNotEmpty)
-                Semantics(
-                  button: true,
-                  label: expanded
-                      ? L10n.t(
-                          '收起 ${node.children.length} 个子代理',
-                          'Collapse ${node.children.length} subagents',
-                        )
-                      : L10n.t(
-                          '展开 ${node.children.length} 个子代理',
-                          'Expand ${node.children.length} subagents',
-                        ),
-                  child: InkWell(
-                    onTap: onToggle,
-                    borderRadius: BorderRadius.circular(8),
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 2),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          CustomPaint(
-                            size: const Size(12, 12),
-                            painter: _AgentTrianglePainter(
-                              expanded: expanded,
-                              color: ink2,
-                            ),
-                          ),
-                          Container(
-                            key: ValueKey<String>('agent-count-${node.id}'),
-                            margin: const EdgeInsets.only(left: 4),
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 6,
-                              vertical: 1,
-                            ),
-                            decoration: BoxDecoration(
-                              color: DshColors.brandSoft(context),
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            child: Text(
-                              '${node.children.length}',
-                              style: TextStyle(
-                                fontSize: 10.5,
-                                fontWeight: FontWeight.w600,
-                                color: brand,
+            ),
+            SizedBox(
+              key: ValueKey<String>('agent-expand-${node.id}'),
+              width: 44,
+              height: 44,
+              child: canExpand
+                  ? Semantics(
+                      button: true,
+                      label: expandLabel,
+                      child: ExcludeSemantics(
+                        child: InkWell(
+                          onTap: onToggle,
+                          borderRadius: BorderRadius.circular(8),
+                          child: Center(
+                            child: FittedBox(
+                              fit: BoxFit.scaleDown,
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  CustomPaint(
+                                    size: const Size(12, 12),
+                                    painter: _AgentTrianglePainter(
+                                      expanded: expanded,
+                                      color: ink2,
+                                    ),
+                                  ),
+                                  Container(
+                                    key: ValueKey<String>(
+                                      'agent-count-${node.id}',
+                                    ),
+                                    margin: const EdgeInsets.only(left: 4),
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 6,
+                                      vertical: 1,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: DshColors.brandSoft(context),
+                                      borderRadius: BorderRadius.circular(8),
+                                    ),
+                                    child: Text(
+                                      '${node.children.length}',
+                                      style: TextStyle(
+                                        fontSize: 10.5,
+                                        fontWeight: FontWeight.w600,
+                                        color: brand,
+                                      ),
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
                           ),
-                        ],
+                        ),
+                      ),
+                    )
+                  : const SizedBox.shrink(),
+            ),
+            Icon(
+              Icons.polyline_outlined,
+              size: 17,
+              color: released ? ink3 : brand,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Semantics(
+                button: !node.isDiagnostic,
+                label: node.isDiagnostic
+                    ? _diagnosticText(node.status)
+                    : '${node.title}，$statusText，$levelHint',
+                hint: node.isDiagnostic ? null : levelHint,
+                child: ExcludeSemantics(
+                  child: InkWell(
+                    key: ValueKey<String>('agent-body-${node.id}'),
+                    onTap: node.isDiagnostic ? null : onOpen,
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          node.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 13.5,
+                            fontWeight: FontWeight.w600,
+                            color: node.isDiagnostic ? ink3 : null,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          [
+                            if (_capped) 'L$level',
+                            node.isDiagnostic
+                                ? _diagnosticText(node.status)
+                                : _subtitleAgentName(node),
+                            if (node.createdAt != null)
+                              relTime(node.createdAt!),
+                          ].join(' · '),
+                          key: ValueKey<String>('agent-subtitle-${node.id}'),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(fontSize: 11.5, color: ink3),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            if (node.isRunning)
+              SizedBox(
+                key: ValueKey<String>('agent-interrupt-${node.id}'),
+                width: 44,
+                height: 44,
+                child: Semantics(
+                  button: true,
+                  label: L10n.t(
+                    '中断子代理 ${node.title}',
+                    'Interrupt subagent ${node.title}',
+                  ),
+                  child: ExcludeSemantics(
+                    child: IconButton(
+                      onPressed: interrupting ? null : onInterrupt,
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints.tightFor(
+                        width: 44,
+                        height: 44,
+                      ),
+                      tooltip: L10n.t('中断子代理', 'Interrupt subagent'),
+                      icon: Icon(
+                        Icons.stop_circle_outlined,
+                        size: 19,
+                        color: interrupting ? ink3 : danger,
                       ),
                     ),
                   ),
-                )
-              else
-                const SizedBox(width: 20),
-              const SizedBox(width: 4),
-              Icon(
-                Icons.polyline_outlined,
-                size: 17,
-                color: released ? ink3 : brand,
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      node.title,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 13.5,
-                        fontWeight: FontWeight.w600,
-                        color: node.isDiagnostic ? ink3 : null,
-                      ),
-                    ),
-                    const SizedBox(height: 2),
-                    Text(
-                      [
-                        node.isDiagnostic
-                            ? _diagnosticText(node.status)
-                            : _subtitleAgentName(node),
-                        if (node.createdAt != null) relTime(node.createdAt!),
-                      ].join(' · '),
-                      key: ValueKey<String>('agent-subtitle-${node.id}'),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontSize: 11.5, color: ink3),
-                    ),
-                  ],
                 ),
-              ),
-              if (node.isRunning)
-                IconButton(
-                  onPressed: interrupting ? null : onInterrupt,
-                  tooltip: L10n.t('中断子代理', 'Interrupt subagent'),
-                  icon: Icon(
-                    Icons.stop_circle_outlined,
-                    size: 19,
-                    color: interrupting ? ink3 : danger,
-                  ),
-                ),
+              )
+            else
               const SizedBox(width: 4),
-            ],
-          ),
+          ],
         ),
       ),
     );
@@ -1417,7 +1470,11 @@ class _AgentTreeRow extends StatelessWidget {
     return name != null && name.isNotEmpty ? name : node.id;
   }
 
-  String _rowAgentName(AgentNode node) => _subtitleAgentName(node);
+  String _statusText(AgentNode node) => node.isDiagnostic
+      ? _diagnosticText(node.status)
+      : node.isRunning
+      ? L10n.t('运行中', 'Running')
+      : L10n.t('空闲', 'Idle');
 
   String _diagnosticText(String status) => switch (status) {
     'corrupt' => L10n.t('目录数据损坏', 'Corrupt catalog'),
@@ -1429,7 +1486,14 @@ class _AgentTreeRow extends StatelessWidget {
 class _TreeRailPainter extends CustomPainter {
   final int levels;
   final Color color;
-  const _TreeRailPainter({required this.levels, required this.color});
+
+  /// level>3：最深一级 rail 画 6dp 缺口，提示“显示封顶”，不新增缩进层级。
+  final bool capped;
+  const _TreeRailPainter({
+    required this.levels,
+    required this.color,
+    this.capped = false,
+  });
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -1438,13 +1502,19 @@ class _TreeRailPainter extends CustomPainter {
       ..strokeWidth = 1;
     for (var i = 0; i < levels; i++) {
       final x = 7.0 + i * 14.0;
-      canvas.drawLine(Offset(x, 0), Offset(x, size.height), paint);
+      if (capped && i == levels - 1) {
+        final mid = size.height / 2;
+        canvas.drawLine(Offset(x, 0), Offset(x, mid - 3), paint);
+        canvas.drawLine(Offset(x, mid + 3), Offset(x, size.height), paint);
+      } else {
+        canvas.drawLine(Offset(x, 0), Offset(x, size.height), paint);
+      }
     }
   }
 
   @override
   bool shouldRepaint(covariant _TreeRailPainter old) =>
-      old.levels != levels || old.color != color;
+      old.levels != levels || old.color != color || old.capped != capped;
 }
 
 class _AgentTrianglePainter extends CustomPainter {
