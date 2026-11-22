@@ -115,6 +115,10 @@ final Api api = Api();
 /// （null = 旧版插件未返回，由调用方按根视图推断，见 sheets.dart dirSepOf）。
 typedef DirListing = ({List<String> dirs, List<String> files, String? sep});
 
+abstract interface class GitTagsApi {
+  Future<GitTagPage> tags(String sessionId, String repositoryId);
+}
+
 abstract interface class GitReadApi {
   Future<GitReadCapabilities> capabilities(String sessionId);
   Future<GitRepository> repository(String sessionId);
@@ -227,7 +231,7 @@ class BaseRotationResult {
   final String identity;
 }
 
-class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
+class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi, GitTagsApi {
   final http.Client _client;
 
   Api({http.Client? client})
@@ -2403,6 +2407,24 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
   }
 
   @override
+  @override
+  Future<GitTagPage> tags(String sessionId, String repositoryId) async {
+    final data = await getJson(
+      _gitQuery('/api/git/tags', {
+        'sessionId': sessionId,
+        'repositoryId': repositoryId,
+      }),
+    );
+    return GitTagPage(
+      tags: (data['tags'] as List? ?? const [])
+          .whereType<Map>()
+          .map((row) => GitTag.fromJson(Map<String, dynamic>.from(row)))
+          .where((tag) => tag.name.isNotEmpty && tag.shortName.isNotEmpty)
+          .toList(),
+      truncated: data['truncated'] == true,
+    );
+  }
+
   Future<List<GitBranch>> branches(
     String sessionId,
     String repositoryId,

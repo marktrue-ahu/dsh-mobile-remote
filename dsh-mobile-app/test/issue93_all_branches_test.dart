@@ -148,8 +148,10 @@ void main() {
       final api = _FakeGitApi();
       final controller = GitBrowserController(api, branchLimit: GitGraphBranchLimit.unlimited);
       await controller.open('session-a');
-      expect(controller.graphAllMode, isTrue);
+      expect(controller.allModeCapable, isTrue);
+      expect(controller.graphAllMode, isFalse);
       await controller.openAllGraph();
+      expect(controller.graphAllMode, isTrue);
       expect(api.allCalls, 1);
       expect(api.requests.single, {
         'all': true,

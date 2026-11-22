@@ -1062,6 +1062,7 @@ fetch/push 序列化 common domain，pull/sync/abort 同时序列化 common 与 
 | GET | `/m/api/git/capabilities` | Git 只读能力与契约版本 |
 | GET | `/m/api/git/repository` | 当前会话 cwd 解析出的仓库标识 |
 | GET | `/m/api/git/branches` | 本地/远程分支列表 |
+| GET | `/m/api/git/tags` | 仓库 tag 列表（v3.3.1 #159） |
 | GET | `/m/api/git/graph` | 1–32 tip 的提交拓扑（分页） |
 | POST | `/m/api/git/graph` | 1–128 tip 的提交拓扑（JSON body，分页/续页） |
 | GET | `/m/api/git/commit` | 提交详情 + 变更文件（分页） |
@@ -1140,6 +1141,17 @@ graph 的每个提交与 commit 详情都**保留旧的** `refs: string[]`（dep
 - **graph 行只保证名称级信息**：`tagsDetail` 条目只含 `name` / `shortName` / `oid` / `annotated`；完整 tag 元数据只在 `commit` 详情返回。
 - **目标不是 commit 的 tag 不会出现在 graph/commit 的 `tagsDetail`**：它们不指向任何提交行，无法挂在某个提交上；provider 契约仍通过 `refs()` 暴露这些 tag（`hint: "non-commit-target"`）。`nested-tag` 因为最终解引用到提交而出现在对应提交的 `tagsDetail`；graph 行按名称级规则省略该 `hint`。
 - **失败降级**：annotated tag 元数据读不到时静默降级为「名字 + `annotated`」，不影响列表展示，不产生错误。
+
+#### 6.19.2b GET /m/api/git/tags（只读 tag 列表，v3.3.1 issue #159）
+
+- 仓库作用域：`sessionId` + `repositoryId`；调用 `provider.refs()` 一次读取，不执行 checkout/写操作。
+- 响应：`{ok:true, repositoryId, tags:[{name,shortName,refOid,targetOid?,annotated,peeled,tagger?,date?,subject?,hint?}], truncated}`。
+  - `targetOid` 为 peel 后的 commit OID；轻量 tag 的 `targetOid==refOid`；附注 tag `peeled=true`。
+  - 目标不是 commit（blob/tree/不可 peel）→ `targetOid:null` + `hint:"non-commit-target"`，App 不提供定位。
+  - 最多 5000 条，超出 `truncated:true`；按 `name` 升序。
+- 旧宿主无 `refs`/`tags` 能力：`features.tags=false`，App 隐藏标签子 Tab；旧 App 忽略。
+- 错误：未授权 403、非仓库 404、provider 不支持 503 `provider-incompatible`；不泄露主机绝对路径。
+- 点击 tag 的图定位复用 `POST /git/graph all=true&focus=targetOid`；tag 不进入选择集。
 
 #### 6.19.3 GET /m/api/git/repository、GET /m/api/git/branches
 

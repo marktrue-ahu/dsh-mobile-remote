@@ -23,6 +23,25 @@ void main() {
       if (request.url.path.endsWith('/branches')) {
         return http.Response(jsonEncode({'branches': []}), 200);
       }
+      if (request.url.path.endsWith('/tags')) {
+        return http.Response(
+          jsonEncode({
+            'truncated': true,
+            'tags': [
+              {
+                'name': 'refs/tags/v1',
+                'shortName': 'v1',
+                'refOid': 'r1',
+                'targetOid': 'c1',
+                'annotated': true,
+                'peeled': true,
+                'hint': null,
+              },
+            ],
+          }),
+          200,
+        );
+      }
       if (request.url.path.endsWith('/worktree')) {
         return http.Response(
           jsonEncode({
@@ -188,5 +207,36 @@ void main() {
     expect(requests[1].url.queryParameters['limit'], '20');
     // 空 q 不发送过滤参数（宿主按"无 q"返回排序后的上限条数）。
     expect(requests[2].url.queryParameters.containsKey('q'), isFalse);
+  });
+
+  test('Git tags API preserves truncated and peeled target', () async {
+    final client = MockClient((request) async {
+      expect(request.url.path, '/m/api/git/tags');
+      return http.Response(
+        jsonEncode({
+          'repositoryId': 'repo',
+          'truncated': true,
+          'tags': [
+            {
+              'name': 'refs/tags/v1',
+              'shortName': 'v1',
+              'refOid': 'r1',
+              'targetOid': 'c1',
+              'annotated': true,
+              'peeled': true,
+            },
+          ],
+        }),
+        200,
+      );
+    });
+    final api = Api(client: client)
+      ..baseUrl = 'https://host.example'
+      ..path = '/m';
+    final page = await api.tags('s', 'repo');
+    expect(page.truncated, isTrue);
+    expect(page.tags.single.shortName, 'v1');
+    expect(page.tags.single.targetOid, 'c1');
+    expect(page.tags.single.peeled, isTrue);
   });
 }
