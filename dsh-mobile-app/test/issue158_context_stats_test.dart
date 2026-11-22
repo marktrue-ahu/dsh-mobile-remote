@@ -105,10 +105,15 @@ Map<String, dynamic> _legacyUsage() => {
 };
 
 class _Backend {
-  _Backend({this.statsStatus = 200, this.statsBody});
+  _Backend({
+    this.statsStatus = 200,
+    this.statsBody,
+    Map<String, dynamic>? usage,
+  }) : usage = usage ?? _legacyUsage();
 
   int statsStatus;
   Map<String, dynamic>? statsBody;
+  Map<String, dynamic> usage;
   int statsCalls = 0;
   int usageCalls = 0;
   Completer<void>? statsGate;
@@ -126,7 +131,7 @@ class _Backend {
             }
             if (path == '/m/api/usage') {
               usageCalls++;
-              return _json(_legacyUsage());
+              return _json(usage);
             }
             if (path == '/m/api/context-stats') {
               statsCalls++;
@@ -256,6 +261,96 @@ void main() {
     );
   });
 
+  testWidgets('pressure 缺失：累计量>窗口也不显示 100%，入口仍可点且三 Tab 独立降级', (tester) async {
+    final backend = _Backend(
+      usage: {
+        'ok': true,
+        'usage': {
+          'inputTokens': 10000,
+          'outputTokens': 10,
+          'cacheReadTokens': 5000,
+          'cacheWriteTokens': 0,
+        },
+        'contextWindow': 8000,
+      },
+      statsBody: {
+        'ok': true,
+        'sessionId': _session,
+        'tokenUsage': {
+          'uncachedInput': 10000,
+          'output': 10,
+          'cacheRead': 5000,
+          'cacheWrite': 0,
+        },
+        'timing': {
+          'turns': 1,
+          'steps': 2,
+          'llmMs': 100,
+          'toolMs': 20,
+          'ttftMs': 30,
+          'decodeMs': 40,
+          'avgTtftMs': 30,
+          'tps': 2.5,
+        },
+      },
+    );
+    await _pumpChat(tester, backend);
+    final trigger = find.byKey(const ValueKey<String>('context-stats-trigger'));
+    expect(trigger, findsOneWidget);
+    expect(tester.getSize(trigger), const Size(44, 44));
+    expect(
+      find.byKey(const ValueKey<String>('context-stats-unknown')),
+      findsOneWidget,
+    );
+    expect(find.textContaining('100%'), findsNothing);
+
+    await _openSheet(tester);
+    final percent = tester.widget<Text>(
+      find.byKey(const ValueKey<String>('context-stats-percent')),
+    );
+    expect(percent.data, '--');
+    expect(find.text('当前电脑端未提供构成'), findsOneWidget);
+
+    await tester.tap(
+      find.byKey(const ValueKey<String>('context-stats-tab-tokens')),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('未缓存输入'), findsOneWidget);
+    await tester.tap(
+      find.byKey(const ValueKey<String>('context-stats-tab-stats')),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('轮次'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('无数据：上下文 -- 仍可点，三 Tab 各自空态', (tester) async {
+    final backend = _Backend(
+      usage: {'ok': true, 'usage': <String, dynamic>{}},
+      statsBody: {'ok': true, 'sessionId': _session},
+    );
+    await _pumpChat(tester, backend);
+    final trigger = find.byKey(const ValueKey<String>('context-stats-trigger'));
+    expect(trigger, findsOneWidget);
+    expect(
+      find.byKey(const ValueKey<String>('context-stats-unknown')),
+      findsOneWidget,
+    );
+    await _openSheet(tester);
+    expect(find.text('等待首次请求后生成构成估算'), findsOneWidget);
+    await tester.tap(
+      find.byKey(const ValueKey<String>('context-stats-tab-tokens')),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('等待首次用量'), findsWidgets);
+    await tester.tap(
+      find.byKey(const ValueKey<String>('context-stats-tab-stats')),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('等待首次用量'), findsWidgets);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('旧宿主：context-stats 404 → /usage 回退，构成/统计明确降级', (tester) async {
     final backend = _Backend(statsStatus: 404);
     await _pumpChat(tester, backend);
@@ -380,6 +475,40 @@ void main() {
     await tester.pump(const Duration(milliseconds: 800));
     await tester.pumpAndSettle();
     expect(backend.statsCalls, afterCurrent, reason: '别的会话不得刷新/串数据');
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('刷新失败：保留旧值但显示过期提示 + 重试', (tester) async {
+    final backend = _Backend();
+    await _pumpChat(tester, backend);
+    await _openSheet(tester);
+    expect(find.text('系统提示'), findsOneWidget);
+
+    backend.statsStatus = 500;
+    await tester.tap(
+      find.byKey(const ValueKey<String>('context-stats-refresh')),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey<String>('context-stats-stale-notice')),
+      findsOneWidget,
+    );
+    expect(find.textContaining('数据可能已过期'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey<String>('context-stats-stale-retry')),
+      findsOneWidget,
+    );
+    expect(find.text('系统提示'), findsOneWidget, reason: '旧值仍保留');
+
+    backend.statsStatus = 200;
+    await tester.tap(
+      find.byKey(const ValueKey<String>('context-stats-stale-retry')),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey<String>('context-stats-stale-notice')),
+      findsNothing,
+    );
     expect(tester.takeException(), isNull);
   });
 

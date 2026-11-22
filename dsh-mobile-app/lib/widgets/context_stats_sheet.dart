@@ -22,6 +22,8 @@ Future<void> showContextStatsSheet(
   required String sessionId,
   required String model,
   required Map<String, dynamic> fallbackUsage,
+  ContextStatsSnapshot? initialSnapshot,
+  ValueChanged<ContextStatsSnapshot>? onSnapshot,
 }) {
   return showModalBottomSheet<void>(
     context: context,
@@ -44,6 +46,8 @@ Future<void> showContextStatsSheet(
           sessionId: sessionId,
           model: model,
           fallbackUsage: fallbackUsage,
+          initialSnapshot: initialSnapshot,
+          onSnapshot: onSnapshot,
         ),
       );
     },
@@ -57,6 +61,12 @@ class ContextStatsSheet extends StatefulWidget {
   final String model;
   final Map<String, dynamic> fallbackUsage;
 
+  /// 聊天页已经拿到的最新快照：先渲染，避免打开时闪空；随后仍会刷新。
+  final ContextStatsSnapshot? initialSnapshot;
+
+  /// 刷新成功/回退成功后回传聊天页，保证输入区圆环与抽屉同一份 pressure 来源。
+  final ValueChanged<ContextStatsSnapshot>? onSnapshot;
+
   const ContextStatsSheet({
     super.key,
     required this.api,
@@ -64,6 +74,8 @@ class ContextStatsSheet extends StatefulWidget {
     required this.sessionId,
     required this.model,
     required this.fallbackUsage,
+    this.initialSnapshot,
+    this.onSnapshot,
   });
 
   @override
@@ -74,6 +86,7 @@ class _ContextStatsSheetState extends State<ContextStatsSheet>
     with SingleTickerProviderStateMixin {
   late final TabController _tabs = TabController(length: 3, vsync: this);
   ContextStatsSnapshot? _snapshot;
+  DateTime? _updatedAt;
   bool _loading = false;
   String? _error;
   Timer? _refreshDebounce;
@@ -84,6 +97,8 @@ class _ContextStatsSheetState extends State<ContextStatsSheet>
     super.initState();
     widget.store.addListener(_onStoreChanged);
     widget.store.addChatListener(_onChatEvent);
+    _snapshot = widget.initialSnapshot;
+    if (_snapshot != null) _updatedAt = DateTime.now();
     _load();
   }
 
@@ -140,8 +155,10 @@ class _ContextStatsSheetState extends State<ContextStatsSheet>
       if (!mounted || request != _request) return;
       setState(() {
         _snapshot = snapshot;
+        _updatedAt = DateTime.now();
         _loading = false;
       });
+      widget.onSnapshot?.call(snapshot);
     } catch (e) {
       if (!mounted || request != _request) return;
       // 旧宿主（404/not-found）回退现有 /usage；其他失败保留已有快照并提示。
@@ -168,11 +185,31 @@ class _ContextStatsSheetState extends State<ContextStatsSheet>
       // 旧宿主连 /usage 都失败时仍用页面已有 usage（页面圆环可能已有数据），不伪造。
     }
     if (!mounted || request != _request) return;
+    final snapshot = ContextStatsSnapshot.fromLegacyUsage(usage);
     setState(() {
-      _snapshot = ContextStatsSnapshot.fromLegacyUsage(usage);
+      _snapshot = snapshot;
+      _updatedAt = DateTime.now();
       _loading = false;
       _error = null;
     });
+    widget.onSnapshot?.call(snapshot);
+  }
+
+  String _staleTimeLabel() {
+    final at = _updatedAt;
+    if (at == null) return '';
+    return '（上次更新 ${_clockLabel(at)}）';
+  }
+
+  String _staleTimeLabelEn() {
+    final at = _updatedAt;
+    if (at == null) return '';
+    return ' (last updated ${_clockLabel(at)})';
+  }
+
+  String _clockLabel(DateTime at) {
+    String two(int value) => value.toString().padLeft(2, '0');
+    return '${two(at.hour)}:${two(at.minute)}:${two(at.second)}';
   }
 
   @override
@@ -283,17 +320,23 @@ class _ContextStatsSheetState extends State<ContextStatsSheet>
     final ink3 = DshColors.ink3(context);
     return Column(
       children: [
-        if (snapshot.legacyFallback || _error != null)
+        if (_error != null)
           _NoticeBar(
-            text: snapshot.legacyFallback
-                ? L10n.t(
-                    '部分数据来自旧版 /usage 近似值；不可用的构成/统计会明确标注。',
-                    'Some data comes from legacy /usage approximations; unavailable tabs are marked.',
-                  )
-                : L10n.t(
-                    '刷新失败，显示的是上一次数据。',
-                    'Refresh failed; showing the previous data.',
-                  ),
+            key: const ValueKey<String>('context-stats-stale-notice'),
+            text: L10n.t(
+              '刷新失败，数据可能已过期${_staleTimeLabel()}',
+              'Refresh failed; data may be stale${_staleTimeLabelEn()}',
+            ),
+            actionKey: const ValueKey<String>('context-stats-stale-retry'),
+            actionLabel: L10n.t('重试', 'Retry'),
+            onAction: _loading ? null : _load,
+          )
+        else if (snapshot.legacyFallback)
+          _NoticeBar(
+            text: L10n.t(
+              '部分数据来自旧版 /usage 近似值；不可用的构成/统计会明确标注。',
+              'Some data comes from legacy /usage approximations; unavailable tabs are marked.',
+            ),
           ),
         _SummaryCard(snapshot: snapshot),
         TabBar(
@@ -864,7 +907,17 @@ class _EmptyHint extends StatelessWidget {
 
 class _NoticeBar extends StatelessWidget {
   final String text;
-  const _NoticeBar({required this.text});
+  final String? actionLabel;
+  final VoidCallback? onAction;
+  final Key? actionKey;
+
+  const _NoticeBar({
+    super.key,
+    required this.text,
+    this.actionLabel,
+    this.onAction,
+    this.actionKey,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -872,15 +925,32 @@ class _NoticeBar extends StatelessWidget {
     return Container(
       width: double.infinity,
       margin: const EdgeInsets.fromLTRB(16, 2, 16, 6),
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      padding: const EdgeInsets.fromLTRB(10, 5, 6, 5),
       decoration: BoxDecoration(
         color: DshColors.brandSoft(context),
         borderRadius: BorderRadius.circular(8),
         border: Border.all(color: DshColors.line(context)),
       ),
-      child: Text(
-        text,
-        style: TextStyle(fontSize: 11, color: ink2, height: 1.35),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              text,
+              style: TextStyle(fontSize: 11, color: ink2, height: 1.35),
+            ),
+          ),
+          if (actionLabel != null)
+            TextButton(
+              key: actionKey,
+              onPressed: onAction,
+              style: TextButton.styleFrom(
+                minimumSize: const Size(44, 32),
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+              child: Text(actionLabel!, style: const TextStyle(fontSize: 11.5)),
+            ),
+        ],
       ),
     );
   }

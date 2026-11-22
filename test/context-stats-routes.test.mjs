@@ -42,13 +42,24 @@ class FakeRequest extends EventEmitter {
 	on() { return this; } pause() {}
 }
 
-function createHarness({ projections = {}, sessionExists = true } = {}) {
+// wireValues 是客户端可见的 wire view（与宿主 unit 的 wire.view 同形状）：
+//   contextPressure: {pressureTokens?,projectedTokens?,contextWindow?}
+//   contextBreakdown: {systemTokens,toolsTokens,messageTokens}
+//   tokenUsage: {uncachedInputTokens,outputTokens,cacheReadTokens,cacheWriteTokens}
+//   sessionStats: {turns,steps,llmMs,toolMs,ttftMs,ttftSteps,decodeMs,decodeTokens}
+// rawStates 刻意返回错误形状（tokenUsage.totals / contextBreakdown.breakdown /
+// contextPressure 无 projected），用于证明 endpoint 只读 snapshot.values。
+function createHarness({ wireValues = {}, rawStates = {}, asOfSeq = 7, sessionExists = true } = {}) {
 	const routes = [];
 	const events = [{ seq: 1, type: "turn/start", data: { turn: 1 } }, { seq: 7, type: "turn/end", data: { turn: 1 } }];
 	const session = sessionExists ? { id: "s-158", snapshotEvents: () => events } : undefined;
 	const provided = new Map([
 		["sessions", { get: (id) => (id === "s-158" ? session : undefined), list: () => (session ? [session] : []) }],
-		["sessionProjections", { stateOf: (s, key) => (s === session ? projections[key] : undefined) }],
+		["sessionProjections", {
+			snapshot: (s, keys) => (s === session ? { asOfSeq, values: wireValues } : { asOfSeq: -1, values: {} }),
+			// 旧实现读的就是 raw state；这里给错误形状，若再回退 stateOf 测试会立刻失败。
+			stateOf: (s, key) => (s === session ? rawStates[key] : undefined),
+		}],
 	]);
 	const ctx = {
 		webServer: { host: "127.0.0.1", port: 43130, register(spec) { routes.push(spec); return () => {}; } },
@@ -83,7 +94,7 @@ const FULL = {
 };
 
 test("完整投影：四块字段/百分比/缓存命中率/TTFT/TPS/来源/asOfSeq", async () => {
-	const h = createHarness({ projections: FULL });
+	const h = createHarness({ wireValues: FULL });
 	const { status, body } = await call(h.route);
 	h.clean();
 	assert.equal(status, 200);
@@ -105,7 +116,7 @@ test("完整投影：四块字段/百分比/缓存命中率/TTFT/TPS/来源/asOf
 });
 
 test("缺投影：省略四块、不返回 0 冒充（仅 ok/sessionId/asOfSeq）", async () => {
-	const h = createHarness({ projections: {} });
+	const h = createHarness({ wireValues: {} });
 	const { status, body } = await call(h.route);
 	h.clean();
 	assert.equal(status, 200);
@@ -114,7 +125,7 @@ test("缺投影：省略四块、不返回 0 冒充（仅 ok/sessionId/asOfSeq�
 
 test("部分投影：缺的 block 省略，不整页失败", async () => {
 	const h = createHarness({
-		projections: {
+		wireValues: {
 			contextPressure: { contextWindow: 8000 },
 			contextBreakdown: { systemTokens: 1, toolsTokens: 2 }, // 缺 messageTokens
 			tokenUsage: { uncachedInputTokens: 1, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0 },
@@ -132,7 +143,7 @@ test("部分投影：缺的 block 省略，不整页失败", async () => {
 
 test("zero billed：不计算 cacheHitRate，不伪造 0 命中率", async () => {
 	const h = createHarness({
-		projections: {
+		wireValues: {
 			tokenUsage: { uncachedInputTokens: 0, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0 },
 		},
 	});
@@ -140,6 +151,32 @@ test("zero billed：不计算 cacheHitRate，不伪造 0 命中率", async () =>
 	h.clean();
 	assert.equal(body.tokenUsage.cacheHitRate, undefined);
 	assert.equal(body.tokenUsage.output, 5);
+});
+
+test("只读 wire snapshot：raw state 的错误形状不得泄漏/回退", async () => {
+	const h = createHarness({
+		wireValues: {
+			contextPressure: { pressureTokens: 1000, projectedTokens: 5000, contextWindow: 8000 },
+			contextBreakdown: { systemTokens: 400, toolsTokens: 600, messageTokens: 800 },
+			tokenUsage: { uncachedInputTokens: 100, outputTokens: 50, cacheReadTokens: 300, cacheWriteTokens: 100 },
+			sessionStats: { turns: 1, steps: 1, llmMs: 10, toolMs: 20, ttftMs: 30, ttftSteps: 1, decodeMs: 40, decodeTokens: 5 },
+		},
+		rawStates: {
+			// 真实 raw state 形状：tokenUsage 顶层是 totals/last；breakdown 包一层；
+			// pressure 没有 projectedTokens。
+			tokenUsage: { totals: { uncachedInputTokens: 999 }, last: null },
+			contextBreakdown: { breakdown: { systemTokens: 999, toolsTokens: 999, messageTokens: 999 } },
+			contextPressure: { pressureTokens: 111, contextWindow: 9999 },
+		},
+	});
+	const { body } = await call(h.route);
+	h.clean();
+	assert.equal(body.pressure.projectedTokens, 5000, "projected 必须来自 wire.view");
+	assert.equal(body.pressure.percent, 63, "percent 用 projected/window 而非 raw pressure");
+	assert.equal(body.breakdown.systemTokens, 400, "breakdown 必须来自 wire 扁平值");
+	assert.equal(body.tokenUsage.uncachedInput, 100, "tokenUsage 必须来自 wire 扁平值");
+	assert.equal(body.timing.turns, 1);
+	assert.equal(body.asOfSeq, 7);
 });
 
 test("会话不存在 404；缺 sessionId 400；方法不符拒绝", async () => {
