@@ -2605,12 +2605,9 @@ class AppStore extends ChangeNotifier {
         final fetchedCatalog = await api.catalog();
         if (!_hostReadStillCurrent(catalogStamp)) return;
         catalog = fetchedCatalog;
+        // 复用 guarded 方法：sessionId/连接代在 await 后再次核对。
         if (sessionId != null) {
-          try {
-            sessionConfig = await api.sessionConfig(sessionId!);
-          } catch (_) {
-            /* 冷会话保持旧值 */
-          }
+          await refreshSessionConfig();
         }
         notifyListeners();
       } catch (_) {
@@ -2623,8 +2620,11 @@ class AppStore extends ChangeNotifier {
 
   /// 拉取模型目录（新建会话弹层懒加载用），成功返回目录、失败返回 null。
   Future<Catalog?> refreshCatalog({bool force = false}) async {
+    final stamp = _hostReadStamp();
     try {
-      catalog = await api.catalog(refresh: force);
+      final fetched = await api.catalog(refresh: force);
+      if (!_hostReadStillCurrent(stamp)) return null;
+      catalog = fetched;
       notifyListeners();
       return catalog;
     } catch (_) {

@@ -40,6 +40,40 @@ class _DelayedNotifApi extends _StoreApi {
   }
 }
 
+class _DelayedHostReadApi extends _StoreApi {
+  Completer<Catalog>? catalogGate;
+  Completer<SessionConfig>? configGate;
+  bool catalogUsed = false;
+  bool configUsed = false;
+
+  @override
+  Future<Catalog> catalog({bool refresh = false}) {
+    final gate = catalogGate;
+    if (gate != null && !catalogUsed) {
+      catalogUsed = true;
+      return gate.future;
+    }
+    return Future.value(Catalog(
+      models: const [],
+      permissionPresets: const [],
+      agentPresets: const [],
+      defaults: const {},
+      rechargeUrl: '',
+      providers: const [],
+    ));
+  }
+
+  @override
+  Future<SessionConfig> sessionConfig(String sessionId) {
+    final gate = configGate;
+    if (gate != null && !configUsed) {
+      configUsed = true;
+      return gate.future;
+    }
+    return Future.value(SessionConfig(model: 'b-model'));
+  }
+}
+
 class _CountingStoreApi extends _StoreApi {
   int requests = 0;
 
@@ -1287,5 +1321,57 @@ void main() {
     expect(store.notifs, isEmpty);
     expect(store.unread, 0);
     expect(newNotifCalls, 0);
+  });
+
+  test('A catalog 迟到、A config 迟到均不写 B 模型/权限/目录', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    var host = 'host-a';
+    final api = _DelayedHostReadApi();
+    final manager = ConnectionManager(
+      api: api,
+      credentials: MemoryCredentialStore(),
+      probeBootstrap: (_) async => {'plugin': {'hostId': host}},
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    a.hostId = 'host-a';
+    manager.profiles[0] = a;
+    final b = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: 'B',
+      baseUrls: ['https://b.example.com/m'],
+      hostId: 'host-b',
+    );
+    manager.profiles.add(b);
+    await manager.credentials.writeToken(b.id, 'b-token');
+    final store = AppStore(apiClient: api)..attachConnections(manager);
+    addTearDown(store.disposeBridge);
+    store.sessionId = 'same-session';
+
+    api.catalogGate = Completer<Catalog>();
+    final catalogRead = store.refreshCatalog();
+    api.configGate = Completer<SessionConfig>();
+    final configRead = store.refreshSessionConfig();
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+    host = 'host-b';
+    expect(await store.switchProfile(b.id), isNull);
+
+    api.catalogGate!.complete(Catalog(
+      models: [CatalogModel(provider: 'a', id: 'a-model', name: 'A')],
+      permissionPresets: const [],
+      agentPresets: const [],
+      defaults: const {},
+      rechargeUrl: '',
+      providers: const [],
+    ));
+    api.configGate!.complete(SessionConfig(model: 'a-model', permissionPreset: 'a-perm'));
+    await catalogRead;
+    await configRead;
+    expect(store.catalog?.models.any((m) => m.id == 'a-model'), isNot(true));
+    expect(store.sessionConfig.model, isNot('a-model'));
+    expect(store.sessionConfig.permissionPreset, isNot('a-perm'));
   });
 }
