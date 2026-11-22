@@ -25,6 +25,30 @@ class _StoreApi extends Api {
   Stream<Map<String, dynamic>> eventsRaw() => controller.stream;
 }
 
+class _RotatingSseApi extends Api {
+  int connections = 0;
+  bool firstCancelled = false;
+  StreamController<Map<String, dynamic>>? current;
+
+  @override
+  Stream<Map<String, dynamic>> eventsRaw() {
+    connections++;
+    final controller = StreamController<Map<String, dynamic>>();
+    controller.onCancel = () {
+      if (connections == 1) firstCancelled = true;
+    };
+    if (connections == 1) {
+      scheduleMicrotask(() {
+        controller.addError(TimeoutException('blackhole'));
+        controller.close();
+      });
+    } else {
+      current = controller;
+    }
+    return controller.stream;
+  }
+}
+
 class _DelayedNotifApi extends _StoreApi {
   Completer<List<AppNotification>>? gate;
   bool used = false;
@@ -105,6 +129,14 @@ class _FailingActivateStore extends MemoryCredentialStore {
   Future<void> activate(String profileId) async {
     throw StateError('keystore-unavailable');
   }
+}
+
+Future<void> waitFor(bool Function() condition, {String label = '条件'}) async {
+  for (var i = 0; i < 400; i++) {
+    if (condition()) return;
+    await Future<void>.delayed(const Duration(milliseconds: 25));
+  }
+  fail('等待「$label」超时');
 }
 
 void main() {
@@ -1373,5 +1405,46 @@ void main() {
     expect(store.catalog?.models.any((m) => m.id == 'a-model'), isNot(true));
     expect(store.sessionConfig.model, isNot('a-model'));
     expect(store.sessionConfig.permissionPreset, isNot('a-perm'));
+  });
+
+  test('真实 SSE onError→候选验证→A2 hello：旧流取消、新订阅建立', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a1.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    final api = _RotatingSseApi();
+    final manager = ConnectionManager(
+      api: api,
+      credentials: MemoryCredentialStore(),
+      probeClient: MockClient((_) async => http.Response(
+        '{"ok":true,"plugin":{"hostId":"host-a"}}',
+        200,
+        headers: {'content-type': 'application/json'},
+      )),
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    a.hostId = 'host-a';
+    a.baseUrls = ['https://a1.example.com', 'https://a2.example.com'];
+    manager.profiles[0] = a;
+    api.hostIdentity = 'host-a';
+    api.baseUrls = ['https://a1.example.com', 'https://a2.example.com'];
+    api.baseUrl = 'https://a1.example.com';
+    final store = AppStore(apiClient: api)..attachConnections(manager);
+    addTearDown(store.disposeBridge);
+
+    store.connect();
+    await waitFor(() => api.connections >= 2, label: 'A2 SSE 重建');
+    api.current!.add({
+      'type': 'hello',
+      'hostId': 'host-a',
+      'capabilities': <String, dynamic>{},
+    });
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(store.connState, 'connected');
+    expect(api.baseUrl, 'https://a2.example.com');
+    expect(manager.active!.primaryBase, 'https://a2.example.com');
+    expect(api.connections, greaterThanOrEqualTo(2));
+    expect(api.firstCancelled, isTrue, reason: '旧 SSE 必须被取消');
   });
 }
