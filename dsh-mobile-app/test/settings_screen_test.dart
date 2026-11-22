@@ -10,6 +10,9 @@ import 'package:dsh_mobile_app/theme.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+import 'settings_tabs_helper.dart';
+
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -36,6 +39,7 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
+    await selectSettingsTab(tester, '通用');
     final gitTabsIcon = find.byIcon(Icons.tab_outlined);
     await tester.scrollUntilVisible(
       gitTabsIcon,
@@ -64,6 +68,7 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
+    await selectSettingsTab(tester, '通用');
     final scrollable = find.byType(Scrollable).first;
     await tester.scrollUntilVisible(
       find.text('插件管理'),
@@ -111,6 +116,7 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
+    await selectSettingsTab(tester, '通知');
 
     final recovery = find.text('通知权限未开启');
     await tester.scrollUntilVisible(
@@ -277,6 +283,7 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
+      await selectSettingsTab(tester, '通用');
       final title = find.text('更新电脑端插件');
       await tester.scrollUntilVisible(
         title,
@@ -404,6 +411,8 @@ void main() {
     );
     await tester.pumpAndSettle();
     final title = find.text('最近一次插件更新：失败');
+    // #155：目标项在对应 Tab，真实切换到该 Tab 后再滚动。
+    await selectSettingsTab(tester, '通用');
     await tester.scrollUntilVisible(
       title,
       240,
@@ -504,6 +513,8 @@ void main() {
     );
     await tester.pump();
     await tester.pump(const Duration(seconds: 1));
+    // #155：目标项在对应 Tab，真实切换到该 Tab 后再滚动。
+    await selectSettingsTab(tester, '通用');
     await tester.scrollUntilVisible(
       find.text('更新电脑端插件'),
       240,
@@ -575,6 +586,8 @@ void main() {
       );
       await tester.pump();
       await tester.pump(const Duration(seconds: 1));
+      // #155：目标项在对应 Tab，真实切换到该 Tab 后再滚动。
+      await selectSettingsTab(tester, '通用');
       await tester.scrollUntilVisible(
         find.text('更新电脑端插件'),
         240,
@@ -626,6 +639,8 @@ void main() {
     await tester.pumpAndSettle();
 
     final rowText = find.text('显示隐藏文件');
+    // #155：目标项在对应 Tab，真实切换到该 Tab 后再滚动。
+    await selectSettingsTab(tester, '通用');
     await tester.scrollUntilVisible(
       rowText,
       300,

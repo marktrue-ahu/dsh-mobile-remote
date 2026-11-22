@@ -7,6 +7,9 @@ import 'package:dsh_mobile_app/theme.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+import 'settings_tabs_helper.dart';
+
 import 'package:shared_preferences/shared_preferences.dart';
 
 Future<AppStore> _store() async {
@@ -73,12 +76,14 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
+    await selectSettingsTab(tester, '通用');
     await tester.scrollUntilVisible(
       find.text('日志记录级别'),
       260,
       scrollable: find.byType(Scrollable).first,
     );
     await tester.pumpAndSettle();
+    await selectSettingsTab(tester, '通用');
     expect(find.text('日志记录级别'), findsOneWidget);
     expect(find.text('信息'), findsOneWidget, reason: '默认 info');
 
@@ -114,6 +119,7 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
+    await selectSettingsTab(tester, '通用');
     await tester.scrollUntilVisible(
       find.text('日志记录级别'),
       300,

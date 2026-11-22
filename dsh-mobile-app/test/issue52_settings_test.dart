@@ -8,6 +8,9 @@ import 'package:dsh_mobile_app/store.dart';
 import 'package:dsh_mobile_app/turn_process.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+import 'settings_tabs_helper.dart';
+
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
@@ -37,6 +40,7 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
+    await selectSettingsTab(tester, '对话');
   }
 
   Future<void> openRow(WidgetTester tester, String title, IconData icon) async {
@@ -46,7 +50,11 @@ void main() {
       scrollable: find.byType(Scrollable).first,
     );
     await tester.pumpAndSettle();
-    await tester.tap(find.ancestor(of: find.byIcon(icon), matching: find.byType(InkWell)).first);
+    await tester.tap(
+      find
+          .ancestor(of: find.byIcon(icon), matching: find.byType(InkWell))
+          .first,
+    );
     await tester.pumpAndSettle();
     expect(find.text(title), findsWidgets);
   }
@@ -92,7 +100,8 @@ void main() {
   });
 
   testWidgets('设置页展示当前档位说明', (tester) async {
-    final store = await makeStore()..stepDisplayMode = WorkStepDisplayMode.detailed;
+    final store = await makeStore()
+      ..stepDisplayMode = WorkStepDisplayMode.detailed;
     await pumpSettings(tester, store);
 
     await tester.scrollUntilVisible(
@@ -127,5 +136,4 @@ void main() {
     expect(find.text('思考内容'), findsNothing);
     expect(find.text('思维链默认展开'), findsNothing);
   });
-
 }

@@ -637,7 +637,12 @@ class SettingsScreen extends StatefulWidget {
   State<SettingsScreen> createState() => _SettingsScreenState();
 }
 
-class _SettingsScreenState extends State<SettingsScreen> {
+class _SettingsScreenState extends State<SettingsScreen>
+    with SingleTickerProviderStateMixin {
+  static int _lastTabIndex = 0;
+  late final TabController _tabController;
+  int _tabIndex = 0;
+
   UsageSnapshot? _usage;
   String? _usageError; // partial | outdated | failed；build 时再翻译
   bool _usageBusy = false; // 用量与额度刷新中
@@ -667,6 +672,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
   @override
   void initState() {
     super.initState();
+    final connected =
+        widget.store.connections?.active != null &&
+        widget.store.connState == 'connected';
+    _tabIndex = connected ? _lastTabIndex.clamp(0, 4) : 0;
+    _tabController = TabController(
+      length: 5,
+      vsync: this,
+      initialIndex: _tabIndex,
+    )..addListener(_onTabChanged);
     _refreshUsage();
     _loadAppVersion();
     _initBubbleState();
@@ -866,10 +880,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   @override
   void dispose() {
+    _tabController.removeListener(_onTabChanged);
+    _tabController.dispose();
     _diagTimer?.cancel();
     _progressTimer?.cancel();
     widget.store.removeListener(_onStoreChanged);
     super.dispose();
+  }
+
+  void _onTabChanged() {
+    if (_tabController.indexIsChanging) return;
+    final next = _tabController.index;
+    if (next == _tabIndex) return;
+    setState(() => _tabIndex = next);
+    _lastTabIndex = next;
   }
 
   void _onStoreChanged() {
@@ -950,7 +974,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
       final epoch = store.api.connectionEpoch;
       final identity = store.api.connectionIdentity;
       final data = await store.api.getJson('/api/bootstrap');
-      store.api.absorbBootstrapIfCurrent(data, epoch: epoch, identity: identity);
+      store.api.absorbBootstrapIfCurrent(
+        data,
+        epoch: epoch,
+        identity: identity,
+      );
     } catch (_) {
       // 宿主重启期间会短暂失败：保留旧状态，等下一次轮询。
     }
@@ -1365,76 +1393,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
       });
     } catch (_) {
       // 读取失败时版本行显示 App 端为「…」
-    }
-  }
-
-  /// 手动切换连接地址（回家想切回局域网 / 出门想切蒲公英时用）。
-  Future<void> _pickAddress() async {
-    final candidates = api.baseUrls;
-    if (candidates.isEmpty) return;
-    final current = api.baseUrl;
-    final choice = await showModalBottomSheet<String>(
-      context: context,
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 14, 20, 6),
-              child: Text(
-                L10n.t('选择连接地址', 'Choose address'),
-                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
-              ),
-            ),
-            // 候选地址随使用动态累积（局域网/组网/历史地址），列表区可滚动防溢出
-            Flexible(
-              child: ListView(
-                shrinkWrap: true,
-                children: [
-                  for (final c in candidates)
-                    ListTile(
-                      dense: true,
-                      leading: Icon(
-                        c == current
-                            ? Icons.check_circle
-                            : Icons.circle_outlined,
-                        size: 18,
-                        color: c == current
-                            ? DshColors.brand(context)
-                            : DshColors.ink3(context),
-                      ),
-                      title: Text(
-                        c,
-                        style: TextStyle(
-                          fontSize: 13.5,
-                          color: c == current ? DshColors.brand(context) : null,
-                        ),
-                      ),
-                      onTap: () => Navigator.of(ctx).pop(c),
-                    ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 6),
-          ],
-        ),
-      ),
-    );
-    if (choice == null || choice == current || !mounted) return;
-    final err = await widget.store.switchBase(choice);
-    if (!mounted) return;
-    if (err != null) {
-      ScaffoldMessenger.of(context)
-        ..clearSnackBars()
-        ..showSnackBar(
-          SnackBar(
-            content: Text(err),
-            duration: const Duration(milliseconds: 2000),
-            behavior: SnackBarBehavior.floating,
-          ),
-        );
-    } else {
-      showToast(context, L10n.t('已切换 → ', 'Switched to ') + choice);
     }
   }
 
@@ -2186,11 +2144,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   @override
   Widget build(BuildContext context) {
     final store = widget.store;
-    final ink3 = DshColors.ink3(context);
     final brand = DshColors.brand(context);
     final danger = DshColors.danger(context);
-    final ok = DshColors.ok(context);
-    final warn = DshColors.warn(context);
 
     String permName(String? id) => permNameOf(id) ?? '…';
     String presetName(String? id) => switch (id) {
@@ -2201,614 +2156,638 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _ => '…',
     };
 
-    return ListView(
-      padding: const EdgeInsets.all(16),
+    final factor = MediaQuery.textScalerOf(context).scale(1.0);
+    final width = MediaQuery.sizeOf(context).width;
+    // 中文 2 字标签在 320×1.5 可五等分；英文标签更长，窄屏大字号退化为可滚动，
+    // 不压字号、不裁字（设计要求的五等分以中文标签为基准）。
+    final scrollableTabs =
+        factor >= 1.9 || (L10n.lang == 'en' && width <= 340 && factor >= 1.25);
+    final tabLabels = [
+      L10n.t('连接', 'Connect'),
+      L10n.t('对话', 'Chat'),
+      L10n.t('外观', 'Style'),
+      L10n.t('通知', 'Alerts'),
+      L10n.t('通用', 'General'),
+    ];
+    return Column(
       children: [
-        _card(L10n.t('连接', 'Connection'), [
-          _row(
-            leading: const Icon(Icons.computer_outlined),
-            title: L10n.t('电脑地址', 'PC address'),
-            sub: api.baseUrls.length > 1
-                ? L10n.t(
-                    '${api.baseUrl} · 共 ${api.baseUrls.length} 个地址自动切换 · 点按手动切换',
-                    '${api.baseUrl} · ${api.baseUrls.length} addresses · tap to switch',
-                  )
-                : api.baseUrl,
-            onTap: () => _pickAddress(),
-            // 连接状态实时显示（修复：旧版写死「已连接」，断线也显示绿色已连接）
-            trailing: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Container(
-                  width: 8,
-                  height: 8,
-                  decoration: BoxDecoration(
-                    color: switch (store.connState) {
-                      'connected' => ok,
-                      'connecting' => warn,
-                      _ => ink3,
-                    },
-                    shape: BoxShape.circle,
-                  ),
-                ),
-                const SizedBox(width: 5),
-                Text(
-                  switch (store.connState) {
-                    'connected' => L10n.t('已连接', 'Connected'),
-                    'connecting' => L10n.t('连接中…', 'Connecting…'),
-                    _ => L10n.t('离线 · 自动重连', 'Offline · reconnecting'),
-                  },
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: switch (store.connState) {
-                      'connected' => ok,
-                      'connecting' => warn,
-                      _ => ink3,
-                    },
-                  ),
-                ),
-                IconButton(
-                  key: const ValueKey('settings-manage-connections'),
-                  tooltip: L10n.t('连接档案', 'Connections'),
-                  onPressed: () => showConnectionProfilesScreen(context, store),
-                  icon: const Icon(Icons.list_alt, size: 18),
-                  visualDensity: VisualDensity.compact,
+        TabBar(
+          controller: _tabController,
+          isScrollable: scrollableTabs,
+          tabAlignment: scrollableTabs ? TabAlignment.center : null,
+          labelPadding: const EdgeInsets.symmetric(horizontal: 2),
+          labelStyle: const TextStyle(
+            fontSize: 13.5,
+            fontWeight: FontWeight.w600,
+          ),
+          unselectedLabelStyle: const TextStyle(
+            fontSize: 13.5,
+            fontWeight: FontWeight.w600,
+          ),
+          indicatorSize: TabBarIndicatorSize.tab,
+          dividerColor: DshColors.line(context),
+          tabs: [for (final label in tabLabels) Tab(height: 44, text: label)],
+        ),
+        Expanded(
+          child: ListView(
+            key: PageStorageKey<String>('settings-tab-$_tabIndex'),
+            padding: _tabIndex == 0
+                ? const EdgeInsets.symmetric(vertical: 8)
+                : const EdgeInsets.all(16),
+            children: [
+              if (_tabIndex == 0) ...[
+                ConnectionSettingsSection(store: store),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: _card(L10n.t('连接', 'Connection'), [
+                    _row(
+                      leading: const Icon(Icons.settings_outlined),
+                      title: L10n.t('重新配置连接', 'Reconfigure connection'),
+                      sub: L10n.t('更换电脑地址或访问口令', 'Change PC address or token'),
+                      trailing: Text(
+                        L10n.t('配置 ▸', 'Configure ▸'),
+                        style: TextStyle(fontSize: 12, color: brand),
+                      ),
+                      onTap: () => widget.onReconfigure(),
+                    ),
+                  ]),
                 ),
               ],
-            ),
-          ),
-          _row(
-            leading: const Icon(Icons.settings_outlined),
-            title: L10n.t('重新配置连接', 'Reconfigure connection'),
-            sub: L10n.t('更换电脑地址或访问口令', 'Change PC address or token'),
-            trailing: Text(
-              L10n.t('配置 ▸', 'Configure ▸'),
-              style: TextStyle(fontSize: 12, color: brand),
-            ),
-            onTap: () => widget.onReconfigure(),
-          ),
-        ]),
-        // v3.1.2：推送通道自检（配置在电脑端 cordis.patch.yml 的 pushUrls）
-        _card(L10n.t('通知', 'Notifications'), [
-          _row(
-            leading: const Icon(Icons.notifications_active_outlined),
-            title: L10n.t('发送测试通知', 'Send test notification'),
-            sub: L10n.t(
-              '验证推送通道（电脑端 cordis.patch.yml 配置）',
-              'Verify push channels (configured on the PC)',
-            ),
-            trailing: Text(
-              L10n.t('发送 ▸', 'Send ▸'),
-              style: TextStyle(fontSize: 12, color: brand),
-            ),
-            onTap: _sendTestPush,
-          ),
-        ]),
-        _card(L10n.t('默认配置', 'Defaults'), [
-          _row(
-            leading: const Icon(Icons.security_outlined),
-            title: L10n.t('默认权限预设', 'Default permission'),
-            sub: L10n.t('作用于之后新建的会话', 'Applies to new sessions'),
-            trailing: Text(
-              permName(store.catalog?.defaults['permissionPreset'] as String?),
-              style: TextStyle(fontSize: 12, color: brand),
-            ),
-            onTap: () => _pickDefaultPerm(store),
-          ),
-          _row(
-            leading: const Icon(Icons.bolt_outlined),
-            title: L10n.t('默认 Agent 预设', 'Default agent preset'),
-            sub: L10n.t('作用于之后新建的会话', 'Applies to new sessions'),
-            trailing: Text(
-              presetName(store.catalog?.defaults['agentPreset'] as String?),
-              style: TextStyle(fontSize: 12, color: brand),
-            ),
-            onTap: () => _pickDefaultPreset(store),
-          ),
-          _row(
-            leading: const Icon(Icons.dns_outlined),
-            title: L10n.t('模型提供商', 'Model providers'),
-            sub: L10n.t(
-              '与 PC 端「设置 → 模型」同一配置通道',
-              'Same channel as PC Settings → Models',
-            ),
-            trailing: Text(
-              L10n.t('管理', 'Manage'),
-              style: TextStyle(fontSize: 12, color: brand),
-            ),
-            onTap: () {
-              // Phase 2：与模型弹层共用提供商页打开入口
-              openProviders(context, store);
-            },
-          ),
-        ]),
-        _card(L10n.t('账户', 'Account'), [
-          _row(
-            leading: const Icon(Icons.account_balance_wallet_outlined),
-            title: L10n.t('用量与额度', 'Usage & allowance'),
-            sub: _usageLabel,
-            trailing: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  _usage == null
-                      ? '—'
-                      : '${_usage!.sources.where((source) => source.available).length}',
-                  style: TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.w600,
-                    color: _deepSeekLow ? danger : brand,
+              // v3.1.2：推送通道自检（配置在电脑端 cordis.patch.yml 的 pushUrls）
+              if (_tabIndex == 3)
+                _card(L10n.t('通知', 'Notifications'), [
+                  _row(
+                    leading: const Icon(Icons.notifications_active_outlined),
+                    title: L10n.t('发送测试通知', 'Send test notification'),
+                    sub: L10n.t(
+                      '验证推送通道（电脑端 cordis.patch.yml 配置）',
+                      'Verify push channels (configured on the PC)',
+                    ),
+                    trailing: Text(
+                      L10n.t('发送 ▸', 'Send ▸'),
+                      style: TextStyle(fontSize: 12, color: brand),
+                    ),
+                    onTap: _sendTestPush,
                   ),
-                ),
-                if (_usageBusy)
-                  const Padding(
-                    padding: EdgeInsets.only(left: 8),
-                    child: SizedBox(
-                      width: 14,
-                      height: 14,
-                      child: CircularProgressIndicator(strokeWidth: 2),
+                  _row(
+                    leading: const Icon(Icons.notifications_active_outlined),
+                    title: L10n.t('余额预警', 'Low-balance alert'),
+                    sub:
+                        L10n.t(
+                          '余额低于 ¥',
+                          'Remind to top up when balance is below ¥',
+                        ) +
+                        _fmtThreshold(store.balanceThreshold) +
+                        L10n.t(' 时提醒充值（点此修改）', ' — tap to change'),
+                    onTap: _pickThreshold,
+                    trailing: DshSwitch(
+                      value: store.balanceAlert,
+                      onChanged: (v) => store.setBalanceAlert(v),
                     ),
                   ),
-              ],
-            ),
-            onTap: _openUsage,
-          ),
-          _row(
-            leading: const Icon(Icons.add_card_outlined),
-            title: L10n.t('充值', 'Top up'),
-            sub: L10n.t('跳转 DeepSeek 开放平台', 'Go to DeepSeek Open Platform'),
-            trailing: Text(
-              L10n.t('去充值 ▸', 'Top up ▸'),
-              style: TextStyle(fontSize: 12, color: brand),
-            ),
-            onTap: () => launchUrl(
-              // 以电脑端插件配置为准（catalog.rechargeUrl），缺省回退官方充值页
-              Uri.parse(
-                store.catalog?.rechargeUrl ??
-                    'https://platform.deepseek.com/top_up',
-              ),
-              mode: LaunchMode.externalApplication,
-            ),
-          ),
-          _row(
-            leading: const Icon(Icons.notifications_active_outlined),
-            title: L10n.t('余额预警', 'Low-balance alert'),
-            // v2.7.1：副标题动态显示当前阈值
-            sub:
-                L10n.t('余额低于 ¥', 'Remind to top up when balance is below ¥') +
-                _fmtThreshold(store.balanceThreshold) +
-                L10n.t(' 时提醒充值（点此修改）', ' — tap to change'),
-            onTap: _pickThreshold,
-            trailing: DshSwitch(
-              value: store.balanceAlert,
-              onChanged: (v) => store.setBalanceAlert(v),
-            ),
-          ),
-        ]),
-        _appearanceCard(),
-        _card(L10n.t('显示', 'Display'), [
-          _row(
-            leading: const Icon(Icons.tab_outlined),
-            title: L10n.t('Git 标签页', 'Git tabs'),
-            sub: _gitTabsSummary,
-            onTap: _pickGitTabs,
-          ),
-          // issue #86：分支图选中上限（全局偏好，下次打开分支图生效）。
-          _row(
-            key: const Key('settings-git-graph-limit'),
-            leading: const Icon(Icons.account_tree_outlined),
-            title: L10n.t('Git 分支图上限', 'Git branch graph limit'),
-            sub: _gitGraphLimitSub,
-            trailing: Text(
-              _gitGraphLimitSummary,
-              style: TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
-                color: brand,
-              ),
-            ),
-            onTap: _pickGitGraphLimit,
-          ),
-          // issue #52（ADR 0027 §2）：轮次过程折叠的工作步骤展示模式与收起时机。
-          // 偏好只存手机本地；改动即时重算时间线（store.notifyListeners）。
-          //
-          // issue #53（§6.20）：这三个能力位是旧插件缺失的增量契约——旧插件下两卡与
-          // 展示模式设置都不显示（不按宿主/App 版本推断，只看服务端显式声明）。
-          if (store.api.turnTailCapabilities.available) ...[
-            _row(
-              leading: const Icon(Icons.tune_outlined),
-              title: L10n.t('工作步骤展示模式', 'Work-step display mode'),
-              sub: _stepDisplayModeSummary(store.stepDisplayMode),
-              onTap: () => _pickStepDisplayMode(store),
-            ),
-            _row(
-              leading: const Icon(Icons.unfold_less_outlined),
-              title: L10n.t('过程收起时机', 'Process fold timing'),
-              sub: store.turnFoldTiming == TurnFoldTiming.onNewMessage
-                  ? L10n.t(
-                      '下次有新消息时收起上一轮（含电脑端发来的）',
-                      'Fold the previous turn when the next message arrives (including from desktop)',
-                    )
-                  : L10n.t(
-                      '回答结束后立即收起已完成轮次的过程',
-                      'Fold a completed turn as soon as its answer ends',
+                ]),
+              if (_tabIndex == 1)
+                _card(L10n.t('默认配置', 'Defaults'), [
+                  _row(
+                    leading: const Icon(Icons.security_outlined),
+                    title: L10n.t('默认权限预设', 'Default permission'),
+                    sub: L10n.t('作用于之后新建的会话', 'Applies to new sessions'),
+                    trailing: Text(
+                      permName(
+                        store.catalog?.defaults['permissionPreset'] as String?,
+                      ),
+                      style: TextStyle(fontSize: 12, color: brand),
                     ),
-              onTap: () => _pickTurnFoldTiming(store),
-            ),
-          ],
-          _row(
-            leading: const Icon(Icons.bug_report_outlined),
-            title: L10n.t('对话调试模式', 'Conversation debug mode'),
-            sub: L10n.t(
-              '显示工具原始参数、结果、事件序号与未知可见事件（默认关闭）',
-              'Show raw tool IO, event metadata and unknown visible events (off by default)',
-            ),
-            trailing: DshSwitch(
-              value: store.timelineDebug,
-              onChanged: (v) => store.setTimelineDebug(v),
-            ),
-          ),
-          _row(
-            leading: const Icon(Icons.dark_mode_outlined),
-            title: L10n.t('深色模式', 'Dark mode'),
-            sub: switch (store.darkMode) {
-              'dark' => L10n.t('已选深色', 'Dark'),
-              'light' => L10n.t('已选浅色', 'Light'),
-              _ => L10n.t('跟随系统', 'System'),
-            },
-            trailing: GestureDetector(
-              onTap: () {
-                final next = switch (store.darkMode) {
-                  'system' => 'dark',
-                  'dark' => 'light',
-                  _ => 'system',
-                };
-                store.setDarkMode(next);
-              },
-              child: Text(switch (store.darkMode) {
-                'dark' => L10n.t('深色', 'Dark'),
-                'light' => L10n.t('浅色', 'Light'),
-                _ => L10n.t('跟随系统', 'System'),
-              }, style: TextStyle(fontSize: 13, color: brand)),
-            ),
-          ),
-          _row(
-            leading: const Icon(Icons.language_outlined),
-            title: L10n.t('语言', 'Language'),
-            sub: L10n.t('界面显示语言（即时生效）', 'UI language (applies immediately)'),
-            onTap: () => _pickLanguage(store),
-            trailing: Text(
-              store.language == 'en' ? 'English' : '中文',
-              style: TextStyle(fontSize: 13, color: brand),
-            ),
-          ),
-          _row(
-            leading: const Icon(Icons.pets_outlined),
-            title: L10n.t('桌面宠物（大肥鱼）', 'Desktop pet (BigFish)'),
-            sub: L10n.t(
-              '显示任务状态/通知/余额，点它互动，长按打开面板（默认关）',
-              'Shows task status / notifications / balance; tap to interact, long-press for panel (off by default)',
-            ),
-            trailing: DshSwitch(value: _bubbleOn, onChanged: _toggleBubble),
-          ),
-          _row(
-            leading: const Icon(Icons.notifications_paused_outlined),
-            title: L10n.t(
-              '后台提醒（常驻通知）',
-              'Background alerts (persistent notice)',
-            ),
-            sub: NotifyDiag.summary(
-              keepAliveEnabled: _keepAliveOn,
-              keepAliveError: BackgroundKeepAlive.instance.lastError,
-            ),
-            trailing: DshSwitch(
-              value: _keepAliveOn,
-              onChanged: _toggleKeepAlive,
-            ),
-          ),
-          if (_keepAliveOn && !NotifyDiag.notificationsEnabled)
-            _row(
-              leading: const Icon(Icons.notifications_off_outlined),
-              title: L10n.t('通知权限未开启', 'Notification permission is off'),
-              // 永久拒绝后 requestNotificationsPermission() 不再弹窗，只能去系统设置开。
-              sub: L10n.t(
-                '保活在跑，但提醒不会显示——点这里去开启',
-                'The service runs, but alerts stay hidden — tap to enable',
-              ),
-              trailing: const Icon(Icons.chevron_right),
-              onTap: () async {
-                final ok = await BackgroundKeepAlive.instance
-                    .openNotificationSettings();
-                if (!mounted) return;
-                if (!ok) {
-                  showToast(
-                    this.context,
-                    L10n.t(
-                      '打不开系统设置，请手动进入「应用 → 通知」',
-                      'Cannot open settings; go to App → Notifications',
-                    ),
-                  );
-                }
-              },
-            ),
-          if (_keepAliveOn)
-            _row(
-              leading: const Icon(Icons.battery_saver_outlined),
-              title: L10n.t('系统省电设置', 'Battery settings'),
-              // 真机结论：开了前台服务仍会被 ROM 冻结（后台 90 秒零日志），
-              // 必须把应用设为「不受限制/允许后台运行」才能真正常驻。
-              sub: L10n.t(
-                '国产 ROM 默认会冻结后台应用，请把本应用设为「不受限制」',
-                'Some ROMs freeze background apps; set this app to "Unrestricted"',
-              ),
-              trailing: const Icon(Icons.chevron_right),
-              onTap: () async {
-                final ok = await BackgroundKeepAlive.instance
-                    .openBatterySettings();
-                if (!mounted) return;
-                if (!ok) {
-                  showToast(
-                    this.context,
-                    L10n.t(
-                      '打不开系统设置，请手动进入「电池 → 应用省电策略」',
-                      'Cannot open settings; go to Battery → App battery usage',
-                    ),
-                  );
-                }
-              },
-            ),
-          _row(
-            leading: const Icon(Icons.straighten_outlined),
-            title: L10n.t('宠物大小', 'Pet size'),
-            sub: L10n.t('迷你 / 标准 / 大', 'Mini / Standard / Large'),
-            trailing: Text(
-              _petSizeLabel(widget.store.petHeight),
-              style: TextStyle(fontSize: 12, color: brand),
-            ),
-            onTap: () => _pickPetSize(widget.store),
-          ),
-          _row(
-            leading: const Icon(Icons.vertical_align_bottom_outlined),
-            title: L10n.t('贴边自动躲藏', 'Auto-hide at edge'),
-            sub: L10n.t(
-              '5 秒无操作后缩到屏幕边缘并虚化',
-              'Tuck into the edge and fade after 5s idle',
-            ),
-            trailing: DshSwitch(
-              value: widget.store.petEdgeHide,
-              onChanged: (v) => widget.store.setPetEdgeHide(v),
-            ),
-          ),
-          _row(
-            leading: const Icon(Icons.phone_iphone_outlined),
-            title: L10n.t('App 在前台时收起', 'Hide while the app is open'),
-            sub: L10n.t(
-              '避免和首页角色同屏，也不再挡住按钮',
-              'Avoids doubling with the home character and covering buttons',
-            ),
-            trailing: DshSwitch(
-              value: widget.store.petHideInApp,
-              onChanged: (v) => widget.store.setPetHideInApp(v),
-            ),
-          ),
-          _row(
-            leading: const Icon(Icons.help_outline),
-            title: L10n.t('桌面宠物操作说明', 'Pet guide'),
-            sub: L10n.t('状态含义与手势操作', 'Status meaning and gestures'),
-            trailing: Text(
-              L10n.t('查看 ▸', 'View ▸'),
-              style: TextStyle(fontSize: 12, color: brand),
-            ),
-            onTap: _showBubbleGuide,
-          ),
-        ]),
-        _card(L10n.t('文件浏览', 'File browsing'), [
-          _row(
-            leading: const Icon(Icons.visibility_outlined),
-            title: L10n.t('显示隐藏文件', 'Show hidden files'),
-            sub: L10n.t(
-              '会话文件浏览中显示点开头的文件与目录（.git 始终隐藏；不影响目录选择器）',
-              'Show dot-prefixed files and folders in session file browsing (.git stays hidden; directory picker unaffected)',
-            ),
-            trailing: DshSwitch(
-              value: widget.store.showHiddenFiles,
-              onChanged: (v) => widget.store.setShowHiddenFiles(v),
-            ),
-          ),
-        ]),
-        _card(L10n.t('插件', 'Plugins'), [
-          _row(
-            leading: const Icon(Icons.extension_outlined),
-            title: L10n.t('插件管理', 'Plugins'),
-            sub: L10n.t(
-              '当前电脑的插件清单、版本与健康（只读）',
-              'Installed plugins, versions and health on this computer (read-only)',
-            ),
-            trailing: Text(
-              L10n.t('查看 ▸', 'View ▸'),
-              style: TextStyle(fontSize: 12, color: brand),
-            ),
-            onTap: () => Navigator.of(context).push(
-              MaterialPageRoute(
-                builder: (_) => PluginInventoryScreen(store: widget.store),
-              ),
-            ),
-          ),
-        ]),
-        _card(L10n.t('关于', 'About'), [
-          _row(
-            leading: const Icon(Icons.info_outline),
-            title: L10n.t('版本', 'Version'),
-            sub:
-                'App v${_appVersion.isEmpty ? '…' : _appVersion}'
-                ' · ${L10n.t('插件', 'plugin')} v${store.api.pluginVersion.isEmpty ? '…' : store.api.pluginVersion}'
-                '${_alignmentNote()}'
-                '${store.updateCandidate != null ? ' · ${L10n.t('有新版本', 'update available')} ${store.updateCandidate!.version}' : ''}',
-            onTap: store.updateCandidate == null
-                ? null
-                : () {
-                    final candidate = store.updateCandidate;
-                    if (candidate != null) {
-                      unawaited(runUpdateFlow(context, store, candidate));
-                    }
-                  },
-            trailing: store.updateCandidate != null
-                ? Icon(
-                    Icons.brightness_1,
-                    size: 9,
-                    color: DshColors.danger(context),
-                  )
-                : (store.alignment.needsAttention
-                      ? Icon(
-                          Icons.brightness_1,
-                          size: 9,
-                          color: DshColors.danger(context),
-                        )
-                      : null),
-          ),
-          // 插件更新入口常驻（与桌面「连接移动端」页一致）：即使还不知道有没有新版，
-          // 手机也必须能主动触发宿主侧只读检查；有进行中的记录时可点开「处理」。
-          // 已知候选时按本机形态给「更新」/「指引」，未检查时给「检查」。
-          // 不能自更新的形态给出**对应那一条**可复制指引（评审 R11）。
-          _row(
-            leading: const Icon(Icons.desktop_windows_outlined),
-            title: L10n.t('更新电脑端插件', 'Update desktop plugin'),
-            sub: _pluginCheckRunning
-                ? L10n.t('正在检查…', 'Checking…')
-                : _pendingPluginCheckId != null
-                ? L10n.t(
-                    '上次检查仍在电脑端进行，点击继续检查',
-                    'The previous check is still running; tap to continue',
-                  )
-                : store.pluginUpdateJournal != null
-                ? _journalSub(store)
-                : !store.api.pluginUpdate.contentUpdateAvailable
-                ? L10n.t(
-                    '检查电脑端插件是否有可用更新',
-                    'Check the desktop plugin for updates',
-                  )
-                : store.api.pluginUpdate.canSelfUpdate
-                ? L10n.t(
-                    '电脑端插件有新版本：可在这里直接触发更新',
-                    'A newer desktop plugin is available — trigger the update here',
-                  )
-                : L10n.t(
-                    '电脑端插件有新版本：本机形态需按指引更新',
-                    'A newer desktop plugin is available — follow the guide for your install',
+                    onTap: () => _pickDefaultPerm(store),
                   ),
-            onTap: _pluginCheckRunning
-                ? null
-                : store.pluginUpdateJournal != null
-                ? () => unawaited(_updateJournalActions(store))
-                : (!store.api.pluginUpdate.contentUpdateAvailable ||
-                          store.api.pluginUpdate.canSelfUpdate
-                      ? _triggerPluginUpdate
-                      : _showPluginUpdateGuidance),
-            trailing: _pluginCheckRunning
-                ? Text(
-                    L10n.t('检查中…', 'Checking…'),
-                    style: TextStyle(fontSize: 12, color: brand),
-                  )
-                : _pendingPluginCheckId != null
-                ? Text(
-                    L10n.t('继续检查 ▸', 'Continue ▸'),
-                    style: TextStyle(fontSize: 12, color: brand),
-                  )
-                : store.pluginUpdateJournal == null
-                ? Text(
-                    !store.api.pluginUpdate.contentUpdateAvailable
-                        ? L10n.t('检查 ▸', 'Check ▸')
+                  _row(
+                    leading: const Icon(Icons.bolt_outlined),
+                    title: L10n.t('默认 Agent 预设', 'Default agent preset'),
+                    sub: L10n.t('作用于之后新建的会话', 'Applies to new sessions'),
+                    trailing: Text(
+                      presetName(
+                        store.catalog?.defaults['agentPreset'] as String?,
+                      ),
+                      style: TextStyle(fontSize: 12, color: brand),
+                    ),
+                    onTap: () => _pickDefaultPreset(store),
+                  ),
+                  _row(
+                    leading: const Icon(Icons.dns_outlined),
+                    title: L10n.t('模型提供商', 'Model providers'),
+                    sub: L10n.t(
+                      '与 PC 端「设置 → 模型」同一配置通道',
+                      'Same channel as PC Settings → Models',
+                    ),
+                    trailing: Text(
+                      L10n.t('管理', 'Manage'),
+                      style: TextStyle(fontSize: 12, color: brand),
+                    ),
+                    onTap: () {
+                      // Phase 2：与模型弹层共用提供商页打开入口
+                      openProviders(context, store);
+                    },
+                  ),
+                ]),
+              if (_tabIndex == 4)
+                _card(L10n.t('账户', 'Account'), [
+                  _row(
+                    leading: const Icon(Icons.account_balance_wallet_outlined),
+                    title: L10n.t('用量与额度', 'Usage & allowance'),
+                    sub: _usageLabel,
+                    trailing: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          _usage == null
+                              ? '—'
+                              : '${_usage!.sources.where((source) => source.available).length}',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600,
+                            color: _deepSeekLow ? danger : brand,
+                          ),
+                        ),
+                        if (_usageBusy)
+                          const Padding(
+                            padding: EdgeInsets.only(left: 8),
+                            child: SizedBox(
+                              width: 14,
+                              height: 14,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                          ),
+                      ],
+                    ),
+                    onTap: _openUsage,
+                  ),
+                  _row(
+                    leading: const Icon(Icons.add_card_outlined),
+                    title: L10n.t('充值', 'Top up'),
+                    sub: L10n.t(
+                      '跳转 DeepSeek 开放平台',
+                      'Go to DeepSeek Open Platform',
+                    ),
+                    trailing: Text(
+                      L10n.t('去充值 ▸', 'Top up ▸'),
+                      style: TextStyle(fontSize: 12, color: brand),
+                    ),
+                    onTap: () => launchUrl(
+                      // 以电脑端插件配置为准（catalog.rechargeUrl），缺省回退官方充值页
+                      Uri.parse(
+                        store.catalog?.rechargeUrl ??
+                            'https://platform.deepseek.com/top_up',
+                      ),
+                      mode: LaunchMode.externalApplication,
+                    ),
+                  ),
+                ]),
+              if (_tabIndex == 2) _appearanceCard(),
+              if (_tabIndex == 1)
+                _card(L10n.t('对话行为', 'Conversation'), [
+                  if (store.api.turnTailCapabilities.available) ...[
+                    _row(
+                      leading: const Icon(Icons.tune_outlined),
+                      title: L10n.t('工作步骤展示模式', 'Work-step display mode'),
+                      sub: _stepDisplayModeSummary(store.stepDisplayMode),
+                      onTap: () => _pickStepDisplayMode(store),
+                    ),
+                    _row(
+                      leading: const Icon(Icons.unfold_less_outlined),
+                      title: L10n.t('过程收起时机', 'Process fold timing'),
+                      sub: store.turnFoldTiming == TurnFoldTiming.onNewMessage
+                          ? L10n.t(
+                              '下次有新消息时收起上一轮（含电脑端发来的）',
+                              'Fold the previous turn when the next message arrives (including from desktop)',
+                            )
+                          : L10n.t(
+                              '回答结束后立即收起已完成轮次的过程',
+                              'Fold a completed turn as soon as its answer ends',
+                            ),
+                      onTap: () => _pickTurnFoldTiming(store),
+                    ),
+                  ],
+                  _row(
+                    leading: const Icon(Icons.bug_report_outlined),
+                    title: L10n.t('对话调试模式', 'Conversation debug mode'),
+                    sub: L10n.t(
+                      '显示工具原始参数、结果、事件序号与未知可见事件（默认关闭）',
+                      'Show raw tool IO, event metadata and unknown visible events (off by default)',
+                    ),
+                    trailing: DshSwitch(
+                      value: store.timelineDebug,
+                      onChanged: (v) => store.setTimelineDebug(v),
+                    ),
+                  ),
+                ]),
+              if (_tabIndex == 2)
+                _card(L10n.t('外观与交互', 'Appearance & interaction'), [
+                  _row(
+                    leading: const Icon(Icons.dark_mode_outlined),
+                    title: L10n.t('深色模式', 'Dark mode'),
+                    sub: switch (store.darkMode) {
+                      'dark' => L10n.t('已选深色', 'Dark'),
+                      'light' => L10n.t('已选浅色', 'Light'),
+                      _ => L10n.t('跟随系统', 'System'),
+                    },
+                    trailing: GestureDetector(
+                      onTap: () {
+                        final next = switch (store.darkMode) {
+                          'system' => 'dark',
+                          'dark' => 'light',
+                          _ => 'system',
+                        };
+                        store.setDarkMode(next);
+                      },
+                      child: Text(switch (store.darkMode) {
+                        'dark' => L10n.t('深色', 'Dark'),
+                        'light' => L10n.t('浅色', 'Light'),
+                        _ => L10n.t('跟随系统', 'System'),
+                      }, style: TextStyle(fontSize: 13, color: brand)),
+                    ),
+                  ),
+                  _row(
+                    leading: const Icon(Icons.language_outlined),
+                    title: L10n.t('语言', 'Language'),
+                    sub: L10n.t(
+                      '界面显示语言（即时生效）',
+                      'UI language (applies immediately)',
+                    ),
+                    onTap: () => _pickLanguage(store),
+                    trailing: Text(
+                      store.language == 'en' ? 'English' : '中文',
+                      style: TextStyle(fontSize: 13, color: brand),
+                    ),
+                  ),
+                  _row(
+                    leading: const Icon(Icons.pets_outlined),
+                    title: L10n.t('桌面宠物（大肥鱼）', 'Desktop pet (BigFish)'),
+                    sub: L10n.t(
+                      '显示任务状态/通知/余额，点它互动，长按打开面板（默认关）',
+                      'Shows task status / notifications / balance; tap to interact, long-press for panel (off by default)',
+                    ),
+                    trailing: DshSwitch(
+                      value: _bubbleOn,
+                      onChanged: _toggleBubble,
+                    ),
+                  ),
+                  _row(
+                    leading: const Icon(Icons.straighten_outlined),
+                    title: L10n.t('宠物大小', 'Pet size'),
+                    sub: L10n.t('迷你 / 标准 / 大', 'Mini / Standard / Large'),
+                    trailing: Text(
+                      _petSizeLabel(widget.store.petHeight),
+                      style: TextStyle(fontSize: 12, color: brand),
+                    ),
+                    onTap: () => _pickPetSize(widget.store),
+                  ),
+                  _row(
+                    leading: const Icon(Icons.vertical_align_bottom_outlined),
+                    title: L10n.t('贴边自动躲藏', 'Auto-hide at edge'),
+                    sub: L10n.t(
+                      '5 秒无操作后缩到屏幕边缘并虚化',
+                      'Tuck into the edge and fade after 5s idle',
+                    ),
+                    trailing: DshSwitch(
+                      value: widget.store.petEdgeHide,
+                      onChanged: (v) => widget.store.setPetEdgeHide(v),
+                    ),
+                  ),
+                  _row(
+                    leading: const Icon(Icons.phone_iphone_outlined),
+                    title: L10n.t('App 在前台时收起', 'Hide while the app is open'),
+                    sub: L10n.t(
+                      '避免和首页角色同屏，也不再挡住按钮',
+                      'Avoids doubling with the home character and covering buttons',
+                    ),
+                    trailing: DshSwitch(
+                      value: widget.store.petHideInApp,
+                      onChanged: (v) => widget.store.setPetHideInApp(v),
+                    ),
+                  ),
+                  _row(
+                    leading: const Icon(Icons.help_outline),
+                    title: L10n.t('桌面宠物操作说明', 'Pet guide'),
+                    sub: L10n.t('状态含义与手势操作', 'Status meaning and gestures'),
+                    trailing: Text(
+                      L10n.t('查看 ▸', 'View ▸'),
+                      style: TextStyle(fontSize: 12, color: brand),
+                    ),
+                    onTap: _showBubbleGuide,
+                  ),
+                ]),
+              if (_tabIndex == 3)
+                _card(L10n.t('后台提醒', 'Background alerts'), [
+                  _row(
+                    leading: const Icon(Icons.notifications_paused_outlined),
+                    title: L10n.t(
+                      '后台提醒（常驻通知）',
+                      'Background alerts (persistent notice)',
+                    ),
+                    sub: NotifyDiag.summary(
+                      keepAliveEnabled: _keepAliveOn,
+                      keepAliveError: BackgroundKeepAlive.instance.lastError,
+                    ),
+                    trailing: DshSwitch(
+                      value: _keepAliveOn,
+                      onChanged: _toggleKeepAlive,
+                    ),
+                  ),
+                  if (_keepAliveOn && !NotifyDiag.notificationsEnabled)
+                    _row(
+                      leading: const Icon(Icons.notifications_off_outlined),
+                      title: L10n.t(
+                        '通知权限未开启',
+                        'Notification permission is off',
+                      ),
+                      sub: L10n.t(
+                        '保活在跑，但提醒不会显示——点这里去开启',
+                        'The service runs, but alerts stay hidden — tap to enable',
+                      ),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () async {
+                        final ok = await BackgroundKeepAlive.instance
+                            .openNotificationSettings();
+                        if (!mounted) return;
+                        if (!ok) {
+                          showToast(
+                            this.context,
+                            L10n.t(
+                              '打不开系统设置，请手动进入「应用 → 通知」',
+                              'Cannot open settings; go to App → Notifications',
+                            ),
+                          );
+                        }
+                      },
+                    ),
+                  if (_keepAliveOn)
+                    _row(
+                      leading: const Icon(Icons.battery_saver_outlined),
+                      title: L10n.t('系统省电设置', 'Battery settings'),
+                      sub: L10n.t(
+                        '国产 ROM 默认会冻结后台应用，请把本应用设为「不受限制」',
+                        'Some ROMs freeze background apps; set this app to "Unrestricted"',
+                      ),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () async {
+                        final ok = await BackgroundKeepAlive.instance
+                            .openBatterySettings();
+                        if (!mounted) return;
+                        if (!ok) {
+                          showToast(
+                            this.context,
+                            L10n.t(
+                              '打不开系统设置，请手动进入「电池 → 应用省电策略」',
+                              'Cannot open settings; go to Battery → App battery usage',
+                            ),
+                          );
+                        }
+                      },
+                    ),
+                ]),
+              if (_tabIndex == 4)
+                _card(L10n.t('Git', 'Git'), [
+                  _row(
+                    leading: const Icon(Icons.tab_outlined),
+                    title: L10n.t('Git 标签页', 'Git tabs'),
+                    sub: _gitTabsSummary,
+                    onTap: _pickGitTabs,
+                  ),
+                  _row(
+                    key: const Key('settings-git-graph-limit'),
+                    leading: const Icon(Icons.account_tree_outlined),
+                    title: L10n.t('Git 分支图上限', 'Git branch graph limit'),
+                    sub: _gitGraphLimitSub,
+                    trailing: Text(
+                      _gitGraphLimitSummary,
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: brand,
+                      ),
+                    ),
+                    onTap: _pickGitGraphLimit,
+                  ),
+                ]),
+              if (_tabIndex == 4)
+                _card(L10n.t('文件浏览', 'File browsing'), [
+                  _row(
+                    leading: const Icon(Icons.visibility_outlined),
+                    title: L10n.t('显示隐藏文件', 'Show hidden files'),
+                    sub: L10n.t(
+                      '会话文件浏览中显示点开头的文件与目录（.git 始终隐藏；不影响目录选择器）',
+                      'Show dot-prefixed files and folders in session file browsing (.git stays hidden; directory picker unaffected)',
+                    ),
+                    trailing: DshSwitch(
+                      value: widget.store.showHiddenFiles,
+                      onChanged: (v) => widget.store.setShowHiddenFiles(v),
+                    ),
+                  ),
+                ]),
+              if (_tabIndex == 4)
+                _card(L10n.t('插件', 'Plugins'), [
+                  _row(
+                    leading: const Icon(Icons.extension_outlined),
+                    title: L10n.t('插件管理', 'Plugins'),
+                    sub: L10n.t(
+                      '当前电脑的插件清单、版本与健康（只读）',
+                      'Installed plugins, versions and health on this computer (read-only)',
+                    ),
+                    trailing: Text(
+                      L10n.t('查看 ▸', 'View ▸'),
+                      style: TextStyle(fontSize: 12, color: brand),
+                    ),
+                    onTap: () => Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) =>
+                            PluginInventoryScreen(store: widget.store),
+                      ),
+                    ),
+                  ),
+                ]),
+              if (_tabIndex == 4)
+                _card(L10n.t('关于', 'About'), [
+                  _row(
+                    leading: const Icon(Icons.info_outline),
+                    title: L10n.t('版本', 'Version'),
+                    sub:
+                        'App v${_appVersion.isEmpty ? '…' : _appVersion}'
+                        ' · ${L10n.t('插件', 'plugin')} v${store.api.pluginVersion.isEmpty ? '…' : store.api.pluginVersion}'
+                        '${_alignmentNote()}'
+                        '${store.updateCandidate != null ? ' · ${L10n.t('有新版本', 'update available')} ${store.updateCandidate!.version}' : ''}',
+                    onTap: store.updateCandidate == null
+                        ? null
+                        : () {
+                            final candidate = store.updateCandidate;
+                            if (candidate != null) {
+                              unawaited(
+                                runUpdateFlow(context, store, candidate),
+                              );
+                            }
+                          },
+                    trailing: store.updateCandidate != null
+                        ? Icon(
+                            Icons.brightness_1,
+                            size: 9,
+                            color: DshColors.danger(context),
+                          )
+                        : (store.alignment.needsAttention
+                              ? Icon(
+                                  Icons.brightness_1,
+                                  size: 9,
+                                  color: DshColors.danger(context),
+                                )
+                              : null),
+                  ),
+                  // 插件更新入口常驻（与桌面「连接移动端」页一致）：即使还不知道有没有新版，
+                  // 手机也必须能主动触发宿主侧只读检查；有进行中的记录时可点开「处理」。
+                  // 已知候选时按本机形态给「更新」/「指引」，未检查时给「检查」。
+                  // 不能自更新的形态给出**对应那一条**可复制指引（评审 R11）。
+                  _row(
+                    leading: const Icon(Icons.desktop_windows_outlined),
+                    title: L10n.t('更新电脑端插件', 'Update desktop plugin'),
+                    sub: _pluginCheckRunning
+                        ? L10n.t('正在检查…', 'Checking…')
+                        : _pendingPluginCheckId != null
+                        ? L10n.t(
+                            '上次检查仍在电脑端进行，点击继续检查',
+                            'The previous check is still running; tap to continue',
+                          )
+                        : store.pluginUpdateJournal != null
+                        ? _journalSub(store)
+                        : !store.api.pluginUpdate.contentUpdateAvailable
+                        ? L10n.t(
+                            '检查电脑端插件是否有可用更新',
+                            'Check the desktop plugin for updates',
+                          )
                         : store.api.pluginUpdate.canSelfUpdate
-                        ? L10n.t('更新 ▸', 'Update ▸')
-                        : L10n.t('指引 ▸', 'Guide ▸'),
-                    style: TextStyle(fontSize: 12, color: brand),
-                  )
-                : Text(
-                    L10n.t('处理 ▸', 'Manage ▸'),
-                    style: TextStyle(fontSize: 12, color: brand),
+                        ? L10n.t(
+                            '电脑端插件有新版本：可在这里直接触发更新',
+                            'A newer desktop plugin is available — trigger the update here',
+                          )
+                        : L10n.t(
+                            '电脑端插件有新版本：本机形态需按指引更新',
+                            'A newer desktop plugin is available — follow the guide for your install',
+                          ),
+                    onTap: _pluginCheckRunning
+                        ? null
+                        : store.pluginUpdateJournal != null
+                        ? () => unawaited(_updateJournalActions(store))
+                        : (!store.api.pluginUpdate.contentUpdateAvailable ||
+                                  store.api.pluginUpdate.canSelfUpdate
+                              ? _triggerPluginUpdate
+                              : _showPluginUpdateGuidance),
+                    trailing: _pluginCheckRunning
+                        ? Text(
+                            L10n.t('检查中…', 'Checking…'),
+                            style: TextStyle(fontSize: 12, color: brand),
+                          )
+                        : _pendingPluginCheckId != null
+                        ? Text(
+                            L10n.t('继续检查 ▸', 'Continue ▸'),
+                            style: TextStyle(fontSize: 12, color: brand),
+                          )
+                        : store.pluginUpdateJournal == null
+                        ? Text(
+                            !store.api.pluginUpdate.contentUpdateAvailable
+                                ? L10n.t('检查 ▸', 'Check ▸')
+                                : store.api.pluginUpdate.canSelfUpdate
+                                ? L10n.t('更新 ▸', 'Update ▸')
+                                : L10n.t('指引 ▸', 'Guide ▸'),
+                            style: TextStyle(fontSize: 12, color: brand),
+                          )
+                        : Text(
+                            L10n.t('处理 ▸', 'Manage ▸'),
+                            style: TextStyle(fontSize: 12, color: brand),
+                          ),
                   ),
-          ),
-          if (store.api.pluginUpdate.transaction != null ||
-              store.pluginUpdateJournal != null ||
-              store.api.pluginUpdate.checkLog.isNotEmpty)
-            _updateProgressCard(store),
-          _row(
-            leading: const Icon(Icons.sync_outlined),
-            title: L10n.t('检查 App 更新', 'Check App updates'),
-            sub: store.updateChecking
-                ? L10n.t('检查中…', 'Checking…')
-                : L10n.t(
-                    '检查电脑端提供的固定 App 发布',
-                    'Check host-provided fixed App releases',
+                  if (store.api.pluginUpdate.transaction != null ||
+                      store.pluginUpdateJournal != null ||
+                      store.api.pluginUpdate.checkLog.isNotEmpty)
+                    _updateProgressCard(store),
+                  _row(
+                    leading: const Icon(Icons.sync_outlined),
+                    title: L10n.t('检查 App 更新', 'Check App updates'),
+                    sub: store.updateChecking
+                        ? L10n.t('检查中…', 'Checking…')
+                        : L10n.t(
+                            '检查电脑端提供的固定 App 发布',
+                            'Check host-provided fixed App releases',
+                          ),
+                    trailing: TextButton(
+                      onPressed: store.updateChecking || _updateFlowBusy
+                          ? null
+                          : _checkUpdate,
+                      child: Text(
+                        store.updateChecking
+                            ? L10n.t('检查中…', 'Checking…')
+                            : L10n.t('检查 ▸', 'Check ▸'),
+                        style: TextStyle(fontSize: 12, color: brand),
+                      ),
+                    ),
                   ),
-            trailing: TextButton(
-              onPressed: store.updateChecking || _updateFlowBusy
-                  ? null
-                  : _checkUpdate,
-              child: Text(
-                store.updateChecking
-                    ? L10n.t('检查中…', 'Checking…')
-                    : L10n.t('检查 ▸', 'Check ▸'),
-                style: TextStyle(fontSize: 12, color: brand),
-              ),
-            ),
+                  _row(
+                    leading: const Icon(Icons.auto_awesome_outlined),
+                    title: L10n.t('角色素材', 'Character assets'),
+                    sub: L10n.t(
+                      'PC2005-cloud/dsh-pet · MIT（经 dsh-dafeiyu 转码）',
+                      'PC2005-cloud/dsh-pet · MIT (encoded via dsh-dafeiyu)',
+                    ),
+                  ),
+                  _row(
+                    leading: const Icon(Icons.monitor_heart_outlined),
+                    title: L10n.t('环境诊断', 'Diagnostics'),
+                    sub: _diagLoaded
+                        ? '${L10n.t('检测完成 · ', 'Done · ')}$_diagTime'
+                        : L10n.t(
+                            '检测当前环境各项能力',
+                            'Check environment capabilities',
+                          ),
+                    trailing: TextButton(
+                      onPressed: _openDiag,
+                      child: Text(
+                        L10n.t('查看 ▸', 'View ▸'),
+                        style: TextStyle(fontSize: 12, color: brand),
+                      ),
+                    ),
+                  ),
+                  _row(
+                    key: const ValueKey('settings-log-level'),
+                    leading: const Icon(Icons.tune_outlined),
+                    title: L10n.t('日志记录级别', 'Log level'),
+                    sub: L10n.t(
+                      '默认 info；debug 仅排障时开启；warn/error 始终保留',
+                      'Default info; debug only for troubleshooting; warn/error always kept',
+                    ),
+                    trailing: Text(
+                      _logLevelName(AppLog.instance.level),
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: brand,
+                      ),
+                    ),
+                    onTap: _pickLogLevel,
+                  ),
+                  _row(
+                    leading: const Icon(Icons.article_outlined),
+                    title: L10n.t('应用日志', 'App log'),
+                    sub: L10n.t(
+                      '启动/连接/加载事件（排障用）',
+                      'Startup/connection/load events (troubleshooting)',
+                    ),
+                    trailing: TextButton(
+                      onPressed: _openLog,
+                      child: Text(
+                        L10n.t('查看 ▸', 'View ▸'),
+                        style: TextStyle(fontSize: 12, color: brand),
+                      ),
+                    ),
+                  ),
+                ]),
+            ],
           ),
-          _row(
-            leading: const Icon(Icons.auto_awesome_outlined),
-            title: L10n.t('角色素材', 'Character assets'),
-            sub: L10n.t(
-              'PC2005-cloud/dsh-pet · MIT（经 dsh-dafeiyu 转码）',
-              'PC2005-cloud/dsh-pet · MIT (encoded via dsh-dafeiyu)',
-            ),
-          ),
-          _row(
-            leading: const Icon(Icons.monitor_heart_outlined),
-            title: L10n.t('环境诊断', 'Diagnostics'),
-            sub: _diagLoaded
-                ? '${L10n.t('检测完成 · ', 'Done · ')}$_diagTime'
-                : L10n.t('检测当前环境各项能力', 'Check environment capabilities'),
-            trailing: TextButton(
-              onPressed: _openDiag,
-              child: Text(
-                L10n.t('查看 ▸', 'View ▸'),
-                style: TextStyle(fontSize: 12, color: brand),
-              ),
-            ),
-          ),
-          _row(
-            key: const ValueKey('settings-log-level'),
-            leading: const Icon(Icons.tune_outlined),
-            title: L10n.t('日志记录级别', 'Log level'),
-            sub: L10n.t(
-              '默认 info；debug 仅排障时开启；warn/error 始终保留',
-              'Default info; debug only for troubleshooting; warn/error always kept',
-            ),
-            trailing: Text(
-              _logLevelName(AppLog.instance.level),
-              style: TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
-                color: brand,
-              ),
-            ),
-            onTap: _pickLogLevel,
-          ),
-          _row(
-            leading: const Icon(Icons.article_outlined),
-            title: L10n.t('应用日志', 'App log'),
-            sub: L10n.t(
-              '启动/连接/加载事件（排障用）',
-              'Startup/connection/load events (troubleshooting)',
-            ),
-            trailing: TextButton(
-              onPressed: _openLog,
-              child: Text(
-                L10n.t('查看 ▸', 'View ▸'),
-                style: TextStyle(fontSize: 12, color: brand),
-              ),
-            ),
-          ),
-        ]),
+        ),
       ],
     );
   }
@@ -3683,7 +3662,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
       final epoch = store.api.connectionEpoch;
       final identity = store.api.connectionIdentity;
       final data = await store.api.getJson('/api/bootstrap');
-      store.api.absorbBootstrapIfCurrent(data, epoch: epoch, identity: identity);
+      store.api.absorbBootstrapIfCurrent(
+        data,
+        epoch: epoch,
+        identity: identity,
+      );
     } catch (_) {}
     if (store.pluginUpdateJournal != null) {
       try {
@@ -3704,7 +3687,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
         final epoch = store.api.connectionEpoch;
         final identity = store.api.connectionIdentity;
         final data = await store.api.getJson('/api/bootstrap');
-        store.api.absorbBootstrapIfCurrent(data, epoch: epoch, identity: identity);
+        store.api.absorbBootstrapIfCurrent(
+          data,
+          epoch: epoch,
+          identity: identity,
+        );
       } catch (_) {}
     }
     if (!mounted) return;
