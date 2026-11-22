@@ -15,6 +15,7 @@ import 'package:path_provider/path_provider.dart';
 import '../api.dart';
 import '../download_foreground.dart';
 import '../git_browser_controller.dart';
+import '../image_preview_logic.dart';
 import '../l10n.dart';
 import '../logger.dart';
 import '../resumable_download.dart';
@@ -28,6 +29,7 @@ import '../turn_file_actions.dart' show mimeOfTurnFileName;
 import '../widgets/git_file_viewer.dart';
 import 'download_resume_picker.dart';
 import 'git_browser_sheet.dart';
+import 'session_image_preview_screen.dart';
 
 /// 打开「会话文件浏览」全屏只读页。
 ///
@@ -499,10 +501,10 @@ class _SessionFilesScreenState extends State<SessionFilesScreen> {
               for (final f in _c.files)
                 ListTile(
                   key: Key('sf-file-$f'),
-                  leading: const Icon(Icons.description_outlined, size: 20),
+                  leading: Icon(_fileIcon(f), size: 20),
                   title: Text(f),
                   trailing: _fileDownloadAction(f),
-                  onTap: () => _c.openFile(f),
+                  onTap: () => _openFile(f),
                 ),
               if (_c.dirs.isEmpty && _c.files.isEmpty)
                 Padding(
@@ -582,6 +584,78 @@ class _SessionFilesScreenState extends State<SessionFilesScreen> {
         style: TextStyle(fontSize: 12, color: DshColors.warn(context)),
       ),
     );
+  }
+
+  // ── 文件行图标 / 打开（issue #157） ──
+
+  /// 列表行图标：图片（支持或已知不支持预览的格式）统一用图片图标，
+  /// 其余沿用文本文件图标（设计稿 §7.3：不新增缩略图/大小/类型，行高不变）。
+  IconData _fileIcon(String name) {
+    if (isSupportedImagePreviewName(name) ||
+        isUnsupportedImagePreviewName(name)) {
+      return Icons.image_outlined;
+    }
+    return Icons.description_outlined;
+  }
+
+  /// 点按文件行：能力位就绪的图片走全屏图片预览；其余（含旧宿主）走原有文本预览。
+  ///
+  /// 门控口径（设计稿 §7.3「旧宿主/无文件端点」）：
+  /// - `files.imagePreview`（新宿主）**且** `files.sessionRelative`（`/workspace-image`
+  ///   需要 sessionId + cwd 相对路径）同时为真才走新路径；
+  /// - 否则一律回退旧的文本/二进制预览（#16 契约），不请求 `/workspace-image`。
+  Future<void> _openFile(String name) async {
+    if (!_imagePreviewAvailableFor(name)) {
+      await _c.openFile(name);
+      return;
+    }
+    final path = joinBrowsePath(_c.currentPath, name, _c.sep);
+    final relative = relativePathWithinRoot(_c.root, path);
+    if (relative == null) {
+      // 词法上不在会话 cwd 内：不进图片预览（也不请求宿主）。
+      await _c.openFile(name);
+      return;
+    }
+    final unsupported = isSupportedImagePreviewName(name)
+        ? null
+        : L10n.t(
+            '此格式暂不支持预览',
+            'This format is not previewable yet',
+          );
+    // 选择模式（文件历史「选择文件」）：查看器里给「选择此文件」，选中后把绝对
+    // 路径一路 pop 回调用方——与文本查看器 `sf-history` 的确认语义一致。
+    final selected = await Navigator.of(context).push<String?>(
+      MaterialPageRoute<String?>(
+        builder: (_) => SessionImagePreviewScreen(
+          api: _api,
+          sessionId: widget.sessionId,
+          name: name,
+          relativePath: relative,
+          unsupportedReason: unsupported,
+          onDownload: _imageDownloadAction(path),
+          selectResult: widget.selectionMode ? path : null,
+        ),
+      ),
+    );
+    if (!mounted || selected == null || selected.isEmpty) return;
+    if (widget.selectionMode) Navigator.of(context).pop(selected);
+  }
+
+  /// 该文件是否走会话图片预览（能力位 + 扩展名双向门控）。
+  bool _imagePreviewAvailableFor(String name) {
+    if (!_api.filesImagePreviewSupported) return false;
+    // `/workspace-image` 的 path 是会话 cwd 相对路径；旧宿主只有绝对路径契约。
+    if (!_api.sessionRelativeFilesSupported) return false;
+    return isSupportedImagePreviewName(name) ||
+        isUnsupportedImagePreviewName(name);
+  }
+
+  /// 查看器内的下载回调：复用 #138 的 [_startDownload]（同一控制器/进度条）。
+  Future<void> Function()? _imageDownloadAction(String path) {
+    if (widget.selectionMode) return null;
+    if (!_api.sessionRelativeFilesSupported) return null;
+    if (_downloader == null) return null;
+    return () => _startDownload(path);
   }
 
   // ── 下载（#138） ──

@@ -28,7 +28,18 @@ import 'version_alignment.dart';
 class WorkspaceImageData {
   final Uint8List bytes;
   final String? contentType;
-  const WorkspaceImageData({required this.bytes, this.contentType});
+
+  /// 服务端 `ETag`（issue #157 图片缓存按 profile/session/path/etag 复用）。
+  final String? etag;
+
+  /// 304：调用方应继续使用缓存字节（[bytes] 为空）。
+  final bool notModified;
+  const WorkspaceImageData({
+    required this.bytes,
+    this.contentType,
+    this.etag,
+    this.notModified = false,
+  });
 }
 
 class ApiException implements Exception {
@@ -339,6 +350,10 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi, GitTagsApi {
   /// 路径契约（不会把相对路径发进旧实现导致 404/错文件）。
   bool sessionRelativeFilesSupported = false;
 
+  /// issue #157：服务端是否声明 `files.imagePreview`（会话文件图片预览）。
+  /// 旧插件缺失 → false，文件列表回退旧的文本/二进制预览路径。
+  bool filesImagePreviewSupported = false;
+
   /// issue #53（§6.20）：轮末产出物能力位。旧插件不下发 → 三项皆假，App 隐藏两卡
   /// 与展示模式设置；`changed/changesDiff` 由电脑端按 `workspaceChanges` 服务真实存在判定。
   TurnTailCapabilities turnTailCapabilities = const TurnTailCapabilities();
@@ -619,6 +634,8 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi, GitTagsApi {
         c['fileRange'] is Map && (c['fileRange'] as Map)['supported'] == true;
     sessionRelativeFilesSupported =
         c['files'] is Map && (c['files'] as Map)['sessionRelative'] == true;
+    filesImagePreviewSupported =
+        c['files'] is Map && (c['files'] as Map)['imagePreview'] == true;
     // issue #53：轮末产出物能力位（旧插件缺失 → available=false，两卡与设置隐藏）。
     turnTailCapabilities = TurnTailCapabilities.fromJson(
       c['turnTail'] is Map
@@ -1901,6 +1918,7 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi, GitTagsApi {
     String sessionId,
     String path, {
     String? consentId,
+    String? ifNoneMatch,
     Duration timeout = const Duration(seconds: 20),
   }) async {
     final uri = _uri(
@@ -1915,13 +1933,24 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi, GitTagsApi {
             if (token.isNotEmpty) 'x-mobile-token': token,
             if (appVersion.isNotEmpty) 'x-mobile-app-version': appVersion,
             'accept': 'image/*',
+            if (ifNoneMatch != null && ifNoneMatch.isNotEmpty)
+              'if-none-match': ifNoneMatch,
           },
         )
         .timeout(timeout);
+    if (res.statusCode == 304) {
+      return WorkspaceImageData(
+        bytes: Uint8List(0),
+        contentType: res.headers['content-type'],
+        etag: res.headers['etag'] ?? ifNoneMatch,
+        notModified: true,
+      );
+    }
     if (res.statusCode == 200) {
       return WorkspaceImageData(
         bytes: res.bodyBytes,
         contentType: res.headers['content-type'],
+        etag: res.headers['etag'],
       );
     }
     Map<String, dynamic>? body;
