@@ -16,6 +16,9 @@ class ProfileNamespace {
 
   static String key(String base) => _scope.isEmpty ? base : '$base@$_scope';
 
+  /// 单一 scope 格式化：hostId 为空也保留分隔符，便于空 host → 首次绑定迁移。
+  static String scopeFor(String profileId, String hostId) => '$profileId:$hostId';
+
   static String forScope(String scope, String base) =>
       scope.isEmpty ? base : '$base@$scope';
 }

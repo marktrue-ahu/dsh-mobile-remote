@@ -11,6 +11,8 @@ import 'package:dsh_mobile_app/credential_store.dart';
 import 'package:dsh_mobile_app/attention_storage.dart';
 import 'package:dsh_mobile_app/git_file_history_controller.dart';
 import 'package:dsh_mobile_app/store.dart';
+import 'package:dsh_mobile_app/plugin_update_resume.dart';
+import 'package:dsh_mobile_app/update_core.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -21,6 +23,92 @@ class _StoreApi extends Api {
 
   @override
   Stream<Map<String, dynamic>> eventsRaw() => controller.stream;
+}
+
+class _RotatingSseApi extends Api {
+  int connections = 0;
+  bool firstCancelled = false;
+  StreamController<Map<String, dynamic>>? current;
+
+  @override
+  Stream<Map<String, dynamic>> eventsRaw() {
+    connections++;
+    final controller = StreamController<Map<String, dynamic>>();
+    controller.onCancel = () {
+      if (connections == 1) firstCancelled = true;
+    };
+    if (connections == 1) {
+      scheduleMicrotask(() {
+        controller.addError(TimeoutException('blackhole'));
+        controller.close();
+      });
+    } else {
+      current = controller;
+    }
+    return controller.stream;
+  }
+}
+
+class _DelayedNotifApi extends _StoreApi {
+  Completer<List<AppNotification>>? gate;
+  bool used = false;
+
+  @override
+  Future<List<AppNotification>> notifications() {
+    final g = gate;
+    if (g != null && !used) {
+      used = true;
+      return g.future;
+    }
+    return Future.value(const []);
+  }
+}
+
+class _DelayedHostReadApi extends _StoreApi {
+  Completer<Catalog>? catalogGate;
+  Completer<SessionConfig>? configGate;
+  bool catalogUsed = false;
+  bool configUsed = false;
+
+  @override
+  Future<Catalog> catalog({bool refresh = false}) {
+    final gate = catalogGate;
+    if (gate != null && !catalogUsed) {
+      catalogUsed = true;
+      return gate.future;
+    }
+    return Future.value(Catalog(
+      models: const [],
+      permissionPresets: const [],
+      agentPresets: const [],
+      defaults: const {},
+      rechargeUrl: '',
+      providers: const [],
+    ));
+  }
+
+  @override
+  Future<SessionConfig> sessionConfig(String sessionId) {
+    final gate = configGate;
+    if (gate != null && !configUsed) {
+      configUsed = true;
+      return gate.future;
+    }
+    return Future.value(SessionConfig(model: 'b-model'));
+  }
+}
+
+class _CountingStoreApi extends _StoreApi {
+  int requests = 0;
+
+  @override
+  Future<Map<String, dynamic>> getJson(
+    String path, {
+    Duration timeout = const Duration(seconds: 15),
+  }) {
+    requests++;
+    return super.getJson(path, timeout: timeout);
+  }
 }
 
 class _FailAfterActivateStore extends MemoryCredentialStore {
@@ -41,6 +129,14 @@ class _FailingActivateStore extends MemoryCredentialStore {
   Future<void> activate(String profileId) async {
     throw StateError('keystore-unavailable');
   }
+}
+
+Future<void> waitFor(bool Function() condition, {String label = '条件'}) async {
+  for (var i = 0; i < 400; i++) {
+    if (condition()) return;
+    await Future<void>.delayed(const Duration(milliseconds: 25));
+  }
+  fail('等待「$label」超时');
 }
 
 void main() {
@@ -638,6 +734,7 @@ void main() {
     final a = manager.profiles.single;
     a.hostId = 'host-a';
     manager.profiles[0] = a;
+    if (a.hostId.isNotEmpty) api.hostIdentity = a.hostId;
     await manager.credentials.writeToken(a.id, 'a-token');
     api.baseUrls = [
       'https://a.example.com',
@@ -646,10 +743,11 @@ void main() {
     api.baseUrl = 'https://a.example.com';
     a.baseUrls = ['https://a.example.com'];
     manager.profiles[0] = a;
+    if (a.hostId.isNotEmpty) api.hostIdentity = a.hostId;
 
     // 广告/候选中的公网 HTTP：admission/verify 均拒绝，0 请求。
     seen.clear();
-    expect(await api.rotateBaseUrlVerified(), isFalse);
+    expect((await api.rotateBaseUrlVerified()).rotated, isFalse);
     expect(seen, isEmpty);
 
     // 加入已确认 HTTPS 候选；hostId 变化拒绝。
@@ -664,16 +762,17 @@ void main() {
       'https://d.example.com',
     ];
     manager.profiles[0] = a;
+    if (a.hostId.isNotEmpty) api.hostIdentity = a.hostId;
     seen.clear();
     probeHost = 'host-b';
-    expect(await api.rotateBaseUrlVerified(), isFalse);
+    expect((await api.rotateBaseUrlVerified()).rotated, isFalse);
     expect(seen, isNotEmpty);
     expect(api.baseUrl, 'https://a.example.com');
 
     // 确认且 hostId 一致：允许且只切该候选。
     seen.clear();
     probeHost = 'host-a';
-    expect(await api.rotateBaseUrlVerified(), isTrue);
+    expect((await api.rotateBaseUrlVerified()).rotated, isTrue);
     expect(api.baseUrl, 'https://c.example.com');
     expect(seen, ['/m/api/bootstrap']);
   });
@@ -744,6 +843,7 @@ void main() {
     final a = manager.profiles.single;
     a.hostId = 'host-a';
     manager.profiles[0] = a;
+    if (a.hostId.isNotEmpty) api.hostIdentity = a.hostId;
 
     await expectLater(
       manager.stageSwitch(a.id),
@@ -758,5 +858,593 @@ void main() {
     final confirmed = await manager.stageSwitch(a.id, allowHostChange: true);
     expect(confirmed.hostId, isNot('host-a'));
     expect(confirmed.hostId, startsWith('legacy:'));
+  });
+
+  test('A2 probe 挂起时切 B：完成 true 也不改 B base/token，B token 不发 A2', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    final gate = Completer<http.Response>();
+    final tokens = <String?>[];
+    final client = MockClient((request) async {
+      tokens.add(request.headers['x-mobile-token']);
+      return gate.future;
+    });
+    final api = Api()..baseUrl = '';
+    final manager = ConnectionManager(
+      api: api,
+      credentials: MemoryCredentialStore(),
+      probeClient: client,
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    a.hostId = 'host-a';
+    a.baseUrls = ['https://a.example.com', 'https://a2.example.com'];
+    manager.profiles[0] = a;
+    if (a.hostId.isNotEmpty) api.hostIdentity = a.hostId;
+    api.baseUrls = ['https://a.example.com', 'https://a2.example.com'];
+    api.baseUrl = 'https://a.example.com';
+
+    final rotating = api.rotateBaseUrlVerified();
+    for (var i = 0; i < 100 && tokens.isEmpty; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+    expect(tokens, isNotEmpty);
+    expect(tokens.every((t) => t == 'a-token'), isTrue);
+
+    // 用户成功切 B：B token/profile 已生效。
+    api.applyConnection(
+      base: 'https://b.example.com',
+      connectionPath: '/m',
+      connectionToken: 'b-token',
+      profile: 'profile-b',
+      hostIdentity: 'host-b',
+    );
+    gate.complete(http.Response(
+      '{"ok":true,"plugin":{"hostId":"${a.hostId}"}}',
+      200,
+      headers: {'content-type': 'application/json'},
+    ));
+    expect((await rotating).rotated, isFalse, reason: '旧 A2 验证结果必须被 CAS 丢弃');
+    expect(api.baseUrl, 'https://b.example.com');
+    expect(api.token, 'b-token');
+    expect(api.profileId, 'profile-b');
+    expect(tokens.every((t) => t == 'a-token'), isTrue, reason: 'B token 绝不能发到 A2');
+  });
+
+  test('首次绑定 hostId：旧 scope 缓存/草稿迁到新 scope，重启可见', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    final manager = ConnectionManager(
+      api: Api()..baseUrl = '',
+      credentials: MemoryCredentialStore(),
+      probeBootstrap: (_) async => {'plugin': {'hostId': 'host-a'}},
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    a.hostId = '';
+    manager.profiles[0] = a;
+    manager.activeProfileId = a.id;
+    final api = _StoreApi();
+    final store = AppStore(apiClient: api)..attachConnections(manager);
+    addTearDown(store.disposeBridge);
+    store.saveDraft('same', 'draft-before-binding');
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('dsh_mr_session.${a.id}:', 'session-before-binding');
+    await prefs.setString(
+      'dsh_attention_ledger_v1@${a.id}:',
+      '{"version":1,"entries":[]}',
+    );
+    await prefs.setString(
+      'dsh_mr_git_recent_files_repo@${a.id}:',
+      '["old.txt"]',
+    );
+
+    final error = await store.switchProfile(a.id);
+    expect(error, isNull);
+    expect(manager.profileScope, '${a.id}:host-a');
+    final moved = prefs.getString('dsh_mr_session.${a.id}:host-a');
+    expect(moved, 'session-before-binding');
+    expect(store.draftOf('same'), 'draft-before-binding');
+    expect(prefs.getString('dsh_attention_ledger_v1@${a.id}:host-a'), isNotNull);
+    expect(prefs.getString('dsh_mr_git_recent_files_repo@${a.id}:host-a'), isNotNull);
+    expect(prefs.getString('dsh_attention_ledger_v1@${a.id}:'), isNull);
+  });
+
+  test('A1→A2 自动轮换同步 active profile/descriptor；重启沿用 A2', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a1.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    final api = Api()..baseUrl = '';
+    final manager = ConnectionManager(
+      api: api,
+      credentials: MemoryCredentialStore(),
+      probeClient: MockClient((request) async => http.Response(
+        '{"ok":true,"plugin":{"hostId":"host-a"}}',
+        200,
+        headers: {'content-type': 'application/json'},
+      )),
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    a.hostId = 'host-a';
+    a.baseUrls = ['https://a1.example.com', 'https://a2.example.com'];
+    manager.profiles[0] = a;
+    if (a.hostId.isNotEmpty) api.hostIdentity = a.hostId;
+    api.baseUrls = ['https://a1.example.com', 'https://a2.example.com'];
+    api.baseUrl = 'https://a1.example.com';
+    final oldGeneration = manager.generation;
+
+    expect((await api.rotateBaseUrlVerified()).rotated, isTrue);
+    expect(api.baseUrl, 'https://a2.example.com');
+    expect(manager.active!.primaryBase, 'https://a2.example.com');
+    expect(manager.generation, oldGeneration + 1);
+    final prefs = await SharedPreferences.getInstance();
+    expect((jsonDecode(prefs.getString('dsh_native_connection')!) as Map)['baseUrl'],
+        'https://a2.example.com');
+
+    final restarted = ConnectionManager(
+      api: Api()..baseUrl = '',
+      credentials: manager.credentials,
+      probeClient: manager.probeClient,
+    );
+    await restarted.load();
+    expect(restarted.active!.primaryBase, 'https://a2.example.com');
+    expect(restarted.api.baseUrl, 'https://a2.example.com');
+  });
+
+  test('A→B→A 草稿不跨档：B 看不到 A，切回 A 恢复', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    var host = 'host-a';
+    final manager = ConnectionManager(
+      api: Api()..baseUrl = '',
+      credentials: MemoryCredentialStore(),
+      probeBootstrap: (_) async => {'plugin': {'hostId': host}},
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    a.hostId = 'host-a';
+    manager.profiles[0] = a;
+    if (a.hostId.isNotEmpty) api.hostIdentity = a.hostId;
+    final b = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: 'B',
+      baseUrls: ['https://b.example.com/m'],
+      hostId: 'host-b',
+    );
+    manager.profiles.add(b);
+    await manager.credentials.writeToken(b.id, 'b-token');
+    final store = AppStore(apiClient: _StoreApi())..attachConnections(manager);
+    addTearDown(store.disposeBridge);
+    store.saveDraft('same-session', 'draft-a');
+
+    host = 'host-b';
+    expect(await store.switchProfile(b.id), isNull);
+    expect(store.draftOf('same-session'), isEmpty, reason: 'B 不得看到 A 草稿');
+
+    host = 'host-a';
+    expect(await store.switchProfile(a.id), isNull);
+    expect(store.draftOf('same-session'), 'draft-a', reason: '切回 A 应恢复 A 草稿');
+  });
+
+  test('A2 active-base 提交在途切 B：B 的持久档案/descriptor 不被 A 覆盖', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a1.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    var probeHost = 'host-a';
+    final api = Api()..baseUrl = '';
+    final manager = ConnectionManager(
+      api: api,
+      credentials: MemoryCredentialStore(),
+      probeClient: MockClient((_) async => http.Response(
+        '{"ok":true,"plugin":{"hostId":"$probeHost"}}',
+        200,
+        headers: {'content-type': 'application/json'},
+      )),
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    a.hostId = 'host-a';
+    a.baseUrls = ['https://a1.example.com', 'https://a2.example.com'];
+    manager.profiles[0] = a;
+    if (a.hostId.isNotEmpty) api.hostIdentity = a.hostId;
+    api.baseUrls = ['https://a1.example.com', 'https://a2.example.com'];
+    api.baseUrl = 'https://a1.example.com';
+    final gate = Completer<void>();
+    var entered = false;
+    manager.activeBaseGate = () {
+      entered = true;
+      return gate.future;
+    };
+    final b = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: 'B',
+      baseUrls: ['https://b.example.com/m'],
+      hostId: 'host-b',
+    );
+    manager.profiles.add(b);
+    await manager.credentials.writeToken(b.id, 'b-token');
+
+    final rotation = api.rotateBaseUrlVerified();
+    for (var i = 0; i < 100 && !entered; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+    expect(entered, isTrue);
+    probeHost = 'host-b';
+    final stageB = await manager.stageSwitch(b.id);
+    final switchingB = manager.commitSwitch(stageB);
+    gate.complete();
+    await rotation;
+    await switchingB;
+
+    final prefs = await SharedPreferences.getInstance();
+    expect(manager.activeProfileId, b.id);
+    expect((jsonDecode(prefs.getString('dsh_native_connection')!) as Map)['profileId'], b.id);
+    expect((jsonDecode(prefs.getString('dsh_native_connection')!) as Map)['baseUrl'], 'https://b.example.com/m');
+    expect(prefs.getString('dsh_mr_active_profile'), b.id);
+    expect(await manager.credentials.status().then((s) => s.activeProfileId), b.id);
+  });
+
+  test('A update continuation gate 暂停切 B：旧链不写 B journal/候选', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    var host = 'host-a';
+    final api = _CountingStoreApi();
+    final manager = ConnectionManager(
+      api: api,
+      credentials: MemoryCredentialStore(),
+      probeBootstrap: (_) async => {'plugin': {'hostId': host}},
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    a.hostId = 'host-a';
+    manager.profiles[0] = a;
+    final b = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: 'B',
+      baseUrls: ['https://b.example.com/m'],
+      hostId: 'host-b',
+    );
+    manager.profiles.add(b);
+    await manager.credentials.writeToken(b.id, 'b-token');
+    final store = AppStore(apiClient: api)..attachConnections(manager);
+    addTearDown(store.disposeBridge);
+    store.pluginUpdateJournal = PluginUpdateJournal(
+      opId: 'op-a',
+      targetVersion: '3.3.0',
+      targetContentSha256: 'a' * 64,
+      startedAt: DateTime.now().toUtc(),
+      phase: UpdatePhase.pluginConfirmed,
+    );
+    final gate = Completer<void>();
+    var entered = false;
+    store.continueGate = () {
+      entered = true;
+      return gate.future;
+    };
+    final resume = store.resumePluginUpdate();
+    for (var i = 0; i < 100 && !entered; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+    expect(entered, isTrue);
+    host = 'host-b';
+    expect(await store.switchProfile(b.id), isNull);
+    // B 设置非空 sentinel，区分“旧 A 动态 ctx 误清”与真正的隔离。
+    final sentinelJournal = PluginUpdateJournal(
+      opId: 'op-b',
+      targetVersion: '3.3.1',
+      targetContentSha256: 'b' * 64,
+      startedAt: DateTime.now().toUtc(),
+      phase: UpdatePhase.pluginRetry,
+    );
+    const sentinelCandidate = UpdateCandidate(
+      version: '3.3.1+70',
+      downloadUrl: 'https://b.example.com/app.apk',
+      source: 'host',
+    );
+    store.pluginUpdateJournal = sentinelJournal;
+    store.pluginUpdateNotice = 'B sentinel notice';
+    store.updateCandidate = sentinelCandidate;
+    final requestsAfterB = api.requests;
+    gate.complete();
+    await resume;
+    expect(identical(store.pluginUpdateJournal, sentinelJournal), isTrue);
+    expect(store.pluginUpdateNotice, 'B sentinel notice');
+    expect(identical(store.updateCandidate, sentinelCandidate), isTrue);
+    expect(api.requests, requestsAfterB, reason: '旧 A continuation 不得额外请求 B');
+  });
+
+  test('A→B→A 后旧 A journal 写入不得覆盖新 A sentinel', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    var host = 'host-a';
+    final api = _StoreApi();
+    final manager = ConnectionManager(
+      api: api,
+      credentials: MemoryCredentialStore(),
+      probeBootstrap: (_) async => {'plugin': {'hostId': host}},
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    a.hostId = 'host-a';
+    manager.profiles[0] = a;
+    final b = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: 'B',
+      baseUrls: ['https://b.example.com/m'],
+      hostId: 'host-b',
+    );
+    manager.profiles.add(b);
+    await manager.credentials.writeToken(b.id, 'b-token');
+    final store = AppStore(apiClient: api)..attachConnections(manager);
+    addTearDown(store.disposeBridge);
+    store.pluginUpdateJournal = PluginUpdateJournal(
+      opId: 'op-a-old',
+      targetVersion: '3.3.0',
+      targetContentSha256: 'a' * 64,
+      startedAt: DateTime.now().toUtc(),
+      phase: UpdatePhase.pluginConfirmed,
+    );
+    final gate = Completer<void>();
+    var entered = false;
+    store.persistGate = (_) {
+      entered = true;
+      return gate.future;
+    };
+    final resume = store.resumePluginUpdate();
+    for (var i = 0; i < 100 && !entered; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+    expect(entered, isTrue);
+    host = 'host-b';
+    expect(await store.switchProfile(b.id), isNull);
+    host = 'host-a';
+    expect(await store.switchProfile(a.id), isNull);
+    // A 新一代 sentinel：旧 A persist 若只看 scope（A→B→A 后仍相同）会覆盖它。
+    final sentinel = PluginUpdateJournal(
+      opId: 'op-a-new',
+      targetVersion: '3.3.1',
+      targetContentSha256: 'n' * 64,
+      startedAt: DateTime.now().toUtc(),
+      phase: UpdatePhase.pluginRetry,
+    );
+    store.pluginUpdateJournal = sentinel;
+    store.pluginUpdateNotice = 'A new sentinel';
+    final sentinelPrefs = await SharedPreferences.getInstance();
+    await sentinelPrefs.setString(
+      'dsh_mr_plugin_update_journal.${a.id}:host-a',
+      jsonEncode(sentinel.toJson()),
+    );
+    gate.complete();
+    await resume;
+    expect(identical(store.pluginUpdateJournal, sentinel), isTrue);
+    expect(store.pluginUpdateNotice, 'A new sentinel');
+    final persisted = (await SharedPreferences.getInstance()).getString(
+      'dsh_mr_plugin_update_journal.${a.id}:host-a',
+    );
+    expect(persisted, contains('op-a-new'), reason: '旧 A 写不得覆盖 prefs');
+  });
+
+  test('persist 失败发生在 apply B 后：回滚 A generation 并重建 A SSE', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    var host = 'host-a';
+    final api = _StoreApi();
+    final manager = ConnectionManager(
+      api: api,
+      credentials: MemoryCredentialStore(),
+      probeBootstrap: (_) async => {'plugin': {'hostId': host}},
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    a.hostId = 'host-a';
+    manager.profiles[0] = a;
+    final oldGeneration = manager.generation;
+    final b = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: 'B',
+      baseUrls: ['https://b.example.com/m'],
+      hostId: 'host-b',
+    );
+    manager.profiles.add(b);
+    await manager.credentials.writeToken(b.id, 'b-token');
+    final store = AppStore(apiClient: api)..attachConnections(manager);
+    addTearDown(store.disposeBridge);
+    manager.persistOverride = () async => throw StateError('prefs-full');
+    host = 'host-b';
+    final error = await store.switchProfile(b.id);
+    expect(error, isNotNull);
+    expect(manager.activeProfileId, a.id);
+    expect(api.baseUrl, 'https://a.example.com');
+    expect(api.token, 'a-token');
+    expect(manager.generation, oldGeneration);
+    expect(api.connectionGeneration, oldGeneration);
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(store.connState, isNot('offline'));
+  });
+
+  test('_resumePluginUpdate 抛错：调用者捕获且无 unhandled async error', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    final manager = ConnectionManager(
+      api: Api()..baseUrl = '',
+      credentials: MemoryCredentialStore(),
+    );
+    await manager.load();
+    final store = AppStore(apiClient: _StoreApi())..attachConnections(manager);
+    addTearDown(store.disposeBridge);
+    store.pluginUpdateJournal = PluginUpdateJournal(
+      opId: 'op-a',
+      targetVersion: '3.3.0',
+      targetContentSha256: 'a' * 64,
+      startedAt: DateTime.now().toUtc(),
+      phase: UpdatePhase.pluginConfirmed,
+    );
+    store.continueGate = () async => throw StateError('boom');
+    final unhandled = <Object>[];
+    await runZonedGuarded(() async {
+      await expectLater(store.resumePluginUpdate(), throwsA(isA<StateError>()));
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }, (error, _) => unhandled.add(error));
+    expect(unhandled, isEmpty);
+  });
+
+  test('A 通知读挂起切 B：迟到 A 响应不写 B 未读/提醒', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    var host = 'host-a';
+    final api = _DelayedNotifApi();
+    final manager = ConnectionManager(
+      api: api,
+      credentials: MemoryCredentialStore(),
+      probeBootstrap: (_) async => {'plugin': {'hostId': host}},
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    a.hostId = 'host-a';
+    manager.profiles[0] = a;
+    final b = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: 'B',
+      baseUrls: ['https://b.example.com/m'],
+      hostId: 'host-b',
+    );
+    manager.profiles.add(b);
+    await manager.credentials.writeToken(b.id, 'b-token');
+    final store = AppStore(apiClient: api)..attachConnections(manager);
+    addTearDown(store.disposeBridge);
+    var newNotifCalls = 0;
+    store.onNewNotifications = (_, {bool force = false}) => newNotifCalls++;
+    api.gate = Completer<List<AppNotification>>();
+    final reading = store.refreshNotifs();
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    host = 'host-b';
+    expect(await store.switchProfile(b.id), isNull);
+    api.gate!.complete([
+      AppNotification(
+        id: 'n-a',
+        sessionId: 'same-session',
+        title: 'A late',
+        detail: '',
+        kind: 'done',
+        time: DateTime.now().millisecondsSinceEpoch,
+        unread: true,
+      ),
+    ]);
+    await reading;
+    expect(store.notifs, isEmpty);
+    expect(store.unread, 0);
+    expect(newNotifCalls, 0);
+  });
+
+  test('A catalog 迟到、A config 迟到均不写 B 模型/权限/目录', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    var host = 'host-a';
+    final api = _DelayedHostReadApi();
+    final manager = ConnectionManager(
+      api: api,
+      credentials: MemoryCredentialStore(),
+      probeBootstrap: (_) async => {'plugin': {'hostId': host}},
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    a.hostId = 'host-a';
+    manager.profiles[0] = a;
+    final b = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: 'B',
+      baseUrls: ['https://b.example.com/m'],
+      hostId: 'host-b',
+    );
+    manager.profiles.add(b);
+    await manager.credentials.writeToken(b.id, 'b-token');
+    final store = AppStore(apiClient: api)..attachConnections(manager);
+    addTearDown(store.disposeBridge);
+    store.sessionId = 'same-session';
+
+    api.catalogGate = Completer<Catalog>();
+    final catalogRead = store.refreshCatalog();
+    api.configGate = Completer<SessionConfig>();
+    final configRead = store.refreshSessionConfig();
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+    host = 'host-b';
+    expect(await store.switchProfile(b.id), isNull);
+
+    api.catalogGate!.complete(Catalog(
+      models: [CatalogModel(provider: 'a', id: 'a-model', name: 'A')],
+      permissionPresets: const [],
+      agentPresets: const [],
+      defaults: const {},
+      rechargeUrl: '',
+      providers: const [],
+    ));
+    api.configGate!.complete(SessionConfig(model: 'a-model', permissionPreset: 'a-perm'));
+    await catalogRead;
+    await configRead;
+    expect(store.catalog?.models.any((m) => m.id == 'a-model'), isNot(true));
+    expect(store.sessionConfig.model, isNot('a-model'));
+    expect(store.sessionConfig.permissionPreset, isNot('a-perm'));
+  });
+
+  test('真实 SSE onError→候选验证→A2 hello：旧流取消、新订阅建立', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a1.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    final api = _RotatingSseApi();
+    final manager = ConnectionManager(
+      api: api,
+      credentials: MemoryCredentialStore(),
+      probeClient: MockClient((_) async => http.Response(
+        '{"ok":true,"plugin":{"hostId":"host-a"}}',
+        200,
+        headers: {'content-type': 'application/json'},
+      )),
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    a.hostId = 'host-a';
+    a.baseUrls = ['https://a1.example.com', 'https://a2.example.com'];
+    manager.profiles[0] = a;
+    api.hostIdentity = 'host-a';
+    api.baseUrls = ['https://a1.example.com', 'https://a2.example.com'];
+    api.baseUrl = 'https://a1.example.com';
+    final store = AppStore(apiClient: api)..attachConnections(manager);
+    addTearDown(store.disposeBridge);
+
+    store.connect();
+    await waitFor(() => api.connections >= 2, label: 'A2 SSE 重建');
+    api.current!.add({
+      'type': 'hello',
+      'hostId': 'host-a',
+      'capabilities': <String, dynamic>{},
+    });
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(store.connState, 'connected');
+    expect(api.baseUrl, 'https://a2.example.com');
+    expect(manager.active!.primaryBase, 'https://a2.example.com');
+    expect(api.connections, greaterThanOrEqualTo(2));
+    expect(api.firstCancelled, isTrue, reason: '旧 SSE 必须被取消');
   });
 }

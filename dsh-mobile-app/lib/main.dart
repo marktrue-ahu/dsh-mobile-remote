@@ -139,6 +139,11 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
     ]);
   }
 
+  String _scopeOfSource(String profileId, String hostId) {
+    if (profileId.isEmpty) return ProfileNamespace.scope;
+    return ProfileNamespace.scopeFor(profileId, hostId);
+  }
+
   Future<void> _reloadAttentionForProfile() async {
     final scope = ProfileNamespace.scope;
     // 入同一写者队列，避免与旧宿主已排队的 handle/save 并发；旧任务在队列里
@@ -210,25 +215,27 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
     }
     // v3.3（吸收上游 #64）：通知账本单写者——恢复 → 事件 → 持久化；回放与结算同样串行。
     store.onAttentionEvent = (event) {
-      final scope = ProfileNamespace.scope;
+      final scope = _scopeOfSource(event.profileId, event.hostId);
       _queueAttention(() => _handleAttention(event, scope), scope: scope);
     };
-    store.onAttentionResolved = (identity) {
+    store.onAttentionResolved = (identity, profileId, hostId) {
       final source = api.notificationScope;
+      final scope = _scopeOfSource(profileId, hostId);
       _queueAttention(() async {
         final id = _ledger.resolveByIdentity(identity, source: source);
         if (id != null) {
           await LocalNotifier.instance.cancel(id);
           AppLog.instance.log('通知：结算撤销 identity=$identity id=$id');
         }
-      });
+      }, scope: scope);
     };
-    store.onAttentionSnapshot = (source, pendingKeys) {
+    store.onAttentionSnapshot = (source, pendingKeys, profileId, hostId) {
+      final scope = _scopeOfSource(profileId, hostId);
       _queueAttention(() async {
         for (final id in _ledger.reconcile(source, pendingKeys)) {
           await LocalNotifier.instance.cancel(id);
         }
-      });
+      }, scope: scope);
     };
     // S1：进入会话 → 收掉横幅（未读标已读由 store 负责）。
     store.onChatOpened = (sessionId) {
@@ -1062,6 +1069,10 @@ class _ConnectionSheetState extends State<ConnectionSheet> {
     if (api.baseUrl.isNotEmpty) _baseCtrl.text = api.baseUrl;
     if (api.token.isNotEmpty) _tokenCtrl.text = api.token;
     _baseCtrl.addListener(_onEndpointChanged);
+    final securityError = widget.store.connections?.connectionStateError ?? '';
+    if (securityError.isNotEmpty) {
+      _status = L10n.t('安全凭据不可用：$securityError', 'Secure credential unavailable: $securityError');
+    }
   }
 
   void _onEndpointChanged() {
@@ -1074,6 +1085,22 @@ class _ConnectionSheetState extends State<ConnectionSheet> {
     _baseCtrl.dispose();
     _tokenCtrl.dispose();
     super.dispose();
+  }
+
+  Future<void> _retrySecurity() async {
+    setState(() {
+      _busy = true;
+      _status = L10n.t('正在重试安全凭据…', 'Retrying secure credential…');
+    });
+    final error = await widget.store.retryConnectionLoad();
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      _status = error == null
+          ? L10n.t('✅ 已恢复', '✅ Recovered')
+          : '${L10n.t('恢复失败：', 'Recovery failed:')}$error';
+    });
+    if (error == null) widget.onConnected();
   }
 
   Future<void> _connect() async {
@@ -1152,7 +1179,14 @@ class _ConnectionSheetState extends State<ConnectionSheet> {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return SafeArea(
+    return PopScope(
+      canPop: !_busy,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _busy && mounted) {
+          showToast(context, L10n.t('正在连接，请等待完成', 'Connecting; please wait'));
+        }
+      },
+      child: SafeArea(
       child: Column(
         children: [
           // 返回按钮固定在左上角（重新配置时可见，放弃保留原配置）
@@ -1237,12 +1271,19 @@ class _ConnectionSheetState extends State<ConnectionSheet> {
             ),
             const SizedBox(height: 12),
             Text(_status, textAlign: TextAlign.center, style: const TextStyle(fontSize: 12)),
+            if ((widget.store.connections?.connectionStateError ?? '').isNotEmpty)
+              TextButton(
+                key: const ValueKey('connection-retry-security'),
+                onPressed: _busy ? null : _retrySecurity,
+                child: Text(L10n.t('重试迁移/凭据', 'Retry migration/credential')),
+              ),
           ],
                 ),
               ),
             ),
           ),
         ],
+      ),
       ),
     );
   }

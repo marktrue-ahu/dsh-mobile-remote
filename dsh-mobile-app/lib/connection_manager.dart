@@ -35,6 +35,17 @@ class ConnectionManager {
   /// 测试注入：模拟 prefs 写入失败；生产为 null → [_saveProfiles]。
   Future<void> Function()? persistOverride;
 
+  /// 测试注入：暂停 active base 提交，构造与档案切换的确定性交错。
+  Future<void> Function()? activeBaseGate;
+
+  Future<void> _transactionTail = Future<void>.value();
+
+  Future<T> _serialized<T>(Future<T> Function() action) {
+    final run = _transactionTail.then((_) => action());
+    _transactionTail = run.then<void>((_) {}, onError: (_, __) {});
+    return run;
+  }
+
   /// 启动校验失败时给 UI 的明确原因；不把 token 套到错误 endpoint。
   String connectionStateError = '';
 
@@ -56,7 +67,7 @@ class ConnectionManager {
   String get profileScope {
     final p = active;
     if (p == null) return '';
-    return '${p.id}:${p.hostId}';
+    return ProfileNamespace.scopeFor(p.id, p.hostId);
   }
 
   Future<SharedPreferences> get _store async =>
@@ -130,6 +141,7 @@ class ConnectionManager {
         profile: current.id,
         hostIdentity: current.hostId,
         urls: current.baseUrls,
+        generation: generation,
       );
       migrationState = 'complete';
       connectionStateError = '';
@@ -214,6 +226,7 @@ class ConnectionManager {
     }
     if (base.isEmpty || legacyToken.isEmpty) {
       migrationState = 'legacy-incomplete';
+      connectionStateError = '旧连接信息不完整；旧口令仍保留，可重试迁移或重新输入';
       return;
     }
     final id = ConnectionProfile.newId();
@@ -260,6 +273,7 @@ class ConnectionManager {
       profiles.removeWhere((p) => p.id == id);
       activeProfileId = '';
       migrationState = 'legacy-migration-failed';
+      connectionStateError = '迁移安全凭据失败；旧口令仍保留，可重试迁移';
       await prefs.setString(_kMigrationState, migrationState);
     }
   }
@@ -413,7 +427,10 @@ class ConnectionManager {
   /// 可恢复事务：任一步失败都回滚 target token、Keystore active、descriptor、
   /// profiles/activeProfileId/generation/ProfileNamespace；不允许留下
   /// “descriptor A + native token B”或“current A + token B”。
-  Future<void> commitSwitch(StagedConnectionSwitch stage) async {
+  Future<void> commitSwitch(StagedConnectionSwitch stage) =>
+      _serialized(() => _commitSwitchUnlocked(stage));
+
+  Future<void> _commitSwitchUnlocked(StagedConnectionSwitch stage) async {
     final profile = stage.profile;
     final prefs = await _store;
     final oldDescriptor = prefs.getString(_kNativeDescriptor);
@@ -422,6 +439,7 @@ class ConnectionManager {
     final oldGeneration = generation;
     final oldScope = ProfileNamespace.scope;
     final index = profiles.indexWhere((p) => p.id == profile.id);
+    final oldHostId = index >= 0 ? profiles[index].hostId : '';
     final oldToken = await credentials.readToken(profile.id);
     var applied = false;
     var credentialsMutated = false;
@@ -448,8 +466,8 @@ class ConnectionManager {
       }
       activeProfileId = profile.id;
       generation = stage.generation;
-      ProfileNamespace.setScope(profileScope);
-      await (persistOverride ?? _saveProfiles)();
+      // 先失效旧 Api/SSE 代（旧帧不再通过门禁），再持久化，最后才切全局通知 scope；
+      // 防止 A 的迟到事件在窗口内被按 B scope 入队。
       api.applyConnection(
         base: updated.primaryBase,
         connectionPath: updated.path,
@@ -457,8 +475,16 @@ class ConnectionManager {
         profile: updated.id,
         hostIdentity: updated.hostId,
         urls: updated.baseUrls,
+        generation: generation,
       );
       applied = true;
+      await (persistOverride ?? _saveProfiles)();
+      // 首次绑定 hostId：旧缓存 key 从 `profileId:` 迁到 `profileId:hostId`，
+      // 否则原档案历史会话/工作区/草稿在新 scope 下不可见。
+      if (oldHostId.isEmpty && stage.hostId.isNotEmpty) {
+        await _migrateScopedPrefs('${profile.id}:', profileScope);
+      }
+      ProfileNamespace.setScope(profileScope);
       migrationState = 'complete';
       connectionStateError = '';
       _installCandidateGuards();
@@ -534,6 +560,7 @@ class ConnectionManager {
             profile: restored.id,
             hostIdentity: restored.hostId,
             urls: restored.baseUrls,
+            generation: oldGeneration,
           );
         }
       }
@@ -551,6 +578,84 @@ class ConnectionManager {
       );
     };
     api.candidateVerifier = verifyCandidate;
+    api.candidateCommitter = (base, profile, host, generation) =>
+        commitActiveBase(
+          base,
+          expectedProfileId: profile,
+          expectedHostId: host,
+          expectedGeneration: generation,
+        );
+  }
+
+  /// 同 host 的已确认候选轮换：原子更新 active profile base + generation + descriptor，
+  /// 再通知原生重建；失败回滚档案/descriptor/generation，不返回成功。
+  Future<bool> commitActiveBase(
+    String base, {
+    String? expectedProfileId,
+    String? expectedHostId,
+    int? expectedGeneration,
+  }) => _serialized(
+    () => _commitActiveBaseUnlocked(
+      base,
+      expectedProfileId: expectedProfileId,
+      expectedHostId: expectedHostId,
+      expectedGeneration: expectedGeneration,
+    ),
+  );
+
+  Future<bool> _commitActiveBaseUnlocked(
+    String base, {
+    String? expectedProfileId,
+    String? expectedHostId,
+    int? expectedGeneration,
+  }) async {
+    final current = active;
+    if (current == null) return false;
+    // 锁内第一式 CAS：验证时的档案/宿主/generation 必须仍是当前事务目标。
+    if (expectedProfileId != null && current.id != expectedProfileId) return false;
+    if (expectedHostId != null && current.hostId != expectedHostId) return false;
+    if (expectedGeneration != null && generation != expectedGeneration) return false;
+    final normalized = Api.forProbe(base, '').baseUrl;
+    final prefs = await _store;
+    final oldDescriptor = prefs.getString(_kNativeDescriptor);
+    final oldProfile = current;
+    final oldGeneration = generation;
+    final index = profiles.indexWhere((p) => p.id == current.id);
+    final urls = <String>[
+      normalized,
+      for (final value in current.baseUrls)
+        if (Api.forProbe(value, '').baseUrl != normalized) value,
+    ];
+    final updated = current.copyWith(baseUrls: urls);
+    try {
+      if (index >= 0) profiles[index] = updated;
+      if (expectedProfileId != null && profiles[index].id != expectedProfileId) {
+        return false;
+      }
+      generation = generation + 1;
+      await _writeNativeDescriptor(updated, updated.hostId, generation);
+      await activeBaseGate?.call();
+      // gate/await 后仍必须属于同一档案代；B 已提交则不再写。
+      if (activeProfileId != updated.id || generation != oldGeneration + 1) {
+        return false;
+      }
+      await _saveProfiles();
+      await credentials.refreshNative();
+      api.connectionGeneration = generation;
+      return true;
+    } catch (_) {
+      if (index >= 0) profiles[index] = oldProfile;
+      generation = oldGeneration;
+      try {
+        if (oldDescriptor != null) {
+          await prefs.setString(_kNativeDescriptor, oldDescriptor);
+        } else {
+          await prefs.remove(_kNativeDescriptor);
+        }
+        await _saveProfiles();
+      } catch (_) {}
+      return false;
+    }
   }
 
   /// 自动轮换候选：必须是档案已确认地址 + 传输策略允许 + hostId 与绑定身份一致。
@@ -586,6 +691,41 @@ class ConnectionManager {
       return hostId.isNotEmpty && hostId == current.hostId;
     } catch (_) {
       return false;
+    }
+  }
+
+  Future<void> _migrateScopedPrefs(String oldScope, String newScope) async {
+    if (oldScope == newScope) return;
+    final prefs = await _store;
+    final moves = <String, String>{};
+    for (final key in prefs.getKeys().toList(growable: false)) {
+      for (final sep in const ['.', '@']) {
+        final marker = '$sep$oldScope';
+        if (!key.endsWith(marker)) continue;
+        final migrated =
+            '${key.substring(0, key.length - marker.length)}$sep$newScope';
+        if (prefs.get(migrated) != null) continue;
+        final value = prefs.get(key);
+        if (value == null) continue;
+        if (value is String) {
+          await prefs.setString(migrated, value);
+        } else if (value is bool) {
+          await prefs.setBool(migrated, value);
+        } else if (value is int) {
+          await prefs.setInt(migrated, value);
+        } else if (value is double) {
+          await prefs.setDouble(migrated, value);
+        } else if (value is List<String>) {
+          await prefs.setStringList(migrated, value);
+        } else {
+          continue;
+        }
+        // 复制并回读成功后才删除旧 key。
+        if (prefs.get(migrated) == value) moves[key] = migrated;
+      }
+    }
+    for (final oldKey in moves.keys) {
+      await prefs.remove(oldKey);
     }
   }
 
@@ -691,17 +831,7 @@ class ConnectionManager {
 
   /// 地址候选切换（非档案切换）后同步 active 档案，避免重启回到旧地址。
   Future<void> updateActiveBase(String base) async {
-    final current = active;
-    if (current == null) return;
-    final probe = Api.forProbe(base, '');
-    final updated = current.copyWith(
-      baseUrls: [probe.baseUrl],
-      path: probe.path,
-    );
-    final index = profiles.indexWhere((p) => p.id == current.id);
-    if (index >= 0) profiles[index] = updated;
-    await _saveProfiles();
-    await _writeNativeDescriptor(updated, updated.hostId, generation);
+    await commitActiveBase(base);
   }
 
   /// 编辑现有档案 endpoint/token：临时副本探测/提交，失败保留旧档案/旧 token/旧缓存身份。

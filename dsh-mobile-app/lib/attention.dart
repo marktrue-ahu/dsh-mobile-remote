@@ -41,6 +41,9 @@ class AttentionEvent {
     this.summary,
     this.isReplay = false,
     this.source = '',
+    this.profileId = '',
+    this.hostId = '',
+    this.epoch = 0,
   });
 
   final AttentionKind kind;
@@ -58,6 +61,11 @@ class AttentionEvent {
   /// 插件重连时会回放未结算帧（带原始 `at`），回放帧不应重复提醒。
   final bool isReplay;
   final String source;
+
+  /// 发起该事件的连接身份（#152）；旧 SSE 迟到事件据此丢弃，不按全局 scope 推断。
+  final String profileId;
+  final String hostId;
+  final int epoch;
 
   String get key => attentionKey(
     kind: kind.wire,

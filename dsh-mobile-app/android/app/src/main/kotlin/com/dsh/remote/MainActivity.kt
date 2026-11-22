@@ -146,6 +146,10 @@ class MainActivity : FlutterActivity() {
                         FloatingBubbleService.onConnectionChanged(this)
                         result.success(true)
                     }
+                    "reload" -> {
+                        FloatingBubbleService.onConnectionChanged(this)
+                        result.success(true)
+                    }
                     "status" -> result.success(CredentialStore.status(this))
                     else -> result.notImplemented()
                 }
