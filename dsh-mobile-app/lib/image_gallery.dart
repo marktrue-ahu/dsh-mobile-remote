@@ -28,6 +28,7 @@ import 'api.dart';
 import 'l10n.dart';
 import 'theme.dart';
 import 'toast.dart';
+import 'widgets/image_viewer_shell.dart';
 
 /// 原生文件通道（保存到手机 / 分享）；widget 测试可经 [ImageGalleryIo] 注入假实现。
 const MethodChannel imageGalleryFilesChannel = MethodChannel('dsh/files');
@@ -943,45 +944,35 @@ class _ImageGalleryViewerState extends State<ImageGalleryViewer> {
   Widget build(BuildContext context) {
     final imageCount = _images.length;
     final current = imageCount == 0 ? null : _images[_index];
+    // 全屏 dialog 路由 + 共享查看器壳（issue #157 §7.6：视觉/交互只定义一次）。
     return Dialog.fullscreen(
       backgroundColor: Colors.black,
-      child: ScaffoldMessenger(
-        key: _messengerKey,
-        child: Scaffold(
-          key: const Key('issue69-viewer-scaffold'),
-          backgroundColor: Colors.black,
-          body: SafeArea(
-            child: Stack(
-              children: [
-                Positioned.fill(
-                  child: Listener(
-                    onPointerDown: _onPointerDown,
-                    onPointerMove: _onPointerMove,
-                    onPointerUp: _onPointerUp,
-                    onPointerCancel: (_) => _resetDrag(),
-                    child: Transform.translate(
-                      offset: Offset(_dragDx, 0),
-                      child: PageView.builder(
-                        key: const Key('issue69-viewer-pages'),
-                        controller: _pageController,
-                        // 手势由上面的 Listener 手动驱动；InteractiveViewer 独占缩放/拖动。
-                        physics: const NeverScrollableScrollPhysics(),
-                        onPageChanged: _onPageChanged,
-                        itemCount: imageCount,
-                        itemBuilder: (context, index) => _buildPage(index),
-                      ),
-                    ),
-                  ),
-                ),
-                Positioned(top: 0, left: 0, right: 0, child: _buildToolbar()),
-                if (current != null)
-                  Positioned(
-                    left: 0,
-                    right: 0,
-                    bottom: 0,
-                    child: _buildMetaBar(),
-                  ),
-              ],
+      child: ImageViewerShell(
+        messengerKey: _messengerKey,
+        scaffoldKey: const Key('issue69-viewer-scaffold'),
+        closeKey: const Key('issue69-viewer-close'),
+        title: _buildPageIndicator(),
+        centerTitle: true,
+        actions: [_buildSaveAction(), _buildShareAction()],
+        meta: current == null
+            ? null
+            : imageMetaLine(_images[_index], _index),
+        metaKey: const Key('issue69-viewer-meta'),
+        body: Listener(
+          onPointerDown: _onPointerDown,
+          onPointerMove: _onPointerMove,
+          onPointerUp: _onPointerUp,
+          onPointerCancel: (_) => _resetDrag(),
+          child: Transform.translate(
+            offset: Offset(_dragDx, 0),
+            child: PageView.builder(
+              key: const Key('issue69-viewer-pages'),
+              controller: _pageController,
+              // 手势由上面的 Listener 手动驱动；InteractiveViewer 独占缩放/拖动。
+              physics: const NeverScrollableScrollPhysics(),
+              onPageChanged: _onPageChanged,
+              itemCount: imageCount,
+              itemBuilder: (context, index) => _buildPage(index),
             ),
           ),
         ),
@@ -989,69 +980,40 @@ class _ImageGalleryViewerState extends State<ImageGalleryViewer> {
     );
   }
 
-  Widget _buildToolbar() {
-    final imageCount = _images.length;
-    return Container(
-      color: Colors.black.withValues(alpha: 0.45),
-      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-      child: Row(
-        children: [
-          IconButton(
-            key: const Key('issue69-viewer-close'),
-            tooltip: L10n.t('关闭', 'Close'),
-            icon: const Icon(Icons.close, color: Colors.white),
-            onPressed: () => Navigator.of(context).pop(),
-          ),
-          Expanded(
-            child: Center(
-              child: imageCount > 1
-                  ? Text(
-                      '${_index + 1}/$imageCount',
-                      key: const Key('issue69-viewer-page-indicator'),
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 13,
-                        fontFeatures: [FontFeature.tabularFigures()],
-                      ),
-                    )
-                  : const SizedBox.shrink(),
-            ),
-          ),
-          IconButton(
-            key: const Key('issue69-viewer-save'),
-            tooltip: L10n.t('保存到手机', 'Save to phone'),
-            icon: const Icon(Icons.download_outlined, color: Colors.white),
-            // 进行中禁用：防止重复点按产生多份临时文件/多次保存。
-            onPressed: (_currentBytes == null || _saving || _sharing)
-                ? null
-                : _saveCurrent,
-          ),
-          IconButton(
-            key: const Key('issue69-viewer-share'),
-            tooltip: L10n.t('分享', 'Share'),
-            icon: const Icon(Icons.share_outlined, color: Colors.white),
-            onPressed: (_currentBytes == null || _saving || _sharing)
-                ? null
-                : _shareCurrent,
-          ),
-        ],
+  /// 单图不显示页码；多图显示 `N/M`（既有行为）。
+  Widget _buildPageIndicator() {
+    if (_images.length <= 1) return const SizedBox.shrink();
+    return Text(
+      '${_index + 1}/${_images.length}',
+      key: const Key('issue69-viewer-page-indicator'),
+      style: const TextStyle(
+        color: Colors.white,
+        fontSize: 13,
+        fontFeatures: [FontFeature.tabularFigures()],
       ),
     );
   }
 
-  Widget _buildMetaBar() {
-    return Container(
-      color: Colors.black.withValues(alpha: 0.45),
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 10),
-      child: Text(
-        imageMetaLine(_images[_index], _index),
-        key: const Key('issue69-viewer-meta'),
-        maxLines: 1,
-        softWrap: false,
-        overflow: TextOverflow.ellipsis,
-        textAlign: TextAlign.center,
-        style: const TextStyle(color: Colors.white70, fontSize: 12),
-      ),
+  Widget _buildSaveAction() {
+    return IconButton(
+      key: const Key('issue69-viewer-save'),
+      tooltip: L10n.t('保存到手机', 'Save to phone'),
+      icon: const Icon(Icons.download_outlined, color: Colors.white),
+      // 进行中禁用：防止重复点按产生多份临时文件/多次保存。
+      onPressed: (_currentBytes == null || _saving || _sharing)
+          ? null
+          : _saveCurrent,
+    );
+  }
+
+  Widget _buildShareAction() {
+    return IconButton(
+      key: const Key('issue69-viewer-share'),
+      tooltip: L10n.t('分享', 'Share'),
+      icon: const Icon(Icons.share_outlined, color: Colors.white),
+      onPressed: (_currentBytes == null || _saving || _sharing)
+          ? null
+          : _shareCurrent,
     );
   }
 
@@ -1065,11 +1027,12 @@ class _ImageGalleryViewerState extends State<ImageGalleryViewer> {
     final pageKey = ValueKey<String>('issue69-viewer-page-$index');
     if (bytes != null) {
       return SizedBox.expand(
-        child: InteractiveViewer(
-          key: pageKey,
-          transformationController: controller,
-          minScale: 0.5,
-          maxScale: 4,
+        child: ImageViewerZoom(
+          viewerKey: pageKey,
+          controller: controller,
+          // 图库保持既有手势集合（捏合缩放 + 手动分页），不新增双击，
+          // 避免与 Listener 驱动的翻页手势竞争（#69/#74 回归面）。
+          enableDoubleTap: false,
           child: Center(
             // 查看器为全屏，直接按可用尺寸 contain（不再受缩略图 cacheWidth 限制）。
             child: Image.memory(
@@ -1085,42 +1048,20 @@ class _ImageGalleryViewerState extends State<ImageGalleryViewer> {
       );
     }
     if (failure != null) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(
-              Icons.broken_image_outlined,
-              color: Colors.white70,
-              size: 40,
-            ),
-            const SizedBox(height: 8),
-            Text(
-              failure,
-              style: const TextStyle(color: Colors.white70, fontSize: 13),
-            ),
-            const SizedBox(height: 10),
-            TextButton.icon(
-              key: const Key('issue69-viewer-retry'),
-              onPressed: _retryCurrent,
-              icon: const Icon(Icons.refresh, color: Colors.white),
-              label: Text(
-                L10n.t('重试', 'Retry'),
-                style: const TextStyle(color: Colors.white),
-              ),
-            ),
-          ],
-        ),
+      return ImageViewerStatePane(
+        title: failure,
+        titleColor: Colors.white70,
+        onRetry: _retryCurrent,
+        retryKey: const Key('issue69-viewer-retry'),
       );
     }
     // 首次构建 / 切页动画中：加载中。
-    return Center(
-      child: unavailable
-          ? Text(
-              L10n.t('图片不可用', 'Image unavailable'),
-              style: const TextStyle(color: Colors.white70, fontSize: 13),
-            )
-          : const CircularProgressIndicator(strokeWidth: 2),
-    );
+    return unavailable
+        ? ImageViewerStatePane(
+            title: L10n.t('图片不可用', 'Image unavailable'),
+            titleColor: Colors.white70,
+            padding: EdgeInsets.zero,
+          )
+        : const Center(child: CircularProgressIndicator(strokeWidth: 2));
   }
 }

@@ -124,4 +124,67 @@ void main() {
     }
   });
 
+  test('issue #157：ETag 随 200 返回；带 ifNoneMatch 时发 if-none-match 头', () async {
+    late http.Request seen;
+    final api = Api(client: MockClient((request) async {
+      seen = request;
+      return http.Response.bytes(
+        _png,
+        200,
+        headers: {'content-type': 'image/png', 'etag': '"abc"'},
+      );
+    }))
+      ..baseUrl = 'http://host.test'
+      ..path = '/m'
+      ..token = 't';
+
+    final first = await api.workspaceImage('s1', 'pics/a.png');
+    expect(first.etag, '"abc"');
+    expect(first.notModified, isFalse);
+    expect(seen.headers.containsKey('if-none-match'), isFalse);
+
+    final second = await api.workspaceImage(
+      's1',
+      'pics/a.png',
+      ifNoneMatch: '"abc"',
+    );
+    expect(seen.headers['if-none-match'], '"abc"');
+    expect(second.etag, '"abc"');
+    expect(second.notModified, isFalse);
+  });
+
+  test('issue #157：304 → notModified=true、bytes 为空、etag 回退请求值', () async {
+    final api = Api(client: MockClient((request) async {
+      expect(request.headers['if-none-match'], '"abc"');
+      return http.Response('', 304);
+    }))
+      ..baseUrl = 'http://host.test'
+      ..path = '/m'
+      ..token = 't';
+
+    final data = await api.workspaceImage(
+      's1',
+      'pics/a.png',
+      ifNoneMatch: '"abc"',
+    );
+    expect(data.notModified, isTrue);
+    expect(data.bytes, isEmpty);
+    // 304 通常不带 content-type；etag 缺失时回退到请求里用的值，便于继续复核。
+    expect(data.etag, '"abc"');
+    expect(data.contentType, isNull);
+  });
+
+  test('issue #157：ifNoneMatch 为空串/未传时都不发条件请求头', () async {
+    final headers = <String, String>{};
+    final api = Api(client: MockClient((request) async {
+      headers.addAll(request.headers);
+      return http.Response.bytes(_png, 200);
+    }))
+      ..baseUrl = 'http://host.test'
+      ..path = '/m'
+      ..token = 't';
+
+    await api.workspaceImage('s1', 'pics/a.png', ifNoneMatch: '');
+    expect(headers.containsKey('if-none-match'), isFalse);
+  });
 }

@@ -341,6 +341,7 @@ test("bootstrap/hello 声明 files.sessionRelative 能力位", async () => {
 		assert.ok(helloLine, "SSE hello 必须存在");
 		const hello = JSON.parse(helloLine.slice("data: ".length));
 		assert.equal(hello.capabilities.files.sessionRelative, true);
+		assert.equal(hello.capabilities.files.imagePreview, true);
 		assert.equal(hello.capabilities.files.version, 1);
 		res.destroy();
 	} finally {
