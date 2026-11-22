@@ -20,6 +20,7 @@ import 'package:dsh_mobile_app/screens/chat_screen.dart';
 import 'package:dsh_mobile_app/store.dart';
 import 'package:dsh_mobile_app/theme.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/semantics.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -699,6 +700,100 @@ void main() {
       expect(find.textContaining('L5'), findsOneWidget);
       final expand = find.byKey(const ValueKey('agent-expand-c1'));
       expect(tester.getSize(expand), const Size(44, 44));
+    });
+
+    testWidgets('Semantics：展开/打开有 tap action，performAction 能真正触发', (
+      tester,
+    ) async {
+      final backend = _Backend([
+        _row('s1', name: 'agent-one', depth: 1, parent: _root, title: '语义父'),
+        _row('s2', name: 'agent-two', depth: 2, parent: 's1', title: '语义子'),
+      ]);
+      final store = await _mountPanel(tester, backend);
+      final semantics = tester.ensureSemantics();
+
+      final expandFinder = find.byKey(
+        const ValueKey('agent-expand-semantics-s1'),
+      );
+      final expandNode = tester.getSemantics(expandFinder);
+      expect(
+        expandNode.getSemanticsData().hasAction(SemanticsAction.tap),
+        isTrue,
+        reason: '展开区外层 Semantics 必须有 tap action',
+      );
+      tester.binding.pipelineOwner.semanticsOwner!.performAction(
+        expandNode.id,
+        SemanticsAction.tap,
+      );
+      await _settle(tester);
+      expect(find.byKey(const ValueKey('agent-row-s2')), findsOneWidget);
+      expect(store.sessionId, _root);
+
+      final bodyFinder = find.byKey(const ValueKey('agent-body-semantics-s1'));
+      final bodyNode = tester.getSemantics(bodyFinder);
+      final bodyData = bodyNode.getSemanticsData();
+      expect(bodyData.hasAction(SemanticsAction.tap), isTrue);
+      expect(bodyData.label, contains('agent-one'));
+      expect(bodyData.label, contains('第 1 层'));
+      expect(
+        bodyData.hint,
+        isNot(contains('第 1 层')),
+        reason: 'hint 不得重复 level',
+      );
+      tester.binding.pipelineOwner.semanticsOwner!.performAction(
+        bodyNode.id,
+        SemanticsAction.tap,
+      );
+      await _settle(tester);
+      expect(find.byType(ChatScreen), findsOneWidget);
+      semantics.dispose();
+    });
+
+    testWidgets('Semantics：中断有 tap action 且 performAction 发真实请求', (
+      tester,
+    ) async {
+      final backend = _Backend([
+        _row(
+          'run',
+          name: 'runner',
+          depth: 1,
+          parent: _root,
+          title: '运行节点',
+          status: 'running',
+        ),
+      ]);
+      await _mountPanel(tester, backend);
+      final semantics = tester.ensureSemantics();
+      final node = tester.getSemantics(
+        find.byKey(const ValueKey('agent-interrupt-semantics-run')),
+      );
+      expect(node.getSemanticsData().hasAction(SemanticsAction.tap), isTrue);
+      tester.binding.pipelineOwner.semanticsOwner!.performAction(
+        node.id,
+        SemanticsAction.tap,
+      );
+      await _settle(tester);
+      expect(backend.interrupts, hasLength(1));
+      semantics.dispose();
+    });
+
+    testWidgets('Semantics：diagnostic 行不可打开（无 tap action）', (tester) async {
+      final backend = _Backend([
+        _row(
+          'diag',
+          depth: 1,
+          parent: _root,
+          kind: 'diagnostic',
+          status: 'corrupt',
+        ),
+      ]);
+      await _mountPanel(tester, backend);
+      final semantics = tester.ensureSemantics();
+      final node = tester.getSemantics(
+        find.byKey(const ValueKey('agent-body-semantics-diag')),
+      );
+      expect(node.getSemanticsData().hasAction(SemanticsAction.tap), isFalse);
+      semantics.dispose();
     });
 
     testWidgets('降级 multiLevelUnavailable：不渲染展开区/胶囊，行体仍可打开', (tester) async {

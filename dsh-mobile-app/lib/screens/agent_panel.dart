@@ -1325,8 +1325,12 @@ class _AgentTreeRow extends StatelessWidget {
               height: 44,
               child: canExpand
                   ? Semantics(
+                      key: ValueKey<String>(
+                        'agent-expand-semantics-${node.id}',
+                      ),
                       button: true,
                       label: expandLabel,
+                      onTap: onToggle,
                       child: ExcludeSemantics(
                         child: InkWell(
                           onTap: onToggle,
@@ -1383,11 +1387,12 @@ class _AgentTreeRow extends StatelessWidget {
             const SizedBox(width: 8),
             Expanded(
               child: Semantics(
+                key: ValueKey<String>('agent-body-semantics-${node.id}'),
                 button: !node.isDiagnostic,
                 label: node.isDiagnostic
                     ? _diagnosticText(node.status)
-                    : '${node.title}，$statusText，$levelHint',
-                hint: node.isDiagnostic ? null : levelHint,
+                    : '${node.title}，${_subtitleAgentName(node)}，$statusText，$levelHint',
+                onTap: node.isDiagnostic ? null : onOpen,
                 child: ExcludeSemantics(
                   child: InkWell(
                     key: ValueKey<String>('agent-body-${node.id}'),
@@ -1433,11 +1438,14 @@ class _AgentTreeRow extends StatelessWidget {
                 width: 44,
                 height: 44,
                 child: Semantics(
+                  key: ValueKey<String>('agent-interrupt-semantics-${node.id}'),
                   button: true,
+                  enabled: !interrupting,
                   label: L10n.t(
                     '中断子代理 ${node.title}',
                     'Interrupt subagent ${node.title}',
                   ),
+                  onTap: interrupting ? null : onInterrupt,
                   child: ExcludeSemantics(
                     child: IconButton(
                       onPressed: interrupting ? null : onInterrupt,
