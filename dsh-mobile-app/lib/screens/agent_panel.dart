@@ -95,6 +95,7 @@ class _AgentPanelScreenState extends State<AgentPanelScreen>
   final Set<String> _sessionConfigLoading = <String>{};
   final List<String> _sessionConfigQueue = <String>[];
   int _sessionConfigActive = 0;
+  int _sessionConfigGeneration = 0;
 
   // #143：只读任务板（按页签懒加载；旧宿主 unsupported，团队未启用时显示引导）。
   TeamTaskBoard? _taskBoard;
@@ -174,6 +175,12 @@ class _AgentPanelScreenState extends State<AgentPanelScreen>
 
   Future<void> _load() async {
     if (!mounted) return;
+    // 刷新/回到面板：清掉上一代模型缓存；在途旧响应由 generation 丢弃。
+    _sessionConfigGeneration++;
+    _sessionConfigs.clear();
+    _sessionConfigLoading.clear();
+    _sessionConfigQueue.clear();
+    _sessionConfigActive = 0;
     setState(() {
       _loading = true;
       _error = null;
@@ -212,17 +219,21 @@ class _AgentPanelScreenState extends State<AgentPanelScreen>
   }
 
   Future<void> _loadSessionConfig(String id) async {
+    final generation = _sessionConfigGeneration;
     try {
       final config = await _api.sessionConfig(id);
-      if (!mounted) return;
+      if (!mounted || generation != _sessionConfigGeneration) return;
       setState(() => _sessionConfigs[id] = config);
     } catch (_) {
-      if (!mounted) return;
+      if (!mounted || generation != _sessionConfigGeneration) return;
+      // 失败只在本代内不重复打；刷新/回到面板会递增 generation 并重拉。
       setState(() => _sessionConfigs[id] = null);
     } finally {
-      _sessionConfigActive = math.max(0, _sessionConfigActive - 1);
-      _sessionConfigLoading.remove(id);
-      if (mounted) _pumpSessionConfigs();
+      if (generation == _sessionConfigGeneration) {
+        _sessionConfigActive = math.max(0, _sessionConfigActive - 1);
+        _sessionConfigLoading.remove(id);
+        if (mounted) _pumpSessionConfigs();
+      }
     }
   }
 
@@ -308,6 +319,7 @@ class _AgentPanelScreenState extends State<AgentPanelScreen>
       apiClient: widget.apiClient,
       onReturn: () async {
         await widget.store.setSession(widget.sessionId);
+        if (mounted) await _load();
       },
     );
   }
@@ -1640,11 +1652,14 @@ class _AgentTreeRow extends StatelessWidget {
                             ),
                           ),
                         if (modelMeta!.hasEffort)
-                          Text(
-                            '${modelMeta!.model.isNotEmpty ? ' · ' : ''}${modelMeta!.effort}',
-                            key: ValueKey<String>('agent-effort-${node.id}'),
-                            maxLines: 1,
-                            style: TextStyle(fontSize: 11.5, color: ink3),
+                          Flexible(
+                            child: Text(
+                              '${modelMeta!.model.isNotEmpty ? ' · ' : ''}${modelMeta!.effort}',
+                              key: ValueKey<String>('agent-effort-${node.id}'),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(fontSize: 11.5, color: ink3),
+                            ),
                           ),
                       ],
                     ),

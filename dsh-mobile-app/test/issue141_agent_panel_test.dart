@@ -75,6 +75,9 @@ class _Backend {
   int sessionConfigActive = 0;
   int sessionConfigMaxActive = 0;
   int sessionConfigDelayMs = 0;
+  int sessionConfigFailures = 0;
+  bool holdSessionConfigs = false;
+  final List<Completer<http.Response>> heldSessionConfigResponses = [];
 
   late final Api api = Api(client: MockClient(_handle))
     ..baseUrl = 'http://agent-panel.test'
@@ -109,6 +112,15 @@ class _Backend {
         sessionConfigMaxActive = sessionConfigActive;
       }
       try {
+        if (holdSessionConfigs) {
+          final completer = Completer<http.Response>();
+          heldSessionConfigResponses.add(completer);
+          return await completer.future;
+        }
+        if (sessionConfigFailures > 0) {
+          sessionConfigFailures--;
+          return _json({'ok': false, 'error': 'config-unavailable'}, 500);
+        }
         if (sessionConfigDelayMs > 0) {
           await Future<void>.delayed(
             Duration(milliseconds: sessionConfigDelayMs),
@@ -897,6 +909,112 @@ void main() {
       expect(body.getSemanticsData().label, contains('模型 GPT-5，高'));
       semantics.dispose();
       expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('首次模型请求失败不永久缓存：刷新后恢复真实模型', (tester) async {
+      final backend =
+          _Backend([
+              _row('c1', name: 'a1', depth: 1, parent: _root, title: '一级'),
+            ])
+            ..sessionConfigFailures = 1
+            ..sessionConfigs['c1'] = {'model': 'model-a', 'provider': 'p'};
+      await _mountPanel(tester, backend);
+      await _settle(tester);
+      expect(find.byKey(const ValueKey('agent-model-c1')), findsNothing);
+      expect(backend.sessionConfigCalls, 1);
+      await tester.tap(find.byTooltip('刷新'));
+      await _settle(tester);
+      expect(backend.sessionConfigCalls, greaterThanOrEqualTo(2));
+      expect(
+        find.byKey(const ValueKey('agent-model-c1')),
+        findsOneWidget,
+        reason: '刷新必须清掉失败缓存并重新请求',
+      );
+      expect(find.text('model-a'), findsOneWidget);
+    });
+
+    testWidgets('子会话改模型后返回：面板按世代重拉并显示新模型', (tester) async {
+      final backend = _Backend([
+        _row('c1', name: 'a1', depth: 1, parent: _root, title: '一级'),
+      ])..sessionConfigs['c1'] = {'model': 'model-a', 'provider': 'p'};
+      await _mountPanel(tester, backend);
+      await tester.tap(find.byKey(const ValueKey('agent-expand-c1')));
+      await _settle(tester);
+      expect(find.text('model-a'), findsOneWidget);
+
+      await tester.tap(find.byKey(const ValueKey('agent-body-c1')));
+      await _settle(tester);
+      expect(find.byType(ChatScreen), findsOneWidget);
+      backend.sessionConfigs['c1'] = {'model': 'model-b', 'provider': 'p'};
+      Navigator.of(tester.element(find.byType(ChatScreen))).pop();
+      await _settle(tester);
+      expect(find.byType(ChatScreen), findsNothing);
+      expect(find.text('model-b'), findsOneWidget);
+      expect(find.text('model-a'), findsNothing);
+    });
+
+    testWidgets('旧在途响应不能覆盖刷新后的新一代模型', (tester) async {
+      final backend = _Backend([
+        _row('c1', name: 'a1', depth: 1, parent: _root, title: '一级'),
+      ])..holdSessionConfigs = true;
+      await _mountPanel(tester, backend);
+      await _settle(tester);
+      expect(backend.heldSessionConfigResponses, hasLength(1));
+      await tester.tap(find.byTooltip('刷新'));
+      await _settle(tester);
+      expect(backend.heldSessionConfigResponses, hasLength(2));
+
+      backend.heldSessionConfigResponses[0].complete(
+        _json({
+          'ok': true,
+          'config': {'model': 'stale-model', 'provider': 'p'},
+        }),
+      );
+      await _settle(tester);
+      expect(find.text('stale-model'), findsNothing);
+      backend.heldSessionConfigResponses[1].complete(
+        _json({
+          'ok': true,
+          'config': {'model': 'fresh-model', 'provider': 'p'},
+        }),
+      );
+      await _settle(tester);
+      expect(find.text('fresh-model'), findsOneWidget);
+      expect(find.text('stale-model'), findsNothing);
+    });
+
+    testWidgets('320/2.0x 深层 running + 超长 effort：不溢出且 Semantics 保留完整值', (
+      tester,
+    ) async {
+      final longEffort =
+          'ultra-long-custom-effort-id-abcdefghijklmnopqrstuvwxyz';
+      final backend = _Backend(deepTree())
+        ..sessionConfigs.addAll({
+          for (final id in ['c1', 'c2', 'c3', 'c4', 'c5'])
+            id: {
+              'model': 'a-very-long-model-name-that-needs-ellipsis',
+              'provider': 'p',
+              'reasoningEffort': longEffort,
+            },
+        });
+      await _mountPanel(
+        tester,
+        backend,
+        size: const Size(320, 700),
+        textScaler: const TextScaler.linear(2.0),
+        theme: DshTheme.dark(),
+      );
+      for (final id in ['c1', 'c2', 'c3', 'c4']) {
+        await tester.tap(find.byKey(ValueKey('agent-expand-$id')));
+        await _settle(tester);
+      }
+      expect(tester.takeException(), isNull);
+      final semantics = tester.ensureSemantics();
+      final body = tester.getSemantics(
+        find.byKey(const ValueKey('agent-body-semantics-c1')),
+      );
+      expect(body.getSemanticsData().label, contains(longEffort));
+      semantics.dispose();
     });
 
     testWidgets('旧宿主/缺字段：不伪造模型第三行；3 并发懒加载上限', (tester) async {
