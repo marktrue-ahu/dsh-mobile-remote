@@ -20,6 +20,7 @@ import 'package:dsh_mobile_app/screens/chat_screen.dart';
 import 'package:dsh_mobile_app/store.dart';
 import 'package:dsh_mobile_app/theme.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/semantics.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -68,6 +69,15 @@ class _Backend {
   int failSubagents = 0;
   Completer<http.Response>? holdSubagents;
   final List<Map<String, dynamic>> interrupts = [];
+  final Map<String, Map<String, dynamic>> sessionConfigs = {};
+  final List<String> sessionConfigRequested = [];
+  int sessionConfigCalls = 0;
+  int sessionConfigActive = 0;
+  int sessionConfigMaxActive = 0;
+  int sessionConfigDelayMs = 0;
+  int sessionConfigFailures = 0;
+  bool holdSessionConfigs = false;
+  final List<Completer<http.Response>> heldSessionConfigResponses = [];
 
   late final Api api = Api(client: MockClient(_handle))
     ..baseUrl = 'http://agent-panel.test'
@@ -92,6 +102,37 @@ class _Backend {
         if (multiLevelUnavailable) 'multiLevelUnavailable': true,
         'subagents': rows,
       });
+    }
+    if (path == '/m/api/session-config') {
+      final id = request.url.queryParameters['sessionId'] ?? '';
+      sessionConfigCalls++;
+      sessionConfigRequested.add(id);
+      sessionConfigActive++;
+      if (sessionConfigActive > sessionConfigMaxActive) {
+        sessionConfigMaxActive = sessionConfigActive;
+      }
+      try {
+        if (holdSessionConfigs) {
+          final completer = Completer<http.Response>();
+          heldSessionConfigResponses.add(completer);
+          return await completer.future;
+        }
+        if (sessionConfigFailures > 0) {
+          sessionConfigFailures--;
+          return _json({'ok': false, 'error': 'config-unavailable'}, 500);
+        }
+        if (sessionConfigDelayMs > 0) {
+          await Future<void>.delayed(
+            Duration(milliseconds: sessionConfigDelayMs),
+          );
+        }
+        return _json({
+          'ok': true,
+          'config': sessionConfigs[id] ?? <String, dynamic>{},
+        });
+      } finally {
+        sessionConfigActive--;
+      }
     }
     if (path == '/m/api/subagents/interrupt') {
       interrupts.add(jsonDecode(request.body) as Map<String, dynamic>);
@@ -124,11 +165,13 @@ Future<AppStore> _mountPanel(
   Size size = const Size(390, 844),
   TextScaler textScaler = TextScaler.noScaling,
   ThemeData? theme,
+  Catalog? catalog,
 }) async {
   SharedPreferences.setMockInitialValues({});
   final store = AppStore()
     ..sessionId = _root
     ..sessions = [Session(id: _root, title: '主会话', cwd: null, createdAt: 1)];
+  if (catalog != null) store.catalog = catalog;
   await tester.binding.setSurfaceSize(size);
   addTearDown(() => tester.binding.setSurfaceSize(null));
   await tester.pumpWidget(
@@ -639,7 +682,7 @@ void main() {
       final backend = _Backend(deepTree());
       final store = await _mountPanel(tester, backend);
       final expand = find.byKey(const ValueKey('agent-expand-c1'));
-      expect(tester.getSize(expand), const Size(44, 44));
+      expect(tester.getSize(expand), const Size(56, 48));
       await tester.tapAt(tester.getTopLeft(expand) + const Offset(3, 3));
       await _settle(tester);
       expect(
@@ -681,8 +724,279 @@ void main() {
       expect(tester.takeException(), isNull);
     });
 
-    testWidgets('320/深色/2.0x：深层树不溢出，L{n} 仍可见', (tester) async {
-      final backend = _Backend(deepTree());
+    testWidgets('320/深色/2.0x：深层树不溢出，L{n} 与 effort 仍可见', (tester) async {
+      final backend = _Backend(deepTree())
+        ..sessionConfigs.addAll({
+          for (final id in ['c1', 'c2', 'c3', 'c4', 'c5'])
+            id: {
+              'model': 'a-very-long-model-name-that-needs-ellipsis',
+              'provider': 'p',
+              'reasoningEffort': 'high',
+            },
+        });
+      final catalog = Catalog(
+        models: [
+          CatalogModel(
+            provider: 'p',
+            id: 'a-very-long-model-name-that-needs-ellipsis',
+            name: 'A very long model name that needs ellipsis',
+            reasoning: const ModelReasoning(
+              efforts: [ReasoningEffort(id: 'high', name: '高')],
+            ),
+          ),
+        ],
+        permissionPresets: const [],
+        agentPresets: const [],
+        defaults: const {},
+        rechargeUrl: '',
+        providers: const [],
+      );
+      await _mountPanel(
+        tester,
+        backend,
+        size: const Size(320, 700),
+        textScaler: const TextScaler.linear(2.0),
+        theme: DshTheme.dark(),
+        catalog: catalog,
+      );
+      for (final id in ['c1', 'c2', 'c3', 'c4']) {
+        await tester.tap(find.byKey(ValueKey('agent-expand-$id')));
+        await _settle(tester);
+      }
+      expect(tester.takeException(), isNull);
+      expect(find.textContaining('L4'), findsOneWidget);
+      expect(find.textContaining('L5'), findsOneWidget);
+      expect(find.textContaining('高'), findsWidgets);
+      final expand = find.byKey(const ValueKey('agent-expand-c1'));
+      expect(tester.getSize(expand), const Size(56, 48));
+    });
+
+    testWidgets('Semantics：展开/打开有 tap action，performAction 能真正触发', (
+      tester,
+    ) async {
+      final backend = _Backend([
+        _row('s1', name: 'agent-one', depth: 1, parent: _root, title: '语义父'),
+        _row('s2', name: 'agent-two', depth: 2, parent: 's1', title: '语义子'),
+      ]);
+      final store = await _mountPanel(tester, backend);
+      final semantics = tester.ensureSemantics();
+
+      final expandFinder = find.byKey(
+        const ValueKey('agent-expand-semantics-s1'),
+      );
+      final expandNode = tester.getSemantics(expandFinder);
+      expect(
+        expandNode.getSemanticsData().hasAction(SemanticsAction.tap),
+        isTrue,
+        reason: '展开区外层 Semantics 必须有 tap action',
+      );
+      tester.binding.pipelineOwner.semanticsOwner!.performAction(
+        expandNode.id,
+        SemanticsAction.tap,
+      );
+      await _settle(tester);
+      expect(find.byKey(const ValueKey('agent-row-s2')), findsOneWidget);
+      expect(store.sessionId, _root);
+
+      final bodyFinder = find.byKey(const ValueKey('agent-body-semantics-s1'));
+      final bodyNode = tester.getSemantics(bodyFinder);
+      final bodyData = bodyNode.getSemanticsData();
+      expect(bodyData.hasAction(SemanticsAction.tap), isTrue);
+      expect(bodyData.label, contains('agent-one'));
+      expect(bodyData.label, contains('第 1 层'));
+      expect(
+        bodyData.hint,
+        isNot(contains('第 1 层')),
+        reason: 'hint 不得重复 level',
+      );
+      tester.binding.pipelineOwner.semanticsOwner!.performAction(
+        bodyNode.id,
+        SemanticsAction.tap,
+      );
+      await _settle(tester);
+      expect(find.byType(ChatScreen), findsOneWidget);
+      semantics.dispose();
+    });
+
+    testWidgets('Semantics：中断有 tap action 且 performAction 发真实请求', (
+      tester,
+    ) async {
+      final backend = _Backend([
+        _row(
+          'run',
+          name: 'runner',
+          depth: 1,
+          parent: _root,
+          title: '运行节点',
+          status: 'running',
+        ),
+      ]);
+      await _mountPanel(tester, backend);
+      final semantics = tester.ensureSemantics();
+      final node = tester.getSemantics(
+        find.byKey(const ValueKey('agent-interrupt-semantics-run')),
+      );
+      expect(node.getSemanticsData().hasAction(SemanticsAction.tap), isTrue);
+      tester.binding.pipelineOwner.semanticsOwner!.performAction(
+        node.id,
+        SemanticsAction.tap,
+      );
+      await _settle(tester);
+      expect(backend.interrupts, hasLength(1));
+      semantics.dispose();
+    });
+
+    testWidgets('模型/effort 第三行：本地化、左对齐 105/119/133、懒加载且不伪造旧宿主', (tester) async {
+      final backend =
+          _Backend([
+              _row('c1', name: 'a1', depth: 1, parent: _root, title: '一级'),
+              _row('c2', name: 'a2', depth: 2, parent: 'c1', title: '二级'),
+              _row('c3', name: 'a3', depth: 3, parent: 'c2', title: '三级'),
+            ])
+            ..sessionConfigs.addAll({
+              'c1': {'model': 'm1', 'provider': 'p', 'reasoningEffort': 'high'},
+              'c2': {'model': 'm1', 'provider': 'p', 'reasoningEffort': 'high'},
+              'c3': {'model': 'm1', 'provider': 'p', 'reasoningEffort': 'high'},
+            });
+      final catalog = Catalog(
+        models: [
+          CatalogModel(
+            provider: 'p',
+            id: 'm1',
+            name: 'GPT-5',
+            reasoning: const ModelReasoning(
+              efforts: [ReasoningEffort(id: 'high', name: '高')],
+            ),
+          ),
+        ],
+        permissionPresets: const [],
+        agentPresets: const [],
+        defaults: const {},
+        rechargeUrl: '',
+        providers: const [],
+      );
+      await _mountPanel(tester, backend, catalog: catalog);
+      // 默认折叠：只加载根级直接子代理，孙/曾孙不请求。
+      expect(backend.sessionConfigRequested, ['c1']);
+      await tester.tap(find.byKey(const ValueKey('agent-expand-c1')));
+      await _settle(tester);
+      await tester.tap(find.byKey(const ValueKey('agent-expand-c2')));
+      await _settle(tester);
+      expect(backend.sessionConfigRequested, containsAll(['c1', 'c2', 'c3']));
+      expect(find.text('GPT-5'), findsNWidgets(3));
+      expect(find.text(' · 高'), findsNWidgets(3));
+      final x1 = tester
+          .getTopLeft(find.byKey(const ValueKey('agent-model-c1')))
+          .dx;
+      final x2 = tester
+          .getTopLeft(find.byKey(const ValueKey('agent-model-c2')))
+          .dx;
+      final x3 = tester
+          .getTopLeft(find.byKey(const ValueKey('agent-model-c3')))
+          .dx;
+      expect(x1, closeTo(105, 0.5));
+      expect(x2, closeTo(119, 0.5));
+      expect(x3, closeTo(133, 0.5));
+      // 第二行元信息与第三行同起点。
+      expect(
+        tester.getTopLeft(find.byKey(const ValueKey('agent-subtitle-c1'))).dx,
+        closeTo(105, 0.5),
+      );
+      final semantics = tester.ensureSemantics();
+      final body = tester.getSemantics(
+        find.byKey(const ValueKey('agent-body-semantics-c1')),
+      );
+      expect(body.getSemanticsData().label, contains('模型 GPT-5，高'));
+      semantics.dispose();
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('首次模型请求失败不永久缓存：刷新后恢复真实模型', (tester) async {
+      final backend =
+          _Backend([
+              _row('c1', name: 'a1', depth: 1, parent: _root, title: '一级'),
+            ])
+            ..sessionConfigFailures = 1
+            ..sessionConfigs['c1'] = {'model': 'model-a', 'provider': 'p'};
+      await _mountPanel(tester, backend);
+      await _settle(tester);
+      expect(find.byKey(const ValueKey('agent-model-c1')), findsNothing);
+      expect(backend.sessionConfigCalls, 1);
+      await tester.tap(find.byTooltip('刷新'));
+      await _settle(tester);
+      expect(backend.sessionConfigCalls, greaterThanOrEqualTo(2));
+      expect(
+        find.byKey(const ValueKey('agent-model-c1')),
+        findsOneWidget,
+        reason: '刷新必须清掉失败缓存并重新请求',
+      );
+      expect(find.text('model-a'), findsOneWidget);
+    });
+
+    testWidgets('子会话改模型后返回：面板按世代重拉并显示新模型', (tester) async {
+      final backend = _Backend([
+        _row('c1', name: 'a1', depth: 1, parent: _root, title: '一级'),
+      ])..sessionConfigs['c1'] = {'model': 'model-a', 'provider': 'p'};
+      await _mountPanel(tester, backend);
+      await tester.tap(find.byKey(const ValueKey('agent-expand-c1')));
+      await _settle(tester);
+      expect(find.text('model-a'), findsOneWidget);
+
+      await tester.tap(find.byKey(const ValueKey('agent-body-c1')));
+      await _settle(tester);
+      expect(find.byType(ChatScreen), findsOneWidget);
+      backend.sessionConfigs['c1'] = {'model': 'model-b', 'provider': 'p'};
+      Navigator.of(tester.element(find.byType(ChatScreen))).pop();
+      await _settle(tester);
+      expect(find.byType(ChatScreen), findsNothing);
+      expect(find.text('model-b'), findsOneWidget);
+      expect(find.text('model-a'), findsNothing);
+    });
+
+    testWidgets('旧在途响应不能覆盖刷新后的新一代模型', (tester) async {
+      final backend = _Backend([
+        _row('c1', name: 'a1', depth: 1, parent: _root, title: '一级'),
+      ])..holdSessionConfigs = true;
+      await _mountPanel(tester, backend);
+      await _settle(tester);
+      expect(backend.heldSessionConfigResponses, hasLength(1));
+      await tester.tap(find.byTooltip('刷新'));
+      await _settle(tester);
+      expect(backend.heldSessionConfigResponses, hasLength(2));
+
+      backend.heldSessionConfigResponses[0].complete(
+        _json({
+          'ok': true,
+          'config': {'model': 'stale-model', 'provider': 'p'},
+        }),
+      );
+      await _settle(tester);
+      expect(find.text('stale-model'), findsNothing);
+      backend.heldSessionConfigResponses[1].complete(
+        _json({
+          'ok': true,
+          'config': {'model': 'fresh-model', 'provider': 'p'},
+        }),
+      );
+      await _settle(tester);
+      expect(find.text('fresh-model'), findsOneWidget);
+      expect(find.text('stale-model'), findsNothing);
+    });
+
+    testWidgets('320/2.0x 深层 running + 超长 effort：不溢出且 Semantics 保留完整值', (
+      tester,
+    ) async {
+      final longEffort =
+          'ultra-long-custom-effort-id-abcdefghijklmnopqrstuvwxyz';
+      final backend = _Backend(deepTree())
+        ..sessionConfigs.addAll({
+          for (final id in ['c1', 'c2', 'c3', 'c4', 'c5'])
+            id: {
+              'model': 'a-very-long-model-name-that-needs-ellipsis',
+              'provider': 'p',
+              'reasoningEffort': longEffort,
+            },
+        });
       await _mountPanel(
         tester,
         backend,
@@ -695,10 +1009,51 @@ void main() {
         await _settle(tester);
       }
       expect(tester.takeException(), isNull);
-      expect(find.textContaining('L4'), findsOneWidget);
-      expect(find.textContaining('L5'), findsOneWidget);
-      final expand = find.byKey(const ValueKey('agent-expand-c1'));
-      expect(tester.getSize(expand), const Size(44, 44));
+      final semantics = tester.ensureSemantics();
+      final body = tester.getSemantics(
+        find.byKey(const ValueKey('agent-body-semantics-c1')),
+      );
+      expect(body.getSemanticsData().label, contains(longEffort));
+      semantics.dispose();
+    });
+
+    testWidgets('旧宿主/缺字段：不伪造模型第三行；3 并发懒加载上限', (tester) async {
+      final backend =
+          _Backend([
+              _row('c1', name: 'a1', depth: 1, parent: _root, title: '一级'),
+              _row('c2', name: 'a2', depth: 1, parent: _root, title: '二级'),
+              _row('c3', name: 'a3', depth: 1, parent: _root, title: '三级'),
+              _row('c4', name: 'a4', depth: 1, parent: _root, title: '四级'),
+              _row('c5', name: 'a5', depth: 1, parent: _root, title: '五级'),
+            ])
+            ..sessionConfigDelayMs = 30
+            ..sessionConfigs['c1'] = const {};
+      await _mountPanel(tester, backend);
+      await _settle(tester);
+      expect(backend.sessionConfigMaxActive, lessThanOrEqualTo(3));
+      expect(backend.sessionConfigCalls, 5);
+      expect(find.byKey(const ValueKey('agent-model-c1')), findsNothing);
+      expect(find.textContaining('模型 '), findsNothing);
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('Semantics：diagnostic 行不可打开（无 tap action）', (tester) async {
+      final backend = _Backend([
+        _row(
+          'diag',
+          depth: 1,
+          parent: _root,
+          kind: 'diagnostic',
+          status: 'corrupt',
+        ),
+      ]);
+      await _mountPanel(tester, backend);
+      final semantics = tester.ensureSemantics();
+      final node = tester.getSemantics(
+        find.byKey(const ValueKey('agent-body-semantics-diag')),
+      );
+      expect(node.getSemanticsData().hasAction(SemanticsAction.tap), isFalse);
+      semantics.dispose();
     });
 
     testWidgets('降级 multiLevelUnavailable：不渲染展开区/胶囊，行体仍可打开', (tester) async {
