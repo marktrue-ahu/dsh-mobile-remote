@@ -1181,6 +1181,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _usageLoaded = false;
   int _usageVersion = 0;
   int _usageRequest = 0;
+  DateTime? _usageUpdatedAt;
   // issue #158：新宿主上下文四量投影（pressure 同时供圆环与抽屉；缺失时显示未知）。
   ContextStatsSnapshot? _contextStats;
   bool _contextStatsUnsupported = false;
@@ -3840,6 +3841,7 @@ class _ChatScreenState extends State<ChatScreen> {
         setState(() {
           _usage = u;
           _usageLoaded = true;
+          _usageUpdatedAt = DateTime.now();
         });
       }
     } catch (_) {}
@@ -4210,6 +4212,7 @@ class _ChatScreenState extends State<ChatScreen> {
           _usage[key] = ((_usage[key] as num?) ?? 0) + ((u[key] as num?) ?? 0);
         }
         _usageLoaded = true;
+        _usageUpdatedAt = DateTime.now();
       }
     }
     setState(() => _appendEvent(ev));
@@ -8132,6 +8135,7 @@ class _ChatScreenState extends State<ChatScreen> {
       sessionId: sid,
       model: widget.store.sessionConfig.model ?? '',
       fallbackUsage: Map<String, dynamic>.from(_usage),
+      fallbackCapturedAt: _usageUpdatedAt,
       initialSnapshot: _contextStats,
       onSnapshot: (snapshot) {
         if (mounted) setState(() => _contextStats = snapshot);

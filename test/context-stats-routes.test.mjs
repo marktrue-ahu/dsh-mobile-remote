@@ -49,14 +49,33 @@ class FakeRequest extends EventEmitter {
 //   sessionStats: {turns,steps,llmMs,toolMs,ttftMs,ttftSteps,decodeMs,decodeTokens}
 // rawStates 刻意返回错误形状（tokenUsage.totals / contextBreakdown.breakdown /
 // contextPressure 无 projected），用于证明 endpoint 只读 snapshot.values。
-function createHarness({ wireValues = {}, rawStates = {}, asOfSeq = 7, sessionExists = true } = {}) {
+function createHarness({
+	wireValues = {},
+	rawStates = {},
+	asOfSeq = 7,
+	failKeys = new Set(),
+	cuts = {},
+	sessionExists = true,
+} = {}) {
 	const routes = [];
 	const events = [{ seq: 1, type: "turn/start", data: { turn: 1 } }, { seq: 7, type: "turn/end", data: { turn: 1 } }];
 	const session = sessionExists ? { id: "s-158", snapshotEvents: () => events } : undefined;
 	const provided = new Map([
 		["sessions", { get: (id) => (id === "s-158" ? session : undefined), list: () => (session ? [session] : []) }],
 		["sessionProjections", {
-			snapshot: (s, keys) => (s === session ? { asOfSeq, values: wireValues } : { asOfSeq: -1, values: {} }),
+			snapshot: (s, keys) => {
+				if (s !== session) return { asOfSeq: -1, values: {} };
+				const key = Array.isArray(keys) ? keys[0] : undefined;
+				// 模拟某个 unit 的 viewSchema 抛错：只影响该 key 的单独读取。
+				if (key && failKeys.has(key)) throw new Error(`viewSchema failed: ${key}`);
+				const cut = key && Object.hasOwn(cuts, key) ? cuts[key] : asOfSeq;
+				return {
+					asOfSeq: cut,
+					values: key
+						? (wireValues[key] === undefined ? {} : { [key]: wireValues[key] })
+						: wireValues,
+				};
+			},
 			// 旧实现读的就是 raw state；这里给错误形状，若再回退 stateOf 测试会立刻失败。
 			stateOf: (s, key) => (s === session ? rawStates[key] : undefined),
 		}],
@@ -177,6 +196,45 @@ test("只读 wire snapshot：raw state 的错误形状不得泄漏/回退", asyn
 	assert.equal(body.tokenUsage.uncachedInput, 100, "tokenUsage 必须来自 wire 扁平值");
 	assert.equal(body.timing.turns, 1);
 	assert.equal(body.asOfSeq, 7);
+});
+
+test("单个 unit/viewSchema 抛错：只降级该块，其余块仍返回", async () => {
+	const h = createHarness({
+		wireValues: FULL,
+		failKeys: new Set(["contextBreakdown"]),
+	});
+	const { status, body } = await call(h.route);
+	h.clean();
+	assert.equal(status, 200);
+	assert.equal(body.breakdown, undefined, "损坏的 breakdown 只降级自己");
+	assert.ok(body.pressure && body.tokenUsage && body.timing, "健康块不得被连坐");
+	assert.deepEqual(body.sources, {
+		pressure: "provider",
+		tokenUsage: "provider",
+		timing: "session-stats",
+	});
+	assert.equal(body.asOfSeq, undefined, "缺一块时不得给全局原子 cut");
+	assert.deepEqual(body.asOfSeqByBlock, {
+		pressure: 7,
+		tokenUsage: 7,
+		timing: 7,
+	});
+});
+
+test("各块 cut 不一致：不给全局 asOfSeq，按块如实标注", async () => {
+	const h = createHarness({
+		wireValues: FULL,
+		cuts: { contextPressure: 5, contextBreakdown: 6, tokenUsage: 7, sessionStats: 8 },
+	});
+	const { body } = await call(h.route);
+	h.clean();
+	assert.equal(body.asOfSeq, undefined);
+	assert.deepEqual(body.asOfSeqByBlock, {
+		pressure: 5,
+		breakdown: 6,
+		tokenUsage: 7,
+		timing: 8,
+	});
 });
 
 test("会话不存在 404；缺 sessionId 400；方法不符拒绝", async () => {

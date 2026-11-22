@@ -22,6 +22,7 @@ Future<void> showContextStatsSheet(
   required String sessionId,
   required String model,
   required Map<String, dynamic> fallbackUsage,
+  DateTime? fallbackCapturedAt,
   ContextStatsSnapshot? initialSnapshot,
   ValueChanged<ContextStatsSnapshot>? onSnapshot,
 }) {
@@ -46,6 +47,7 @@ Future<void> showContextStatsSheet(
           sessionId: sessionId,
           model: model,
           fallbackUsage: fallbackUsage,
+          fallbackCapturedAt: fallbackCapturedAt,
           initialSnapshot: initialSnapshot,
           onSnapshot: onSnapshot,
         ),
@@ -61,6 +63,9 @@ class ContextStatsSheet extends StatefulWidget {
   final String model;
   final Map<String, dynamic> fallbackUsage;
 
+  /// 聊天页 fallbackUsage 被采集的时间；旧宿主 /usage 失败时保留它而不是伪装成刚更新。
+  final DateTime? fallbackCapturedAt;
+
   /// 聊天页已经拿到的最新快照：先渲染，避免打开时闪空；随后仍会刷新。
   final ContextStatsSnapshot? initialSnapshot;
 
@@ -74,6 +79,7 @@ class ContextStatsSheet extends StatefulWidget {
     required this.sessionId,
     required this.model,
     required this.fallbackUsage,
+    this.fallbackCapturedAt,
     this.initialSnapshot,
     this.onSnapshot,
   });
@@ -88,6 +94,7 @@ class _ContextStatsSheetState extends State<ContextStatsSheet>
   ContextStatsSnapshot? _snapshot;
   DateTime? _updatedAt;
   bool _loading = false;
+  bool _refreshPending = false;
   String? _error;
   Timer? _refreshDebounce;
   int _request = 0;
@@ -128,11 +135,17 @@ class _ContextStatsSheetState extends State<ContextStatsSheet>
     // 数据变化只刷新当前 sheet；合并短时间内的多帧，避免每步都打端点。
     _refreshDebounce?.cancel();
     _refreshDebounce = Timer(const Duration(milliseconds: 700), () {
-      if (mounted && !_loading) _load();
+      // 在途时 _load 只登记一次 pending，当前请求完成后补发，不丢更新事件。
+      if (mounted) _load();
     });
   }
 
   Future<void> _load() async {
+    if (_loading) {
+      // 同一时刻只允许一个请求；在途期间的轮末/assistant 事件合并成一次补发。
+      _refreshPending = true;
+      return;
+    }
     final request = ++_request;
     if (mounted) {
       setState(() {
@@ -153,23 +166,23 @@ class _ContextStatsSheetState extends State<ContextStatsSheet>
         }
       }
       if (!mounted || request != _request) return;
-      setState(() {
-        _snapshot = snapshot;
-        _updatedAt = DateTime.now();
-        _loading = false;
-      });
-      widget.onSnapshot?.call(snapshot);
+      _applySnapshot(snapshot);
     } catch (e) {
       if (!mounted || request != _request) return;
       // 旧宿主（404/not-found）回退现有 /usage；其他失败保留已有快照并提示。
       if (_isUnsupported(e)) {
         await _loadLegacy(request);
-        return;
+      } else {
+        setState(() => _error = e.toString());
       }
-      setState(() {
-        _error = e.toString();
-        _loading = false;
-      });
+    } finally {
+      if (mounted && request == _request) {
+        if (_loading) setState(() => _loading = false);
+        if (_refreshPending) {
+          _refreshPending = false;
+          unawaited(_load());
+        }
+      }
     }
   }
 
@@ -177,20 +190,46 @@ class _ContextStatsSheetState extends State<ContextStatsSheet>
       error is ApiException &&
       (error.status == 404 || error.code == 'not-found');
 
-  Future<void> _loadLegacy(int request) async {
-    Map<String, dynamic> usage = widget.fallbackUsage;
-    try {
-      usage = await widget.api.usage(widget.sessionId);
-    } catch (_) {
-      // 旧宿主连 /usage 都失败时仍用页面已有 usage（页面圆环可能已有数据），不伪造。
-    }
-    if (!mounted || request != _request) return;
-    final snapshot = ContextStatsSnapshot.fromLegacyUsage(usage);
+  /// 按 asOfSeq 单调接受宿主投影；旧响应不得覆盖更新的快照。
+  bool _acceptsSnapshot(ContextStatsSnapshot incoming) {
+    final current = _snapshot?.asOfSeq;
+    final next = incoming.asOfSeq;
+    if (current != null && (next == null || next < current)) return false;
+    return true;
+  }
+
+  void _applySnapshot(ContextStatsSnapshot snapshot) {
+    if (!_acceptsSnapshot(snapshot)) return;
     setState(() {
       _snapshot = snapshot;
       _updatedAt = DateTime.now();
-      _loading = false;
       _error = null;
+    });
+    widget.onSnapshot?.call(snapshot);
+  }
+
+  Future<void> _loadLegacy(int request) async {
+    ContextStatsSnapshot snapshot;
+    DateTime? updatedAt;
+    String? error;
+    try {
+      final usage = await widget.api.usage(widget.sessionId);
+      snapshot = ContextStatsSnapshot.fromLegacyUsage(usage);
+      updatedAt = DateTime.now();
+      error = null;
+    } catch (e) {
+      // 旧宿主 404 后 /usage 也失败：复用打开时的 fallbackUsage，但**不**把采集时间
+      // 刷新成 now；明确标记过期并允许重试，避免伪装成刚更新。
+      snapshot = ContextStatsSnapshot.fromLegacyUsage(widget.fallbackUsage);
+      updatedAt = widget.fallbackCapturedAt ?? _updatedAt;
+      error = L10n.t('旧版用量读取失败', 'Legacy usage read failed');
+    }
+    if (!mounted || request != _request) return;
+    if (!_acceptsSnapshot(snapshot)) return;
+    setState(() {
+      _snapshot = snapshot;
+      _updatedAt = updatedAt;
+      _error = error;
     });
     widget.onSnapshot?.call(snapshot);
   }

@@ -967,7 +967,8 @@ fetch/push 序列化 common domain，pull/sync/abort 同时序列化 common 与 
 - `tokenUsage`：本会话累计 provider 桶；`cacheHitRate = cacheRead / (uncachedInput + cacheRead + cacheWrite)`，分母为 0 时省略。
 - `timing`：整份会话累计（不是每轮）；`avgTtftMs = ttftMs / ttftSteps`（仅 `ttftSteps > 0`），`tps = decodeTokens / (decodeMs / 1000)`（仅 `decodeMs > 0`）。
 - 任一块的宿主投影缺失时**省略该块**（不返回 0 冒充）；四块都缺失时仅返回 `ok/sessionId`。
-- `sources` 只列出实际返回的块；`asOfSeq` 为当前事件末序号。
+- 每块独立读取受控 wire view 并各自容错：某个 unit/viewSchema 抛错只省略该块，不得连坐其它块。
+- `sources` 只列出实际返回的块。`asOfSeq` 仅在四块都读取成功且 cut 相同时返回；任一块失败或 cut 不一致时省略全局 `asOfSeq`，改用 `asOfSeqByBlock`（如 `{"pressure":5,"tokenUsage":7}`）如实标注，不伪造同一原子 cut。
 - 旧宿主没有该端点（404）：App 回退现有 `/m/api/usage` + `contextWindow`，breakdown/timing 明确降级。
 
 ### 6.17 文件传输（v3.1.2，B站 csborbbnc 反馈）

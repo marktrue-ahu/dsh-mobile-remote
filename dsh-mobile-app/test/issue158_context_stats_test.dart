@@ -9,6 +9,7 @@ import 'package:dsh_mobile_app/models.dart';
 import 'package:dsh_mobile_app/screens/chat_screen.dart';
 import 'package:dsh_mobile_app/store.dart';
 import 'package:dsh_mobile_app/theme.dart';
+import 'package:dsh_mobile_app/widgets/context_stats_sheet.dart';
 import 'package:dsh_mobile_app/turn_process.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -92,6 +93,41 @@ Map<String, dynamic> _fullStats() => {
   'asOfSeq': 4,
 };
 
+Map<String, dynamic> _statsWithProjected(int projected, int asOfSeq) => {
+  'ok': true,
+  'sessionId': _session,
+  'pressure': {
+    'pressureTokens': 1000,
+    'projectedTokens': projected,
+    'contextWindow': 8000,
+    'percent': (projected / 8000 * 100).round(),
+  },
+  'breakdown': {
+    'systemTokens': 400,
+    'toolsTokens': 600,
+    'messageTokens': 800,
+    'estimated': true,
+  },
+  'tokenUsage': {
+    'uncachedInput': 100,
+    'output': 50,
+    'cacheRead': 300,
+    'cacheWrite': 100,
+    'cacheHitRate': 0.6,
+  },
+  'timing': {
+    'turns': 1,
+    'steps': 1,
+    'llmMs': 10,
+    'toolMs': 20,
+    'ttftMs': 30,
+    'decodeMs': 40,
+    'avgTtftMs': 30,
+    'tps': 2.5,
+  },
+  'asOfSeq': asOfSeq,
+};
+
 Map<String, dynamic> _legacyUsage() => {
   'ok': true,
   'usage': {
@@ -112,11 +148,14 @@ class _Backend {
   }) : usage = usage ?? _legacyUsage();
 
   int statsStatus;
+  int usageStatus = 200;
   Map<String, dynamic>? statsBody;
   Map<String, dynamic> usage;
   int statsCalls = 0;
   int usageCalls = 0;
   Completer<void>? statsGate;
+  final List<Completer<void>> statsGates = [];
+  final List<Map<String, dynamic>> statsResponses = [];
 
   late final Api api =
       Api(
@@ -131,16 +170,25 @@ class _Backend {
             }
             if (path == '/m/api/usage') {
               usageCalls++;
+              if (usageStatus != 200) {
+                return _json({'error': 'usage-boom'}, usageStatus);
+              }
               return _json(usage);
             }
             if (path == '/m/api/context-stats') {
-              statsCalls++;
+              final index = statsCalls++;
               final gate = statsGate;
               if (gate != null) await gate.future;
+              if (index < statsGates.length) {
+                await statsGates[index].future;
+              }
               if (statsStatus != 200) {
                 return _json({'error': 'boom'}, statsStatus);
               }
-              return _json(statsBody ?? _fullStats());
+              final body = index < statsResponses.length
+                  ? statsResponses[index]
+                  : (statsBody ?? _fullStats());
+              return _json(body);
             }
             if (path == '/m/api/event-detail') {
               return _json({'ok': true, 'event': null});
@@ -206,6 +254,39 @@ Future<void> _openSheet(WidgetTester tester) async {
   );
   await tester.tap(find.byKey(const ValueKey<String>('context-stats-trigger')));
   await tester.pumpAndSettle();
+}
+
+Future<AppStore> _pumpSheet(
+  WidgetTester tester,
+  _Backend backend, {
+  Map<String, dynamic> fallbackUsage = const <String, dynamic>{},
+  DateTime? fallbackCapturedAt,
+}) async {
+  final store = AppStore(apiClient: backend.api)
+    ..sessionId = _session
+    ..sessions = [Session(id: _session, title: 'S', cwd: null, createdAt: 1)];
+  await tester.binding.setSurfaceSize(const Size(390, 844));
+  addTearDown(() => tester.binding.setSurfaceSize(null));
+  addTearDown(() async {
+    await tester.pump(const Duration(seconds: 1));
+  });
+  await tester.pumpWidget(
+    MaterialApp(
+      theme: DshTheme.light(),
+      home: Scaffold(
+        body: ContextStatsSheet(
+          api: backend.api,
+          store: store,
+          sessionId: _session,
+          model: 'M',
+          fallbackUsage: fallbackUsage,
+          fallbackCapturedAt: fallbackCapturedAt,
+        ),
+      ),
+    ),
+  );
+  await tester.pump();
+  return store;
 }
 
 void main() {
@@ -563,6 +644,103 @@ void main() {
     await _openSheet(tester);
     expect(tester.takeException(), isNull);
     expect(find.text('上下文构成'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('在途刷新合并：轮末事件扣住 pending，旧响应后补发并展示新快照', (tester) async {
+    final firstGate = Completer<void>();
+    final secondGate = Completer<void>();
+    final backend = _Backend();
+    backend.statsGates.addAll([firstGate, secondGate]);
+    backend.statsResponses.addAll([
+      _statsWithProjected(1600, 4), // 20%
+      _statsWithProjected(3200, 9), // 40%
+    ]);
+    final store = await _pumpSheet(tester, backend);
+    expect(backend.statsCalls, 1, reason: '打开即发第一次请求（已挂起）');
+
+    // 在途期间到达轮末事件：debounce 到点不能直接丢弃，只能登记 pending。
+    store.injectFrame({
+      'type': 'session/event',
+      'sessionId': _session,
+      'event': {
+        'seq': 5,
+        'type': 'turn/end',
+        'data': {'turn': 1},
+      },
+    });
+    await tester.pump(const Duration(milliseconds: 800));
+    expect(backend.statsCalls, 1, reason: '在途时不得并发第二请求');
+
+    firstGate.complete();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+    expect(backend.statsCalls, 2, reason: '旧请求完成后必须补发一次 pending 刷新');
+
+    secondGate.complete();
+    await tester.pumpAndSettle();
+    final percent = tester.widget<Text>(
+      find.byKey(const ValueKey<String>('context-stats-percent')),
+    );
+    expect(percent.data, '40%', reason: '最终展示新快照而不是旧响应');
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('旧宿主 404→/usage 成功→刷新 /usage 失败：保留旧值+原采集时间+过期提示', (tester) async {
+    final fallback = Map<String, dynamic>.from(_legacyUsage()['usage'] as Map)
+      ..['contextWindow'] = 8000;
+    final capturedAt = DateTime(2026, 11, 22, 10, 0, 0);
+    final backend = _Backend(statsStatus: 404);
+    await _pumpSheet(
+      tester,
+      backend,
+      fallbackUsage: fallback,
+      fallbackCapturedAt: capturedAt,
+    );
+    await tester.pumpAndSettle();
+    expect(
+      tester
+          .widget<Text>(
+            find.byKey(const ValueKey<String>('context-stats-percent')),
+          )
+          .data,
+      '25%',
+    );
+
+    backend.usageStatus = 500;
+    await tester.tap(
+      find.byKey(const ValueKey<String>('context-stats-refresh')),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey<String>('context-stats-stale-notice')),
+      findsOneWidget,
+    );
+    expect(find.textContaining('数据可能已过期'), findsOneWidget);
+    expect(
+      find.textContaining('上次更新 10:00:00'),
+      findsOneWidget,
+      reason: 'fallback 复用不得伪装成刚更新',
+    );
+    expect(
+      tester
+          .widget<Text>(
+            find.byKey(const ValueKey<String>('context-stats-percent')),
+          )
+          .data,
+      '25%',
+      reason: '保留旧值',
+    );
+
+    backend.usageStatus = 200;
+    await tester.tap(
+      find.byKey(const ValueKey<String>('context-stats-stale-retry')),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey<String>('context-stats-stale-notice')),
+      findsNothing,
+    );
     expect(tester.takeException(), isNull);
   });
 }
