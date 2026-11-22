@@ -4,6 +4,9 @@ import 'package:dsh_mobile_app/api.dart';
 import 'package:dsh_mobile_app/connection_manager.dart';
 import 'package:dsh_mobile_app/connection_profile.dart';
 import 'package:dsh_mobile_app/credential_store.dart';
+import 'package:dsh_mobile_app/attention_storage.dart';
+import 'package:dsh_mobile_app/git_file_history_controller.dart';
+import 'package:dsh_mobile_app/store.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -250,6 +253,69 @@ void main() {
     expect(manager.profileScope, isNot(oldScope));
     expect(manager.profileScope, contains('host-b'));
     // sessionId 不在命名空间中，同一 sessionId 也不会因为 host 不同而串缓存。
+  });
+
+  test('草稿/最近文件/通知账本按 (profileId,hostId) 隔离，切回恢复旧草稿', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    final manager = ConnectionManager(
+      api: Api()..baseUrl = '',
+      credentials: MemoryCredentialStore(),
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    final b = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: 'B',
+      baseUrls: ['https://b.example.com/m'],
+      hostId: 'host-b',
+    );
+    manager.profiles.add(b);
+    final store = AppStore(apiClient: Api());
+    addTearDown(store.disposeBridge);
+
+    manager.activeProfileId = a.id;
+    store.attachConnections(manager);
+    store.saveDraft('same-session', 'draft-for-a');
+    final gitKeyA = GitFileHistoryController.recentFilesKey('repo-1');
+    final ledgerKeyA = AttentionStorage.preferenceKey;
+
+    manager.activeProfileId = b.id;
+    store.attachConnections(manager);
+    expect(store.draftOf('same-session'), isEmpty, reason: '同一 sessionId 不得串到 B');
+    store.saveDraft('same-session', 'draft-for-b');
+    expect(GitFileHistoryController.recentFilesKey('repo-1'), isNot(gitKeyA));
+    expect(AttentionStorage.preferenceKey, isNot(ledgerKeyA));
+
+    manager.activeProfileId = a.id;
+    store.attachConnections(manager);
+    expect(store.draftOf('same-session'), 'draft-for-a', reason: '切回 A 应恢复 A 的草稿');
+  });
+
+  test('删除档案清理该命名空间缓存', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    final manager = ConnectionManager(
+      api: Api()..baseUrl = '',
+      credentials: MemoryCredentialStore(),
+    );
+    await manager.load();
+    final other = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: 'B',
+      baseUrls: ['https://b.example.com/m'],
+      hostId: 'host-b',
+    );
+    manager.profiles.add(other);
+    final prefs = await SharedPreferences.getInstance();
+    final scopedKey = 'dsh_mr_session.${other.id}:host-b';
+    await prefs.setString(scopedKey, 'cached-session');
+    await manager.deleteProfile(other.id);
+    expect(prefs.getString(scopedKey), isNull);
   });
 
   test('token-bearing 请求禁止跟随跨 origin 重定向', () async {

@@ -12,6 +12,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'api.dart';
 import 'connection_profile.dart';
 import 'credential_store.dart';
+import 'profile_namespace.dart';
 
 class ConnectionManager {
   ConnectionManager({
@@ -83,6 +84,7 @@ class ConnectionManager {
       }
       return;
     }
+    ProfileNamespace.setScope(profileScope);
     try {
       final token = await credentials.readActiveToken() ??
           await credentials.readToken(current.id);
@@ -317,6 +319,7 @@ class ConnectionManager {
       if (index >= 0) profiles[index] = updated;
       activeProfileId = profile.id;
       generation = stage.generation;
+      ProfileNamespace.setScope(profileScope);
       await _saveProfiles();
       api.applyConnection(
         base: updated.primaryBase,

@@ -14,6 +14,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'api.dart';
 import 'git_models.dart';
+import 'profile_namespace.dart';
 
 /// 文件历史控制器：历史分页 + 文件选择器。
 class GitFileHistoryController extends ChangeNotifier {
@@ -31,8 +32,9 @@ class GitFileHistoryController extends ChangeNotifier {
   static const int recentFilesLimit = 5;
 
   /// 最近使用文件的 SharedPreferences 键（按 repositoryId 隔离）。
-  static String recentFilesKey(String repositoryId) =>
-      'dsh_mr_git_recent_files_$repositoryId';
+  static String recentFilesKey(String repositoryId) => ProfileNamespace.key(
+    'dsh_mr_git_recent_files_$repositoryId',
+  );
 
   final GitReadApi api;
   final String sessionId;

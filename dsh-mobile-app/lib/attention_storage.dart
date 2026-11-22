@@ -4,10 +4,12 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'attention.dart';
 import 'logger.dart';
+import 'profile_namespace.dart';
 
 /// Versioned, bounded notification ledger. No prompts, tokens or tool arguments.
 class AttentionStorage {
-  static const preferenceKey = 'dsh_attention_ledger_v1';
+  static String get preferenceKey =>
+      ProfileNamespace.key('dsh_attention_ledger_v1');
 
   Future<void> restore(AttentionLedger ledger) async {
     try {

@@ -136,6 +136,16 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
     ]);
   }
 
+  Future<void> _reloadAttentionForProfile() async {
+    await _attentionReady;
+    final ids = _ledger.entries.map((entry) => entry.id).toList(growable: false);
+    for (final id in ids) {
+      await LocalNotifier.instance.cancel(id);
+    }
+    _ledger.clear();
+    await _attentionStorage.restore(_ledger);
+  }
+
   /// 通知账本的单写者队列：restore → event → persist（回放、结算、快照对账都串行）。
   void _queueAttention(Future<void> Function() action) {
     _attentionQueue = _attentionQueue
@@ -165,6 +175,8 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
     // 只在 App 不在前台时真正弹出；点击通知走统一 openChat 入口。
     WidgetsBinding.instance.addObserver(this);
     _attentionReady = _initNotifications();
+    // #152：切换宿主后通知账本按新 (profileId,hostId) 命名空间重载。
+    store.onConnectionSwitched = _reloadAttentionForProfile;
     // M2：后台保活（默认关；开启后 onResume 会拉起前台服务）。
     unawaited(_initKeepAlive());
     LocalNotifier.instance.onOpenSession = (id) =>

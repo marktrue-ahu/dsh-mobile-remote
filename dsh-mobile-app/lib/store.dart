@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'api.dart';
 import 'connection_manager.dart';
 import 'connection_profile.dart';
+import 'profile_namespace.dart';
 import 'attention.dart';
 import 'floating.dart';
 import 'git_models.dart';
@@ -52,6 +53,9 @@ class AppStore extends ChangeNotifier {
 
   /// #152：活动连接档案（main 启动时 attach；测试可为 null）。
   ConnectionManager? connections;
+
+  /// #152：切换提交后由 main 重新加载按宿主隔离的通知账本。
+  Future<void> Function()? onConnectionSwitched;
   final UpdateInstaller? _installer;
 
   bool _installingApp = false;
@@ -1421,16 +1425,18 @@ class AppStore extends ChangeNotifier {
 
   // ── v2.7：会话级输入草稿（返回/切会话后恢复） ──
   final Map<String, String> _drafts = {};
-  String draftOf(String sessionId) => _drafts[sessionId] ?? '';
+  String _draftKey(String sessionId) => ProfileNamespace.key('draft:$sessionId');
+  String draftOf(String sessionId) => _drafts[_draftKey(sessionId)] ?? '';
   void saveDraft(String sessionId, String text) {
+    final key = _draftKey(sessionId);
     if (text.isEmpty) {
-      _drafts.remove(sessionId);
+      _drafts.remove(key);
     } else {
-      _drafts[sessionId] = text;
+      _drafts[key] = text;
     }
   }
 
-  void clearDraft(String sessionId) => _drafts.remove(sessionId);
+  void clearDraft(String sessionId) => _drafts.remove(_draftKey(sessionId));
 
   // ── v2.7：会话任务视图（session/jobs 帧，与 PC 端同源） ──
   final Map<String, List<Map<String, dynamic>>> jobsBySession = {};
@@ -1576,6 +1582,7 @@ class AppStore extends ChangeNotifier {
   void attachConnections(ConnectionManager manager) {
     connections = manager;
     _profileScope = manager.profileScope;
+    ProfileNamespace.setScope(_profileScope);
   }
 
   Future<void> loadPrefs() async {
@@ -2624,7 +2631,9 @@ class AppStore extends ChangeNotifier {
       _pendingQuestionsBySession.clear();
       _pendingApprovalsBySession.clear();
       _profileScope = manager.profileScope;
+      ProfileNamespace.setScope(_profileScope);
       notifyListeners();
+      await onConnectionSwitched?.call();
       connect();
       unawaited(refreshAll());
       return null;

@@ -313,6 +313,12 @@ class AttentionLedger {
 
   Iterable<AttentionEntry> get entries => _byKey.values;
 
+  /// 切换宿主时清空内存账本；系统通知 id 由调用方在清空前撤销。
+  void clear() {
+    _byKey.clear();
+    _keyById.clear();
+  }
+
   AttentionEntry? byKey(String key) => _byKey[key];
 
   AttentionEntry? byId(int id) {
