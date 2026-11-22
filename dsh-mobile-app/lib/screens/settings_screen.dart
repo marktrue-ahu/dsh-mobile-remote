@@ -32,7 +32,6 @@ import '../update_flow.dart';
 import '../updater.dart';
 import '../version_alignment.dart';
 import 'sheets.dart';
-import 'connection_profiles_screen.dart';
 import 'log_sheet.dart';
 import 'providers_screen.dart';
 import 'plugin_inventory_screen.dart';
@@ -672,12 +671,9 @@ class _SettingsScreenState extends State<SettingsScreen>
   @override
   void initState() {
     super.initState();
-    final connected =
-        widget.store.connections?.active != null &&
-        widget.store.connState == 'connected';
-    _tabIndex = connected ? _lastTabIndex.clamp(0, 4) : 0;
+    _tabIndex = _lastTabIndex.clamp(0, 3);
     _tabController = TabController(
-      length: 5,
+      length: 4,
       vsync: this,
       initialIndex: _tabIndex,
     )..addListener(_onTabChanged);
@@ -1799,17 +1795,26 @@ class _SettingsScreenState extends State<SettingsScreen>
           children: [
             Row(
               children: [
-                Text(
-                  L10n.t('主题皮肤', 'Theme skin'),
-                  style: const TextStyle(fontSize: 14),
+                Expanded(
+                  child: Text(
+                    L10n.t('主题皮肤', 'Theme skin'),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 14),
+                  ),
                 ),
-                const Spacer(),
-                Text(
-                  widget.store.skin.labelFor(en),
-                  style: TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                    color: DshColors.brand(context),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Text(
+                    widget.store.skin.labelFor(en),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.right,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: DshColors.brand(context),
+                    ),
                   ),
                 ),
               ],
@@ -1835,17 +1840,26 @@ class _SettingsScreenState extends State<SettingsScreen>
           children: [
             Row(
               children: [
-                Text(
-                  L10n.t('App 图标', 'App icon'),
-                  style: const TextStyle(fontSize: 14),
+                Expanded(
+                  child: Text(
+                    L10n.t('App 图标', 'App icon'),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 14),
+                  ),
                 ),
-                const Spacer(),
-                Text(
-                  AppIconStyle.byId(widget.store.appIcon).labelFor(en),
-                  style: TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                    color: DshColors.brand(context),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Text(
+                    AppIconStyle.byId(widget.store.appIcon).labelFor(en),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.right,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: DshColors.brand(context),
+                    ),
                   ),
                 ),
               ],
@@ -2158,12 +2172,11 @@ class _SettingsScreenState extends State<SettingsScreen>
 
     final factor = MediaQuery.textScalerOf(context).scale(1.0);
     final width = MediaQuery.sizeOf(context).width;
-    // 中文 2 字标签在 320×1.5 可五等分；英文标签更长，窄屏大字号退化为可滚动，
-    // 不压字号、不裁字（设计要求的五等分以中文标签为基准）。
+    // #163：连接入口移出设置页后为四等分；英文标签更长/大字号时退化为可滚动，
+    // 不压字号、不裁字（以中文 2 字标签为四等分基准）。
     final scrollableTabs =
         factor >= 1.9 || (L10n.lang == 'en' && width <= 340 && factor >= 1.25);
     final tabLabels = [
-      L10n.t('连接', 'Connect'),
       L10n.t('对话', 'Chat'),
       L10n.t('外观', 'Style'),
       L10n.t('通知', 'Alerts'),
@@ -2191,30 +2204,10 @@ class _SettingsScreenState extends State<SettingsScreen>
         Expanded(
           child: ListView(
             key: PageStorageKey<String>('settings-tab-$_tabIndex'),
-            padding: _tabIndex == 0
-                ? const EdgeInsets.symmetric(vertical: 8)
-                : const EdgeInsets.all(16),
+            padding: const EdgeInsets.all(16),
             children: [
-              if (_tabIndex == 0) ...[
-                ConnectionSettingsSection(store: store),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16),
-                  child: _card(L10n.t('连接', 'Connection'), [
-                    _row(
-                      leading: const Icon(Icons.settings_outlined),
-                      title: L10n.t('重新配置连接', 'Reconfigure connection'),
-                      sub: L10n.t('更换电脑地址或访问口令', 'Change PC address or token'),
-                      trailing: Text(
-                        L10n.t('配置 ▸', 'Configure ▸'),
-                        style: TextStyle(fontSize: 12, color: brand),
-                      ),
-                      onTap: () => widget.onReconfigure(),
-                    ),
-                  ]),
-                ),
-              ],
               // v3.1.2：推送通道自检（配置在电脑端 cordis.patch.yml 的 pushUrls）
-              if (_tabIndex == 3)
+              if (_tabIndex == 2)
                 _card(L10n.t('通知', 'Notifications'), [
                   _row(
                     leading: const Icon(Icons.notifications_active_outlined),
@@ -2246,7 +2239,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                     ),
                   ),
                 ]),
-              if (_tabIndex == 1)
+              if (_tabIndex == 0)
                 _card(L10n.t('默认配置', 'Defaults'), [
                   _row(
                     leading: const Icon(Icons.security_outlined),
@@ -2289,7 +2282,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                     },
                   ),
                 ]),
-              if (_tabIndex == 4)
+              if (_tabIndex == 3)
                 _card(L10n.t('账户', 'Account'), [
                   _row(
                     leading: const Icon(Icons.account_balance_wallet_outlined),
@@ -2342,8 +2335,8 @@ class _SettingsScreenState extends State<SettingsScreen>
                     ),
                   ),
                 ]),
-              if (_tabIndex == 2) _appearanceCard(),
-              if (_tabIndex == 1)
+              if (_tabIndex == 1) _appearanceCard(),
+              if (_tabIndex == 0)
                 _card(L10n.t('对话行为', 'Conversation'), [
                   if (store.api.turnTailCapabilities.available) ...[
                     _row(
@@ -2380,7 +2373,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                     ),
                   ),
                 ]),
-              if (_tabIndex == 2)
+              if (_tabIndex == 1)
                 _card(L10n.t('外观与交互', 'Appearance & interaction'), [
                   _row(
                     leading: const Icon(Icons.dark_mode_outlined),
@@ -2476,7 +2469,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                     onTap: _showBubbleGuide,
                   ),
                 ]),
-              if (_tabIndex == 3)
+              if (_tabIndex == 2)
                 _card(L10n.t('后台提醒', 'Background alerts'), [
                   _row(
                     leading: const Icon(Icons.notifications_paused_outlined),
@@ -2545,7 +2538,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                       },
                     ),
                 ]),
-              if (_tabIndex == 4)
+              if (_tabIndex == 3)
                 _card(L10n.t('Git', 'Git'), [
                   _row(
                     leading: const Icon(Icons.tab_outlined),
@@ -2569,7 +2562,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                     onTap: _pickGitGraphLimit,
                   ),
                 ]),
-              if (_tabIndex == 4)
+              if (_tabIndex == 3)
                 _card(L10n.t('文件浏览', 'File browsing'), [
                   _row(
                     leading: const Icon(Icons.visibility_outlined),
@@ -2584,7 +2577,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                     ),
                   ),
                 ]),
-              if (_tabIndex == 4)
+              if (_tabIndex == 3)
                 _card(L10n.t('插件', 'Plugins'), [
                   _row(
                     leading: const Icon(Icons.extension_outlined),
@@ -2605,7 +2598,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                     ),
                   ),
                 ]),
-              if (_tabIndex == 4)
+              if (_tabIndex == 3)
                 _card(L10n.t('关于', 'About'), [
                   _row(
                     leading: const Icon(Icons.info_outline),
