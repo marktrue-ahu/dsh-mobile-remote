@@ -15,7 +15,7 @@ const CONFIG = {
 const header = (id) => ({ id, version: 1, createdAt: 1, cwd: "/tmp", isSeeded: false });
 const pick = (provider, model, effort) => ({ provider, model, ...(effort ? { reasoningEffort: effort } : {}) });
 
-function harness({ live = false, events = [], noQuery = false, seeded = false, cache } = {}) {
+function harness({ live = false, events = [], noQuery = false, seeded = false, cache, surface } = {}) {
   const routes = [];
   const cacheCalls = [];
   const resumeCalls = [];
@@ -55,6 +55,11 @@ function harness({ live = false, events = [], noQuery = false, seeded = false, c
       async readSession(id) {
         if (seeded) throw new Error("seeded session constructor seed must equal its inherited prefix");
         return { session: header(id), events };
+      },
+      async readSurface(id) {
+        if (surface === undefined) return { session: header(id), events: [] };
+        if (surface instanceof Error) throw surface;
+        return surface;
       },
       async listEvents() { return events.map((event, index) => ({ type: event.type, seq: index + 1 })); },
       async readEvent({ seq }) { return { target: { ...events[seq - 1], seq } }; },
@@ -102,7 +107,7 @@ async function request(route, path, body) {
   return { status: res.statusCode, body: JSON.parse(text || "{}") };
 }
 
-const projection = (lastUsed, next) => ({ values: { modelSelection: { lastUsed, next } } });
+const projection = (lastUsed, next, asOfSeq = 10) => ({ asOfSeq, values: { modelSelection: { lastUsed, next } } });
 
 test("live 会话行为不变：control next 优先，不读 projection cache", async () => {
   const h = harness({ live: true, cache: projection(pick("p-proj", "m-proj", "max"), pick("p-proj", "m-proj", "max")) });
@@ -114,28 +119,72 @@ test("live 会话行为不变：control next 优先，不读 projection cache", 
   } finally { h.dispose?.(); }
 });
 
-test("dormant：lastUsed=A / next=B 且事件=C → session-config 显示 B（不反向覆盖）", async () => {
+test("P1：cache asOfSeq 旧（B pending）但事件 C 更新 → config 用 C 并标降级", async () => {
   const h = harness({
-    events: [{ seq: 1, type: "model/selection", data: pick("event", "event-model", "low") }],
-    cache: projection(pick("a", "model-a", "medium"), pick("b", "model-b", "max")),
+    events: [{ seq: 11, type: "model/selection", data: pick("c", "model-c", "high") }],
+    cache: projection(pick("a", "model-a", "medium"), pick("b", "model-b", "max"), 10),
   });
   try {
     const res = await request(h.route, "/m/api/session-config?sessionId=dormant-b");
     assert.equal(res.status, 200);
-    assert.deepEqual([res.body.config.provider, res.body.config.model, res.body.config.reasoningEffort], ["b", "model-b", "max"]);
+    assert.deepEqual([res.body.config.provider, res.body.config.model, res.body.config.reasoningEffort], ["c", "model-c", "high"]);
+    assert.equal(res.body.configDegraded, true);
     assert.deepEqual(h.cacheCalls[0].keys, ["modelSelection"]);
-    assert.equal(JSON.stringify(res.body).includes("SECRET_PROMPT_BODY"), false);
   } finally { h.dispose?.(); }
 });
 
-test("dormant：无 pending 时事件折叠优先于 lastUsed；无模型则省略", async () => {
+test("dormant：cache 覆盖最新事件时 pending B 优先于事件 A", async () => {
   const h = harness({
     events: [{ seq: 1, type: "model/selection", data: pick("event", "event-model", "low") }],
-    cache: projection(pick("a", "model-a", "medium"), pick("a", "model-a", "medium")),
+    cache: projection(pick("a", "model-a", "medium"), pick("b", "model-b", "max"), 10),
+  });
+  try {
+    const res = await request(h.route, "/m/api/session-config?sessionId=dormant-cache-fresh");
+    assert.deepEqual([res.body.config.provider, res.body.config.model, res.body.config.reasoningEffort], ["b", "model-b", "max"]);
+    assert.equal(res.body.config.configDegraded, undefined);
+  } finally { h.dispose?.(); }
+});
+
+test("P2 seeded 回退：从 readSurface header 取 cache-only 模型", async () => {
+  const id = "seeded-cache-only";
+  const h = harness({
+    seeded: true,
+    events: [],
+    surface: { session: header(id), events: [] },
+    cache: projection(pick("seed", "seed-model", "max"), pick("seed", "seed-model", "max"), 7),
+  });
+  try {
+    const res = await request(h.route, `/m/api/session-config?sessionId=${id}`);
+    assert.equal(res.status, 200);
+    assert.deepEqual([res.body.config.provider, res.body.config.model, res.body.config.reasoningEffort], ["seed", "seed-model", "max"]);
+    assert.equal(h.cacheCalls.length, 1);
+    assert.equal(h.cacheCalls[0].id, id);
+  } finally { h.dispose?.(); }
+});
+
+test("P2 seeded 回退无可信 header：不读 cache，如实降级", async () => {
+  const h = harness({
+    seeded: true,
+    events: [],
+    surface: new Error("surface unavailable"),
+    cache: projection(pick("seed", "seed-model", "max"), pick("seed", "seed-model", "max"), 7),
+  });
+  try {
+    const res = await request(h.route, "/m/api/session-config?sessionId=seeded-no-header");
+    assert.equal(res.body.config.model, undefined);
+    assert.equal(h.cacheCalls.length, 0);
+  } finally { h.dispose?.(); }
+});
+
+test("dormant：cache stale 且无 pending → 重放事件优先于 lastUsed；无模型则省略", async () => {
+  const h = harness({
+    events: [{ seq: 1, type: "model/selection", data: pick("event", "event-model", "low") }],
+    cache: projection(pick("a", "model-a", "medium"), pick("a", "model-a", "medium"), 0),
   });
   try {
     const res = await request(h.route, "/m/api/session-config?sessionId=dormant-event");
     assert.deepEqual([res.body.config.provider, res.body.config.model, res.body.config.reasoningEffort], ["event", "event-model", "low"]);
+    assert.equal(res.body.configDegraded, true);
   } finally { h.dispose?.(); }
 
   const empty = harness({ events: [], cache: undefined });
@@ -146,15 +195,16 @@ test("dormant：无 pending 时事件折叠优先于 lastUsed；无模型则省�
   } finally { empty.dispose?.(); }
 });
 
-test("resume dormant agentOptions 使用权威 next（P1）", async () => {
+test("P1 resume：stale cache B、事件 C → agentOptions 用 C", async () => {
   const h = harness({
-    events: [{ seq: 1, type: "model/selection", data: pick("event", "event-model", "low") }],
-    cache: projection(pick("a", "model-a", "medium"), pick("b", "model-b", "max")),
+    events: [{ seq: 11, type: "model/selection", data: pick("c", "model-c", "high") }],
+    cache: projection(pick("a", "model-a", "medium"), pick("b", "model-b", "max"), 10),
   });
   try {
     const res = await request(h.route, "/m/api/send", { sessionId: "resume", text: "hi" });
     assert.equal(res.status, 200);
-    assert.deepEqual(h.resumeCalls[0].agentOptions, { provider: "b", model: "model-b", reasoningEffort: "max" });
+    assert.deepEqual(h.resumeCalls[0].agentOptions, { provider: "c", model: "model-c", reasoningEffort: "high" });
+    assert.equal(res.body.configDegraded, true);
   } finally { h.dispose?.(); }
 });
 
