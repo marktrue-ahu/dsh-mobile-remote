@@ -88,6 +88,7 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
   Timer? _freshnessTimer;
   bool _defaultGraphRequested = false;
   bool _allGraphAutoRequested = false;
+  int _branchSubTab = 0; // 0 本地 / 1 远程 / 2 标签（#159）
 
   /// 图行标签缓存：标签只在图数据变化时计算/测量一次（TextPainter 是 O(标签数)）。
   final Map<String, List<GitGraphLabel>> _rowLabels = {};
@@ -821,44 +822,206 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
   }
 
   Widget _branches(GitBrowserState state) {
+    final supportsTags = state.capabilities?.tags == true;
+    final tab = supportsTags ? _branchSubTab : 0;
     final branches = state.filteredBranches;
     final locals = branches.where((branch) => branch.isLocal).toList();
     final remotes = branches.where((branch) => branch.isRemote).toList();
     final other = branches
         .where((branch) => !branch.isLocal && !branch.isRemote)
         .toList();
+    if (supportsTags && tab == 2 && !state.tagsLoaded && !state.loadingTags) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) widget.controller.loadTags();
+      });
+    }
+    final tags = state.filteredTags;
     return Column(
       children: [
+        if (supportsTags)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: Row(
+              children: [
+                for (final item in <(int, String, int)>[
+                  (0, L10n.t('本地', 'Local'), locals.length),
+                  (1, L10n.t('远程', 'Remote'), remotes.length),
+                  (2, L10n.t('标签', 'Tags'), state.tags.length),
+                ])
+                  Expanded(
+                    child: TextButton(
+                      key: Key('git-branch-subtab-${item.$1}'),
+                      onPressed: () => setState(() => _branchSubTab = item.$1),
+                      style: TextButton.styleFrom(
+                        minimumSize: const Size(0, 44),
+                        padding: EdgeInsets.zero,
+                        foregroundColor: tab == item.$1
+                            ? DshColors.brand(context)
+                            : DshColors.ink3(context),
+                      ),
+                      child: Text(
+                        '${item.$2} ${item.$3}',
+                        maxLines: 1,
+                        style: TextStyle(
+                          fontSize: 13.5,
+                          fontWeight: FontWeight.w600,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
           child: TextFormField(
-            key: const Key('git-branch-search'),
-            initialValue: state.branchQuery,
-            onChanged: widget.controller.setBranchQuery,
+            key: Key(tab == 0 ? 'git-branch-search' : 'git-branch-search-$tab'),
+            initialValue: tab == 2 ? state.tagQuery : state.branchQuery,
+            onChanged: tab == 2
+                ? widget.controller.setTagQuery
+                : widget.controller.setBranchQuery,
             decoration: InputDecoration(
               prefixIcon: const Icon(Icons.search),
-              hintText: L10n.t('搜索分支', 'Search branches'),
+              hintText: tab == 2
+                  ? L10n.t('搜索标签', 'Search tags')
+                  : L10n.t('搜索分支', 'Search branches'),
               border: const OutlineInputBorder(),
             ),
           ),
         ),
         Expanded(
-          child: ListView(
-            controller: _branchScroll,
-            children: [
-              _branchGroup(L10n.t('本地分支', 'Local branches'), locals),
-              _branchGroup(L10n.t('远程分支', 'Remote branches'), remotes),
-              if (other.isNotEmpty) _branchGroup(L10n.t('其他', 'Other'), other),
-              if (branches.isEmpty)
-                Padding(
-                  padding: const EdgeInsets.all(24),
-                  child: Text(L10n.t('没有匹配的分支', 'No matching branches')),
+          child: tab == 2
+              ? _tagList(state, tags)
+              : ListView(
+                  controller: _branchScroll,
+                  children: [
+                    if (!supportsTags || tab == 0)
+                      _branchGroup(
+                        L10n.t('本地分支', 'Local branches'),
+                        locals,
+                      ),
+                    if (!supportsTags || tab == 1)
+                      _branchGroup(
+                        L10n.t('远程分支', 'Remote branches'),
+                        remotes,
+                      ),
+                    if (other.isNotEmpty && (tab == 0 || !supportsTags))
+                      _branchGroup(L10n.t('其他', 'Other'), other),
+                    if (branches.isEmpty)
+                      Padding(
+                        padding: const EdgeInsets.all(24),
+                        child: Text(
+                          L10n.t('没有匹配的分支', 'No matching branches'),
+                        ),
+                      ),
+                  ],
                 ),
-            ],
-          ),
         ),
       ],
     );
+  }
+
+  Widget _tagList(GitBrowserState state, List<GitTag> tags) {
+    if (state.loadingTags && !state.tagsLoaded) {
+      return const Center(
+        key: ValueKey('git-tags-loading'),
+        child: CircularProgressIndicator(),
+      );
+    }
+    if (state.tagsError != null) {
+      return _MessageState(
+        message: state.tagsError == 'unsupported'
+            ? L10n.t('当前电脑端不支持标签列表', 'This desktop does not support tags')
+            : L10n.t('标签加载失败', 'Failed to load tags'),
+        onRetry: () => widget.controller.loadTags(force: true),
+      );
+    }
+    if (tags.isEmpty) {
+      return Center(
+        child: Text(
+          state.tagQuery.trim().isEmpty
+              ? L10n.t('没有标签', 'No tags')
+              : L10n.t('没有匹配的标签', 'No matching tags'),
+          key: const ValueKey('git-tags-empty'),
+        ),
+      );
+    }
+    return ListView.builder(
+      key: const ValueKey('git-tag-list'),
+      controller: _branchScroll,
+      itemCount: tags.length,
+      itemBuilder: (context, index) {
+        final tag = tags[index];
+        return ListTile(
+          key: Key('git-tag-${tag.shortName}'),
+          leading: const Icon(Icons.local_offer_outlined, size: 18),
+          title: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  tag.shortName,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+              ),
+              if (tag.annotated)
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                  decoration: BoxDecoration(
+                    color: DshColors.brandSoft(context),
+                    borderRadius: BorderRadius.circular(5),
+                  ),
+                  child: Text(
+                    L10n.t('附注', 'annotated'),
+                    style: TextStyle(fontSize: 10, color: DshColors.brand(context)),
+                  ),
+                ),
+            ],
+          ),
+          subtitle: Text(
+            '${_short(tag.targetOid ?? tag.refOid)}'
+            '${tag.date != null ? ' · ${_time(tag.date!)}' : ''}',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontSize: 11.5, color: DshColors.ink3(context)),
+          ),
+          trailing: Icon(
+            Icons.chevron_right,
+            size: 18,
+            color: DshColors.ink3(context),
+            semanticLabel: L10n.t('定位到分支图', 'Locate in graph'),
+          ),
+          onTap: () => _locateTag(tag),
+        );
+      },
+    );
+  }
+
+  Future<void> _locateTag(GitTag tag) async {
+    if (!tag.isCommitTarget) {
+      _toast(
+        L10n.t('该标签不指向提交，无法在分支图定位', 'This tag does not point to a commit'),
+      );
+      return;
+    }
+    final ok = await widget.controller.locateTag(tag);
+    if (!mounted) return;
+    if (!ok) {
+      _toast(
+        widget.controller.state.error == 'graph-focus-not-found'
+            ? L10n.t(
+                '标签目标超出全部分支图扫描范围（5000 条/20 秒软超时），未定位',
+                'Tag target is outside the 5000-commit/20s scan limit',
+              )
+            : L10n.t('无法定位该标签', 'Could not locate this tag'),
+      );
+      return;
+    }
+    final index = _tabIds.indexOf('graph');
+    if (index >= 0) _tabs.animateTo(index);
+    setState(() {});
   }
 
   Widget _worktree(GitBrowserState state) {

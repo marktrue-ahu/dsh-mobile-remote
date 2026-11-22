@@ -493,6 +493,63 @@ Future<GitBrowserController> mountSheet(
   return controller;
 }
 
+class TagWidgetApi extends WidgetGitApi
+    implements GitTagsApi, GitGraphAllApi {
+  @override
+  Future<GitReadCapabilities> capabilities(String sessionId) async =>
+      const GitReadCapabilities(
+        available: true,
+        features: {'tags': true},
+        graphTipsMax: 128,
+        graphTipsGetMax: 32,
+        graphAllPageSize: 16,
+        graphAllMaxRefs: 512,
+        graphAllMaxScan: 5000,
+      );
+
+  @override
+  Future<GitGraphPage> graphAll(
+    String sessionId,
+    String repositoryId, {
+    required bool all,
+    String? focus,
+    String? snapshotId,
+    String? cursor,
+    int limit = 16,
+    Duration timeout = const Duration(seconds: 35),
+  }) async {
+    graphCalls++;
+    return GitGraphPage(
+      snapshotId: 'all-snapshot',
+      focusOid: focus,
+      pageStart: 0,
+      commits: const [
+        GitCommitSummary(oid: 'missing-oid', subject: 'Tag target'),
+      ],
+    );
+  }
+
+  @override
+  Future<List<GitTag>> tags(String sessionId, String repositoryId) async =>
+      const [
+        GitTag(
+          name: 'refs/tags/v1.0.0',
+          shortName: 'v1.0.0',
+          refOid: 'tag-ref-1',
+          targetOid: 'main-oid',
+          annotated: false,
+        ),
+        GitTag(
+          name: 'refs/tags/v2.0.0',
+          shortName: 'v2.0.0',
+          refOid: 'tag-ref-2',
+          targetOid: 'missing-oid',
+          annotated: true,
+          date: 1700000000,
+        ),
+      ];
+}
+
 void main() {
   setUp(() => L10n.lang = 'en');
   tearDown(() => L10n.lang = 'zh');
@@ -1117,5 +1174,85 @@ void main() {
     expect(find.text(longRef), findsOneWidget);
     expect(find.byKey(const Key('git-graph-horizontal')), findsOneWidget);
     expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('#159 标签子 Tab：列表、搜索、点击未命中发起一次 focus', (tester) async {
+    final api = TagWidgetApi();
+    final controller = await mountSheet(tester, api);
+    addTearDown(controller.dispose);
+    controller.setBranchLimit(GitGraphBranchLimit.unlimited);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('git-branch-subtab-2')));
+    await tester.pumpAndSettle();
+    expect(find.text('v1.0.0'), findsOneWidget);
+    expect(find.text('v2.0.0'), findsOneWidget);
+    expect(find.text('annotated'), findsOneWidget);
+
+    await tester.enterText(
+      find.byKey(const Key('git-branch-search-2')),
+      'v2',
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('v1.0.0'), findsNothing);
+    expect(find.text('v2.0.0'), findsOneWidget);
+
+    final before = api.graphCalls;
+    final selectionBefore = controller.state.selectedBranches.map((b) => b.name).toList();
+    await tester.tap(find.byKey(const Key('git-tag-v2.0.0')));
+    await tester.pumpAndSettle();
+    expect(api.graphCalls, before + 1);
+    expect(controller.state.commits, isNotEmpty);
+    expect(
+      controller.state.selectedBranches.map((b) => b.name).toList(),
+      selectionBefore,
+      reason: 'tag 不得加入分支选择集',
+    );
+  });
+
+  testWidgets('#159 旧宿主无 tags 能力：隐藏标签子 Tab', (tester) async {
+    final controller = await mountSheet(tester, WidgetGitApi());
+    addTearDown(controller.dispose);
+    expect(find.byKey(const Key('git-branch-subtab-2')), findsNothing);
+    expect(find.text('Local branches'), findsOneWidget);
+  });
+
+  testWidgets('#159 320/深色/1.5×：标签子 Tab 不溢出', (tester) async {
+    final controller = await mountSheet(
+      tester,
+      TagWidgetApi(),
+      size: const Size(320, 640),
+      theme: ThemeData.dark(),
+      textScaler: const TextScaler.linear(1.5),
+    );
+    addTearDown(controller.dispose);
+    await tester.tap(find.byKey(const Key('git-branch-subtab-2')));
+    await tester.pumpAndSettle();
+    expect(find.text('v1.0.0'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('#159 已加载 commits 命中 tag：零网络定位、不加入选择集', (tester) async {
+    final api = TagWidgetApi();
+    final controller = await mountSheet(tester, api);
+    addTearDown(controller.dispose);
+    controller.setBranchLimit(GitGraphBranchLimit.unlimited);
+    await controller.openAllGraph(focus: 'missing-oid');
+    await tester.pumpAndSettle();
+    // TagWidgetApi.graphAll 返回 missing-oid，正好是 v2 tag 目标。
+    expect(controller.state.commits.any((c) => c.oid == 'missing-oid'), isTrue);
+    await tester.tap(find.text('Branches'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('git-branch-subtab-2')));
+    await tester.pumpAndSettle();
+    final before = api.graphCalls;
+    final selectionBefore = controller.state.selectedBranches.map((b) => b.name).toList();
+    await tester.tap(find.byKey(const Key('git-tag-v2.0.0')));
+    await tester.pumpAndSettle();
+    expect(api.graphCalls, before, reason: '命中已加载 commits 不应发网络');
+    expect(controller.state.graphFocusOid, 'missing-oid');
+    expect(
+      controller.state.selectedBranches.map((b) => b.name).toList(),
+      selectionBefore,
+    );
   });
 }

@@ -74,6 +74,9 @@ class GitReadCapabilities {
   /// 是否支持 POST graph（新宿主才暴露 graphTips）。
   bool get supportsGraphPost => graphTipsMax != null;
 
+  /// issue #159：宿主是否提供只读 tag 列表（缺失 = 旧宿主，隐藏标签子 Tab）。
+  bool get tags => features['tags'] == true;
+
   /// 实际生效的 POST 上限（旧宿主回退 5）。
   int get effectiveGraphTipsMax => graphTipsMax ?? 5;
 
@@ -136,6 +139,50 @@ class GitRepository {
     detached: json['detached'] == true,
     empty: json['empty'] == true,
   );
+}
+
+class GitTag {
+  const GitTag({
+    required this.name,
+    required this.shortName,
+    required this.refOid,
+    this.targetOid,
+    this.annotated = false,
+    this.peeled = false,
+    this.tagger,
+    this.date,
+    this.subject,
+    this.hint,
+  });
+
+  final String name;
+  final String shortName;
+  final String refOid;
+  final String? targetOid;
+  final bool annotated;
+  final bool peeled;
+  final String? tagger;
+  final int? date;
+  final String? subject;
+  final String? hint;
+
+  bool get isCommitTarget => targetOid != null && targetOid!.isNotEmpty;
+
+  factory GitTag.fromJson(Map<String, dynamic> json) {
+    final target = json['targetOid']?.toString();
+    return GitTag(
+      name: json['name']?.toString() ?? '',
+      shortName: json['shortName']?.toString() ?? '',
+      refOid: json['refOid']?.toString() ?? '',
+      targetOid: target != null && target.isNotEmpty ? target : null,
+      annotated: json['annotated'] == true,
+      peeled: json['peeled'] == true,
+      tagger: json['tagger']?.toString(),
+      date: (json['date'] as num?)?.toInt(),
+      subject: json['subject']?.toString(),
+      hint: json['hint']?.toString(),
+    );
+  }
 }
 
 class GitBranch {

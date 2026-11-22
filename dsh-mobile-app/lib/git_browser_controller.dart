@@ -13,6 +13,12 @@ class GitBrowserState {
   final GitReadCapabilities? capabilities;
   final GitRepository? repository;
   final List<GitBranch> branches;
+  final List<GitTag> tags;
+  final String tagQuery;
+  final bool loadingTags;
+  final bool tagsLoaded;
+  final bool tagsTruncated;
+  final String? tagsError;
   final String branchQuery;
   final List<GitBranch> selectedBranches;
   final List<GitCommitSummary> commits;
@@ -57,6 +63,12 @@ class GitBrowserState {
     this.capabilities,
     this.repository,
     this.branches = const [],
+    this.tags = const [],
+    this.tagQuery = '',
+    this.loadingTags = false,
+    this.tagsLoaded = false,
+    this.tagsTruncated = false,
+    this.tagsError,
     this.branchQuery = '',
     this.selectedBranches = const [],
     this.commits = const [],
@@ -86,6 +98,18 @@ class GitBrowserState {
     this.graphPageTimedOutNewer = false,
   });
 
+  List<GitTag> get filteredTags {
+    final query = tagQuery.trim().toLowerCase();
+    if (query.isEmpty) return tags;
+    return UnmodifiableListView(
+      tags.where(
+        (tag) =>
+            tag.shortName.toLowerCase().contains(query) ||
+            tag.name.toLowerCase().contains(query),
+      ),
+    );
+  }
+
   List<GitBranch> get filteredBranches {
     final query = branchQuery.trim().toLowerCase();
     if (query.isEmpty) return branches;
@@ -101,6 +125,12 @@ class GitBrowserState {
     Object? capabilities = _keep,
     Object? repository = _keep,
     List<GitBranch>? branches,
+    List<GitTag>? tags,
+    String? tagQuery,
+    bool? loadingTags,
+    bool? tagsLoaded,
+    bool? tagsTruncated,
+    Object? tagsError = _keep,
     String? branchQuery,
     List<GitBranch>? selectedBranches,
     List<GitCommitSummary>? commits,
@@ -139,6 +169,14 @@ class GitBrowserState {
         ? this.repository
         : repository as GitRepository?,
     branches: branches == null ? this.branches : UnmodifiableListView(branches),
+    tags: tags == null ? this.tags : UnmodifiableListView(tags),
+    tagQuery: tagQuery ?? this.tagQuery,
+    loadingTags: loadingTags ?? this.loadingTags,
+    tagsLoaded: tagsLoaded ?? this.tagsLoaded,
+    tagsTruncated: tagsTruncated ?? this.tagsTruncated,
+    tagsError: identical(tagsError, _keep)
+        ? this.tagsError
+        : tagsError as String?,
     branchQuery: branchQuery ?? this.branchQuery,
     selectedBranches: selectedBranches == null
         ? this.selectedBranches
@@ -675,6 +713,46 @@ class GitBrowserController extends ChangeNotifier {
       if (branch.isRemote) return branch;
     }
     return null;
+  }
+
+  void setTagQuery(String value) {
+    _emit(_state.copyWith(tagQuery: value));
+  }
+
+  Future<void> loadTags({bool force = false}) async {
+    if (_state.loadingTags) return;
+    if (_state.tagsLoaded && !force) return;
+    final api = _api;
+    final tagsApi = api is GitTagsApi ? api as GitTagsApi : null;
+    if (tagsApi == null) {
+      _emit(_state.copyWith(tagsLoaded: true, tagsError: 'unsupported'));
+      return;
+    }
+    final repository = _state.repository;
+    if (repository == null) return;
+    final generation = _generation;
+    _emit(_state.copyWith(loadingTags: true, tagsError: null));
+    try {
+      final tags = await tagsApi.tags(_state.sessionId ?? '', repository.repositoryId);
+      if (generation != _generation) return;
+      _emit(_state.copyWith(tags: tags, loadingTags: false, tagsLoaded: true));
+    } catch (e) {
+      if (generation != _generation) return;
+      _emit(_state.copyWith(loadingTags: false, tagsLoaded: true, tagsError: '$e'));
+    }
+  }
+
+  /// 点击 tag：当前已加载 commits 命中则只设置 focus（零网络）；未命中一次 all=true focus。
+  Future<bool> locateTag(GitTag tag) async {
+    final target = tag.targetOid;
+    if (target == null || target.isEmpty) return false;
+    final index = _state.commits.indexWhere((commit) => commit.oid == target);
+    if (index >= 0) {
+      _emit(_state.copyWith(graphFocusOid: target));
+      return true;
+    }
+    await openAllGraph(focus: target);
+    return _state.error == null && _state.graphFocusOid == target;
   }
 
   void setBranchQuery(String value) {
