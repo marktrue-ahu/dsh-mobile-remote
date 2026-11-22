@@ -421,4 +421,33 @@ void main() {
     expect(prefs.getString('dsh_mr_add_txn'), isNull);
     expect(creds.tokens.values, ['token']);
   });
+  test('commit marker 成功后 remove 抛错：保持新档案与凭据，重启保留', () async {
+    SharedPreferences.setMockInitialValues({});
+    final creds = _FaultCredentialStore();
+    final manager = await _manager(creds);
+    final prefs = await SharedPreferences.getInstance();
+    manager.removeOverride = (key) async => throw StateError('remove-throw');
+    final created = await manager.addProfile(
+      displayName: '测试电脑',
+      baseUrl: 'https://home.example.com/m',
+      token: 'token',
+    );
+    expect(manager.profiles.map((p) => p.id), [created.id]);
+    expect(creds.tokens.values, ['token']);
+    expect(prefs.getString('dsh_mr_add_txn'), isNotNull);
+    expect(
+      (jsonDecode(prefs.getString('dsh_mr_add_txn')!) as Map)['phase'],
+      'commit',
+    );
+
+    // 重启：commit marker 只清理 marker，不能回滚已成功添加的档案/凭据。
+    final restarted = ConnectionManager(
+      api: Api()..baseUrl = '',
+      credentials: creds,
+    );
+    await restarted.load();
+    expect(restarted.profiles.map((p) => p.id), [created.id]);
+    expect(creds.tokens.values, ['token']);
+    expect(prefs.getString('dsh_mr_add_txn'), isNull);
+  });
 }

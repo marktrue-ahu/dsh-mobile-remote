@@ -918,9 +918,11 @@ class ConnectionManager {
           '无法完成连接事务，请重试',
         );
       }
-      // commit marker 已写：即使 remove 返回 false，档案已成功落盘，marker 留给
-      // 下次 load 清理；不能把 remove 失败误当成需要回滚。
-      await _remove(prefs, _kAddTxn);
+      // commit marker 已写：remove 返回 false 或抛异常都只意味着“marker 清理
+      // 失败”，档案/token 已成功落盘；绝不能让它进入失败回滚分支。
+      try {
+        await _remove(prefs, _kAddTxn);
+      } catch (_) {}
       return profile;
     } catch (_) {
       profiles
