@@ -402,3 +402,54 @@ test("files lists HEAD-tracked paths and treats an unborn repository as empty", 
     rmSync(emptyRoot, { recursive: true, force: true });
   }
 });
+
+test("branches fail-soft on stale upstream and keep normal tracking", async () => {
+  const root = mkdtempSync(join(tmpdir(), "git-stale-upstream-"));
+  const remote = mkdtempSync(join(tmpdir(), "git-stale-upstream-remote-"));
+  try {
+    fixture(root);
+    git(remote, "init", "-q", "--bare");
+    git(root, "remote", "add", "origin", remote);
+    git(root, "push", "-q", "origin", "main");
+
+    // 正常 tracking：feature 领先 origin/feature 1 个提交。
+    git(root, "branch", "feature");
+    git(root, "push", "-q", "origin", "feature");
+    git(root, "branch", "--set-upstream-to=origin/feature", "feature");
+    git(root, "checkout", "-q", "feature");
+    writeFileSync(join(root, "feature.txt"), "ahead\n");
+    git(root, "add", "feature.txt");
+    git(root, "commit", "-qm", "feature ahead");
+    git(root, "checkout", "-q", "main");
+
+    // stale tracking：upstream 已从远端删除（本地 branch.<name>.merge 仍指向它）。
+    git(root, "branch", "stale");
+    git(root, "push", "-q", "origin", "stale");
+    git(root, "branch", "--set-upstream-to=origin/stale", "stale");
+    git(root, "push", "-q", "origin", "--delete", "stale");
+
+    const branches = await providerFor(root).branches(root);
+    const byName = new Map(branches.map((row) => [row.name, row]));
+
+    const stale = byName.get("refs/heads/stale");
+    assert.ok(stale, "stale upstream 分支仍必须返回");
+    assert.equal(stale.tracking, null);
+    assert.equal(stale.ahead, 0);
+    assert.equal(stale.behind, 0);
+
+    const feature = byName.get("refs/heads/feature");
+    assert.ok(feature, "正常分支不受影响");
+    assert.equal(feature.tracking, "refs/remotes/origin/feature");
+    assert.equal(feature.ahead, 1);
+    assert.equal(feature.behind, 0);
+
+    const main = byName.get("refs/heads/main");
+    assert.ok(main);
+    assert.equal(main.tracking, null);
+    assert.equal(main.ahead, 0);
+    assert.equal(main.behind, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(remote, { recursive: true, force: true });
+  }
+});

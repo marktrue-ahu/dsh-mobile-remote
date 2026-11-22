@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { createGitReadService } from "../lib/git-read-service.js";
 
@@ -949,4 +950,34 @@ test("issue #93: all mode rejects unknown focus refs and supports 211 branches w
       (error) => error.code === "graph-focus-invalid" && error.status === 400,
     );
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("branches service returns stale-upstream rows as 0/null without failing", async () => {
+  const root = mkdtempSync(`${tmpdir()}/git-read-stale-`);
+  const remote = mkdtempSync(`${tmpdir()}/git-read-stale-remote-`);
+  try {
+    fixture(root);
+    git(root, "init", "-q", "--bare", remote);
+    git(root, "remote", "add", "origin", remote);
+    writeFileSync(join(root, "tracked.txt"), "tracked\n");
+    git(root, "add", "-A");
+    git(root, "commit", "-qm", "initial");
+    git(root, "push", "-q", "origin", "main");
+    git(root, "branch", "stale");
+    git(root, "push", "-q", "origin", "stale");
+    git(root, "branch", "--set-upstream-to=origin/stale", "stale");
+    git(root, "push", "-q", "origin", "--delete", "stale");
+
+    const service = createGitReadService(context(root));
+    const repository = await service.repositoryForSession("session-1");
+    const result = await service.branches("session-1", repository.repositoryId);
+    const stale = result.branches.find((row) => row.name === "refs/heads/stale");
+    assert.ok(stale, "stale upstream 分支仍应出现在 service 结果中");
+    assert.equal(stale.tracking, null);
+    assert.equal(stale.ahead, 0);
+    assert.equal(stale.behind, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(remote, { recursive: true, force: true });
+  }
 });
