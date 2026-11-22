@@ -649,7 +649,7 @@ void main() {
 
     // 广告/候选中的公网 HTTP：admission/verify 均拒绝，0 请求。
     seen.clear();
-    expect(await api.rotateBaseUrlVerified(), isFalse);
+    expect((await api.rotateBaseUrlVerified()).rotated, isFalse);
     expect(seen, isEmpty);
 
     // 加入已确认 HTTPS 候选；hostId 变化拒绝。
@@ -666,14 +666,14 @@ void main() {
     manager.profiles[0] = a;
     seen.clear();
     probeHost = 'host-b';
-    expect(await api.rotateBaseUrlVerified(), isFalse);
+    expect((await api.rotateBaseUrlVerified()).rotated, isFalse);
     expect(seen, isNotEmpty);
     expect(api.baseUrl, 'https://a.example.com');
 
     // 确认且 hostId 一致：允许且只切该候选。
     seen.clear();
     probeHost = 'host-a';
-    expect(await api.rotateBaseUrlVerified(), isTrue);
+    expect((await api.rotateBaseUrlVerified()).rotated, isTrue);
     expect(api.baseUrl, 'https://c.example.com');
     expect(seen, ['/m/api/bootstrap']);
   });
@@ -805,7 +805,7 @@ void main() {
       200,
       headers: {'content-type': 'application/json'},
     ));
-    expect(await rotating, isFalse, reason: '旧 A2 验证结果必须被 CAS 丢弃');
+    expect((await rotating).rotated, isFalse, reason: '旧 A2 验证结果必须被 CAS 丢弃');
     expect(api.baseUrl, 'https://b.example.com');
     expect(api.token, 'b-token');
     expect(api.profileId, 'profile-b');
@@ -833,6 +833,14 @@ void main() {
     store.saveDraft('same', 'draft-before-binding');
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('dsh_mr_session.${a.id}:', 'session-before-binding');
+    await prefs.setString(
+      'dsh_attention_ledger_v1@${a.id}:',
+      '{"version":1,"entries":[]}',
+    );
+    await prefs.setString(
+      'dsh_mr_git_recent_files_repo@${a.id}:',
+      '["old.txt"]',
+    );
 
     final error = await store.switchProfile(a.id);
     expect(error, isNull);
@@ -840,6 +848,9 @@ void main() {
     final moved = prefs.getString('dsh_mr_session.${a.id}:host-a');
     expect(moved, 'session-before-binding');
     expect(store.draftOf('same'), 'draft-before-binding');
+    expect(prefs.getString('dsh_attention_ledger_v1@${a.id}:host-a'), isNotNull);
+    expect(prefs.getString('dsh_mr_git_recent_files_repo@${a.id}:host-a'), isNotNull);
+    expect(prefs.getString('dsh_attention_ledger_v1@${a.id}:'), isNull);
   });
 
   test('A1→A2 自动轮换同步 active profile/descriptor；重启沿用 A2', () async {
@@ -866,7 +877,7 @@ void main() {
     api.baseUrl = 'https://a1.example.com';
     final oldGeneration = manager.generation;
 
-    expect(await api.rotateBaseUrlVerified(), isTrue);
+    expect((await api.rotateBaseUrlVerified()).rotated, isTrue);
     expect(api.baseUrl, 'https://a2.example.com');
     expect(manager.active!.primaryBase, 'https://a2.example.com');
     expect(manager.generation, oldGeneration + 1);
@@ -882,5 +893,99 @@ void main() {
     await restarted.load();
     expect(restarted.active!.primaryBase, 'https://a2.example.com');
     expect(restarted.api.baseUrl, 'https://a2.example.com');
+  });
+
+  test('A→B→A 草稿不跨档：B 看不到 A，切回 A 恢复', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    var host = 'host-a';
+    final manager = ConnectionManager(
+      api: Api()..baseUrl = '',
+      credentials: MemoryCredentialStore(),
+      probeBootstrap: (_) async => {'plugin': {'hostId': host}},
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    a.hostId = 'host-a';
+    manager.profiles[0] = a;
+    final b = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: 'B',
+      baseUrls: ['https://b.example.com/m'],
+      hostId: 'host-b',
+    );
+    manager.profiles.add(b);
+    await manager.credentials.writeToken(b.id, 'b-token');
+    final store = AppStore(apiClient: _StoreApi())..attachConnections(manager);
+    addTearDown(store.disposeBridge);
+    store.saveDraft('same-session', 'draft-a');
+
+    host = 'host-b';
+    expect(await store.switchProfile(b.id), isNull);
+    expect(store.draftOf('same-session'), isEmpty, reason: 'B 不得看到 A 草稿');
+
+    host = 'host-a';
+    expect(await store.switchProfile(a.id), isNull);
+    expect(store.draftOf('same-session'), 'draft-a', reason: '切回 A 应恢复 A 草稿');
+  });
+
+  test('A2 active-base 提交在途切 B：B 的持久档案/descriptor 不被 A 覆盖', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a1.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    var probeHost = 'host-a';
+    final api = Api()..baseUrl = '';
+    final manager = ConnectionManager(
+      api: api,
+      credentials: MemoryCredentialStore(),
+      probeClient: MockClient((_) async => http.Response(
+        '{"ok":true,"plugin":{"hostId":"$probeHost"}}',
+        200,
+        headers: {'content-type': 'application/json'},
+      )),
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    a.hostId = 'host-a';
+    a.baseUrls = ['https://a1.example.com', 'https://a2.example.com'];
+    manager.profiles[0] = a;
+    api.baseUrls = ['https://a1.example.com', 'https://a2.example.com'];
+    api.baseUrl = 'https://a1.example.com';
+    final gate = Completer<void>();
+    var entered = false;
+    manager.activeBaseGate = () {
+      entered = true;
+      return gate.future;
+    };
+    final b = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: 'B',
+      baseUrls: ['https://b.example.com/m'],
+      hostId: 'host-b',
+    );
+    manager.profiles.add(b);
+    await manager.credentials.writeToken(b.id, 'b-token');
+
+    final rotation = api.rotateBaseUrlVerified();
+    for (var i = 0; i < 100 && !entered; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+    expect(entered, isTrue);
+    probeHost = 'host-b';
+    final stageB = await manager.stageSwitch(b.id);
+    final switchingB = manager.commitSwitch(stageB);
+    gate.complete();
+    await rotation;
+    await switchingB;
+
+    final prefs = await SharedPreferences.getInstance();
+    expect(manager.activeProfileId, b.id);
+    expect((jsonDecode(prefs.getString('dsh_native_connection')!) as Map)['profileId'], b.id);
+    expect((jsonDecode(prefs.getString('dsh_native_connection')!) as Map)['baseUrl'], 'https://b.example.com/m');
+    expect(prefs.getString('dsh_mr_active_profile'), b.id);
+    expect(await manager.credentials.status().then((s) => s.activeProfileId), b.id);
   });
 }

@@ -36,6 +36,7 @@ class _FakeSwitchStore extends AppStore {
   }) async => null;
 
   String? lastEditedBase;
+  Completer<String?>? addGate;
 
   @override
   Future<String?> editAndSwitchProfile(
@@ -248,5 +249,30 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('connection-profile-save')));
     await tester.pumpAndSettle();
     expect(fake.lastEditedBase, contains('/mobile-remote'));
+  });
+
+  testWidgets('添加页保存中系统返回被阻止；取消后不提交', (tester) async {
+    final fake = store as _FakeSwitchStore;
+    fake.addGate = Completer<String?>();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ConnectionProfileEditorScreen(
+          key: const ValueKey('editor-busy'),
+          store: store,
+          manager: manager,
+        ),
+      ),
+    );
+    await tester.enterText(find.byType(TextField).at(1), 'https://new.example.com');
+    await tester.enterText(find.byType(TextField).at(2), 'token');
+    await tester.tap(find.byKey(const ValueKey('connection-profile-save')));
+    await tester.pump();
+    await tester.binding.handlePopRoute();
+    await tester.pump();
+    expect(find.text('添加电脑'), findsOneWidget, reason: '保存中不得离开页面');
+
+    fake.addGate!.complete(null);
+    await tester.pumpAndSettle();
+    expect(find.text('添加电脑'), findsNothing);
   });
 }

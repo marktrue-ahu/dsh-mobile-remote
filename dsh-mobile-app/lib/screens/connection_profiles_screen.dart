@@ -514,7 +514,18 @@ class _ConnectionProfileEditorScreenState
   @override
   Widget build(BuildContext context) {
     final ink3 = DshColors.ink3(context);
-    return Scaffold(
+    return PopScope(
+      canPop: !_busy,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop || !mounted) return;
+        if (_busy) {
+          showToast(
+            context,
+            L10n.t('正在保存连接，请等待完成后再返回', 'Saving connection; wait for it to finish'),
+          );
+        }
+      },
+      child: Scaffold(
       appBar: AppBar(
         title: Text(_editing ? L10n.t('编辑电脑', 'Edit computer') : L10n.t('添加电脑', 'Add computer')),
         actions: [
@@ -595,6 +606,7 @@ class _ConnectionProfileEditorScreenState
             style: TextStyle(fontSize: 11.5, color: ink3),
           ),
         ],
+      ),
       ),
     );
   }

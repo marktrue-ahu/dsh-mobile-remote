@@ -211,6 +211,18 @@ class _NoRedirectClient extends http.BaseClient {
   void close() => _inner.close();
 }
 
+/// #152：候选轮换结果必须携带**提交后**的 epoch/identity，调用方不能拿旧值比较。
+class BaseRotationResult {
+  const BaseRotationResult({
+    required this.rotated,
+    required this.epoch,
+    required this.identity,
+  });
+  final bool rotated;
+  final int epoch;
+  final String identity;
+}
+
 class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
   final http.Client _client;
 
@@ -440,11 +452,16 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
   }
 
   /// #152：带 staged hostId 校验的候选轮换；未确认/身份不符的候选直接跳过。
-  Future<bool> rotateBaseUrlVerified() async {
-    if (baseUrls.length < 2) return false;
+  Future<BaseRotationResult> rotateBaseUrlVerified() async {
+    BaseRotationResult noRotation() => BaseRotationResult(
+      rotated: false,
+      epoch: connectionEpoch,
+      identity: connectionIdentity,
+    );
+    if (baseUrls.length < 2) return noRotation();
     final cur = _normBase(baseUrl);
     final idx = baseUrls.indexOf(cur);
-    if (idx < 0) return false;
+    if (idx < 0) return noRotation();
     for (var step = 1; step < baseUrls.length; step++) {
       final next = baseUrls[(idx + step) % baseUrls.length];
       if (next == cur) continue;
@@ -462,13 +479,13 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
             host == hostIdentity;
         final verified = await verify(next);
         // await 期间连接可能已切 B：旧 A 候选无论结果如何都不得改当前连接。
-        if (!same()) return false;
+        if (!same()) return noRotation();
         if (!verified) continue;
-        if (!same()) return false;
+        if (!same()) return noRotation();
         final commit = candidateCommitter;
         if (commit != null) {
           final committed = await commit(next);
-          if (!same()) return false;
+          if (!same()) return noRotation();
           if (!committed) continue;
         }
       }
@@ -480,9 +497,13 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
           await prefs.setString(_kBase, baseUrl);
         } catch (_) {}
       }());
-      return true;
+      return BaseRotationResult(
+        rotated: true,
+        epoch: connectionEpoch,
+        identity: connectionIdentity,
+      );
     }
-    return false;
+    return noRotation();
   }
 
   /// #152：切换宿主时清空宿主投影（目录/更新/发布/身份），由 ConnectionManager/Store 调用。

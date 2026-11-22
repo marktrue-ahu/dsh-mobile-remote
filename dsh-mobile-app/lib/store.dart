@@ -2338,9 +2338,12 @@ class AppStore extends ChangeNotifier {
       // 旧连接代的失败不得轮换/影响新连接（Reviewer #16 P2 失败路径）。
       if (!current()) return false;
       // 连接不通：尝试轮换到下一个候选地址（黑洞快速切换）再探测一次
-      final rotated = await api.rotateBaseUrlVerified();
-      if (!current()) return false;
-      if (rotated) {
+      final rotation = await api.rotateBaseUrlVerified();
+      if (rotation.epoch != api.connectionEpoch ||
+          rotation.identity != api.connectionIdentity) {
+        return false;
+      }
+      if (rotation.rotated) {
         AppLog.instance.warn('刷新探测失败 → 切换地址 ${api.baseUrl}');
         final retryEpoch = api.connectionEpoch;
         final retryIdentity = api.connectionIdentity;
@@ -2668,15 +2671,34 @@ class AppStore extends ChangeNotifier {
 
   /// #152：staged 切换连接档案。失败时旧连接/旧页面状态保持不变。
   /// 所有激活入口（首次手动/扫码、设置添加/切换）的统一收口。
-  Future<void> _finishActivation(ConnectionManager manager) async {
-    final oldScope = _profileScope;
-    if (oldScope.isNotEmpty && oldScope != manager.profileScope) {
-      // 首次绑定 hostId 会改变 scope：内存草稿随 prefs 一起迁移。
-      for (final key in _drafts.keys.toList(growable: false)) {
-        if (!key.contains('@$oldScope')) continue;
-        final moved = key.replaceFirst('@$oldScope', '@${manager.profileScope}');
-        _drafts[moved] = _drafts.remove(key)!;
+  bool _draftScopeMigrated = false;
+
+  Future<void> _finishActivation(
+    ConnectionManager manager, {
+    String? draftMigrationFrom,
+  }) async {
+    // 只有「同一 profile 首次从空 hostId 绑定可信 hostId」才迁移内存草稿；
+    // A↔B 换档绝不迁移/删除 A 的草稿。
+    if (!_draftScopeMigrated &&
+        draftMigrationFrom != null &&
+        draftMigrationFrom.isNotEmpty &&
+        draftMigrationFrom != manager.profileScope) {
+      final moved = <String, String>{};
+      final oldKeys = <String>[];
+      for (final key in _drafts.keys) {
+        if (!key.endsWith('@$draftMigrationFrom')) continue;
+        oldKeys.add(key);
+        moved[key.substring(0, key.length - draftMigrationFrom.length - 1) +
+                '@${manager.profileScope}'] =
+            _drafts[key]!;
       }
+      if (moved.isNotEmpty) {
+        _drafts.addAll(moved);
+        for (final key in oldKeys) {
+          _drafts.remove(key);
+        }
+      }
+      _draftScopeMigrated = true;
     }
     // Api 已经是新宿主；再销毁旧 SSE/重连/刷新代并清宿主态。
     disposeBridge();
@@ -2702,13 +2724,24 @@ class AppStore extends ChangeNotifier {
     final manager = connections;
     if (manager == null) return '连接档案未初始化';
     try {
+      final oldProfile = manager.active;
+      final oldScope = manager.profileScope;
       final stage = await manager.stageSwitch(
         profileId,
         allowHostChange: allowHostChange,
         allowInsecure: allowInsecure,
       );
       await manager.commitSwitch(stage);
-      await _finishActivation(manager);
+      final newProfile = manager.active;
+      final firstBinding = oldProfile != null &&
+          newProfile != null &&
+          oldProfile.id == newProfile.id &&
+          oldProfile.hostId.isEmpty &&
+          newProfile.hostId.isNotEmpty;
+      await _finishActivation(
+        manager,
+        draftMigrationFrom: firstBinding ? oldScope : null,
+      );
       return null;
     } on ConnectionSwitchException catch (e) {
       return e.message;
@@ -2726,12 +2759,23 @@ class AppStore extends ChangeNotifier {
     final manager = connections;
     if (manager == null) return '连接档案未初始化';
     try {
+      final oldProfile = manager.active;
+      final oldScope = manager.profileScope;
       await manager.connectManual(
         baseUrl: baseUrl,
         token: token,
         allowInsecure: allowInsecure,
       );
-      await _finishActivation(manager);
+      final newProfile = manager.active;
+      final firstBinding = oldProfile != null &&
+          newProfile != null &&
+          oldProfile.id == newProfile.id &&
+          oldProfile.hostId.isEmpty &&
+          newProfile.hostId.isNotEmpty;
+      await _finishActivation(
+        manager,
+        draftMigrationFrom: firstBinding ? oldScope : null,
+      );
       return null;
     } on ConnectionSwitchException catch (e) {
       return e.message;
@@ -3094,13 +3138,16 @@ class AppStore extends ChangeNotifier {
   }
 
   Future<void> _rotateVerifiedThenSchedule() async {
-    final epoch = api.connectionEpoch;
-    final identity = api.connectionIdentity;
-    final rotated = await api.rotateBaseUrlVerified();
-    if (epoch != api.connectionEpoch || identity != api.connectionIdentity) {
-      return; // 旧 A 的候选验证已完成/超时，但当前已是 B：不切、不调度。
+    final rotation = await api.rotateBaseUrlVerified();
+    if (rotation.epoch != api.connectionEpoch ||
+        rotation.identity != api.connectionIdentity) {
+      return; // 旧 A 的任务已被其他切档取代。
     }
-    if (rotated) {
+    if (rotation.rotated) {
+      // 轮换提交会改变 base/epoch；旧 SSE 必须取消并复位守卫，否则 connect 永远被挡。
+      _sub?.cancel();
+      _sub = null;
+      _connecting = false;
       AppLog.instance.warn('SSE: 超时视为黑洞 → 立即切换 ${api.baseUrl}');
       _retry = 0;
     }
@@ -3650,12 +3697,12 @@ class AppStore extends ChangeNotifier {
             return;
           }
           // 当前地址连续失败：轮换到下一个已确认且 hostId 校验通过的候选。
-          final rotated = await api.rotateBaseUrlVerified();
-          if (connectionEpoch != api.connectionEpoch ||
-              identity != api.connectionIdentity) {
+          final rotation = await api.rotateBaseUrlVerified();
+          if (rotation.epoch != api.connectionEpoch ||
+              rotation.identity != api.connectionIdentity) {
             return;
           }
-          if (rotated) {
+          if (rotation.rotated) {
             AppLog.instance.log('连接切换地址 → ${api.baseUrl}');
             _retry = 0; // 新地址重新开始退避
           } else {

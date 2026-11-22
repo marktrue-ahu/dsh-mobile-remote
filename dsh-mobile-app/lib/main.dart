@@ -141,7 +141,7 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
 
   String _scopeOfSource(String profileId, String hostId) {
     if (profileId.isEmpty) return ProfileNamespace.scope;
-    return hostId.isEmpty ? profileId : '$profileId:$hostId';
+    return ProfileNamespace.scopeFor(profileId, hostId);
   }
 
   Future<void> _reloadAttentionForProfile() async {
@@ -1179,7 +1179,14 @@ class _ConnectionSheetState extends State<ConnectionSheet> {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return SafeArea(
+    return PopScope(
+      canPop: !_busy,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _busy && mounted) {
+          showToast(context, L10n.t('正在连接，请等待完成', 'Connecting; please wait'));
+        }
+      },
+      child: SafeArea(
       child: Column(
         children: [
           // 返回按钮固定在左上角（重新配置时可见，放弃保留原配置）
@@ -1276,6 +1283,7 @@ class _ConnectionSheetState extends State<ConnectionSheet> {
             ),
           ),
         ],
+      ),
       ),
     );
   }
