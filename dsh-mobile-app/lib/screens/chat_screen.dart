@@ -44,6 +44,7 @@ import '../git_browser_controller.dart';
 import '../local_notifications.dart';
 import 'git_browser_sheet.dart';
 import 'agent_panel.dart';
+import 'connection_profiles_sheet.dart';
 import '../tool_cards.dart';
 import '../tool_images.dart';
 import '../widgets/git_file_viewer.dart';
@@ -6494,6 +6495,19 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  Future<void> _switchComputerFromChat() async {
+    final changed = await showConnectionProfilesSheet(
+      context,
+      widget.store,
+      fromChat: true,
+      chatTitle: _title ?? L10n.t('会话', 'Session'),
+      hasDraft: _inputCtrl.text.trim().isNotEmpty,
+    );
+    if (!mounted || !changed) return;
+    // 切换提交后旧 session 已不属于当前宿主：回根页，避免聊天 route 继续持旧状态。
+    Navigator.of(context).popUntil((route) => route.isFirst);
+  }
+
   Future<void> _openConversationActionRail() async {
     // issue #141：渲染层 gating——子代理会话整项不渲染「代理」（不灰显）。
     final isSubagent = widget.store.isSubagentSession(_mySessionId);
@@ -6828,6 +6842,12 @@ class _ChatScreenState extends State<ChatScreen> {
           ],
         ),
         actions: [
+          IconButton(
+            key: const ValueKey('chat-switch-computer'),
+            icon: const Icon(Icons.computer_outlined, size: 20),
+            tooltip: L10n.t('切换电脑', 'Switch computer'),
+            onPressed: _switchComputerFromChat,
+          ),
           IconButton(
             icon: const Icon(Icons.more_vert, size: 20),
             tooltip: L10n.t('对话操作', 'Conversation actions'),

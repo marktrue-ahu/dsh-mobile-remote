@@ -58,6 +58,13 @@ class FloatingBubbleService : Service() {
         /** 运行中的服务实例；未运行时为 null，标志位留待下次 onCreate 时消费。 */
         @Volatile private var instance: FloatingBubbleService? = null
 
+        /** issue #152：凭据/descriptor 激活后由主线程通知原生关闭旧 SSE 并按新 generation 重建。 */
+        fun onConnectionChanged(context: Context) {
+            instance?.let { svc ->
+                svc.mainHandler.post { svc.restartSseForConnection() }
+            }
+        }
+
         /** 由 MainActivity 调用（主线程）：记下前后台状态并让运行中的宠物立刻响应。 */
         fun onAppVisibilityChanged(foreground: Boolean) {
             appForeground = foreground
@@ -1593,6 +1600,17 @@ class FloatingBubbleService : Service() {
         }
     }
 
+    /** issue #152：档案/generation 变化时强制关闭旧流，不能因旧线程存活拒绝新连接。 */
+    private fun restartSseForConnection() {
+        synchronized(sseLock) {
+            sseAlive = false
+            closeSseConn()
+            sseThread?.interrupt()
+            sseThread = null
+        }
+        startSse()
+    }
+
     /**
      * 建立一条 SSE 连接并阻塞读取，直到断开或 [sseAlive] 变 false。
      *
@@ -1601,13 +1619,16 @@ class FloatingBubbleService : Service() {
      * 现在用 try/finally 保证任何退出路径都 disconnect 并清 `sseConn`，且重连前先关旧连接。
      */
     private fun connectSse(): Boolean {
-        val base = baseUrl() ?: return true
-        val token = prefs("flutter.dsh_mr_token") ?: return true
+        // #152：原生只读 Dart 描述符 + Keystore 活动 token；明文 prefs 永不回退。
+        val descriptor = NativeConnection.read(this) ?: return true
+        if (CredentialStore.activeProfileId(this) != descriptor.profileId) return true
+        val token = CredentialStore.readToken(this, descriptor.profileId) ?: return true
         if (!sseAlive) return true
         // 防御：上一轮异常退出可能没走到 cleanup；重连前兜底释放旧连接。
         closeSseConn()
-        val url = URL("$base/m/api/events")
+        val url = URL("${descriptor.baseUrl}${descriptor.path}/api/events")
         val conn = url.openConnection() as HttpURLConnection
+        conn.instanceFollowRedirects = false
         sseConn = conn // v2.7.2 review(FS2)：onDestroy 时 disconnect 解除 readLine 阻塞
         try {
             conn.connectTimeout = 8000
@@ -1635,6 +1656,8 @@ class FloatingBubbleService : Service() {
                         break // onDestroy disconnect 后 readLine 抛 IOException → 正常退出
                     }
                     if (!line.startsWith("data: ")) continue
+                    // #152：旧档案/旧 generation 的迟到帧不得更新 pet/未读/通知/余额。
+                    if (!isNativeConnectionCurrent(descriptor)) break
                     val data = line.removePrefix("data: ")
                     try {
                         handleFrame(JSONObject(data))
@@ -1652,6 +1675,13 @@ class FloatingBubbleService : Service() {
     }
 
     /** 主动断开当前 SSE 连接并清空登记；重复调用安全（onDestroy/重连前共用）。 */
+    /** 当前 descriptor/profile/generation 与 active 凭据一致才允许应用原生帧。 */
+    private fun isNativeConnectionCurrent(expected: NativeConnection): Boolean {
+        val fresh = NativeConnection.read(this) ?: return false
+        if (!expected.isSameConnection(fresh)) return false
+        return CredentialStore.activeProfileId(this) == expected.profileId
+    }
+
     private fun closeSseConn() {
         val old = sseConn
         sseConn = null
@@ -2014,8 +2044,9 @@ class FloatingBubbleService : Service() {
     // ── 公共 helper（Phase 0 收敛：统一 HTTP 骨架/刷新/跳转/圆角/状态判断） ──
     /** 规范化插件 base URL（去尾部 / 与 /m）。 */
     private fun baseUrl(): String? {
-        val base = prefs("flutter.dsh_mr_base") ?: return null
-        var b = base.trim()
+        val descriptor = NativeConnection.read(this) ?: return null
+        if (CredentialStore.activeProfileId(this) != descriptor.profileId) return null
+        var b = descriptor.baseUrl.trim()
         if (b.endsWith("/")) b = b.dropLast(1)
         if (b.endsWith("/m")) b = b.dropLast(2)
         return b
@@ -2023,10 +2054,13 @@ class FloatingBubbleService : Service() {
 
     /** GET 一个 /m/api 端点；非 200 或异常返回 null（各调用点语义一致：失败静默）。 */
     private fun httpGet(path: String, timeoutMs: Int = 5000): String? {
+        val descriptor = NativeConnection.read(this) ?: return null
+        if (CredentialStore.activeProfileId(this) != descriptor.profileId) return null
         val base = baseUrl() ?: return null
-        val token = prefs("flutter.dsh_mr_token") ?: return null
+        val token = CredentialStore.readToken(this, descriptor.profileId) ?: return null
         return try {
-            val conn = URL("$base/m/api/$path").openConnection() as HttpURLConnection
+            val conn = URL("$base${descriptor.path}/api/$path").openConnection() as HttpURLConnection
+            conn.instanceFollowRedirects = false
             conn.connectTimeout = timeoutMs
             // v2.9.0 review(A3)：读超时补齐（默认 0=无限——服务端接受连接但慢回 body 时
             // 后台线程永久阻塞、inflight 累积；SSE 的 connectSse readTimeout=0 是刻意保留长连）

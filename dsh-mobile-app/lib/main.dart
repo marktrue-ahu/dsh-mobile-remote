@@ -9,6 +9,8 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'l10n.dart';
 import 'api.dart';
+import 'connection_manager.dart';
+import 'screens/connection_profiles_sheet.dart';
 import 'app_icon_switcher.dart';
 import 'store.dart';
 import 'attention.dart';
@@ -64,6 +66,8 @@ void main() async {
     );
   };
   await api.load();
+  await appConnections.load();
+  store.attachConnections(appConnections);
   // 自身版本：随每个请求上报给电脑端（两端对齐判定的依据）。取不到就按"无法判定"处理，
   // 不影响任何功能。
   try {
@@ -834,6 +838,37 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
                       },
                       child: Text(L10n.t('＋ 新建会话', '+ New Session')),
                     ),
+                    const SizedBox(height: 12),
+                    // #152：全局连接切换入口（主/次入口分工：这里快速切换，设置页做管理）。
+                    InkWell(
+                      key: const ValueKey('drawer-current-computer'),
+                      borderRadius: BorderRadius.circular(10),
+                      onTap: () async {
+                        Navigator.of(context).pop();
+                        await showConnectionProfilesSheet(context, store);
+                      },
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 6),
+                        child: Row(
+                          children: [
+                            Icon(Icons.computer, size: 16, color: DshColors.ink3(context)),
+                            const SizedBox(width: 6),
+                            Expanded(
+                              child: Text(
+                                L10n.t(
+                                  '当前电脑 · ${store.connections?.active?.displayName ?? '未连接'}',
+                                  'Current computer · ${store.connections?.active?.displayName ?? 'Not connected'}',
+                                ),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(fontSize: 12, color: DshColors.ink2(context)),
+                              ),
+                            ),
+                            Icon(Icons.expand_more, size: 16, color: DshColors.ink3(context)),
+                          ],
+                        ),
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -1005,6 +1040,7 @@ class _ConnectionSheetState extends State<ConnectionSheet> {
   final _tokenCtrl = TextEditingController();
   String _status = '';
   bool _busy = false;
+  bool _allowInsecure = false;
 
   @override
   void initState() {
@@ -1022,11 +1058,26 @@ class _ConnectionSheetState extends State<ConnectionSheet> {
       _busy = true;
       _status = L10n.t('连接中…', 'Connecting…');
     });
+    if (base.startsWith('http://') && !_allowInsecure) {
+      setState(() {
+        _busy = false;
+        _status = L10n.t(
+          'HTTP 地址需要勾选“允许未加密连接”',
+          'HTTP requires allowing an unencrypted connection',
+        );
+      });
+      return;
+    }
     try {
       // v3.0.0：探测客户端与 save() 同源的地址/路径规范化（防 /m 重复拼接 404）
       final probe = Api.forProbe(base, _tokenCtrl.text.trim());
       await probe.getJson('/api/bootstrap');
-      await api.save(base: base, token: _tokenCtrl.text.trim());
+      // #152：token 只写 Android Keystore；档案/descriptor 由 ConnectionManager 激活。
+      await appConnections.connectManual(
+        baseUrl: base,
+        token: _tokenCtrl.text.trim(),
+        allowInsecure: _allowInsecure,
+      );
       if (!mounted) return;
       setState(() => _status = L10n.t('✅ 已连接', '✅ Connected'));
       widget.onConnected();
@@ -1132,6 +1183,17 @@ class _ConnectionSheetState extends State<ConnectionSheet> {
                 border: const OutlineInputBorder(),
               ),
             ),
+            if (_baseCtrl.text.startsWith('http://'))
+              CheckboxListTile(
+                key: const ValueKey('connection-sheet-allow-insecure'),
+                value: _allowInsecure,
+                onChanged: (value) => setState(() => _allowInsecure = value == true),
+                title: Text(L10n.t('允许未加密连接', 'Allow unencrypted connection')),
+                subtitle: Text(
+                  L10n.t('仅在你信任当前网络时使用', 'Use only on a network you trust'),
+                  style: const TextStyle(fontSize: 11.5),
+                ),
+              ),
             const SizedBox(height: 20),
             FilledButton(
               onPressed: _busy ? null : _connect,

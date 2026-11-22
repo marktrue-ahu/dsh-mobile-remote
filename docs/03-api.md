@@ -311,7 +311,7 @@
 | `turn/end` | `{ turn: number, reason: object }` |
 | 其他可见事件 | 保留 `type`、`seq`，未知类型使用通用卡保留顺序；不提供详情指针，也不允许通过 3.5b 读取原始载荷 |
 
-**控制帧**：连接建立后立即 `data: {"type":"hello","serverTime":...,"capabilities":{"eventTimeline":{...},"turnOutline":{...}}}`；每 25s `: ping` 注释行。bootstrap 同样返回这两项能力；`turnOutline` 与 bootstrap 同判据、同形状（见 §6.18），客户端应按能力协商而不是按版本号猜测。
+**控制帧**：连接建立后立即 `data: {"type":"hello","serverTime":...,"hostId":"<宿主稳定身份>","instanceId":"<本次运行实例>","capabilities":{"eventTimeline":{...},"turnOutline":{...}}}`；每 25s `: ping` 注释行。`hostId`/`instanceId` 为 issue #152 新增，旧 App 忽略；旧插件不下发时 App 用 bootstrap 已绑定值，不因此断连（`instanceId` 不作为连接档案身份）。bootstrap 同样返回这两项能力；`turnOutline` 与 bootstrap 同判据、同形状（见 §6.18），客户端应按能力协商而不是按版本号猜测。
 **错误语义**：鉴权失败在连接建立阶段以 `401` HTTP 状态返回（EventSource 会触发 error 事件，客户端转登录态）。
 
 **容量与满龄连接驱逐（启发式，issue #131）**：`connections.size >= maxConnections` 时不再直接 `503 too-many-connections`。宿主按「**stalled 优先** → 同 `clientId`（若请求头 `x-mobile-client-id` 带）→ 同来源 IP → 全局最旧」排序，只驱逐 **1 条年龄 ≥ `sseEvictMinAgeMs`（默认 60000ms）** 的满龄候选；没有达标候选才返回 `503`（body 带 `mobileOnline` / `maxConnections` / `oldestAgeMs` / `maxIdleMs` / `evictMinAgeMs`，并带 `Retry-After: 5`）。被驱逐的客户端按既有 SSE 重连逻辑自动回来并用 `/history` 补拉；年龄阈值用于保护多设备与重连风暴，绝不通过调大 `maxConnections` 掩盖泄漏。`GET /m/api/diagnostics` 的 `runtime.metrics` 增量输出 `mobileOldestAgeMs` / `mobileOldestIdleMs` / `mobileStalled` / `mobileEvicted` / `mobileRejected`，`checks.sseConnections` 输出「连接数 / 上限 · 最旧 · 最久未写 · 满龄候选 · stalled · 安全年龄 · 累计驱逐/拒绝」。**边界（Reviewer P3）**：`age >= sseEvictMinAgeMs` 只是可驱逐门槛，不是"活跃/陈旧"判据（活跃设备也可能连接很久）；`stalled`（写失败/背压/50s 无成功写）只用于排序与日志。二者合起来仍是启发式，宿主不宣称已精确区分活跃/陈旧连接；能保证的只有「60s 内不驱逐、stalled 优先、每次最多 1 条、无候选才 503」。

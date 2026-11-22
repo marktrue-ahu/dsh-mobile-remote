@@ -196,13 +196,32 @@ abstract interface class GitGraphAllApi {
   });
 }
 
+/// #152：token-bearing 请求禁止跨 origin 3xx（http.Client 默认会跟随并可能转发授权头）。
+class _NoRedirectClient extends http.BaseClient {
+  _NoRedirectClient(this._inner);
+  final http.Client _inner;
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) {
+    request.followRedirects = false;
+    return _inner.send(request);
+  }
+
+  @override
+  void close() => _inner.close();
+}
+
 class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
   final http.Client _client;
 
-  Api({http.Client? client}) : _client = client ?? http.Client();
+  Api({http.Client? client})
+    : _client = _NoRedirectClient(client ?? http.Client());
 
   String baseUrl = '';
   String token = '';
+
+  /// #152：当前活动档案 id（仅内存；token 不进 prefs/身份字符串）。
+  String profileId = '';
 
   /// 宿主稳定身份（bootstrap `plugin.hostId`，issue #60 R15）：同一宿主跨地址轮换
   /// 保持不变，不同宿主即使口令/挂载路径相同也不同；旧插件不下发时为空。
@@ -348,7 +367,8 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
     final prefs = await SharedPreferences.getInstance();
     baseUrl = _normBase(prefs.getString(_kBase) ?? '');
     path = prefs.getString(_kPath) ?? '/m';
-    token = prefs.getString(_kToken) ?? '';
+    // #152：token 只从 Android Keystore 经 ConnectionManager 注入，启动加载绝不读明文 prefs。
+    token = '';
     pluginVersion = prefs.getString(_kPluginVer) ?? ''; // 上次连接时记录，断线也可见
     final urls = prefs.getStringList(_kUrls) ?? [];
     if (urls.isNotEmpty) {
@@ -366,7 +386,8 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
     path = _pathOf(base);
     await prefs.setString(_kBase, baseUrl);
     await prefs.setString(_kPath, path);
-    await prefs.setString(_kToken, token);
+    // #152：明文 token 不再落 prefs；由 ConnectionManager 写 Keystore。
+    await prefs.remove(_kToken);
     // 修复：旧版把候选地址表重置为单条。若新地址恰好不可达（如扫到蒲公英 IP
     // 而手机组网没开），连回退的机会都没有。现改为：新地址置首，保留旧候选作兜底。
     final merged = <String>[_normBase(base)];
@@ -379,6 +400,35 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
     baseUrls = merged;
     await prefs.setStringList(_kUrls, baseUrls);
     this.token = token;
+  }
+
+  /// #152 staged switch 的原子内存提交：base/path/token/hostId/profileId 一次替换。
+  /// 调用方已完成探测/凭据激活；失败不得调用。
+  void applyConnection({
+    required String base,
+    required String connectionPath,
+    required String connectionToken,
+    required String profile,
+    required String hostIdentity,
+    List<String>? urls,
+  }) {
+    invalidateConnection();
+    baseUrl = _normBase(base);
+    path = connectionPath.isEmpty ? '/m' : connectionPath;
+    token = connectionToken;
+    profileId = profile;
+    this.hostIdentity = hostIdentity;
+    final merged = <String>[_normBase(base)];
+    for (final value in urls ?? const <String>[]) {
+      final normalized = _normBase(value);
+      if (normalized.isNotEmpty &&
+          normalized != merged.first &&
+          !merged.contains(normalized) &&
+          merged.length < _maxUrls) {
+        merged.add(normalized);
+      }
+    }
+    baseUrls = merged;
   }
 
   /// 合并新收集到的地址（去重、去回环置后、上限裁剪），当前可用地址保持第一位。
@@ -779,7 +829,7 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
 
     try {
       if (cancel?.cancelled ?? false) throw const DownloadCancelled();
-      final req = http.Request('GET', uri);
+      final req = http.Request('GET', uri)..followRedirects = false;
       req.headers.addAll(_headers);
       req.headers.remove('content-type');
       req.headers['accept-encoding'] = 'identity';
@@ -893,7 +943,7 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
     if (maxBytes <= 0) throw ArgumentError.value(maxBytes, 'maxBytes');
     final client = downloadClient ?? _client;
     try {
-      final req = http.Request('GET', uri);
+      final req = http.Request('GET', uri)..followRedirects = false;
       req.headers.addAll(_headers);
       req.headers.remove('content-type');
       if (fileRangeSupported) {
@@ -2468,7 +2518,8 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
         closeClient();
       },
     );
-    final req = http.Request('GET', _uri('/api/events'));
+    final req = http.Request('GET', _uri('/api/events'))
+      ..followRedirects = false;
     req.headers.addAll(_headers);
     // 连接超时：地址不可达但"黑洞"（不拒绝也不响应，如组网 IP 在手机端隧道关闭时）会让
     // send() 永久挂起，旧版因此卡死在 connecting 状态、看门狗与地址轮换全部失效。

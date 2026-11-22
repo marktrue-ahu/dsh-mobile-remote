@@ -98,6 +98,15 @@ void main() {
     expect(api.sessionRelativeFilesSupported, isFalse);
   });
 
+  test('hello 携带 hostId 时更新宿主身份；缺字段不主动清空', () async {
+    final store = AppStore(apiClient: api);
+    addTearDown(store.disposeBridge);
+    store.injectFrame({'type': 'hello', 'hostId': 'host-new', 'capabilities': {}});
+    expect(api.hostIdentity, 'host-new');
+    store.injectFrame({'type': 'hello', 'capabilities': {}});
+    expect(api.hostIdentity, 'host-new', reason: '旧插件缺 hostId 不能清掉已绑定身份');
+  });
+
   test('connect() 里的帧不会因为 store 未配置 sessionId 而丢', () async {
     final store = AppStore();
     addTearDown(store.disposeBridge);

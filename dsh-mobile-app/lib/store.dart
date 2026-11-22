@@ -6,6 +6,8 @@ import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'api.dart';
+import 'connection_manager.dart';
+import 'connection_profile.dart';
 import 'attention.dart';
 import 'floating.dart';
 import 'git_models.dart';
@@ -47,6 +49,9 @@ class AppStore extends ChangeNotifier {
        _installer = installer;
 
   final Future<AppVersion?> Function() _localVersion;
+
+  /// #152：活动连接档案（main 启动时 attach；测试可为 null）。
+  ConnectionManager? connections;
   final UpdateInstaller? _installer;
 
   bool _installingApp = false;
@@ -1539,6 +1544,7 @@ class AppStore extends ChangeNotifier {
   // 又把 retry 清零、每 2s 重连一次形成风暴。
   bool _sseBusy = false;
   bool _connecting = false;
+  String _profileScope = '';
 
   static const _kSession = 'dsh_mr_session';
   static const _kDark = 'dsh_mr_darkmode';
@@ -1567,9 +1573,14 @@ class AppStore extends ChangeNotifier {
   static const _kSkin = 'dsh_mr_skin';
   static const _kAppIcon = 'dsh_mr_app_icon';
 
+  void attachConnections(ConnectionManager manager) {
+    connections = manager;
+    _profileScope = manager.profileScope;
+  }
+
   Future<void> loadPrefs() async {
     final prefs = await SharedPreferences.getInstance();
-    sessionId = prefs.getString(_kSession);
+    sessionId = (prefs.getString(_scopedKey(_kSession)) ?? prefs.getString(_kSession));
     darkMode = prefs.getString(_kDark) ?? 'system';
     skin = DshSkin.fromId(prefs.getString(_kSkin));
     appIcon = prefs.getString(_kAppIcon) ?? 'default';
@@ -1608,9 +1619,9 @@ class AppStore extends ChangeNotifier {
     balanceThreshold = prefs.getDouble(_kBalanceThreshold) ?? 10;
     floatingEnabled = prefs.getBool(_kFloating) ?? false;
     // 进行中的插件自更新记录（跨断线/跨进程）：宿主重启会断线，重连后据此接续
-    lastPluginUpdateOpId = prefs.getString(_kLastPluginUpdateOpId) ?? '';
+    lastPluginUpdateOpId = (prefs.getString(_scopedKey(_kLastPluginUpdateOpId)) ?? prefs.getString(_kLastPluginUpdateOpId)) ?? '';
     try {
-      final rawJournal = prefs.getString(_kPluginUpdateJournal);
+      final rawJournal = (prefs.getString(_scopedKey(_kPluginUpdateJournal)) ?? prefs.getString(_kPluginUpdateJournal));
       pluginUpdateJournal = (rawJournal == null || rawJournal.isEmpty)
           ? null
           : PluginUpdateJournal.fromJson(
@@ -1672,11 +1683,11 @@ class AppStore extends ChangeNotifier {
         _defaultConversationActionOrder,
       );
     }
-    final savedWs = prefs.getString(_kWorkspace);
+    final savedWs = (prefs.getString(_scopedKey(_kWorkspace)) ?? prefs.getString(_kWorkspace));
     workspacePath = savedWs == null ? null : _normPath(savedWs);
     // 会话本地缓存：App 打开瞬间先显示上次的列表，后台静默刷新（解决"进去要等一会才有数据"）
     try {
-      final raw = prefs.getString(_kSessCache);
+      final raw = (prefs.getString(_scopedKey(_kSessCache)) ?? prefs.getString(_kSessCache));
       if (raw != null && raw.isNotEmpty) {
         final list = jsonDecode(raw) as List;
         sessions = list
@@ -1767,7 +1778,21 @@ class AppStore extends ChangeNotifier {
   }
 
   /// 单值持久化（Phase 0 收敛：原各 setter 的 getInstance+setX 样板统一；null = 删除键）。
+  static const Set<String> _profileScopedKeys = {
+    _kSession,
+    _kWorkspace,
+    _kSessCache,
+    _kPluginUpdateJournal,
+    _kLastPluginUpdateOpId,
+  };
+
+  String _scopedKey(String key) =>
+      _profileScope.isNotEmpty && _profileScopedKeys.contains(key)
+      ? '$key.$_profileScope'
+      : key;
+
   Future<void> _persistPrefs(String key, Object? value) async {
+    key = _scopedKey(key);
     final prefs = await SharedPreferences.getInstance();
     if (value is String) {
       await prefs.setString(key, value);
@@ -1944,6 +1969,7 @@ class AppStore extends ChangeNotifier {
     if (err != null) return '该地址不可达';
     AppLog.instance.log('手动切换地址 → $base');
     await api.save(base: base, token: api.token);
+    await connections?.updateActiveBase(base);
     disposeBridge();
     connect();
     // 关键：显式通知刷新。若连接状态未变化（如正卡在 connecting），
@@ -2572,6 +2598,43 @@ class AppStore extends ChangeNotifier {
     if (hadState) notifyListeners();
   }
 
+  /// #152：staged 切换连接档案。失败时旧连接/旧页面状态保持不变。
+  Future<String?> switchProfile(
+    String profileId, {
+    bool allowHostChange = false,
+    bool allowInsecure = false,
+  }) async {
+    final manager = connections;
+    if (manager == null) return '连接档案未初始化';
+    try {
+      final stage = await manager.stageSwitch(
+        profileId,
+        allowHostChange: allowHostChange,
+        allowInsecure: allowInsecure,
+      );
+      await manager.commitSwitch(stage);
+      // Api 已经是新宿主；再销毁旧 SSE/重连/刷新代并清宿主态。
+      disposeBridge();
+      sessionId = null;
+      sessions = [];
+      workspaces = [];
+      workspacePath = null;
+      pendingQuestion = null;
+      pendingApproval = null;
+      _pendingQuestionsBySession.clear();
+      _pendingApprovalsBySession.clear();
+      _profileScope = manager.profileScope;
+      notifyListeners();
+      connect();
+      unawaited(refreshAll());
+      return null;
+    } on ConnectionSwitchException catch (e) {
+      return e.message;
+    } catch (e) {
+      return '切换失败：$e';
+    }
+  }
+
   /// 连接身份变化 → 旧代的刷新归属全部失效（幂等：身份没变就什么都不做）。
   void _syncConnectionGeneration() {
     final id = _connectionIdentity;
@@ -2923,6 +2986,11 @@ class AppStore extends ChangeNotifier {
     _retry = 0;
     final type = frame['type'];
     if (type == 'hello') {
+      // #152：hello 携带宿主身份；旧插件缺失时保留 bootstrap 已绑定值，不因此断连。
+      final helloHostId = frame['hostId'];
+      if (helloHostId is String && helloHostId.trim().isNotEmpty) {
+        api.hostIdentity = helloHostId.trim();
+      }
       // 统一解析：bootstrap 与 SSE hello 同判据；hello 是当前连接的能力权威，
       // 缺失字段会清 false，避免新宿主→旧宿主时旧 true 跨连接残留（#16 P2）。
       api.applyCapabilities(frame['capabilities']);
