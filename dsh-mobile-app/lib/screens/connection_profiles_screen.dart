@@ -37,8 +37,27 @@ class _ConnectionProfilesScreenState extends State<ConnectionProfilesScreen> {
   String? _switching;
   String? _error;
   bool _changed = false;
+  bool _retryingCredentials = false;
+  String? _credentialRetryError;
 
   ConnectionManager? get _manager => widget.store.connections;
+
+  Future<void> _retryCredentials() async {
+    final msgr = ScaffoldMessenger.of(context);
+    setState(() {
+      _retryingCredentials = true;
+      _credentialRetryError = null;
+    });
+    final error = await widget.store.retryConnectionLoad();
+    if (!mounted) return;
+    setState(() {
+      _retryingCredentials = false;
+      _credentialRetryError = error;
+    });
+    if (error == null) {
+      showToastAt(msgr, L10n.t('已恢复连接', 'Connection recovered'));
+    }
+  }
 
   Future<void> _switch(ConnectionProfile profile) async {
     final manager = _manager;
@@ -213,6 +232,98 @@ class _ConnectionProfilesScreenState extends State<ConnectionProfilesScreen> {
                         style: TextStyle(fontSize: 11, color: ink3),
                       ),
                     ),
+                    if (manager.connectionStateError.isNotEmpty ||
+                        _credentialRetryError != null)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                        child: Container(
+                          key: const ValueKey('connection-credential-error'),
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: DshColors.brandSoft(context),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: DshColors.line(context)),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Icon(
+                                    Icons.warning_amber_rounded,
+                                    size: 18,
+                                    color: DshColors.warn(context),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: Text(
+                                      L10n.t(
+                                        '连接凭据需要恢复：${manager.connectionStateError}',
+                                        'Connection credential needs recovery: ${manager.connectionStateError}',
+                                      ),
+                                      key: const ValueKey(
+                                        'connection-credential-reason',
+                                      ),
+                                      style: const TextStyle(
+                                        fontSize: 12,
+                                        height: 1.5,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 6),
+                              Text(
+                                L10n.t(
+                                  '旧凭据仍保留；重试不会删除。',
+                                  'The old credential is kept; retry never deletes it.',
+                                ),
+                                style: TextStyle(fontSize: 11, color: ink3),
+                              ),
+                              if (_credentialRetryError != null) ...[
+                                const SizedBox(height: 6),
+                                Text(
+                                  L10n.t(
+                                    '重试失败：$_credentialRetryError',
+                                    'Retry failed: $_credentialRetryError',
+                                  ),
+                                  key: const ValueKey(
+                                    'connection-credential-retry-error',
+                                  ),
+                                  style: TextStyle(
+                                    fontSize: 11.5,
+                                    color: DshColors.danger(context),
+                                  ),
+                                ),
+                              ],
+                              const SizedBox(height: 8),
+                              OutlinedButton(
+                                key: const ValueKey(
+                                  'connection-retry-credentials',
+                                ),
+                                onPressed: _retryingCredentials
+                                    ? null
+                                    : _retryCredentials,
+                                child: _retryingCredentials
+                                    ? const SizedBox(
+                                        width: 16,
+                                        height: 16,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                        ),
+                                      )
+                                    : Text(
+                                        L10n.t(
+                                          '重试恢复凭据',
+                                          'Retry credential recovery',
+                                        ),
+                                      ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
                     if (_error != null)
                       Padding(
                         padding: const EdgeInsets.symmetric(

@@ -761,21 +761,72 @@ class ConnectionManager {
       tlsPolicy: tlsPolicy,
       insecureConfirmed: insecureConfirmed,
     );
-    await credentials.writeToken(profile.id, token);
-    if (await credentials.readToken(profile.id) != token) {
-      await credentials.deleteToken(profile.id);
-      throw const ConnectionSwitchException('credential-write-failed', '口令写入安全存储失败');
-    }
-    profiles.add(profile);
-    await _saveProfiles();
-    if (switchNow) {
-      final stage = await stageSwitch(
-        profile.id,
-        allowInsecure: insecureConfirmed,
+    // 添加档案是“写 Keystore + 内存 profiles + 持久化”的复合事务：
+    // 任一 await 失败都要撤销 token、内存档案和已写入的 prefs，避免首装/添加
+    // 失败留下孤儿凭据或重启后仍出现半成品档案。
+    final oldProfiles = List<ConnectionProfile>.of(profiles);
+    final oldActive = activeProfileId;
+    final oldGeneration = generation;
+    var tokenAttempted = false;
+    try {
+      tokenAttempted = true;
+      await credentials.writeToken(profile.id, token);
+      if (await credentials.readToken(profile.id) != token) {
+        throw const ConnectionSwitchException(
+          'credential-write-failed',
+          '口令写入安全存储失败',
+        );
+      }
+      profiles.add(profile);
+      await (persistOverride ?? _saveProfiles)();
+      if (switchNow) {
+        final stage = await stageSwitch(
+          profile.id,
+          allowInsecure: insecureConfirmed,
+        );
+        await commitSwitch(stage);
+      }
+      return profile;
+    } catch (_) {
+      profiles
+        ..clear()
+        ..addAll(oldProfiles);
+      activeProfileId = oldActive;
+      generation = oldGeneration;
+      if (tokenAttempted) {
+        try {
+          await credentials.deleteToken(profile.id);
+        } catch (_) {
+          // 保留原始失败原因；凭据删除失败也不影响后续 UI 的恢复提示。
+        }
+      }
+      await _restoreProfilesSnapshot(
+        oldProfiles,
+        oldActive,
+        oldGeneration,
       );
-      await commitSwitch(stage);
+      rethrow;
     }
-    return profile;
+  }
+
+  /// 在 addProfile 失败后把可能已部分写入的 profiles/active/generation
+  /// 直接恢复为旧快照；写入失败本身不被掩盖。
+  Future<void> _restoreProfilesSnapshot(
+    List<ConnectionProfile> snapshot,
+    String active,
+    int generationValue,
+  ) async {
+    try {
+      final prefs = await _store;
+      await prefs.setString(
+        _kProfiles,
+        jsonEncode([for (final profile in snapshot) profile.toJson()]),
+      );
+      await prefs.setString(_kActive, active);
+      await prefs.setInt(_kGeneration, generationValue);
+    } catch (_) {
+      // 恢复持久化失败时保留内存/凭据回滚结果，调用方仍看到原始错误。
+    }
   }
 
   /// 旧版单连接入口（无档案名）的兼容路径；新 UI 统一走 ConnectionProfileEditorScreen。

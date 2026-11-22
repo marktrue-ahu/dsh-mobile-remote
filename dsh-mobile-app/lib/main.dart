@@ -643,7 +643,11 @@ class _DshAppState extends State<DshApp> with WidgetsBindingObserver {
 }
 
 class RootScreen extends StatefulWidget {
-  const RootScreen({super.key});
+  const RootScreen({super.key, this.storeOverride, this.apiOverride});
+
+  /// 测试注入；生产为 null → 使用全局 [store]/[api]。
+  final AppStore? storeOverride;
+  final Api? apiOverride;
 
   @override
   State<RootScreen> createState() => _RootScreenState();
@@ -652,10 +656,15 @@ class RootScreen extends StatefulWidget {
 class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
   bool _configured = false;
   int _index = 0;
+  bool _retryingCredentials = false;
+  String? _credentialRetryError;
   final _drawerKey = GlobalKey<ScaffoldState>();
 
+  AppStore get _store => widget.storeOverride ?? store;
+  Api get _api => widget.apiOverride ?? api;
+
   /// “已配置”以当前 Api 是否拿到地址+口令为准；不能在首装时假设有连接。
-  bool get _hasConnection => api.baseUrl.isNotEmpty && api.token.isNotEmpty;
+  bool get _hasConnection => _api.baseUrl.isNotEmpty && _api.token.isNotEmpty;
 
   @override
   void initState() {
@@ -663,10 +672,10 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     // 全局状态变化（工作区切换、未读数、连接状态等）→ 重建自身（含抽屉），
     // 否则 const RootScreen 会被父级重建跳过，抽屉里的工作区选中态不会跟着变。
-    store.addListener(_onStore);
+    _store.addListener(_onStore);
     // 首页/会话变化回调与“是否已连接”解耦：连接成功后激活流程自己会重连，
     // RootScreen 只需要在 store 通知时切换到已配置壳层。
-    store.onSessionsChanged = () {
+    _store.onSessionsChanged = () {
       if (mounted) setState(() {});
     };
     _configured = _hasConnection;
@@ -680,10 +689,10 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
 
   /// 首次启动弹一次图标入口迁移说明；已提示过则直接返回。
   Future<void> _maybeShowIconMigrationTip() async {
-    if (store.iconMigrationTipShown) return;
+    if (_store.iconMigrationTipShown) return;
     // 只在支持切换图标的平台提示（Android）；其它平台不涉及 alias 迁移
     if (!AppIconSwitcher.supported) {
-      await store.markIconMigrationTipShown();
+      await _store.markIconMigrationTipShown();
       return;
     }
     if (!mounted) return;
@@ -710,7 +719,7 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
         ],
       ),
     );
-    await store.markIconMigrationTipShown();
+    await _store.markIconMigrationTipShown();
   }
 
   void _onStore() {
@@ -725,7 +734,7 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
 
   @override
   void dispose() {
-    store.removeListener(_onStore);
+    _store.removeListener(_onStore);
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -734,19 +743,19 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     // App 回到前台：主动探测电脑端在线状态（PC 退出/恢复实时反映，无需清后台重进）
     if (state == AppLifecycleState.resumed && _configured) {
-      store.resume().then((_) {
+      _store.resume().then((_) {
         // v2.7.1：错过的也提醒——悬浮球跳转/切回 App 时若有未读（后台期间错过的），
         // 强制弹横幅（绕过防抖；后台时横幅已触发过但用户没看到，基线已同步所以增量不触发）
-        if (store.unread > 0) {
-          store.onNewNotifications?.call(store.unread, force: true);
+        if (_store.unread > 0) {
+          _store.onNewNotifications?.call(_store.unread, force: true);
         }
       });
     }
   }
 
   void _boot() {
-    store.connect();
-    store.refreshAll();
+    _store.connect();
+    _store.refreshAll();
   }
 
   /// 首装/无有效主机时的根壳内容：保留 AppBar/Drawer，用户能通过 Drawer
@@ -754,6 +763,9 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
   Widget _unconfiguredBody(BuildContext context) {
     final ink3 = DshColors.ink3(context);
     final brand = DshColors.brand(context);
+    final manager = _store.connections;
+    // 迁移/Keystore/descriptor 失败时只显示 manager 的脱敏原因，不透传异常。
+    final securityError = manager?.connectionStateError ?? '';
     return Center(
       key: const ValueKey('root-unconfigured'),
       child: SingleChildScrollView(
@@ -776,6 +788,81 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
               textAlign: TextAlign.center,
               style: TextStyle(fontSize: 12.5, height: 1.5, color: ink3),
             ),
+            if (securityError.isNotEmpty) ...[
+              const SizedBox(height: 16),
+              Container(
+                key: const ValueKey('root-credential-error'),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: DshColors.brandSoft(context),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: DshColors.line(context)),
+                ),
+                child: Column(
+                  children: [
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Icon(
+                          Icons.warning_amber_rounded,
+                          size: 18,
+                          color: DshColors.warn(context),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            L10n.t(
+                              '连接凭据需要恢复：$securityError',
+                              'Connection credential needs recovery: $securityError',
+                            ),
+                            key: const ValueKey('root-credential-reason'),
+                            style: const TextStyle(fontSize: 12, height: 1.5),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      L10n.t(
+                        '旧凭据仍保留；重试不会删除。',
+                        'The old credential is kept; retry never deletes it.',
+                      ),
+                      style: TextStyle(fontSize: 11, color: ink3),
+                    ),
+                    if (_credentialRetryError != null) ...[
+                      const SizedBox(height: 6),
+                      Text(
+                        L10n.t(
+                          '重试失败：$_credentialRetryError',
+                          'Retry failed: $_credentialRetryError',
+                        ),
+                        key: const ValueKey('root-credential-retry-error'),
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          color: DshColors.danger(context),
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 8),
+                    OutlinedButton(
+                      key: const ValueKey('root-retry-credentials'),
+                      onPressed: _retryingCredentials
+                          ? null
+                          : _retryConnectionCredentials,
+                      child: _retryingCredentials
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : Text(
+                              L10n.t('重试恢复凭据', 'Retry credential recovery'),
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
             const SizedBox(height: 20),
             FilledButton.icon(
               key: const ValueKey('root-add-computer'),
@@ -793,16 +880,32 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
     );
   }
 
+  Future<void> _retryConnectionCredentials() async {
+    setState(() {
+      _retryingCredentials = true;
+      _credentialRetryError = null;
+    });
+    final error = await _store.retryConnectionLoad();
+    if (!mounted) return;
+    setState(() {
+      _retryingCredentials = false;
+      _credentialRetryError = error;
+    });
+    if (error == null) {
+      showToast(context, L10n.t('已恢复连接', 'Connection recovered'));
+    }
+  }
+
   void _openConnections() {
-    unawaited(showConnectionProfilesScreen(context, store));
+    unawaited(showConnectionProfilesScreen(context, _store));
   }
 
   void _openNewSession() {
-    showNewSessionSheet(context, store, (id) async {
+    showNewSessionSheet(context, _store, (id) async {
       // Phase 2(A4)：openChat 内统一 setSession+refreshSessionConfig+push，这里只刷列表
-      store.refreshSessions();
+      _store.refreshSessions();
       if (!mounted) return;
-      await openChat(context, store, id);
+      await openChat(context, _store, id);
     });
   }
 
@@ -833,21 +936,21 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
             Transform.translate(
               offset: const Offset(-6, 0), // 再向抽屉菜单靠近一点
               child: Tooltip(
-                message: switch (store.connState) {
+                message: switch (_store.connState) {
                   'connected' => L10n.t('电脑在线', 'PC online'),
                   'connecting' => L10n.t('连接中…', 'Connecting…'),
                   _ => L10n.t('电脑离线 · 点按重连', 'PC offline · tap to reconnect'),
                 },
                 child: InkWell(
                   customBorder: const CircleBorder(),
-                  onTap: () => store.resume(),
+                  onTap: () => _store.resume(),
                   child: Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 4),
                     child: Container(
                       width: 10,
                       height: 10,
                       decoration: BoxDecoration(
-                        color: switch (store.connState) {
+                        color: switch (_store.connState) {
                           'connected' => DshColors.ok(context),
                           'connecting' => DshColors.warn(context),
                           _ => DshColors.ink3(context),
@@ -877,10 +980,10 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
         actions: [
           IconButton(
             icon: Badge(
-              isLabelVisible: store.unread > 0,
+              isLabelVisible: _store.unread > 0,
               backgroundColor: DshColors.danger(context),
               label: Text(
-                '${store.unread}',
+                '${_store.unread}',
                 style: const TextStyle(fontSize: 9, fontWeight: FontWeight.w700, color: Colors.white),
               ),
               child: const Icon(Icons.notifications_none, size: 20),
@@ -894,7 +997,7 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
         ],
       ),
       drawer: AppDrawer(
-        store: store,
+        store: _store,
         selectedIndex: _index,
         onSelect: (index) => setState(() => _index = index),
         onNewSession: _openNewSession,
@@ -907,20 +1010,20 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
                 // v3.1.6（issue #14）：IndexedStack 让三个页面同时活着，所以"本页是否可见"
                 // 必须显式告知——列表页据此暂停状态标识的旋转动效（页面不可见不耗电）。
                 HomeScreen(
-                  store: store,
+                  store: _store,
                   visible: _index == 0,
                   onOpenSession: () {
                     if (mounted) setState(() {});
                   },
                 ),
                 SessionsScreen(
-                  store: store,
+                  store: _store,
                   visible: _index == 1,
                   onOpenSession: () {
                     if (mounted) setState(() {});
                   },
                 ),
-                SettingsScreen(store: store, onReconfigure: () async {}),
+                SettingsScreen(store: _store, onReconfigure: () async {}),
               ],
             )
           : _unconfiguredBody(context),
