@@ -44,6 +44,30 @@ class ConnectionManager {
   /// 测试注入：addProfile 失败回滚持久化；生产为 null → 直接写旧快照。
   Future<void> Function()? restoreOverride;
 
+  /// 测试注入：模拟 SharedPreferences.setString/setInt/remove 返回 false。
+  /// 为 null 时走真实 prefs；非 null 时由测试完成写入并返回结果。
+  Future<bool> Function(String key, String value)? setStringOverride;
+  Future<bool> Function(String key, int value)? setIntOverride;
+  Future<bool> Function(String key)? removeOverride;
+
+  Future<bool> _setString(SharedPreferences prefs, String key, String value) {
+    final override = setStringOverride;
+    if (override != null) return override(key, value);
+    return prefs.setString(key, value);
+  }
+
+  Future<bool> _setInt(SharedPreferences prefs, String key, int value) {
+    final override = setIntOverride;
+    if (override != null) return override(key, value);
+    return prefs.setInt(key, value);
+  }
+
+  Future<bool> _remove(SharedPreferences prefs, String key) {
+    final override = removeOverride;
+    if (override != null) return override(key);
+    return prefs.remove(key);
+  }
+
   Future<void> _transactionTail = Future<void>.value();
 
   Future<T> _serialized<T>(Future<T> Function() action) {
@@ -235,12 +259,16 @@ class ConnectionManager {
 
   Future<void> _saveProfiles() async {
     final prefs = await _store;
-    await prefs.setString(
+    final okProfiles = await _setString(
+      prefs,
       _kProfiles,
       jsonEncode([for (final profile in profiles) profile.toJson()]),
     );
-    await prefs.setString(_kActive, activeProfileId);
-    await prefs.setInt(_kGeneration, generation);
+    final okActive = await _setString(prefs, _kActive, activeProfileId);
+    final okGeneration = await _setInt(prefs, _kGeneration, generation);
+    if (!okProfiles || !okActive || !okGeneration) {
+      throw StateError('profiles-persist-failed');
+    }
   }
 
   /// 首次升级迁移：base/urls 元数据 + Keystore token + 原生描述符全部成功后才删旧 token。
@@ -835,9 +863,18 @@ class ConnectionManager {
       'active': oldActive,
       'generation': oldGeneration,
     };
+    final beginJson = jsonEncode(beginTxn);
+    bool markerWritten;
     try {
-      await prefs.setString(_kAddTxn, jsonEncode(beginTxn));
+      markerWritten = await _setString(prefs, _kAddTxn, beginJson);
     } catch (_) {
+      markerWritten = false;
+    }
+    final markerReadback = markerWritten ? _readAddTxn(prefs) : null;
+    if (!markerWritten ||
+        markerReadback == null ||
+        markerReadback['phase'] != 'begin' ||
+        markerReadback['newProfileId'] != profile.id) {
       throw const ConnectionSwitchException(
         'add-txn-marker-failed',
         '无法安全保存连接事务，请重试',
@@ -865,20 +902,25 @@ class ConnectionManager {
         await _commitSwitchUnlocked(stage);
       }
       // 先写 commit marker 再删：删 marker 失败也不会让重启误回滚已成功档案。
+      bool commitMarkerWritten;
       try {
-        await prefs.setString(
+        commitMarkerWritten = await _setString(
+          prefs,
           _kAddTxn,
           jsonEncode({...beginTxn, 'phase': 'commit'}),
         );
       } catch (_) {
+        commitMarkerWritten = false;
+      }
+      if (!commitMarkerWritten) {
         throw const ConnectionSwitchException(
           'add-txn-commit-failed',
           '无法完成连接事务，请重试',
         );
       }
-      try {
-        await prefs.remove(_kAddTxn);
-      } catch (_) {}
+      // commit marker 已写：即使 remove 返回 false，档案已成功落盘，marker 留给
+      // 下次 load 清理；不能把 remove 失败误当成需要回滚。
+      await _remove(prefs, _kAddTxn);
       return profile;
     } catch (_) {
       profiles
@@ -940,18 +982,21 @@ class ConnectionManager {
     String active,
     int generationValue,
   ) async {
-    await prefs.setString(
+    final okProfiles = await _setString(
+      prefs,
       _kProfiles,
       jsonEncode([for (final profile in snapshot) profile.toJson()]),
     );
-    await prefs.setString(_kActive, active);
-    await prefs.setInt(_kGeneration, generationValue);
+    final okActive = await _setString(prefs, _kActive, active);
+    final okGeneration = await _setInt(prefs, _kGeneration, generationValue);
+    if (!okProfiles || !okActive || !okGeneration) {
+      throw StateError('profiles-restore-failed');
+    }
   }
 
   Future<bool> _clearAddTxn(SharedPreferences prefs) async {
     try {
-      await prefs.remove(_kAddTxn);
-      return true;
+      return await _remove(prefs, _kAddTxn);
     } catch (_) {
       return false;
     }
@@ -988,7 +1033,10 @@ class ConnectionManager {
   ) async {
     final phase = txn['phase']?.toString() ?? '';
     if (phase == 'commit') {
-      await _clearAddTxn(prefs);
+      final cleared = await _clearAddTxn(prefs);
+      if (!cleared) {
+        connectionStateError = '上次连接事务已完成，但清理标记失败；请重试恢复';
+      }
       return true;
     }
     final newId = txn['newProfileId']?.toString() ?? '';

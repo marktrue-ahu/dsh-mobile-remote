@@ -16,6 +16,7 @@ class _FaultCredentialStore implements CredentialStore {
   bool failWrite = false;
   bool failRead = false;
   bool failDelete = false;
+  int writeCalls = 0;
 
   @override
   Future<String?> readToken(String profileId) async {
@@ -31,6 +32,7 @@ class _FaultCredentialStore implements CredentialStore {
 
   @override
   Future<void> writeToken(String profileId, String token) async {
+    writeCalls++;
     if (failWrite) throw StateError('credential-write-failed');
     tokens[profileId] = token;
   }
@@ -302,5 +304,121 @@ void main() {
     expect(descriptor['baseUrl'], 'https://a2.example.com');
     expect(descriptor['generation'], 2);
     expect(prefs.getString('dsh_mr_add_txn'), isNull);
+  });
+  test('marker 写入返回 false：不写 token/档案，重启干净', () async {
+    SharedPreferences.setMockInitialValues({});
+    final creds = _FaultCredentialStore();
+    final manager = await _manager(creds);
+    manager.setStringOverride = (key, value) async {
+      if (key == 'dsh_mr_add_txn') return false;
+      return SharedPreferences.getInstance().then(
+        (p) => p.setString(key, value),
+      );
+    };
+    await expectLater(
+      manager.addProfile(
+        displayName: '测试电脑',
+        baseUrl: 'https://home.example.com/m',
+        token: 'token',
+      ),
+      throwsA(anything),
+    );
+    expect(creds.writeCalls, 0, reason: 'marker 失败后不得继续写 token');
+    expect(manager.profiles, isEmpty);
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getString('dsh_mr_add_txn'), isNull);
+    expect(prefs.getString('dsh_mr_connection_profiles'), isNull);
+    final restarted = ConnectionManager(
+      api: Api()..baseUrl = '',
+      credentials: creds,
+    );
+    await restarted.load();
+    expect(restarted.profiles, isEmpty);
+    expect(creds.tokens, isEmpty);
+  });
+
+  test('回滚/清 marker 返回 false：保留 marker，重启修复或明确告警', () async {
+    SharedPreferences.setMockInitialValues({});
+    final creds = _FaultCredentialStore();
+    final manager = await _manager(creds);
+    final prefs = await SharedPreferences.getInstance();
+    manager.setStringOverride = (key, value) async {
+      if (key == 'dsh_mr_add_txn') return prefs.setString(key, value);
+      if (key == 'dsh_mr_connection_profiles') {
+        // 前向写半成品；若这是回滚写入（已存在 marker 且已有值），直接返回 false。
+        await prefs.setString(
+          key,
+          jsonEncode([
+            {
+              'id': 'orphan',
+              'displayName': 'orphan',
+              'baseUrls': ['https://orphan.example.com/m'],
+            },
+          ]),
+        );
+        return true;
+      }
+      // active/generation 前向或回滚写返回 false。
+      return false;
+    };
+    manager.removeOverride = (key) async => false;
+    await expectLater(
+      manager.addProfile(
+        displayName: '测试电脑',
+        baseUrl: 'https://home.example.com/m',
+        token: 'token',
+      ),
+      throwsA(anything),
+    );
+    expect(prefs.getString('dsh_mr_add_txn'), isNotNull);
+    expect(creds.tokens, isEmpty);
+
+    // 首次重启：恢复写也被注入 false，应保留 marker 并明确告警。
+    final blocked = ConnectionManager(
+      api: Api()..baseUrl = '',
+      credentials: creds,
+    );
+    blocked.setStringOverride = (key, value) async => false;
+    await blocked.load();
+    expect(blocked.connectionStateError, contains('清理未完成'));
+    expect(prefs.getString('dsh_mr_add_txn'), isNotNull);
+    expect(blocked.profiles, isEmpty);
+
+    // 存储恢复：再次 load 应修复并清除 marker。
+    final restarted = ConnectionManager(
+      api: Api()..baseUrl = '',
+      credentials: creds,
+    );
+    await restarted.load();
+    expect(restarted.profiles, isEmpty);
+    expect(restarted.connectionStateError, isEmpty);
+    expect(prefs.getString('dsh_mr_add_txn'), isNull);
+    expect(creds.tokens, isEmpty);
+  });
+
+  test('成功提交后 marker remove 返回 false：档案保留，重启清 marker', () async {
+    SharedPreferences.setMockInitialValues({});
+    final creds = _FaultCredentialStore();
+    final manager = await _manager(creds);
+    final prefs = await SharedPreferences.getInstance();
+    manager.removeOverride = (key) async => false;
+    final created = await manager.addProfile(
+      displayName: '测试电脑',
+      baseUrl: 'https://home.example.com/m',
+      token: 'token',
+    );
+    expect(manager.profiles.map((p) => p.id), [created.id]);
+    expect(prefs.getString('dsh_mr_add_txn'), isNotNull);
+    expect(creds.tokens.values, ['token']);
+
+    // 重启看到 commit marker：只清 marker，不删除成功档案。
+    final restarted = ConnectionManager(
+      api: Api()..baseUrl = '',
+      credentials: creds,
+    );
+    await restarted.load();
+    expect(restarted.profiles.map((p) => p.id), [created.id]);
+    expect(prefs.getString('dsh_mr_add_txn'), isNull);
+    expect(creds.tokens.values, ['token']);
   });
 }
