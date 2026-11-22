@@ -274,6 +274,7 @@ class GitBrowserController extends ChangeNotifier {
   int _worktreeCheckGeneration = 0;
   int _previewGeneration = 0;
   Future<void>? _graphPageRequest;
+  int _tagIntentGeneration = 0;
   bool _graphPageWantedNewer = false;
   // issue #100：prev 预取先缓存，不立即前插；用户真实到顶才应用。
   GitGraphPage? _pendingPrevPage;
@@ -770,7 +771,8 @@ class GitBrowserController extends ChangeNotifier {
   }
 
   /// 窗口外 tag：staged 请求成功后才原子切换图状态；失败保留原图/选择集/滚动。
-  Future<void> openTagFocus(String focus) async {
+  Future<void> openTagFocus(String focus, {int? intent}) async {
+    final myIntent = intent ?? ++_tagIntentGeneration;
     final api = _allApi;
     final sessionId = _state.sessionId;
     final repository = _state.repository;
@@ -795,7 +797,9 @@ class GitBrowserController extends ChangeNotifier {
         limit: graphAllPageSize,
         timeout: const Duration(seconds: 35),
       );
-      if (generation != _generation || graphGeneration != _graphGeneration) {
+      if (generation != _generation ||
+          graphGeneration != _graphGeneration ||
+          myIntent != _tagIntentGeneration) {
         return;
       }
       _cancelGraphTimeout();
@@ -806,7 +810,9 @@ class GitBrowserController extends ChangeNotifier {
         tagFocusError: null,
       ));
     } catch (error) {
-      if (generation != _generation || graphGeneration != _graphGeneration) {
+      if (generation != _generation ||
+          graphGeneration != _graphGeneration ||
+          myIntent != _tagIntentGeneration) {
         return;
       }
       _cancelGraphTimeout();
@@ -821,6 +827,10 @@ class GitBrowserController extends ChangeNotifier {
   Future<bool> locateTag(GitTag tag) async {
     final target = tag.targetOid;
     if (target == null || target.isEmpty) return false;
+    final intent = ++_tagIntentGeneration;
+    // 任何 tag 意图都作废旧 all 请求：先窗口外 A 挂起、再点窗口内 B 时，
+    // A 的迟到响应不得覆盖 B。
+    _graphGeneration++;
     final index = _state.commits.indexWhere((commit) => commit.oid == target);
     if (index >= 0) {
       _emit(_state.copyWith(
@@ -830,7 +840,7 @@ class GitBrowserController extends ChangeNotifier {
       ));
       return true;
     }
-    await openTagFocus(target);
+    await openTagFocus(target, intent: intent);
     return _state.tagFocusError == null &&
         _state.tagFocusOid == target &&
         _state.graphFocusOid == target;

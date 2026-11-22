@@ -1014,3 +1014,39 @@ test("tags list: lightweight/annotated peel, sorted, non-commit hint, repository
     await assert.rejects(() => service.tags("missing", repository.repositoryId), (e) => e.code === "repository-not-authorized" && e.status === 403);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("tags 5000 boundary: exactly 5000 is complete, 5001 sets truncated", async () => {
+  const root = mkdtempSync(`${tmpdir()}/git-read-tags-cap-`);
+  try {
+    const session = { id: "session-1", header: { cwd: root } };
+    const rows = (count) => Array.from({ length: count }, (_, i) => ({
+      kind: "tag", name: `refs/tags/t${String(i).padStart(5, "0")}`, shortName: `t${String(i).padStart(5, "0")}`,
+      oid: "a".repeat(40), commitOid: "a".repeat(40), annotated: false,
+    }));
+    for (const [count, expectedTruncated] of [[5000, false], [5001, true]]) {
+      const provider = {
+        contractVersion: "1.0.0",
+        capabilities: () => ({ available: true }),
+        repositoryRoot: async () => root,
+        branches: async () => [],
+        resolveTip: async () => null,
+        graph: async () => ({ commits: [], refsDetail: [], tagsDetail: [] }),
+        commit: async () => null,
+        refs: async () => rows(count),
+      };
+      const ctx = {
+        get(name) {
+          if (name === "sessions") return { get: (id) => id === session.id ? session : undefined };
+          if (name === "workspaceRegistry") return { list: () => [{ path: root }] };
+          if (name === "gitReadProvider") return provider;
+          return undefined;
+        },
+      };
+      const service = createGitReadService(ctx);
+      const repository = await service.repositoryForSession(session.id);
+      const result = await service.tags(session.id, repository.repositoryId);
+      assert.equal(result.tags.length, 5000);
+      assert.equal(result.truncated, expectedTruncated);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

@@ -563,6 +563,39 @@ class PagingTagApi extends TagWidgetApi {
   }
 }
 
+class Truncated5002TagApi extends TagWidgetApi {
+  @override
+  Future<GitTagPage> tags(String sessionId, String repositoryId) async =>
+      GitTagPage(
+        tags: [
+          for (var i = 0; i < 5002; i++)
+            GitTag(
+              name: 'refs/tags/t$i',
+              shortName: 't$i',
+              refOid: 'r$i',
+              targetOid: 'c$i',
+            ),
+        ],
+        truncated: true,
+      );
+}
+
+class DeferredTagApi extends TagWidgetApi {
+  final allGate = Completer<GitGraphPage>();
+
+  @override
+  Future<GitGraphPage> graphAll(
+    String sessionId,
+    String repositoryId, {
+    required bool all,
+    String? focus,
+    String? snapshotId,
+    String? cursor,
+    int limit = 16,
+    Duration timeout = const Duration(seconds: 35),
+  }) => allGate.future;
+}
+
 class LongTagApi extends TagWidgetApi {
   @override
   Future<GitTagPage> tags(String sessionId, String repositoryId) async => const GitTagPage(tags: [
@@ -1472,7 +1505,7 @@ void main() {
     // 第 5001 个标签未加载：不能显示“没有匹配”并抹掉截断提示。
     expect(find.byKey(const ValueKey('git-tags-truncated')), findsOneWidget);
     expect(find.byKey(const ValueKey('git-tags-empty')), findsOneWidget);
-    expect(find.textContaining('not loaded'), findsOneWidget);
+    expect(find.textContaining('more tags may exist'), findsWidgets);
   });
 
   testWidgets('#159 默认 5 档窗口外 tag 失败：保留原图/选择集/滚动', (tester) async {
@@ -1507,6 +1540,69 @@ void main() {
     expect(controller.state.commits.map((c) => c.oid), contains('older-1'));
     await controller.loadPrevGraphPage();
     expect(api.allCalls, 3);
+    expect(controller.state.selectedBranches.map((b) => b.name).toList(), selectionBefore);
+  });
+
+  testWidgets('#159 5002 标签截断：提示不伪造剩余数量', (tester) async {
+    final controller = await mountSheet(tester, Truncated5002TagApi());
+    addTearDown(controller.dispose);
+    await tester.tap(find.byKey(const Key('git-branch-subtab-2')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('git-tags-truncated')), findsOneWidget);
+    expect(find.textContaining('后 1 个'), findsNothing);
+    expect(find.textContaining('remaining 1'), findsNothing);
+    await tester.enterText(
+      find.byKey(const Key('git-branch-search-2')),
+      't5001',
+    );
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('git-tags-truncated')), findsOneWidget);
+    expect(find.textContaining('more tags may exist'), findsWidgets);
+  });
+
+  testWidgets('#159 恰好 5000 截断：提示不伪造数量', (tester) async {
+    final controller = await mountSheet(tester, TruncatedTagApi());
+    addTearDown(controller.dispose);
+    await tester.tap(find.byKey(const Key('git-branch-subtab-2')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('git-tags-truncated')), findsOneWidget);
+    expect(find.textContaining('后 1 个'), findsNothing);
+  });
+
+  testWidgets('#159 窗口外 A 挂起时命中 B：B 胜出，A 迟到不覆盖', (tester) async {
+    final api = DeferredTagApi();
+    final controller = await mountSheet(tester, api);
+    addTearDown(controller.dispose);
+    await tester.tap(find.byKey(const Key('git-branch-refs/heads/main')));
+    await tester.pumpAndSettle();
+    final selectionBefore = controller.state.selectedBranches.map((b) => b.name).toList();
+    const tagA = GitTag(
+      name: 'refs/tags/v-a',
+      shortName: 'v-a',
+      refOid: 'a',
+      targetOid: 'outside-a',
+    );
+    const tagB = GitTag(
+      name: 'refs/tags/v-b',
+      shortName: 'v-b',
+      refOid: 'b',
+      targetOid: 'main-oid',
+    );
+    final a = controller.locateTag(tagA);
+    await tester.pump();
+    expect(await controller.locateTag(tagB), isTrue);
+    api.allGate.complete(GitGraphPage(
+      snapshotId: 'stale-a',
+      focusOid: 'outside-a',
+      tips: const [],
+      commits: const [GitCommitSummary(oid: 'outside-a', subject: 'A')],
+    ));
+    await a;
+    await tester.pumpAndSettle();
+    expect(controller.state.tagFocusOid, 'main-oid');
+    expect(controller.state.graphFocusOid, 'main-oid');
+    expect(controller.state.commits.map((c) => c.oid), contains('main-oid'));
+    expect(controller.state.commits.map((c) => c.oid), isNot(contains('outside-a')));
     expect(controller.state.selectedBranches.map((b) => b.name).toList(), selectionBefore);
   });
 }

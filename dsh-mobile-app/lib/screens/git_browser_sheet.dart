@@ -963,8 +963,8 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
               child: Text(
                 L10n.t(
-                  '本地仅搜索已加载的前 5000 个标签，结果不完整；请缩小搜索范围',
-                  'Only the first 5000 loaded tags are searched locally; results are incomplete',
+                  '本地仅搜索已加载的标签，可能还有未加载的标签；本次搜索不包含它们',
+                  'Only loaded tags are searched locally; more tags may exist but are not included',
                 ),
                 style: TextStyle(fontSize: 11.5, color: DshColors.ink2(context)),
               ),
@@ -973,8 +973,8 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
               child: Center(
                 child: Text(
                   L10n.t(
-                    '前 5000 个标签中没有匹配；后 1 个未加载，不能断言仓库无匹配',
-                    'No match in the first 5000 tags; the remaining tags are not loaded',
+                    '已加载标签中没有匹配；可能还有未加载的标签，不能断言仓库无匹配',
+                    'No match in loaded tags; more tags may exist, so this does not prove there is no match',
                   ),
                   key: const ValueKey('git-tags-empty'),
                   textAlign: TextAlign.center,
@@ -1003,8 +1003,8 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
             child: Text(
               L10n.t(
-                '仅显示前 5000 个标签；本地搜索只覆盖已加载部分，请缩小搜索范围',
-                'Showing the first 5000 tags; local search covers only loaded tags',
+                '本地仅搜索已加载标签；可能还有未加载的标签，本次搜索不包含它们',
+                'Only loaded tags are searched; more tags may exist and are not included',
               ),
               style: TextStyle(fontSize: 11.5, color: DshColors.ink2(context)),
             ),
