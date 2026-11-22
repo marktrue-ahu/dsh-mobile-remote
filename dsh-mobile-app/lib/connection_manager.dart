@@ -38,6 +38,12 @@ class ConnectionManager {
   /// 测试注入：暂停 active base 提交，构造与档案切换的确定性交错。
   Future<void> Function()? activeBaseGate;
 
+  /// 测试注入：addProfile 写入前的暂停点，用于构造与 active profile/base 提交的交错。
+  Future<void> Function()? addProfileGate;
+
+  /// 测试注入：addProfile 失败回滚持久化；生产为 null → 直接写旧快照。
+  Future<void> Function()? restoreOverride;
+
   Future<void> _transactionTail = Future<void>.value();
 
   Future<T> _serialized<T>(Future<T> Function() action) {
@@ -77,6 +83,9 @@ class ConnectionManager {
   static const _kActive = 'dsh_mr_active_profile';
   static const _kGeneration = 'dsh_mr_connection_generation';
   static const _kNativeDescriptor = 'dsh_native_connection';
+
+  /// addProfile 复合事务 marker：begin 表示可能已部分写入，commit 表示已落盘待清理。
+  static const _kAddTxn = 'dsh_mr_add_txn';
   static const _kLegacyBase = 'dsh_mr_base';
   static const _kLegacyPath = 'dsh_mr_path';
   static const _kLegacyToken = 'dsh_mr_token';
@@ -85,6 +94,24 @@ class ConnectionManager {
 
   Future<void> load() async {
     final prefs = await _store;
+    connectionStateError = '';
+    if (prefs.getString(_kAddTxn) != null) {
+      final pendingAdd = _readAddTxn(prefs);
+      if (pendingAdd == null) {
+        api.token = '';
+        connectionStateError = '上次添加连接失败后的清理记录损坏；请重试恢复或重新添加';
+        migrationState = 'add-cleanup-incomplete';
+        return;
+      }
+      final repaired = await _repairAddTxn(prefs, pendingAdd);
+      if (!repaired) {
+        _applyAddTxnSnapshotToMemory(pendingAdd);
+        api.token = '';
+        connectionStateError = '上次添加连接失败后的清理未完成；请重试恢复或重新添加';
+        migrationState = 'add-cleanup-incomplete';
+        return;
+      }
+    }
     generation = prefs.getInt(_kGeneration) ?? 0;
     profiles
       ..clear()
@@ -312,11 +339,12 @@ class ConnectionManager {
         token,
         client: probeClient,
       );
-      bootstrap = await (_probeBootstrap?.call(probe) ??
-          probe.getJson(
-            '/api/bootstrap',
-            timeout: const Duration(seconds: 8),
-          ));
+      bootstrap =
+          await (_probeBootstrap?.call(probe) ??
+              probe.getJson(
+                '/api/bootstrap',
+                timeout: const Duration(seconds: 8),
+              ));
     } catch (e) {
       throw ConnectionSwitchException('probe-failed', '连接失败：$e');
     }
@@ -397,7 +425,10 @@ class ConnectionManager {
     }
   }
 
-  void _checkTransport(ConnectionProfile profile, {required bool allowInsecure}) {
+  void _checkTransport(
+    ConnectionProfile profile, {
+    required bool allowInsecure,
+  }) {
     validateEndpoint(
       profile.primaryBase,
       insecureConfirmed: profile.insecureConfirmed,
@@ -417,7 +448,8 @@ class ConnectionManager {
           (a == 192 && b == 168) ||
           a == 127;
     }
-    return h.contains(':') && (h.startsWith('fe80:') || h.startsWith('fc') || h.startsWith('fd'));
+    return h.contains(':') &&
+        (h.startsWith('fe80:') || h.startsWith('fc') || h.startsWith('fd'));
   }
 
   static String _short(String id) => id.length <= 8 ? id : id.substring(0, 8);
@@ -612,9 +644,12 @@ class ConnectionManager {
     final current = active;
     if (current == null) return false;
     // 锁内第一式 CAS：验证时的档案/宿主/generation 必须仍是当前事务目标。
-    if (expectedProfileId != null && current.id != expectedProfileId) return false;
-    if (expectedHostId != null && current.hostId != expectedHostId) return false;
-    if (expectedGeneration != null && generation != expectedGeneration) return false;
+    if (expectedProfileId != null && current.id != expectedProfileId)
+      return false;
+    if (expectedHostId != null && current.hostId != expectedHostId)
+      return false;
+    if (expectedGeneration != null && generation != expectedGeneration)
+      return false;
     final normalized = Api.forProbe(base, '').baseUrl;
     final prefs = await _store;
     final oldDescriptor = prefs.getString(_kNativeDescriptor);
@@ -629,7 +664,8 @@ class ConnectionManager {
     final updated = current.copyWith(baseUrls: urls);
     try {
       if (index >= 0) profiles[index] = updated;
-      if (expectedProfileId != null && profiles[index].id != expectedProfileId) {
+      if (expectedProfileId != null &&
+          profiles[index].id != expectedProfileId) {
         return false;
       }
       generation = generation + 1;
@@ -663,7 +699,9 @@ class ConnectionManager {
     final current = active;
     if (current == null) return false;
     final normalized = Api.forProbe(candidate, '').baseUrl;
-    if (!current.baseUrls.any((value) => Api.forProbe(value, '').baseUrl == normalized)) {
+    if (!current.baseUrls.any(
+      (value) => Api.forProbe(value, '').baseUrl == normalized,
+    )) {
       return false;
     }
     try {
@@ -751,22 +789,61 @@ class ConnectionManager {
     ProfileTlsPolicy tlsPolicy = ProfileTlsPolicy.https,
     bool insecureConfirmed = false,
     bool switchNow = false,
+  }) => _serialized(
+    () => _addProfileUnlocked(
+      displayName: displayName,
+      baseUrl: baseUrl,
+      token: token,
+      path: path,
+      tlsPolicy: tlsPolicy,
+      insecureConfirmed: insecureConfirmed,
+      switchNow: switchNow,
+    ),
+  );
+
+  Future<ConnectionProfile> _addProfileUnlocked({
+    required String displayName,
+    required String baseUrl,
+    required String token,
+    required String path,
+    required ProfileTlsPolicy tlsPolicy,
+    required bool insecureConfirmed,
+    required bool switchNow,
   }) async {
     final normalized = Api.forProbe(baseUrl, '').baseUrl;
     final profile = ConnectionProfile(
       id: ConnectionProfile.newId(),
-      displayName: displayName.trim().isEmpty ? _legacyName(normalized) : displayName.trim(),
+      displayName: displayName.trim().isEmpty
+          ? _legacyName(normalized)
+          : displayName.trim(),
       baseUrls: [normalized],
       path: path,
       tlsPolicy: tlsPolicy,
       insecureConfirmed: insecureConfirmed,
     );
-    // 添加档案是“写 Keystore + 内存 profiles + 持久化”的复合事务：
-    // 任一 await 失败都要撤销 token、内存档案和已写入的 prefs，避免首装/添加
-    // 失败留下孤儿凭据或重启后仍出现半成品档案。
+    // addProfile 是“写 Keystore + 内存 profiles + 持久化”的复合事务，并进入
+    // #152 的串行事务队列（不能与 active base/profile 提交交错）。写入前先落
+    // 一个可恢复 marker：若前向/回滚都失败，重启时至少能清理或明确标记半成品。
+    final prefs = await _store;
     final oldProfiles = List<ConnectionProfile>.of(profiles);
     final oldActive = activeProfileId;
     final oldGeneration = generation;
+    final beginTxn = <String, dynamic>{
+      'phase': 'begin',
+      'newProfileId': profile.id,
+      'profiles': [for (final item in oldProfiles) item.toJson()],
+      'active': oldActive,
+      'generation': oldGeneration,
+    };
+    try {
+      await prefs.setString(_kAddTxn, jsonEncode(beginTxn));
+    } catch (_) {
+      throw const ConnectionSwitchException(
+        'add-txn-marker-failed',
+        '无法安全保存连接事务，请重试',
+      );
+    }
+    await addProfileGate?.call();
     var tokenAttempted = false;
     try {
       tokenAttempted = true;
@@ -784,8 +861,24 @@ class ConnectionManager {
           profile.id,
           allowInsecure: insecureConfirmed,
         );
-        await commitSwitch(stage);
+        // addProfile 已持有 _serialized，不能调用公开 commitSwitch（会重入）。
+        await _commitSwitchUnlocked(stage);
       }
+      // 先写 commit marker 再删：删 marker 失败也不会让重启误回滚已成功档案。
+      try {
+        await prefs.setString(
+          _kAddTxn,
+          jsonEncode({...beginTxn, 'phase': 'commit'}),
+        );
+      } catch (_) {
+        throw const ConnectionSwitchException(
+          'add-txn-commit-failed',
+          '无法完成连接事务，请重试',
+        );
+      }
+      try {
+        await prefs.remove(_kAddTxn);
+      } catch (_) {}
       return profile;
     } catch (_) {
       profiles
@@ -793,40 +886,158 @@ class ConnectionManager {
         ..addAll(oldProfiles);
       activeProfileId = oldActive;
       generation = oldGeneration;
+      var tokenDeleted = true;
       if (tokenAttempted) {
         try {
           await credentials.deleteToken(profile.id);
         } catch (_) {
-          // 保留原始失败原因；凭据删除失败也不影响后续 UI 的恢复提示。
+          tokenDeleted = false;
         }
       }
-      await _restoreProfilesSnapshot(
+      final restored = await _restoreProfilesSnapshot(
         oldProfiles,
         oldActive,
         oldGeneration,
+        usePersistOverride: true,
       );
+      final markerCleared = restored && tokenDeleted
+          ? await _clearAddTxn(prefs)
+          : false;
+      if (!restored || !tokenDeleted || !markerCleared) {
+        throw const ConnectionSwitchException(
+          'add-cleanup-incomplete',
+          '添加连接失败且清理未完成；重启后将自动修复，请稍后重试',
+        );
+      }
       rethrow;
     }
   }
 
-  /// 在 addProfile 失败后把可能已部分写入的 profiles/active/generation
-  /// 直接恢复为旧快照；写入失败本身不被掩盖。
-  Future<void> _restoreProfilesSnapshot(
+  /// 在 addProfile 失败后把可能已部分写入的 profiles/active/generation 恢复为
+  /// 旧快照；返回是否完全成功。生产使用真实存储，测试可注入持久化故障。
+  Future<bool> _restoreProfilesSnapshot(
+    List<ConnectionProfile> snapshot,
+    String active,
+    int generationValue, {
+    bool usePersistOverride = false,
+  }) async {
+    try {
+      if (usePersistOverride && restoreOverride != null) {
+        await restoreOverride!();
+        return true;
+      }
+      final prefs = await _store;
+      await _writeProfilesDirect(prefs, snapshot, active, generationValue);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _writeProfilesDirect(
+    SharedPreferences prefs,
     List<ConnectionProfile> snapshot,
     String active,
     int generationValue,
   ) async {
+    await prefs.setString(
+      _kProfiles,
+      jsonEncode([for (final profile in snapshot) profile.toJson()]),
+    );
+    await prefs.setString(_kActive, active);
+    await prefs.setInt(_kGeneration, generationValue);
+  }
+
+  Future<bool> _clearAddTxn(SharedPreferences prefs) async {
     try {
-      final prefs = await _store;
-      await prefs.setString(
-        _kProfiles,
-        jsonEncode([for (final profile in snapshot) profile.toJson()]),
-      );
-      await prefs.setString(_kActive, active);
-      await prefs.setInt(_kGeneration, generationValue);
+      await prefs.remove(_kAddTxn);
+      return true;
     } catch (_) {
-      // 恢复持久化失败时保留内存/凭据回滚结果，调用方仍看到原始错误。
+      return false;
     }
+  }
+
+  Map<String, dynamic>? _readAddTxn(SharedPreferences prefs) {
+    final raw = prefs.getString(_kAddTxn);
+    if (raw == null || raw.isEmpty) return null;
+    try {
+      final value = jsonDecode(raw);
+      return value is Map ? Map<String, dynamic>.from(value) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  void _applyAddTxnSnapshotToMemory(Map<String, dynamic> txn) {
+    profiles
+      ..clear()
+      ..addAll([
+        for (final item in (txn['profiles'] as List? ?? const []))
+          if (ConnectionProfile.fromJson(item) != null)
+            ConnectionProfile.fromJson(item)!,
+      ]);
+    activeProfileId = txn['active']?.toString() ?? '';
+    generation = txn['generation'] is int ? txn['generation'] as int : 0;
+  }
+
+  /// 启动修复 addProfile 半成品：begin 回滚旧快照；若已有更新代（A2 已提交）
+  /// 则只删除失败新增的档案/凭据，绝不覆盖更新事务。
+  Future<bool> _repairAddTxn(
+    SharedPreferences prefs,
+    Map<String, dynamic> txn,
+  ) async {
+    final phase = txn['phase']?.toString() ?? '';
+    if (phase == 'commit') {
+      await _clearAddTxn(prefs);
+      return true;
+    }
+    final newId = txn['newProfileId']?.toString() ?? '';
+    final currentProfiles = _readProfiles(prefs);
+    final currentActive = prefs.getString(_kActive) ?? '';
+    final currentGeneration = prefs.getInt(_kGeneration) ?? 0;
+    final oldGeneration = txn['generation'] is int
+        ? txn['generation'] as int
+        : 0;
+    var tokenDeleted = true;
+    if (newId.isNotEmpty) {
+      try {
+        await credentials.deleteToken(newId);
+      } catch (_) {
+        tokenDeleted = false;
+      }
+    }
+    if (currentGeneration > oldGeneration) {
+      // 后续 active base/profile 事务已成功：保留当前代，只移除失败的新档案。
+      if (currentActive == newId) return false;
+      final kept = currentProfiles.where((p) => p.id != newId).toList();
+      try {
+        await _writeProfilesDirect(
+          prefs,
+          kept,
+          currentActive,
+          currentGeneration,
+        );
+      } catch (_) {
+        return false;
+      }
+      return tokenDeleted && await _clearAddTxn(prefs);
+    }
+    final oldProfiles = <ConnectionProfile>[
+      for (final item in (txn['profiles'] as List? ?? const []))
+        if (ConnectionProfile.fromJson(item) != null)
+          ConnectionProfile.fromJson(item)!,
+    ];
+    try {
+      await _writeProfilesDirect(
+        prefs,
+        oldProfiles,
+        txn['active']?.toString() ?? '',
+        oldGeneration,
+      );
+    } catch (_) {
+      return false;
+    }
+    return tokenDeleted && await _clearAddTxn(prefs);
   }
 
   /// 旧版单连接入口（无档案名）的兼容路径；新 UI 统一走 ConnectionProfileEditorScreen。
@@ -846,7 +1057,9 @@ class ConnectionManager {
         baseUrl: normalized,
         token: token,
         path: path,
-        tlsPolicy: secure ? ProfileTlsPolicy.https : ProfileTlsPolicy.httpPrivate,
+        tlsPolicy: secure
+            ? ProfileTlsPolicy.https
+            : ProfileTlsPolicy.httpPrivate,
         insecureConfirmed: !secure && allowInsecure,
         switchNow: false,
       );
@@ -901,7 +1114,10 @@ class ConnectionManager {
         ? await credentials.readToken(oldProfile.id)
         : token;
     if (tokenValue == null || tokenValue.isEmpty) {
-      throw const ConnectionSwitchException('credential-missing', '该连接的口令不可读，请重新输入');
+      throw const ConnectionSwitchException(
+        'credential-missing',
+        '该连接的口令不可读，请重新输入',
+      );
     }
     final updated = oldProfile.copyWith(
       displayName: (displayName ?? '').trim().isEmpty
@@ -948,7 +1164,6 @@ class ConnectionManager {
     await _saveProfiles();
   }
 }
-
 
 /// 生产单例：api 全局单例 + Android Keystore 桥。
 final ConnectionManager appConnections = ConnectionManager(
