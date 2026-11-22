@@ -154,7 +154,8 @@ void main() {
     AppLog.instance.error('error-line');
     await AppLog.instance.setLevel(AppLogLevel.info);
     await _pumpLogButton(tester);
-    expect(find.textContaining('显示 ≥ INFO'), findsOneWidget);
+    expect(find.textContaining('记录 ≥ INFO'), findsOneWidget);
+    expect(find.text('INFO ▾'), findsOneWidget);
     expect(_richText(tester), contains('[INFO]'));
     expect(_richText(tester), contains('[WARN]'));
     expect(_richText(tester), contains('[ERROR]'));
@@ -163,7 +164,7 @@ void main() {
 
     await tester.tap(find.byKey(const ValueKey('log-copy-current')));
     await tester.pumpAndSettle();
-    expect(find.textContaining('已复制 3 行（≥ INFO）'), findsOneWidget);
+    expect(find.textContaining('已复制 3 行（显示 ≥ INFO）'), findsOneWidget);
 
     // 等上一个 toast 消失，避免浮动 SnackBar 挡住“复制全部”按钮。
     await tester.pump(const Duration(seconds: 3));
@@ -175,22 +176,38 @@ void main() {
 
     await tester.tap(find.byKey(const ValueKey('log-level-chip')));
     await tester.pumpAndSettle();
+    expect(find.text('日志显示筛选'), findsOneWidget);
     await tester.tap(find.text('调试（debug）'));
     await tester.pumpAndSettle();
-    expect(find.textContaining('显示 ≥ DEBUG'), findsOneWidget);
+    expect(find.text('DEBUG ▾'), findsOneWidget);
     expect(_richText(tester), contains('[DEBUG]'));
-    expect(AppLog.instance.level, AppLogLevel.debug);
+    expect(find.text('复制当前（4 行）'), findsOneWidget);
+    // issue #154：显示筛选只影响查看，不得改记录级别/记录级偏好。
+    expect(AppLog.instance.level, AppLogLevel.info);
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getString(AppLog.prefsKey), 'info');
+    expect(prefs.getString(AppLog.displayPrefsKey), 'debug');
 
+    // 复制当前必须尊重当前显示筛选：debug 行现在可见且应被复制。
+    copied = null;
+    await tester.tap(find.byKey(const ValueKey('log-copy-current')));
+    await tester.pumpAndSettle();
+    expect(copied, contains('[DEBUG]'));
+    expect(copied, contains('[WARN]'));
+
+    // 等 toast 消失再点清空。
+    await tester.pump(const Duration(seconds: 3));
     await tester.tap(find.byKey(const ValueKey('log-clear')));
     await tester.pumpAndSettle();
     expect(find.byKey(const ValueKey('log-empty')), findsOneWidget);
     expect(find.text('（暂无日志）'), findsOneWidget);
     expect(AppLog.instance.lines, isEmpty);
-    expect(AppLog.instance.level, AppLogLevel.debug, reason: '清空保持当前级别');
+    expect(AppLog.instance.level, AppLogLevel.info, reason: '清空保持记录级别');
+    expect(AppLog.instance.loadDisplayLevel(), completion(AppLogLevel.debug));
   });
 
-  testWidgets('全部被过滤：空态且级别 chip 仍可调', (tester) async {
-    // 历史只有 info 行；提高到 error 后旧行仍在文件中，只是被隐藏。
+  testWidgets('全部被过滤：显示筛选空态且 chip 仍可调', (tester) async {
+    // 历史只有 info 行；记录级别提高到 error 后旧 info 行仍在文件中。
     await AppLog.instance.setLevel(AppLogLevel.info);
     await AppLog.instance.clear();
     AppLog.instance.info('hidden-info-1');
@@ -199,21 +216,39 @@ void main() {
     expect(AppLog.instance.level, AppLogLevel.error);
     expect(AppLog.instance.lines, isNotEmpty);
     await _pumpLogButton(tester);
+
+    // 显示筛选默认 info：旧 info 行可见；但显示级别低于记录级别，提示更详细
+    // 日志未被记录。
+    expect(_richText(tester), contains('hidden-info-1'));
+    expect(find.byKey(const ValueKey('log-display-below-record')), findsOneWidget);
+    expect(AppLog.instance.level, AppLogLevel.error);
+
+    // 把显示筛选提高到 error：旧 info 行被隐藏，出现明确的显示空态。
+    await tester.tap(find.byKey(const ValueKey('log-level-chip')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('错误（error）'));
+    await tester.pumpAndSettle();
+    expect(find.text('ERROR ▾'), findsOneWidget);
     expect(
       find.byKey(const ValueKey('log-text')),
       findsNothing,
       reason: '过滤后应为空态而不是渲染空文本',
     );
-    expect(find.text('当前级别下没有日志'), findsOneWidget);
+    expect(find.text('当前显示级别下没有日志'), findsOneWidget);
+    expect(find.byKey(const ValueKey('log-empty-hint')), findsOneWidget);
     expect(find.text('复制当前（0 行）'), findsOneWidget);
     expect(find.byKey(const ValueKey('log-level-chip')), findsOneWidget);
+    expect(AppLog.instance.level, AppLogLevel.error, reason: '筛选不改记录级别');
   });
 
   testWidgets('Semantics：级别 chip 带当前级别标签', (tester) async {
     final handle = tester.ensureSemantics();
     try {
       await _pumpLogButton(tester);
-      expect(find.bySemanticsLabel(RegExp('日志级别，当前 INFO')), findsOneWidget);
+      expect(
+        find.bySemanticsLabel(RegExp('日志显示筛选，当前 INFO；仅筛选显示')),
+        findsOneWidget,
+      );
     } finally {
       handle.dispose();
     }
@@ -228,6 +263,11 @@ void main() {
     );
     expect(find.byKey(const ValueKey('log-text')), findsOneWidget);
     expect(find.byKey(const ValueKey('log-copy-current')), findsOneWidget);
+    final chipSize = tester.getSize(
+      find.byKey(const ValueKey('log-level-chip')),
+    );
+    expect(chipSize.width, greaterThanOrEqualTo(44));
+    expect(chipSize.height, greaterThanOrEqualTo(44));
     expect(tester.takeException(), isNull);
   });
 }
