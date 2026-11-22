@@ -1,11 +1,8 @@
-// issue #162：dormant/inactive 子代理的模型/effort 从持久化 projection 读，
-// lastUsed 优先、事件折叠回退；live 行为不变；不泄露正文。
+// issue #162：dormant/inactive 子代理的模型/effort 从宿主权威 projection cache 读。
+// P1：pending(next) > 事件折叠 > lastUsed；P2：只用 cachedSnapshot，不直读 projcache 文件。
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { apply } from "../lib/index.js";
 
 const CONFIG = {
@@ -15,39 +12,27 @@ const CONFIG = {
   rateLimit: {}, lanBridge: { enabled: false }, approvalMode: "desktop",
 };
 
-let root;
-const projectionFile = (id) => {
-  const dir = join(root, "session_projcache", "sessions");
-  mkdirSync(dir, { recursive: true });
-  return join(dir, `${id}.json`);
-};
-const writeProjection = (id, lastUsed, extra = {}) => {
-  const file = projectionFile(id);
-  writeFileSync(file, JSON.stringify({
-    version: 7,
-    record: {
-      identity: { id },
-      rows: {
-        modelSelection: { ver: 3, seq: 1, val: { lastUsed, pending: null } },
-        prompt: { val: "SECRET_PROMPT_BODY" },
-        ...extra,
-      },
-    },
-  }));
-};
-const removeProjection = (id) => {
-  try { rmSync(projectionFile(id), { force: true }); } catch {}
-};
+const header = (id) => ({ id, version: 1, createdAt: 1, cwd: "/tmp", isSeeded: false });
+const pick = (provider, model, effort) => ({ provider, model, ...(effort ? { reasoningEffort: effort } : {}) });
 
-function harness({ live = false, events = [], noQuery = false, seeded = false } = {}) {
+function harness({ live = false, events = [], noQuery = false, seeded = false, cache } = {}) {
   const routes = [];
+  const cacheCalls = [];
+  const resumeCalls = [];
   const session = {
     id: "live",
-    header: { cwd: "/tmp" },
-    snapshotEvents: () => [{ type: "model/selection", data: { provider: "p-live", model: "m-live", reasoningEffort: "low" } }],
+    header: header("live"),
+    snapshotEvents: () => [{ type: "model/selection", data: pick("p-live", "m-live", "low") }],
   };
+  const resumedAgent = { id: "resume", status: "idle", followup() {} };
   const services = new Map([
-    ["agents", { get: (id) => live && id === "live" ? { id, session } : undefined }],
+    ["agents", {
+      get: (id) => live && id === "live" ? { id, session } : undefined,
+      resume: async (args) => {
+        resumeCalls.push(args);
+        return { agent: { ...resumedAgent, id: args.resumeSessionId } };
+      },
+    }],
     ["sessions", { get: (id) => live && id === "live" ? session : undefined }],
     ["typertGateway", {
       async invokeRpc() { return { ok: true, value: {} }; },
@@ -56,17 +41,7 @@ function harness({ live = false, events = [], noQuery = false, seeded = false } 
           if (live) {
             yield {
               type: "baseline",
-              value: {
-                projections: {
-                  live: {
-                    values: {
-                      modelSelection: {
-                        next: { provider: "p-live", model: "m-live", reasoningEffort: "low" },
-                      },
-                    },
-                  },
-                },
-              },
+              value: { projections: { live: { values: { modelSelection: { next: pick("p-live", "m-live", "low") } } } } },
             };
           } else {
             yield { type: "baseline", value: { projections: {} } };
@@ -78,14 +53,20 @@ function harness({ live = false, events = [], noQuery = false, seeded = false } 
   if (!noQuery) {
     services.set("sessionQuery", {
       async readSession(id) {
-        if (seeded) {
-          const err = new Error("seeded session constructor seed must equal its inherited prefix");
-          throw err;
-        }
-        return { events };
+        if (seeded) throw new Error("seeded session constructor seed must equal its inherited prefix");
+        return { session: header(id), events };
       },
       async listEvents() { return events.map((event, index) => ({ type: event.type, seq: index + 1 })); },
       async readEvent({ seq }) { return { target: { ...events[seq - 1], seq } }; },
+    });
+  }
+  if (cache !== undefined) {
+    services.set("sessionProjectionCache", {
+      cachedSnapshot(meta, keys) {
+        cacheCalls.push({ id: meta.id, keys });
+        if (cache instanceof Error) throw cache;
+        return cache;
+      },
     });
   }
   const ctx = {
@@ -98,13 +79,13 @@ function harness({ live = false, events = [], noQuery = false, seeded = false } 
     inject() {}, waterfall: async () => "unavailable",
   };
   const dispose = apply(ctx, CONFIG);
-  return { route: routes.find((r) => r.path === "/m/api").handler, dispose };
+  return { route: routes.find((r) => r.path === "/m/api").handler, cacheCalls, resumeCalls, dispose };
 }
 
-async function request(route, path) {
+async function request(route, path, body) {
   const req = new EventEmitter();
-  req.url = path; req.method = "GET";
-  req.headers = { host: "127.0.0.1", "x-mobile-token": CONFIG.authToken };
+  req.url = path; req.method = body === undefined ? "GET" : "POST";
+  req.headers = { host: "127.0.0.1", "x-mobile-token": CONFIG.authToken, "content-type": "application/json" };
   req.socket = { remoteAddress: "127.0.0.1" };
   const res = new EventEmitter();
   let text = "";
@@ -114,84 +95,111 @@ async function request(route, path) {
   res.end = (value) => { if (value) text += value; res.emit("finish"); };
   const done = new Promise((resolve) => res.once("finish", resolve));
   route(req, res);
+  if (body !== undefined) queueMicrotask(() => {
+    req.emit("data", Buffer.from(JSON.stringify(body))); req.emit("end");
+  });
   await done;
   return { status: res.statusCode, body: JSON.parse(text || "{}") };
 }
 
-test.before(() => {
-  root = mkdtempSync(join(tmpdir(), "dormant-model-"));
-  process.env.DSH_STORAGE_ROOT = root;
-});
-test.after(() => {
-  delete process.env.DSH_STORAGE_ROOT;
-  rmSync(root, { recursive: true, force: true });
-});
+const projection = (lastUsed, next) => ({ values: { modelSelection: { lastUsed, next } } });
 
-test("live 会话行为不变：control next 优先，不读 projection lastUsed", async () => {
-  writeProjection("live", { provider: "p-proj", model: "m-proj", reasoningEffort: "max" });
-  const h = harness({ live: true });
+test("live 会话行为不变：control next 优先，不读 projection cache", async () => {
+  const h = harness({ live: true, cache: projection(pick("p-proj", "m-proj", "max"), pick("p-proj", "m-proj", "max")) });
   try {
     const res = await request(h.route, "/m/api/session-config?sessionId=live");
     assert.equal(res.status, 200);
-    assert.equal(res.body.config.provider, "p-live");
-    assert.equal(res.body.config.model, "m-live");
-    assert.equal(res.body.config.reasoningEffort, "low");
-  } finally { h.dispose?.(); removeProjection("live"); }
-});
-
-test("dormant 会话无 live agent：projection lastUsed 优先于事件/缺省", async () => {
-  writeProjection("9702-dormant", { provider: "workbuddy", model: "deepseek-v4.1-flash", reasoningEffort: "max" });
-  const h = harness({ events: [{ seq: 1, type: "model/selection", data: { provider: "old", model: "old-model" } }] });
-  try {
-    const res = await request(h.route, "/m/api/session-config?sessionId=9702-dormant");
-    assert.equal(res.status, 200);
-    assert.equal(res.body.config.provider, "workbuddy");
-    assert.equal(res.body.config.model, "deepseek-v4.1-flash");
-    assert.equal(res.body.config.reasoningEffort, "max");
-    assert.equal(JSON.stringify(res.body).includes("SECRET_PROMPT_BODY"), false);
-    assert.equal(JSON.stringify(res.body).includes("prompt"), false);
-  } finally { h.dispose?.(); removeProjection("9702-dormant"); }
-});
-
-test("dormant 无 projection / 无模型事件：不伪造父模型", async () => {
-  removeProjection("no-model");
-  const h = harness({ events: [{ seq: 1, type: "permission/preset", data: { preset: "workspace-write" } }] });
-  try {
-    const res = await request(h.route, "/m/api/session-config?sessionId=no-model");
-    assert.equal(res.status, 200);
-    assert.equal(res.body.config.permissionPreset, "workspace-write");
-    assert.equal(res.body.config.model, undefined);
-    assert.equal(res.body.config.provider, undefined);
-    assert.equal(res.body.config.reasoningEffort, undefined);
+    assert.deepEqual([res.body.config.provider, res.body.config.model, res.body.config.reasoningEffort], ["p-live", "m-live", "low"]);
+    assert.equal(h.cacheCalls.length, 0);
   } finally { h.dispose?.(); }
 });
 
-test("projection 缺失/损坏时回退事件折叠；旧宿主无 sessionQuery 不崩", async () => {
-  const bad = projectionFile("bad-projection");
-  mkdirSync(join(root, "session_projcache", "sessions"), { recursive: true });
-  writeFileSync(bad, "{not-json");
-  const h = harness({ events: [{ seq: 2, type: "model/selection", data: { provider: "ev", model: "event-model", reasoningEffort: "medium" } }] });
+test("dormant：lastUsed=A / next=B 且事件=C → session-config 显示 B（不反向覆盖）", async () => {
+  const h = harness({
+    events: [{ seq: 1, type: "model/selection", data: pick("event", "event-model", "low") }],
+    cache: projection(pick("a", "model-a", "medium"), pick("b", "model-b", "max")),
+  });
   try {
-    const res = await request(h.route, "/m/api/session-config?sessionId=bad-projection");
-    assert.equal(res.body.config.provider, "ev");
-    assert.equal(res.body.config.model, "event-model");
-    assert.equal(res.body.config.reasoningEffort, "medium");
-  } finally { h.dispose?.(); removeProjection("bad-projection"); }
-
-  const old = harness({ noQuery: true });
-  try {
-    const res = await request(old.route, "/m/api/session-config?sessionId=old-host");
+    const res = await request(h.route, "/m/api/session-config?sessionId=dormant-b");
     assert.equal(res.status, 200);
-    assert.equal(res.body.config.model, undefined);
-  } finally { old.dispose?.(); }
+    assert.deepEqual([res.body.config.provider, res.body.config.model, res.body.config.reasoningEffort], ["b", "model-b", "max"]);
+    assert.deepEqual(h.cacheCalls[0].keys, ["modelSelection"]);
+    assert.equal(JSON.stringify(res.body).includes("SECRET_PROMPT_BODY"), false);
+  } finally { h.dispose?.(); }
 });
 
-test("seeded 核心缺陷路径：listEvents 回退仍工作，projection 缺失不伪装", async () => {
-  const h = harness({ seeded: true, events: [{ seq: 1, type: "model/selection", data: { provider: "seeded", model: "seeded-model" } }] });
+test("dormant：无 pending 时事件折叠优先于 lastUsed；无模型则省略", async () => {
+  const h = harness({
+    events: [{ seq: 1, type: "model/selection", data: pick("event", "event-model", "low") }],
+    cache: projection(pick("a", "model-a", "medium"), pick("a", "model-a", "medium")),
+  });
   try {
-    const res = await request(h.route, "/m/api/session-config?sessionId=seeded");
+    const res = await request(h.route, "/m/api/session-config?sessionId=dormant-event");
+    assert.deepEqual([res.body.config.provider, res.body.config.model, res.body.config.reasoningEffort], ["event", "event-model", "low"]);
+  } finally { h.dispose?.(); }
+
+  const empty = harness({ events: [], cache: undefined });
+  try {
+    const res = await request(empty.route, "/m/api/session-config?sessionId=no-model");
+    assert.equal(res.body.config.model, undefined);
+    assert.equal(res.body.config.provider, undefined);
+  } finally { empty.dispose?.(); }
+});
+
+test("resume dormant agentOptions 使用权威 next（P1）", async () => {
+  const h = harness({
+    events: [{ seq: 1, type: "model/selection", data: pick("event", "event-model", "low") }],
+    cache: projection(pick("a", "model-a", "medium"), pick("b", "model-b", "max")),
+  });
+  try {
+    const res = await request(h.route, "/m/api/send", { sessionId: "resume", text: "hi" });
     assert.equal(res.status, 200);
-    assert.equal(res.body.config.provider, "seeded");
-    assert.equal(res.body.config.model, "seeded-model");
+    assert.deepEqual(h.resumeCalls[0].agentOptions, { provider: "b", model: "model-b", reasoningEffort: "max" });
+  } finally { h.dispose?.(); }
+});
+
+test("P2：缺 cache 服务/ID 重建/版本不匹配不读磁盘投影、不冒充权威", async () => {
+  // 磁盘上放一份“lastUsed=A”旧文件；没有 cache 服务时不得使用它。
+  const oldRoot = process.env.DSH_STORAGE_ROOT;
+  process.env.DSH_STORAGE_ROOT = "/tmp/does-not-matter";
+  try {
+    const h = harness({ events: [] });
+    try {
+      const res = await request(h.route, "/m/api/session-config?sessionId=recreated");
+      assert.equal(res.status, 200);
+      assert.equal(res.body.config.model, undefined);
+    } finally { h.dispose?.(); }
+  } finally {
+    if (oldRoot === undefined) delete process.env.DSH_STORAGE_ROOT;
+    else process.env.DSH_STORAGE_ROOT = oldRoot;
+  }
+
+  const recreated = harness({ events: [], cache: undefined });
+  try {
+    const res = await request(recreated.route, "/m/api/session-config?sessionId=recreated");
+    assert.equal(res.body.config.model, undefined);
+  } finally { recreated.dispose?.(); }
+
+  const recreatedProjection = harness({ events: [], cache: null });
+  try {
+    const res = await request(recreatedProjection.route, "/m/api/session-config?sessionId=recreated");
+    assert.equal(res.body.config.model, undefined, "ID 重建后的 cache 不匹配不得冒充旧模型");
+    assert.equal(recreatedProjection.cacheCalls.length, 1);
+  } finally { recreatedProjection.dispose?.(); }
+
+  const stale = harness({ events: [{ seq: 9, type: "model/selection", data: pick("event", "event-model") }], cache: new Error("version-mismatch") });
+  try {
+    const res = await request(stale.route, "/m/api/session-config?sessionId=stale");
+    assert.equal(res.body.config.provider, "event");
+    assert.equal(res.body.config.model, "event-model");
+  } finally { stale.dispose?.(); }
+});
+
+test("旧宿主无 cache 服务：事件折叠可用，不崩", async () => {
+  const h = harness({ events: [{ seq: 1, type: "model/selection", data: pick("old", "old-model", "high") }], noQuery: false, cache: undefined });
+  try {
+    const res = await request(h.route, "/m/api/session-config?sessionId=old-host");
+    assert.equal(res.status, 200);
+    assert.deepEqual([res.body.config.provider, res.body.config.model, res.body.config.reasoningEffort], ["old", "old-model", "high"]);
   } finally { h.dispose?.(); }
 });
