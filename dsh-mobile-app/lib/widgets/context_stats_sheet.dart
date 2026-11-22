@@ -95,6 +95,7 @@ class _ContextStatsSheetState extends State<ContextStatsSheet>
   DateTime? _updatedAt;
   bool _loading = false;
   bool _refreshPending = false;
+  Set<String> _staleBlocks = <String>{};
   String? _error;
   Timer? _refreshDebounce;
   int _request = 0;
@@ -166,7 +167,7 @@ class _ContextStatsSheetState extends State<ContextStatsSheet>
         }
       }
       if (!mounted || request != _request) return;
-      _applySnapshot(snapshot);
+      _mergeIncoming(snapshot);
     } catch (e) {
       if (!mounted || request != _request) return;
       // 旧宿主（404/not-found）回退现有 /usage；其他失败保留已有快照并提示。
@@ -190,48 +191,82 @@ class _ContextStatsSheetState extends State<ContextStatsSheet>
       error is ApiException &&
       (error.status == 404 || error.code == 'not-found');
 
-  /// 按 asOfSeq 单调接受宿主投影；旧响应不得覆盖更新的快照。
-  bool _acceptsSnapshot(ContextStatsSnapshot incoming) {
-    final current = _snapshot?.asOfSeq;
-    final next = incoming.asOfSeq;
-    if (current != null && (next == null || next < current)) return false;
+  /// 合并一次刷新：健康块按各自 watermark 单调更新；失败块保留旧值并标 stale。
+  /// 不得因全局 asOfSeq 缺失而拒绝整包（服务端逐块读取时可能只有 asOfSeqByBlock）。
+  bool _mergeIncoming(ContextStatsSnapshot incoming) {
+    final current = _snapshot;
+    if (current == null) {
+      setState(() {
+        _snapshot = incoming;
+        _updatedAt = DateTime.now();
+        _staleBlocks = <String>{};
+        _error = null;
+      });
+      widget.onSnapshot?.call(incoming);
+      return true;
+    }
+    final result = current.mergeRefresh(incoming);
+    if (!result.changed && result.staleBlocks.isEmpty) return false;
+    setState(() {
+      _snapshot = result.snapshot;
+      _staleBlocks = result.staleBlocks;
+      // 新宿主健康块更新才刷新采样时间；legacy 只补块时保留最近成功时间。
+      if (!incoming.legacyFallback || current.asOfSeq == null) {
+        _updatedAt = DateTime.now();
+      }
+      _error = null;
+    });
+    widget.onSnapshot?.call(result.snapshot);
     return true;
   }
 
-  void _applySnapshot(ContextStatsSnapshot snapshot) {
-    if (!_acceptsSnapshot(snapshot)) return;
-    setState(() {
-      _snapshot = snapshot;
-      _updatedAt = DateTime.now();
-      _error = null;
-    });
-    widget.onSnapshot?.call(snapshot);
-  }
-
   Future<void> _loadLegacy(int request) async {
-    ContextStatsSnapshot snapshot;
-    DateTime? updatedAt;
-    String? error;
     try {
       final usage = await widget.api.usage(widget.sessionId);
-      snapshot = ContextStatsSnapshot.fromLegacyUsage(usage);
-      updatedAt = DateTime.now();
-      error = null;
+      if (!mounted || request != _request) return;
+      final snapshot = ContextStatsSnapshot.fromLegacyUsage(usage);
+      final current = _snapshot;
+      if (current == null) {
+        setState(() {
+          _snapshot = snapshot;
+          _updatedAt = DateTime.now();
+          _staleBlocks = <String>{};
+          _error = null;
+        });
+        widget.onSnapshot?.call(snapshot);
+        return;
+      }
+      final result = current.mergeRefresh(snapshot);
+      setState(() {
+        _snapshot = result.snapshot;
+        _staleBlocks = result.staleBlocks;
+        // 旧宿主没有任何 asOfSeq：本次 /usage 成功就是一次新的成功采样。
+        if (current.asOfSeq == null) _updatedAt = DateTime.now();
+        _error = null;
+      });
+      if (result.changed) widget.onSnapshot?.call(result.snapshot);
     } catch (e) {
-      // 旧宿主 404 后 /usage 也失败：复用打开时的 fallbackUsage，但**不**把采集时间
-      // 刷新成 now；明确标记过期并允许重试，避免伪装成刚更新。
-      snapshot = ContextStatsSnapshot.fromLegacyUsage(widget.fallbackUsage);
-      updatedAt = widget.fallbackCapturedAt ?? _updatedAt;
-      error = L10n.t('旧版用量读取失败', 'Legacy usage read failed');
+      if (!mounted || request != _request) return;
+      // 旧宿主 404 后 /usage 也失败：若已有现存快照（可能来自更近一次成功请求），
+      // 必须保留它和最近成功时间，不能回落到打开时的旧 fallback；只显示过期/重试。
+      if (_snapshot != null) {
+        setState(() {
+          _error = L10n.t('旧版用量读取失败', 'Legacy usage read failed');
+        });
+        return;
+      }
+      // 没有任何现存快照时才用打开时的 fallbackUsage，并保留其原采集时间。
+      final snapshot = ContextStatsSnapshot.fromLegacyUsage(
+        widget.fallbackUsage,
+      );
+      setState(() {
+        _snapshot = snapshot;
+        _updatedAt = widget.fallbackCapturedAt;
+        _staleBlocks = <String>{};
+        _error = L10n.t('旧版用量读取失败', 'Legacy usage read failed');
+      });
+      widget.onSnapshot?.call(snapshot);
     }
-    if (!mounted || request != _request) return;
-    if (!_acceptsSnapshot(snapshot)) return;
-    setState(() {
-      _snapshot = snapshot;
-      _updatedAt = updatedAt;
-      _error = error;
-    });
-    widget.onSnapshot?.call(snapshot);
   }
 
   String _staleTimeLabel() {
@@ -376,6 +411,17 @@ class _ContextStatsSheetState extends State<ContextStatsSheet>
               '部分数据来自旧版 /usage 近似值；不可用的构成/统计会明确标注。',
               'Some data comes from legacy /usage approximations; unavailable tabs are marked.',
             ),
+          )
+        else if (_staleBlocks.isNotEmpty)
+          _NoticeBar(
+            key: const ValueKey<String>('context-stats-partial-notice'),
+            text: L10n.t(
+              '部分块刷新失败，健康块已更新；失败块保留上次值。',
+              'Some blocks failed to refresh; healthy blocks are updated and failed blocks keep previous values.',
+            ),
+            actionKey: const ValueKey<String>('context-stats-stale-retry'),
+            actionLabel: L10n.t('重试', 'Retry'),
+            onAction: _loading ? null : _load,
           ),
         _SummaryCard(snapshot: snapshot),
         TabBar(
@@ -412,9 +458,18 @@ class _ContextStatsSheetState extends State<ContextStatsSheet>
           child: TabBarView(
             controller: _tabs,
             children: [
-              _CompositionTab(snapshot: snapshot),
-              _TokenUsageTab(snapshot: snapshot),
-              _SessionStatsTab(snapshot: snapshot),
+              _CompositionTab(
+                snapshot: snapshot,
+                stale: _staleBlocks.contains('breakdown'),
+              ),
+              _TokenUsageTab(
+                snapshot: snapshot,
+                stale: _staleBlocks.contains('tokenUsage'),
+              ),
+              _SessionStatsTab(
+                snapshot: snapshot,
+                stale: _staleBlocks.contains('timing'),
+              ),
             ],
           ),
         ),
@@ -525,7 +580,8 @@ class _SummaryCard extends StatelessWidget {
 
 class _CompositionTab extends StatelessWidget {
   final ContextStatsSnapshot snapshot;
-  const _CompositionTab({required this.snapshot});
+  final bool stale;
+  const _CompositionTab({required this.snapshot, this.stale = false});
 
   @override
   Widget build(BuildContext context) {
@@ -589,6 +645,14 @@ class _CompositionTab extends StatelessWidget {
       key: const ValueKey<String>('context-stats-composition-list'),
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
       children: [
+        if (stale)
+          _StaleBlockHint(
+            key: const ValueKey<String>('context-stats-stale-block-breakdown'),
+            text: L10n.t(
+              '本次刷新构成不可用，显示上次值。',
+              'Composition failed to refresh; showing the previous values.',
+            ),
+          ),
         for (final row in rows)
           Padding(
             padding: const EdgeInsets.only(bottom: 12),
@@ -696,7 +760,8 @@ class _BreakdownRow extends StatelessWidget {
 
 class _TokenUsageTab extends StatelessWidget {
   final ContextStatsSnapshot snapshot;
-  const _TokenUsageTab({required this.snapshot});
+  final bool stale;
+  const _TokenUsageTab({required this.snapshot, this.stale = false});
 
   @override
   Widget build(BuildContext context) {
@@ -743,6 +808,14 @@ class _TokenUsageTab extends StatelessWidget {
       key: const ValueKey<String>('context-stats-token-list'),
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
       children: [
+        if (stale)
+          _StaleBlockHint(
+            key: const ValueKey<String>('context-stats-stale-block-tokenUsage'),
+            text: L10n.t(
+              '本次刷新累计用量不可用，显示上次值。',
+              'Token usage failed to refresh; showing the previous values.',
+            ),
+          ),
         Text(
           L10n.t(
             '本会话累计用量（不是当前上下文占用）',
@@ -796,7 +869,8 @@ class _TokenUsageTab extends StatelessWidget {
 
 class _SessionStatsTab extends StatelessWidget {
   final ContextStatsSnapshot snapshot;
-  const _SessionStatsTab({required this.snapshot});
+  final bool stale;
+  const _SessionStatsTab({required this.snapshot, this.stale = false});
 
   @override
   Widget build(BuildContext context) {
@@ -832,6 +906,14 @@ class _SessionStatsTab extends StatelessWidget {
       key: const ValueKey<String>('context-stats-session-list'),
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
       children: [
+        if (stale)
+          _StaleBlockHint(
+            key: const ValueKey<String>('context-stats-stale-block-timing'),
+            text: L10n.t(
+              '本次刷新会话统计不可用，显示上次值。',
+              'Session stats failed to refresh; showing the previous values.',
+            ),
+          ),
         Text(
           L10n.t('整份会话累计，不是每轮数据', 'Whole-session totals, not per-turn figures'),
           style: TextStyle(fontSize: 11.5, color: ink3),
@@ -904,6 +986,28 @@ class _MetricRow extends StatelessWidget {
               ),
             ),
           ],
+        ],
+      ),
+    );
+  }
+}
+
+class _StaleBlockHint extends StatelessWidget {
+  final String text;
+  const _StaleBlockHint({super.key, required this.text});
+
+  @override
+  Widget build(BuildContext context) {
+    final ink3 = DshColors.ink3(context);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        children: [
+          Icon(Icons.info_outline, size: 13, color: ink3),
+          const SizedBox(width: 5),
+          Expanded(
+            child: Text(text, style: TextStyle(fontSize: 11, color: ink3)),
+          ),
         ],
       ),
     );

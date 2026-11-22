@@ -4,6 +4,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:dsh_mobile_app/api.dart';
+import 'package:dsh_mobile_app/context_stats.dart';
 import 'package:dsh_mobile_app/l10n.dart';
 import 'package:dsh_mobile_app/models.dart';
 import 'package:dsh_mobile_app/screens/chat_screen.dart';
@@ -261,6 +262,7 @@ Future<AppStore> _pumpSheet(
   _Backend backend, {
   Map<String, dynamic> fallbackUsage = const <String, dynamic>{},
   DateTime? fallbackCapturedAt,
+  ValueChanged<ContextStatsSnapshot>? onSnapshot,
 }) async {
   final store = AppStore(apiClient: backend.api)
     ..sessionId = _session
@@ -281,6 +283,7 @@ Future<AppStore> _pumpSheet(
           model: 'M',
           fallbackUsage: fallbackUsage,
           fallbackCapturedAt: fallbackCapturedAt,
+          onSnapshot: onSnapshot,
         ),
       ),
     ),
@@ -717,10 +720,11 @@ void main() {
       findsOneWidget,
     );
     expect(find.textContaining('数据可能已过期'), findsOneWidget);
+    final staleTime = tester.widget<Text>(find.textContaining('上次更新'));
     expect(
-      find.textContaining('上次更新 10:00:00'),
-      findsOneWidget,
-      reason: 'fallback 复用不得伪装成刚更新',
+      staleTime.data,
+      isNot(contains('10:00:00')),
+      reason: '应保留最近一次成功 /usage 的采样时间，而不是更旧 fallback 时间',
     );
     expect(
       tester
@@ -741,6 +745,170 @@ void main() {
       find.byKey(const ValueKey<String>('context-stats-stale-notice')),
       findsNothing,
     );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('legacy 10%→/usage 成功 60%→下次失败：保持 60 与成功采样时间，不回退 10%', (
+    tester,
+  ) async {
+    final fallback = Map<String, dynamic>.from(_legacyUsage()['usage'] as Map)
+      ..['pressureTokens'] = 800
+      ..['contextWindow'] = 8000;
+    final capturedAt = DateTime(2026, 11, 22, 10, 0, 0);
+    final backend = _Backend(statsStatus: 404)..usageStatus = 500;
+    backend.usage = {
+      'ok': true,
+      'usage': {
+        'inputTokens': 4800,
+        'outputTokens': 10,
+        'cacheReadTokens': 0,
+        'cacheWriteTokens': 0,
+        'pressureTokens': 4800,
+      },
+      'contextWindow': 8000,
+    };
+    final emitted = <ContextStatsSnapshot>[];
+    await _pumpSheet(
+      tester,
+      backend,
+      fallbackUsage: fallback,
+      fallbackCapturedAt: capturedAt,
+      onSnapshot: emitted.add,
+    );
+    await tester.pumpAndSettle();
+    expect(
+      tester
+          .widget<Text>(
+            find.byKey(const ValueKey<String>('context-stats-percent')),
+          )
+          .data,
+      '10%',
+    );
+
+    backend.usageStatus = 200;
+    await tester.tap(
+      find.byKey(const ValueKey<String>('context-stats-refresh')),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      tester
+          .widget<Text>(
+            find.byKey(const ValueKey<String>('context-stats-percent')),
+          )
+          .data,
+      '60%',
+    );
+    final successAt = DateTime.now();
+    expect(emitted.last.pressure?.effectivePercent, 60);
+
+    backend.usageStatus = 500;
+    await tester.tap(
+      find.byKey(const ValueKey<String>('context-stats-refresh')),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      tester
+          .widget<Text>(
+            find.byKey(const ValueKey<String>('context-stats-percent')),
+          )
+          .data,
+      '60%',
+      reason: '失败不得回落到更旧 fallback 的 10%',
+    );
+    expect(emitted.last.pressure?.effectivePercent, 60);
+    final stale = tester.widget<Text>(find.textContaining('上次更新'));
+    expect(stale.data, isNot(contains('10:00:00')));
+    expect(
+      successAt.difference(capturedAt).inHours,
+      greaterThan(0),
+      reason: '成功采样晚于 fallback 采集时间',
+    );
+    expect(
+      find.byKey(const ValueKey<String>('context-stats-stale-notice')),
+      findsOneWidget,
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('全成功→单 unit 失败：健康块按各自 cut 更新，失败块保留并标记', (tester) async {
+    final first = _fullStats();
+    final second = {
+      'ok': true,
+      'sessionId': _session,
+      'pressure': {
+        'pressureTokens': 1000,
+        'projectedTokens': 4000,
+        'contextWindow': 8000,
+        'percent': 50,
+      },
+      'tokenUsage': {
+        'uncachedInput': 999,
+        'output': 1,
+        'cacheRead': 0,
+        'cacheWrite': 0,
+        'cacheHitRate': 0,
+      },
+      'timing': {
+        'turns': 9,
+        'steps': 9,
+        'llmMs': 90,
+        'toolMs': 90,
+        'ttftMs': 90,
+        'decodeMs': 90,
+        'avgTtftMs': 90,
+        'tps': 9,
+      },
+      'asOfSeqByBlock': {'pressure': 9, 'tokenUsage': 9, 'timing': 9},
+    };
+    final backend = _Backend()..statsResponses.addAll([first, second]);
+    await _pumpSheet(tester, backend);
+    await tester.pumpAndSettle();
+    expect(
+      tester
+          .widget<Text>(
+            find.byKey(const ValueKey<String>('context-stats-percent')),
+          )
+          .data,
+      '30%',
+    );
+
+    await tester.tap(
+      find.byKey(const ValueKey<String>('context-stats-refresh')),
+    );
+    await tester.pumpAndSettle();
+
+    // 健康块更新（pressure/token/timing），不因缺 breakdown/全局 asOfSeq 拒绝整包。
+    expect(
+      tester
+          .widget<Text>(
+            find.byKey(const ValueKey<String>('context-stats-percent')),
+          )
+          .data,
+      '50%',
+    );
+    expect(
+      find.byKey(const ValueKey<String>('context-stats-partial-notice')),
+      findsOneWidget,
+    );
+    await tester.tap(
+      find.byKey(const ValueKey<String>('context-stats-tab-tokens')),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('999'), findsOneWidget);
+    await tester.tap(
+      find.byKey(const ValueKey<String>('context-stats-tab-stats')),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('9'), findsWidgets);
+    await tester.tap(
+      find.byKey(const ValueKey<String>('context-stats-tab-composition')),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey<String>('context-stats-stale-block-breakdown')),
+      findsOneWidget,
+    );
+    expect(find.text('系统提示'), findsOneWidget, reason: '失败块保留上次值');
     expect(tester.takeException(), isNull);
   });
 }

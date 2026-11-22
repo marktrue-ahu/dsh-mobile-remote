@@ -198,6 +198,9 @@ class ContextStatsSnapshot {
   final ContextTimingStats? timing;
   final Map<String, String> sources;
   final int? asOfSeq;
+
+  /// 服务端逐块读取时的 cut；某块失败/各块不一致时全局 asOfSeq 省略。
+  final Map<String, int> asOfSeqByBlock;
   final bool legacyFallback;
 
   const ContextStatsSnapshot({
@@ -207,8 +210,97 @@ class ContextStatsSnapshot {
     this.timing,
     this.sources = const <String, String>{},
     this.asOfSeq,
+    this.asOfSeqByBlock = const <String, int>{},
     this.legacyFallback = false,
   });
+
+  /// 某块的 watermark：块 cut 优先，其次全局 cut。
+  int? cutOf(String block) => asOfSeqByBlock[block] ?? asOfSeq;
+
+  /// 失败块合并：健康块按各自 cut 单调更新，失败块保留旧值并标记 stale。
+  ContextStatsMerge mergeRefresh(ContextStatsSnapshot incoming) {
+    final legacy = incoming.legacyFallback;
+    final stale = <String>{};
+    var changed = false;
+    final current = this;
+
+    T? pick<T>({
+      required String block,
+      required T? currentValue,
+      required T? incomingValue,
+    }) {
+      if (incomingValue == null) {
+        if (!legacy && currentValue != null) {
+          stale.add(block);
+          changed = true;
+        }
+        return currentValue;
+      }
+      if (legacy &&
+          currentValue != null &&
+          (!current.legacyFallback || current.asOfSeq != null)) {
+        // 旧宿主回退只补缺块，绝不覆盖更近期的新宿主快照；
+        // 若当前也来自旧宿主（无 cut），新的 /usage 成功采样可以更新。
+        return currentValue;
+      }
+      final currentCut = current.cutOf(block);
+      final incomingCut = incoming.cutOf(block);
+      if (!legacy &&
+          currentCut != null &&
+          incomingCut != null &&
+          incomingCut < currentCut) {
+        // 迟到的旧块：保留当前值，不把它标成失败（只是被丢弃的旧响应）。
+        return currentValue;
+      }
+      changed = true;
+      return incomingValue;
+    }
+
+    final pressure = pick<ContextPressureStats>(
+      block: 'pressure',
+      currentValue: current.pressure,
+      incomingValue: incoming.pressure,
+    );
+    final breakdown = pick<ContextBreakdownStats>(
+      block: 'breakdown',
+      currentValue: current.breakdown,
+      incomingValue: incoming.breakdown,
+    );
+    final tokenUsage = pick<ContextTokenUsageStats>(
+      block: 'tokenUsage',
+      currentValue: current.tokenUsage,
+      incomingValue: incoming.tokenUsage,
+    );
+    final timing = pick<ContextTimingStats>(
+      block: 'timing',
+      currentValue: current.timing,
+      incomingValue: incoming.timing,
+    );
+
+    final cuts = <String, int>{...current.asOfSeqByBlock};
+    for (final entry in incoming.asOfSeqByBlock.entries) {
+      cuts[entry.key] = entry.value;
+    }
+    final sources = <String, String>{...current.sources};
+    for (final entry in incoming.sources.entries) {
+      sources[entry.key] = entry.value;
+    }
+    final merged = ContextStatsSnapshot(
+      pressure: pressure,
+      breakdown: breakdown,
+      tokenUsage: tokenUsage,
+      timing: timing,
+      sources: sources,
+      asOfSeq: incoming.asOfSeq ?? current.asOfSeq,
+      asOfSeqByBlock: cuts,
+      legacyFallback: incoming.legacyFallback || current.legacyFallback,
+    );
+    return ContextStatsMerge(
+      snapshot: merged,
+      staleBlocks: stale,
+      changed: changed,
+    );
+  }
 
   bool get isEmpty =>
       pressure == null &&
@@ -217,6 +309,14 @@ class ContextStatsSnapshot {
       timing == null;
 
   static ContextStatsSnapshot fromJson(Map<String, dynamic> json) {
+    final rawCuts = json['asOfSeqByBlock'];
+    final cuts = <String, int>{};
+    if (rawCuts is Map) {
+      for (final entry in rawCuts.entries) {
+        final value = _intOrNull(entry.value);
+        if (value != null) cuts['${entry.key}'] = value;
+      }
+    }
     final rawSources = json['sources'];
     final sources = <String, String>{};
     if (rawSources is Map) {
@@ -233,6 +333,7 @@ class ContextStatsSnapshot {
       timing: ContextTimingStats.fromJson(json['timing']),
       sources: sources,
       asOfSeq: _intOrNull(json['asOfSeq']),
+      asOfSeqByBlock: cuts,
     );
   }
 
@@ -251,6 +352,7 @@ class ContextStatsSnapshot {
       timing: timing,
       sources: sources,
       asOfSeq: asOfSeq,
+      asOfSeqByBlock: asOfSeqByBlock,
       legacyFallback: true,
     );
   }
@@ -287,6 +389,19 @@ class ContextStatsSnapshot {
       legacyFallback: true,
     );
   }
+}
+
+/// 一次 refresh 的合并结果：健康块更新 + 失败块 stale 集合。
+class ContextStatsMerge {
+  final ContextStatsSnapshot snapshot;
+  final Set<String> staleBlocks;
+  final bool changed;
+
+  const ContextStatsMerge({
+    required this.snapshot,
+    required this.staleBlocks,
+    required this.changed,
+  });
 }
 
 int? _intOrNull(Object? value) {
