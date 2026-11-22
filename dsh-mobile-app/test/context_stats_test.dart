@@ -338,4 +338,54 @@ void main() {
     );
     expect(third.snapshot.cutOf('tokenUsage'), 115);
   });
+
+  test('legacy 补块无 cut 不继承 global；真实 token cut99 替换并移除 legacy 标记', () {
+    final current = ContextStatsSnapshot.fromJson({
+      'pressure': {'pressureTokens': 100, 'contextWindow': 1000},
+      'asOfSeq': 100,
+    });
+    final withLegacy = current.mergedWithLegacyUsage({
+      'inputTokens': 100,
+      'outputTokens': 10,
+      'cacheReadTokens': 0,
+      'cacheWriteTokens': 0,
+      'pressureTokens': 999,
+      'contextWindow': 1000,
+    });
+    expect(withLegacy.legacyBlocks, {'tokenUsage'});
+    expect(
+      withLegacy.pressure?.pressureTokens,
+      100,
+      reason: '已有新宿主 pressure 不被覆盖',
+    );
+    expect(
+      withLegacy.cutOf('tokenUsage'),
+      isNull,
+      reason: 'legacy 补块没有可信 cut，不得继承 global100',
+    );
+    expect(withLegacy.cutOf('pressure'), 100);
+
+    final realToken99 = ContextStatsSnapshot.fromJson({
+      'tokenUsage': {
+        'uncachedInput': 999,
+        'output': 99,
+        'cacheRead': 0,
+        'cacheWrite': 0,
+      },
+      'asOfSeqByBlock': {'tokenUsage': 99},
+    });
+    final merged = withLegacy.mergeRefresh(realToken99);
+    expect(
+      merged.snapshot.tokenUsage?.uncachedInput,
+      999,
+      reason: '99 是第一份真实 token 水位，必须接受',
+    );
+    expect(merged.snapshot.cutOf('tokenUsage'), 99);
+    expect(
+      merged.snapshot.legacyBlocks.contains('tokenUsage'),
+      isFalse,
+      reason: '真实新值替换后应移除 legacy 标记',
+    );
+    expect(merged.snapshot.legacyFallback, isFalse);
+  });
 }

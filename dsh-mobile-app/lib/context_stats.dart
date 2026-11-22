@@ -200,7 +200,9 @@ class ContextStatsSnapshot {
   final int? asOfSeq;
 
   /// 服务端逐块读取时的 cut；某块失败/各块不一致时全局 asOfSeq 省略。
-  final Map<String, int> asOfSeqByBlock;
+  /// 每块 cut；**包含 key 但值为 null = 该块已知没有可信水位**（如 legacy 补块），
+  /// 不得回退继承 global。缺 key 才回退 global。
+  final Map<String, int?> asOfSeqByBlock;
 
   /// 逐块标记来自旧版 /usage fallback 的块；新宿主真实块不受全局 legacy 影响。
   final Set<String> legacyBlocks;
@@ -213,13 +215,14 @@ class ContextStatsSnapshot {
     this.timing,
     this.sources = const <String, String>{},
     this.asOfSeq,
-    this.asOfSeqByBlock = const <String, int>{},
+    this.asOfSeqByBlock = const <String, int?>{},
     this.legacyBlocks = const <String>{},
     this.legacyFallback = false,
   });
 
   /// 某块的 watermark：块 cut 优先，其次全局 cut。
-  int? cutOf(String block) => asOfSeqByBlock[block] ?? asOfSeq;
+  int? cutOf(String block) =>
+      asOfSeqByBlock.containsKey(block) ? asOfSeqByBlock[block] : asOfSeq;
 
   /// 失败块合并：健康块按各自 watermark 单调更新；失败块保留旧值并标记 stale。
   ContextStatsMerge mergeRefresh(ContextStatsSnapshot incoming) {
@@ -321,27 +324,22 @@ class ContextStatsSnapshot {
     // 逐块 watermark 与实际保留/接受值绑定：
     // 先把 current 的 global cut 固化到每个**现存块**（缺失块不得继承新 global），
     // 再让实际被接受的块更新自己的 cut。被接受但无 cut 的块不得回填旧 global。
-    final cuts = <String, int>{...current.asOfSeqByBlock};
-    if (current.asOfSeq != null) {
-      final present = <String>{
-        if (current.pressure != null) 'pressure',
-        if (current.breakdown != null) 'breakdown',
-        if (current.tokenUsage != null) 'tokenUsage',
-        if (current.timing != null) 'timing',
-      };
-      for (final block in present) {
-        if (!acceptedCuts.containsKey(block)) {
-          cuts.putIfAbsent(block, () => current.asOfSeq!);
-        }
+    final cuts = <String, int?>{...current.asOfSeqByBlock};
+    final present = <String>{
+      if (current.pressure != null) 'pressure',
+      if (current.breakdown != null) 'breakdown',
+      if (current.tokenUsage != null) 'tokenUsage',
+      if (current.timing != null) 'timing',
+    };
+    // 现存块显式固化自己的 cut（没有可信 cut 就显式 null），绝不继承 incoming 新 global。
+    for (final block in present) {
+      if (!acceptedCuts.containsKey(block)) {
+        cuts[block] = current.cutOf(block);
       }
     }
+    // 实际被接受的块更新自己的 cut；无 cut 的 legacy 块显式置 null。
     for (final entry in acceptedCuts.entries) {
-      final cut = entry.value;
-      if (cut != null) {
-        cuts[entry.key] = cut;
-      } else {
-        cuts.remove(entry.key);
-      }
+      cuts[entry.key] = entry.value;
     }
     final sources = <String, String>{...current.sources};
     sources.addAll(acceptedSources);
@@ -378,7 +376,7 @@ class ContextStatsSnapshot {
 
   static ContextStatsSnapshot fromJson(Map<String, dynamic> json) {
     final rawCuts = json['asOfSeqByBlock'];
-    final cuts = <String, int>{};
+    final cuts = <String, int?>{};
     if (rawCuts is Map) {
       for (final entry in rawCuts.entries) {
         final value = _intOrNull(entry.value);
@@ -420,7 +418,11 @@ class ContextStatsSnapshot {
       timing: timing,
       sources: sources,
       asOfSeq: asOfSeq,
-      asOfSeqByBlock: asOfSeqByBlock,
+      asOfSeqByBlock: {
+        ...asOfSeqByBlock,
+        if (pressure == null && legacy.pressure != null) 'pressure': null,
+        if (tokenUsage == null && legacy.tokenUsage != null) 'tokenUsage': null,
+      },
       legacyBlocks: {
         ...legacyBlocks,
         if (pressure == null && legacy.pressure != null) 'pressure',
@@ -459,6 +461,10 @@ class ContextStatsSnapshot {
     return ContextStatsSnapshot(
       pressure: pressure,
       tokenUsage: tokens,
+      asOfSeqByBlock: {
+        if (pressure != null) 'pressure': null,
+        if (tokens != null) 'tokenUsage': null,
+      },
       legacyBlocks: {
         if (pressure != null) 'pressure',
         if (tokens != null) 'tokenUsage',
