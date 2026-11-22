@@ -40,11 +40,9 @@ class UpdateGate {
 final Api _defaultStoreApi = api;
 
 class _UpdateCtx {
-  const _UpdateCtx(this.epoch, this.scope, this.isCurrent);
+  const _UpdateCtx(this.epoch, this.scope);
   final int epoch;
   final String scope;
-  final bool Function() isCurrent;
-  bool get current => isCurrent();
 }
 
 class AppStore extends ChangeNotifier {
@@ -441,6 +439,12 @@ class AppStore extends ChangeNotifier {
 
   bool _updateStillCurrent(int epoch, String scope) =>
       epoch == _updateEpoch && scope == ProfileNamespace.scope;
+
+  _UpdateCtx _captureUpdateCtx() =>
+      _UpdateCtx(_updateEpoch, ProfileNamespace.scope);
+
+  bool _updateCtxCurrent(_UpdateCtx ctx) =>
+      _updateStillCurrent(ctx.epoch, ctx.scope);
 
   /// 一次性提示（更新完成/失败/结果待确认），由界面消费后清空。
   String? pluginUpdateNotice;
@@ -900,9 +904,9 @@ class AppStore extends ChangeNotifier {
   }
 
   Future<void> _resumePluginUpdate({required bool connected}) async {
-    final updateEpoch = _updateEpoch;
-    final updateScope = ProfileNamespace.scope;
-    bool stillCurrent() => _updateStillCurrent(updateEpoch, updateScope);
+    final ctx = _captureUpdateCtx();
+    final updateScope = ctx.scope;
+    bool stillCurrent() => _updateCtxCurrent(ctx);
     final journal = pluginUpdateJournal;
     if (journal == null) {
       _pluginUpdateTimer?.cancel();
@@ -925,7 +929,7 @@ class AppStore extends ChangeNotifier {
         _armPluginUpdateTimer();
         return;
       }
-      await _continueAppUpdateAfterPlugin();
+      await _continueAppUpdateAfterPlugin(context: ctx);
       return;
     }
     // D2：**先恢复固定快照再判定**。POST 已被接受、响应丢失/手机被杀时，本地 journal 是空的，
@@ -1009,7 +1013,7 @@ class AppStore extends ChangeNotifier {
         if (!stillCurrent()) return;
         pluginUpdateNotice = '电脑端插件已更新到 v$target';
         if (!stillCurrent()) return;
-        await _continueAppUpdateAfterPlugin();
+        await _continueAppUpdateAfterPlugin(context: ctx);
       case ResumeAction.rolledBack:
       case ResumeAction.failed:
       case ResumeAction.timedOut:
@@ -1103,13 +1107,8 @@ class AppStore extends ChangeNotifier {
   /// - `plugin-confirmed`：插件健康后第一次确定 App 目标；
   /// - `app-pending`：安装器返回后的**首次启动复核**（§5.9）：核对真实安装版本/构建号与配对。
   Future<void> _continueAppUpdateAfterPlugin({_UpdateCtx? context}) async {
-    final ctx = context ??
-        _UpdateCtx(
-          _updateEpoch,
-          ProfileNamespace.scope,
-          () => _updateStillCurrent(_updateEpoch, ProfileNamespace.scope),
-        );
-    bool current() => ctx.current;
+    final ctx = context ?? _captureUpdateCtx();
+    bool current() => _updateCtxCurrent(ctx);
     Future<void> abandon(String notice) =>
         _abandonUpdate(notice, context: ctx);
     var journal = pluginUpdateJournal;
@@ -1244,13 +1243,8 @@ class AppStore extends ChangeNotifier {
     ReleaseSnapshot release, {
     _UpdateCtx? context,
   }) async {
-    final ctx = context ??
-        _UpdateCtx(
-          _updateEpoch,
-          ProfileNamespace.scope,
-          () => _updateStillCurrent(_updateEpoch, ProfileNamespace.scope),
-        );
-    bool stillCurrent() => ctx.current;
+    final ctx = context ?? _captureUpdateCtx();
+    bool stillCurrent() => _updateCtxCurrent(ctx);
     Future<void> abandon(String notice) =>
         _abandonUpdate(notice, context: ctx);
     var current = journal;
@@ -1327,10 +1321,10 @@ class AppStore extends ChangeNotifier {
 
   /// 退出旧目标并给出明确提示（不永久停在"更新进行中"）：清记录 + 清候选。
   Future<void> _abandonUpdate(String notice, {_UpdateCtx? context}) async {
-    if (context != null && !context.current) return;
+    if (context != null && !_updateCtxCurrent(context)) return;
     updateCandidate = null;
     await _clearPluginUpdateJournal(context: context);
-    if (context != null && !context.current) return;
+    if (context != null && !_updateCtxCurrent(context)) return;
     pluginUpdateNotice = notice;
     notifyListeners();
   }
@@ -1435,7 +1429,7 @@ class AppStore extends ChangeNotifier {
   }
 
   Future<void> _clearPluginUpdateJournal({_UpdateCtx? context}) async {
-    if (context != null && !context.current) return;
+    if (context != null && !_updateCtxCurrent(context)) return;
     pluginUpdateJournal = null;
     _pluginUpdateTimer?.cancel();
     _pluginUpdateTimer = null;
