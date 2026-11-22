@@ -16,6 +16,9 @@ import 'package:dsh_mobile_app/screens/settings_screen.dart';
 import 'package:dsh_mobile_app/store.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+import 'settings_tabs_helper.dart';
+
 import 'package:shared_preferences/shared_preferences.dart';
 
 const _branchCount = 12;
@@ -56,8 +59,10 @@ class _FakeGitApi implements GitReadApi {
       );
 
   @override
-  Future<List<GitBranch>> branches(String sessionId, String repositoryId) async =>
-      [for (var i = 0; i < _branchCount; i++) _branch(i)];
+  Future<List<GitBranch>> branches(
+    String sessionId,
+    String repositoryId,
+  ) async => [for (var i = 0; i < _branchCount; i++) _branch(i)];
 
   @override
   Future<GitGraphPage> graph(
@@ -92,8 +97,10 @@ class _FakeGitApi implements GitReadApi {
   }) async => GitCommitDetails(oid: oid);
 
   @override
-  Future<GitWorktreeSnapshot> worktree(String sessionId, String repositoryId) async =>
-      const GitWorktreeSnapshot(repositoryId: 'repo', snapshotId: 'wt');
+  Future<GitWorktreeSnapshot> worktree(
+    String sessionId,
+    String repositoryId,
+  ) async => const GitWorktreeSnapshot(repositoryId: 'repo', snapshotId: 'wt');
 
   @override
   Future<GitFilePreview> preview(
@@ -103,7 +110,8 @@ class _FakeGitApi implements GitReadApi {
     required String path,
     String? snapshotId,
     String? oid,
-  }) async => GitFilePreview(repositoryId: repositoryId, kind: kind, path: path);
+  }) async =>
+      GitFilePreview(repositoryId: repositoryId, kind: kind, path: path);
 
   @override
   Future<GitFileList> files(
@@ -130,24 +138,29 @@ Future<({GitBrowserController controller, AppStore store})> _mountSheet(
   Size? size,
   bool dark = false,
 }) async {
-  final controller = GitBrowserController(api ?? _FakeGitApi(), branchLimit: limit);
+  final controller = GitBrowserController(
+    api ?? _FakeGitApi(),
+    branchLimit: limit,
+  );
   final store = AppStore()..gitGraphBranchLimit = limit;
   final scroll = ScrollController();
   // 真实视口：否则 tester 默认 800×600，底部 sheet 的选项会落在不可点区域。
   tester.view.physicalSize = size ?? const Size(390, 844);
   tester.view.devicePixelRatio = 1.0;
   addTearDown(tester.view.reset);
-  await tester.pumpWidget(MaterialApp(
-    theme: dark ? ThemeData.dark() : ThemeData.light(),
-    home: Scaffold(
-      body: GitBrowserSheet(
-        controller: controller,
-        scrollController: scroll,
-        tabs: const ['graph'],
-        store: store,
+  await tester.pumpWidget(
+    MaterialApp(
+      theme: dark ? ThemeData.dark() : ThemeData.light(),
+      home: Scaffold(
+        body: GitBrowserSheet(
+          controller: controller,
+          scrollController: scroll,
+          tabs: const ['graph'],
+          store: store,
+        ),
       ),
     ),
-  ));
+  );
   await controller.open('session-a');
   await tester.pump(const Duration(milliseconds: 400));
   await tester.pump(const Duration(milliseconds: 200));
@@ -219,10 +232,7 @@ void main() {
   });
 
   testWidgets('降档裁剪前 N 并 toast；改档写全局偏好', (tester) async {
-    final mounted = await _mountSheet(
-      tester,
-      limit: GitGraphBranchLimit.ten,
-    );
+    final mounted = await _mountSheet(tester, limit: GitGraphBranchLimit.ten);
     addTearDown(mounted.controller.dispose);
     final controller = mounted.controller;
     for (var i = 1; i < 10; i++) {
@@ -257,7 +267,10 @@ void main() {
     final controller = mounted.controller;
     expect(controller.state.selectedBranches, hasLength(1), reason: '不自动全选');
     await _openFilter(tester);
-    expect(find.text('Selected 1 / limit Unlimited (desktop 128)'), findsOneWidget);
+    expect(
+      find.text('Selected 1 / limit Unlimited (desktop 128)'),
+      findsOneWidget,
+    );
     expect(find.byKey(const Key('git-graph-select-all')), findsOneWidget);
     expect(find.byKey(const Key('git-graph-clear')), findsOneWidget);
 
@@ -272,7 +285,10 @@ void main() {
       controller.state.selectedBranches.map((b) => b.displayName),
       containsAll(['b0', 'b1', 'b10', 'b11']),
     );
-    expect(find.text('Selected 4 / limit Unlimited (desktop 128)'), findsOneWidget);
+    expect(
+      find.text('Selected 4 / limit Unlimited (desktop 128)'),
+      findsOneWidget,
+    );
 
     await tester.tap(find.byKey(const Key('git-graph-clear')));
     await tester.pump(const Duration(milliseconds: 300));
@@ -297,7 +313,11 @@ void main() {
 
     await tester.pump(const Duration(seconds: 31));
     await tester.pump();
-    expect(controller.branchLimit, GitGraphBranchLimit.unlimited, reason: '不自动降档');
+    expect(
+      controller.branchLimit,
+      GitGraphBranchLimit.unlimited,
+      reason: '不自动降档',
+    );
     expect(controller.state.graphTimedOut, isTrue);
     expect(find.text('Load timed out'), findsOneWidget);
     expect(
@@ -363,12 +383,15 @@ void main() {
     SharedPreferences.setMockInitialValues({'dsh_mr_language': 'en'});
     final store = AppStore();
     await store.loadPrefs();
-    await tester.pumpWidget(MaterialApp(
-      home: Scaffold(
-        body: SettingsScreen(store: store, onReconfigure: () async {}),
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SettingsScreen(store: store, onReconfigure: () async {}),
+        ),
       ),
-    ));
+    );
     await tester.pump(const Duration(milliseconds: 100));
+    await selectSettingsTab(tester, '通用');
     final row = find.byKey(const Key('settings-git-graph-limit'));
     await tester.scrollUntilVisible(
       row,
@@ -413,8 +436,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 100));
     expect(controller.state.loadingGraphPage, isTrue);
     await tester.pump(const Duration(seconds: 31));
-    expect(controller.state.graphTimedOut, isFalse,
-        reason: '分页加载不启动 30s 计时');
+    expect(controller.state.graphTimedOut, isFalse, reason: '分页加载不启动 30s 计时');
     expect(find.byKey(const Key('git-graph-timeout-message')), findsNothing);
   });
 
@@ -467,10 +489,15 @@ void main() {
 
     expect(controller.state.selectedBranches, isEmpty);
     expect(find.byKey(const Key('git-graph-empty-selection')), findsOneWidget);
-    expect(find.text('Selected 0 / limit Unlimited (desktop 128)'), findsOneWidget);
+    expect(
+      find.text('Selected 0 / limit Unlimited (desktop 128)'),
+      findsOneWidget,
+    );
     expect(api.graphCalls, callsBefore, reason: '0 选择不应发起 graph 请求');
   });
-  testWidgets('旧宿主：已持久化 10 档打开即 clamp 回 5 并说明；快捷 sheet 禁用 10/不限', (tester) async {
+  testWidgets('旧宿主：已持久化 10 档打开即 clamp 回 5 并说明；快捷 sheet 禁用 10/不限', (
+    tester,
+  ) async {
     final api = _FakeGitApi(
       capsOverride: const GitReadCapabilities(available: true),
     );
@@ -504,7 +531,10 @@ void main() {
       find.byKey(const Key('git-graph-limit-unlimited')),
     );
     expect(unlimited.onTap, isNull);
-    expect(find.textContaining('Unsupported by this desktop version'), findsWidgets);
+    expect(
+      find.textContaining('Unsupported by this desktop version'),
+      findsWidgets,
+    );
     await tester.tap(find.byKey(const Key('git-graph-limit-cancel')));
     await tester.pumpAndSettle();
   });
