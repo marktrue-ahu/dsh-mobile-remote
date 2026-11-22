@@ -201,6 +201,9 @@ class ContextStatsSnapshot {
 
   /// 服务端逐块读取时的 cut；某块失败/各块不一致时全局 asOfSeq 省略。
   final Map<String, int> asOfSeqByBlock;
+
+  /// 逐块标记来自旧版 /usage fallback 的块；新宿主真实块不受全局 legacy 影响。
+  final Set<String> legacyBlocks;
   final bool legacyFallback;
 
   const ContextStatsSnapshot({
@@ -211,48 +214,86 @@ class ContextStatsSnapshot {
     this.sources = const <String, String>{},
     this.asOfSeq,
     this.asOfSeqByBlock = const <String, int>{},
+    this.legacyBlocks = const <String>{},
     this.legacyFallback = false,
   });
 
   /// 某块的 watermark：块 cut 优先，其次全局 cut。
   int? cutOf(String block) => asOfSeqByBlock[block] ?? asOfSeq;
 
-  /// 失败块合并：健康块按各自 cut 单调更新，失败块保留旧值并标记 stale。
+  /// 失败块合并：健康块按各自 watermark 单调更新；失败块保留旧值并标记 stale。
   ContextStatsMerge mergeRefresh(ContextStatsSnapshot incoming) {
-    final legacy = incoming.legacyFallback;
     final stale = <String>{};
     var changed = false;
     final current = this;
+    final currentFallbackAll =
+        current.legacyFallback && current.legacyBlocks.isEmpty;
+    final incomingFallbackAll =
+        incoming.legacyFallback && incoming.legacyBlocks.isEmpty;
+    final currentLegacy = currentFallbackAll
+        ? <String>{'pressure', 'breakdown', 'tokenUsage', 'timing'}
+        : current.legacyBlocks;
+    final incomingLegacy = incomingFallbackAll
+        ? <String>{'pressure', 'breakdown', 'tokenUsage', 'timing'}
+        : incoming.legacyBlocks;
+    final acceptedCuts = <String, int?>{};
+    final acceptedSources = <String, String>{};
+    final legacyBlocks = <String>{...currentLegacy};
+    // incoming 是否含任何新宿主真实块/水位；纯旧宿主响应缺块是能力边界，不标 stale。
+    final incomingHasTrusted =
+        incoming.asOfSeq != null ||
+        incoming.asOfSeqByBlock.isNotEmpty ||
+        (incoming.pressure != null && !incomingLegacy.contains('pressure')) ||
+        (incoming.breakdown != null && !incomingLegacy.contains('breakdown')) ||
+        (incoming.tokenUsage != null &&
+            !incomingLegacy.contains('tokenUsage')) ||
+        (incoming.timing != null && !incomingLegacy.contains('timing'));
 
     T? pick<T>({
       required String block,
       required T? currentValue,
       required T? incomingValue,
     }) {
+      final incomingIsLegacy = incomingLegacy.contains(block);
+      final currentIsLegacy = currentLegacy.contains(block);
       if (incomingValue == null) {
-        if (!legacy && currentValue != null) {
+        // 新宿主（或其部分真实块）响应缺块 = 该块失败；纯旧宿主回退缺块是能力边界。
+        if ((!incoming.legacyFallback || incomingHasTrusted) &&
+            currentValue != null) {
           stale.add(block);
           changed = true;
         }
         return currentValue;
       }
-      if (legacy &&
-          currentValue != null &&
-          (!current.legacyFallback || current.asOfSeq != null)) {
-        // 旧宿主回退只补缺块，绝不覆盖更近期的新宿主快照；
-        // 若当前也来自旧宿主（无 cut），新的 /usage 成功采样可以更新。
+      // 旧源的新值不得覆盖当前来自新宿主的真实块。
+      if (incomingIsLegacy && currentValue != null && !currentIsLegacy) {
         return currentValue;
       }
+      // 新宿主的当前块只能被可比较 watermark 的新块更新；无 cut 的 incoming 不可信。
       final currentCut = current.cutOf(block);
       final incomingCut = incoming.cutOf(block);
-      if (!legacy &&
-          currentCut != null &&
-          incomingCut != null &&
-          incomingCut < currentCut) {
-        // 迟到的旧块：保留当前值，不把它标成失败（只是被丢弃的旧响应）。
-        return currentValue;
+      if (!incomingIsLegacy) {
+        if (currentCut != null && incomingCut == null) {
+          stale.add(block);
+          changed = true;
+          return currentValue;
+        }
+        if (currentCut != null &&
+            incomingCut != null &&
+            incomingCut < currentCut) {
+          // 迟到的旧块：保留当前值，不把它标成失败。
+          return currentValue;
+        }
       }
       changed = true;
+      acceptedCuts[block] = incomingCut;
+      if (incomingIsLegacy) {
+        legacyBlocks.add(block);
+      } else {
+        legacyBlocks.remove(block);
+      }
+      final source = incoming.sources[block];
+      if (source != null) acceptedSources[block] = source;
       return incomingValue;
     }
 
@@ -277,23 +318,35 @@ class ContextStatsSnapshot {
       incomingValue: incoming.timing,
     );
 
+    // 逐块 watermark 与实际接受值绑定：只有接受新值的块才更新 cut。
     final cuts = <String, int>{...current.asOfSeqByBlock};
-    for (final entry in incoming.asOfSeqByBlock.entries) {
-      cuts[entry.key] = entry.value;
+    for (final entry in acceptedCuts.entries) {
+      final cut = entry.value;
+      if (cut != null) {
+        cuts[entry.key] = cut;
+      } else {
+        cuts.remove(entry.key);
+      }
     }
     final sources = <String, String>{...current.sources};
-    for (final entry in incoming.sources.entries) {
-      sources[entry.key] = entry.value;
-    }
+    sources.addAll(acceptedSources);
+    final currentGlobal = current.asOfSeq;
+    final incomingGlobal = incoming.asOfSeq;
+    final mergedGlobal =
+        incomingGlobal != null &&
+            (currentGlobal == null || incomingGlobal >= currentGlobal)
+        ? incomingGlobal
+        : currentGlobal;
     final merged = ContextStatsSnapshot(
       pressure: pressure,
       breakdown: breakdown,
       tokenUsage: tokenUsage,
       timing: timing,
       sources: sources,
-      asOfSeq: incoming.asOfSeq ?? current.asOfSeq,
+      asOfSeq: mergedGlobal,
       asOfSeqByBlock: cuts,
-      legacyFallback: incoming.legacyFallback || current.legacyFallback,
+      legacyBlocks: legacyBlocks,
+      legacyFallback: legacyBlocks.isNotEmpty,
     );
     return ContextStatsMerge(
       snapshot: merged,
@@ -353,6 +406,11 @@ class ContextStatsSnapshot {
       sources: sources,
       asOfSeq: asOfSeq,
       asOfSeqByBlock: asOfSeqByBlock,
+      legacyBlocks: {
+        ...legacyBlocks,
+        if (pressure == null && legacy.pressure != null) 'pressure',
+        if (tokenUsage == null && legacy.tokenUsage != null) 'tokenUsage',
+      },
       legacyFallback: true,
     );
   }
@@ -386,6 +444,10 @@ class ContextStatsSnapshot {
     return ContextStatsSnapshot(
       pressure: pressure,
       tokenUsage: tokens,
+      legacyBlocks: {
+        if (pressure != null) 'pressure',
+        if (tokens != null) 'tokenUsage',
+      },
       legacyFallback: true,
     );
   }

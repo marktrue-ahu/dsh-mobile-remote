@@ -94,6 +94,28 @@ Map<String, dynamic> _fullStats() => {
   'asOfSeq': 4,
 };
 
+Map<String, dynamic> _statsMissingToken(int projected, int asOfSeq) => {
+  'ok': true,
+  'sessionId': _session,
+  'pressure': {
+    'pressureTokens': 1000,
+    'projectedTokens': projected,
+    'contextWindow': 8000,
+    'percent': (projected / 8000 * 100).round(),
+  },
+  'timing': {
+    'turns': 1,
+    'steps': 1,
+    'llmMs': 10,
+    'toolMs': 20,
+    'ttftMs': 30,
+    'decodeMs': 40,
+    'avgTtftMs': 30,
+    'tps': 2.5,
+  },
+  'asOfSeq': asOfSeq,
+};
+
 Map<String, dynamic> _statsWithProjected(int projected, int asOfSeq) => {
   'ok': true,
   'sessionId': _session,
@@ -909,6 +931,57 @@ void main() {
       findsOneWidget,
     );
     expect(find.text('系统提示'), findsOneWidget, reason: '失败块保留上次值');
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('新宿主缺 tokenUsage：usage 补块，pressure seq10→11 更新圆环与 sheet', (
+    tester,
+  ) async {
+    final backend = _Backend();
+    backend.statsResponses.addAll([
+      _statsMissingToken(2400, 10), // 30%
+      _statsMissingToken(3200, 11), // 40%
+      _statsMissingToken(3200, 11),
+    ]);
+    final store = await _pumpChat(tester, backend);
+    final visual = find.byKey(const ValueKey<String>('context-stats-visual'));
+    expect(
+      find.descendant(of: visual, matching: find.text('30%')),
+      findsOneWidget,
+    );
+
+    store.injectFrame({
+      'type': 'session/event',
+      'sessionId': _session,
+      'event': {
+        'seq': 5,
+        'type': 'turn/end',
+        'data': {'turn': 1},
+      },
+    });
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pumpAndSettle();
+    expect(
+      find.descendant(of: visual, matching: find.text('40%')),
+      findsOneWidget,
+      reason: '新宿主 pressure 更新不得被 legacy token 块阻止',
+    );
+
+    await _openSheet(tester);
+    expect(
+      tester
+          .widget<Text>(
+            find.byKey(const ValueKey<String>('context-stats-percent')),
+          )
+          .data,
+      '40%',
+    );
+    await tester.tap(
+      find.byKey(const ValueKey<String>('context-stats-tab-tokens')),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('未缓存输入'), findsOneWidget);
+    expect(find.textContaining('旧版 /usage'), findsWidgets);
     expect(tester.takeException(), isNull);
   });
 }

@@ -164,4 +164,117 @@ void main() {
     expect(breakdownShareOfWindow(1000, 8000), 0.125);
     expect(breakdownShareOfWindow(1000, 0), isNull);
   });
+
+  test('逐块 watermark：拒绝旧块绝不下调 cut，后续旧块仍被拒', () {
+    final current = ContextStatsSnapshot.fromJson({
+      'pressure': {'pressureTokens': 100, 'contextWindow': 1000},
+      'asOfSeq': 100,
+    });
+    final older = ContextStatsSnapshot.fromJson({
+      'pressure': {'pressureTokens': 200, 'contextWindow': 1000},
+      'asOfSeqByBlock': {'pressure': 80},
+    });
+    final first = current.mergeRefresh(older);
+    expect(first.snapshot.pressure?.pressureTokens, 100);
+    expect(first.snapshot.cutOf('pressure'), 100);
+
+    final older2 = ContextStatsSnapshot.fromJson({
+      'pressure': {'pressureTokens': 300, 'contextWindow': 1000},
+      'asOfSeqByBlock': {'pressure': 90},
+    });
+    final second = first.snapshot.mergeRefresh(older2);
+    expect(second.snapshot.pressure?.pressureTokens, 100);
+    expect(second.snapshot.cutOf('pressure'), 100);
+  });
+
+  test('逐块 watermark：新全局覆盖 per-block cut，后续更旧块被拒', () {
+    final current = ContextStatsSnapshot.fromJson({
+      'pressure': {'pressureTokens': 100, 'contextWindow': 1000},
+      'asOfSeqByBlock': {'pressure': 10},
+    });
+    final global = ContextStatsSnapshot.fromJson({
+      'pressure': {'pressureTokens': 200, 'contextWindow': 1000},
+      'asOfSeq': 100,
+    });
+    final first = current.mergeRefresh(global);
+    expect(first.snapshot.pressure?.pressureTokens, 200);
+    expect(first.snapshot.cutOf('pressure'), 100);
+
+    final olderBlock = ContextStatsSnapshot.fromJson({
+      'pressure': {'pressureTokens': 300, 'contextWindow': 1000},
+      'asOfSeqByBlock': {'pressure': 20},
+    });
+    final second = first.snapshot.mergeRefresh(olderBlock);
+    expect(second.snapshot.pressure?.pressureTokens, 200);
+    expect(second.snapshot.cutOf('pressure'), 100);
+  });
+
+  test('无可比较水位：无 cut 的非 legacy incoming 不覆盖可信块，并标 stale', () {
+    final current = ContextStatsSnapshot.fromJson({
+      'pressure': {'pressureTokens': 100, 'contextWindow': 1000},
+      'asOfSeq': 100,
+    });
+    final unknown = ContextStatsSnapshot.fromJson({
+      'pressure': {'pressureTokens': 200, 'contextWindow': 1000},
+    });
+    final merged = current.mergeRefresh(unknown);
+    expect(merged.snapshot.pressure?.pressureTokens, 100);
+    expect(merged.snapshot.cutOf('pressure'), 100);
+    expect(merged.staleBlocks, contains('pressure'));
+  });
+
+  test('逐块 legacy：只对实际 fallback 块走旧源策略，新宿主 pressure 继续更新', () {
+    final newHost = ContextStatsSnapshot.fromJson({
+      'pressure': {'pressureTokens': 100, 'contextWindow': 1000},
+      'timing': {
+        'turns': 1,
+        'steps': 1,
+        'llmMs': 10,
+        'toolMs': 20,
+        'ttftMs': 30,
+        'decodeMs': 40,
+      },
+      'asOfSeq': 10,
+    });
+    final withLegacyToken = newHost.mergedWithLegacyUsage({
+      'inputTokens': 100,
+      'outputTokens': 50,
+      'cacheReadTokens': 300,
+      'cacheWriteTokens': 100,
+      'pressureTokens': 999,
+      'contextWindow': 1000,
+    });
+    expect(withLegacyToken.legacyBlocks, {'tokenUsage'});
+    expect(withLegacyToken.legacyBlocks.contains('pressure'), isFalse);
+    expect(withLegacyToken.pressure?.pressureTokens, 100);
+
+    final newerPressure = ContextStatsSnapshot.fromJson({
+      'pressure': {'pressureTokens': 200, 'contextWindow': 1000},
+      'asOfSeq': 11,
+    });
+    final merged = withLegacyToken.mergeRefresh(newerPressure);
+    expect(
+      merged.snapshot.pressure?.pressureTokens,
+      200,
+      reason: '新 pressure 不被 legacy 阻止',
+    );
+    expect(
+      merged.snapshot.tokenUsage?.uncachedInput,
+      100,
+      reason: 'legacy token 块保留',
+    );
+    expect(merged.snapshot.legacyBlocks, {'tokenUsage'});
+
+    // 旧源 pressure 不得覆盖新宿主 pressure。
+    final legacyOlder = ContextStatsSnapshot.fromLegacyUsage({
+      'pressureTokens': 300,
+      'contextWindow': 1000,
+      'inputTokens': 1,
+      'outputTokens': 1,
+      'cacheReadTokens': 0,
+      'cacheWriteTokens': 0,
+    });
+    final stillNew = merged.snapshot.mergeRefresh(legacyOlder);
+    expect(stillNew.snapshot.pressure?.pressureTokens, 200);
+  });
 }

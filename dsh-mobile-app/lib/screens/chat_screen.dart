@@ -8068,6 +8068,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final ink3 = DshColors.ink3(context);
     return ExcludeSemantics(
       child: SizedBox(
+        key: const ValueKey<String>('context-stats-visual'),
         width: 44,
         child: Center(
           child: FittedBox(
