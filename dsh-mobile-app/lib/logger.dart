@@ -1,8 +1,10 @@
 // 应用日志：关键事件写入本地文件 + 内存环形缓冲，设置页可查看/复制/清空。
 // 用途：排查"加载不出来/连接异常"等问题（release 无控制台输出时唯一手段）。
 //
-// issue #136：日志级别（debug/info/warn/error）。默认 info；阈值同时控制**写入**与
-// **展示**：低于阈值的日志不写文件/内存，也不在日志页显示；warn/error 不会被额外过滤。
+// issue #136：日志级别（debug/info/warn/error）。
+// issue #154：把「记录级别」与日志页「显示筛选」拆开：
+//   - [level]（`app_log_level`）是写入阈值：低于它的日志不写文件/内存；
+//   - [displayPrefsKey] 只记住日志页显示筛选，绝不参与写入判断、也不改 [level]。
 // 旧日志文件无级别行仍可读取，按 info 处理；文件路径、15 天清理、256KB 截断、800 行
 // 缓冲语义保持不变。
 import 'dart:io';
@@ -53,6 +55,10 @@ class AppLog {
   static const prefsKey = 'app_log_level';
   static const defaultLevel = AppLogLevel.info;
 
+  /// 日志页「显示筛选」偏好：只影响查看，与 [prefsKey]/[level] 完全分开。
+  static const displayPrefsKey = 'app_log_display_level';
+  static const defaultDisplayLevel = AppLogLevel.info;
+
   final List<String> _buf = [];
   File? _file;
   static const _maxBuf = 800;
@@ -101,13 +107,40 @@ class AppLog {
     }
   }
 
-  /// 持久化并立即切换级别；失败返回错误文案且保持原级别（调用方 toast）。
+  /// 持久化并立即切换记录级别；失败返回错误文案且保持原级别（调用方 toast）。
   Future<String?> setLevel(AppLogLevel level) async {
     try {
       final prefs = await SharedPreferences.getInstance();
       final ok = await prefs.setString(prefsKey, level.name);
       if (!ok) return '偏好写入失败';
       _level = level;
+      return null;
+    } catch (e) {
+      return '$e';
+    }
+  }
+
+  /// 读取日志页显示筛选；失败/非法值回退 [defaultDisplayLevel]。
+  ///
+  /// 只读 [displayPrefsKey]，不改变 [level]，也不影响后续写入阈值。
+  Future<AppLogLevel> loadDisplayLevel() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return AppLogLevel.tryParse(prefs.getString(displayPrefsKey)) ??
+          defaultDisplayLevel;
+    } catch (_) {
+      return defaultDisplayLevel;
+    }
+  }
+
+  /// 只持久化日志页显示筛选；失败返回错误文案。
+  ///
+  /// 明确不修改 [level]/[prefsKey]：显示筛选不是记录级别。
+  Future<String?> setDisplayLevel(AppLogLevel level) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final ok = await prefs.setString(displayPrefsKey, level.name);
+      if (!ok) return '偏好写入失败';
       return null;
     } catch (e) {
       return '$e';

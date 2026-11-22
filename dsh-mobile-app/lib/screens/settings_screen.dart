@@ -2756,8 +2756,8 @@ class _SettingsScreenState extends State<SettingsScreen>
                     leading: const Icon(Icons.tune_outlined),
                     title: L10n.t('日志记录级别', 'Log level'),
                     sub: L10n.t(
-                      '默认 info；debug 仅排障时开启；warn/error 始终保留',
-                      'Default info; debug only for troubleshooting; warn/error always kept',
+                      '影响之后写入的日志；默认 info，debug 仅排障时开启；warn/error 保留',
+                      'Affects logs written from now on; default info, debug only for troubleshooting; warn/error kept',
                     ),
                     trailing: Text(
                       _logLevelName(AppLog.instance.level),
@@ -2781,6 +2781,21 @@ class _SettingsScreenState extends State<SettingsScreen>
                       child: Text(
                         L10n.t('查看 ▸', 'View ▸'),
                         style: TextStyle(fontSize: 12, color: brand),
+                      ),
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2, bottom: 4),
+                    child: Text(
+                      L10n.t(
+                        '日志页的“显示筛选”只影响查看，不会改变记录级别。',
+                        'The log page display filter only affects the view; it never changes the recording level.',
+                      ),
+                      key: const ValueKey('settings-log-filter-note'),
+                      style: TextStyle(
+                        fontSize: 11,
+                        height: 1.5,
+                        color: DshColors.ink3(context),
                       ),
                     ),
                   ),
@@ -3785,8 +3800,8 @@ class _SettingsScreenState extends State<SettingsScreen>
         ),
       ],
       footnote: L10n.t(
-        '只影响之后写入与日志页展示；已有日志不删除。低于当前级别的历史行会被隐藏。',
-        'Affects future writes and this view only; existing logs are not deleted. Older lines below the level are hidden.',
+        '只影响之后写入的日志；已有日志不删除；日志页显示筛选不会改变记录级别。',
+        'Affects only logs written from now on; existing logs are kept; the log page display filter never changes the recording level.',
       ),
       onPick: (id) async {
         final level = AppLogLevel.tryParse(id) ?? AppLogLevel.info;
