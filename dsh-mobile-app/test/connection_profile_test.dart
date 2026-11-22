@@ -25,6 +25,21 @@ class _StoreApi extends Api {
   Stream<Map<String, dynamic>> eventsRaw() => controller.stream;
 }
 
+class _DelayedNotifApi extends _StoreApi {
+  Completer<List<AppNotification>>? gate;
+  bool used = false;
+
+  @override
+  Future<List<AppNotification>> notifications() {
+    final g = gate;
+    if (g != null && !used) {
+      used = true;
+      return g.future;
+    }
+    return Future.value(const []);
+  }
+}
+
 class _CountingStoreApi extends _StoreApi {
   int requests = 0;
 
@@ -1150,6 +1165,10 @@ void main() {
     await resume;
     expect(identical(store.pluginUpdateJournal, sentinel), isTrue);
     expect(store.pluginUpdateNotice, 'A new sentinel');
+    final persisted = (await SharedPreferences.getInstance()).getString(
+      'dsh_mr_plugin_update_journal.${a.id}:host-a',
+    );
+    expect(persisted, contains('op-a-new'), reason: '旧 A 写不得覆盖 prefs');
   });
 
   test('persist 失败发生在 apply B 后：回滚 A generation 并重建 A SSE', () async {
@@ -1218,5 +1237,55 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 20));
     }, (error, _) => unhandled.add(error));
     expect(unhandled, isEmpty);
+  });
+
+  test('A 通知读挂起切 B：迟到 A 响应不写 B 未读/提醒', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    var host = 'host-a';
+    final api = _DelayedNotifApi();
+    final manager = ConnectionManager(
+      api: api,
+      credentials: MemoryCredentialStore(),
+      probeBootstrap: (_) async => {'plugin': {'hostId': host}},
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    a.hostId = 'host-a';
+    manager.profiles[0] = a;
+    final b = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: 'B',
+      baseUrls: ['https://b.example.com/m'],
+      hostId: 'host-b',
+    );
+    manager.profiles.add(b);
+    await manager.credentials.writeToken(b.id, 'b-token');
+    final store = AppStore(apiClient: api)..attachConnections(manager);
+    addTearDown(store.disposeBridge);
+    var newNotifCalls = 0;
+    store.onNewNotifications = (_, {bool force = false}) => newNotifCalls++;
+    api.gate = Completer<List<AppNotification>>();
+    final reading = store.refreshNotifs();
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    host = 'host-b';
+    expect(await store.switchProfile(b.id), isNull);
+    api.gate!.complete([
+      AppNotification(
+        id: 'n-a',
+        sessionId: 'same-session',
+        title: 'A late',
+        detail: '',
+        kind: 'done',
+        time: DateTime.now().millisecondsSinceEpoch,
+        unread: true,
+      ),
+    ]);
+    await reading;
+    expect(store.notifs, isEmpty);
+    expect(store.unread, 0);
+    expect(newNotifCalls, 0);
   });
 }

@@ -955,6 +955,7 @@ class AppStore extends ChangeNotifier {
           _kPluginUpdateJournal,
           jsonEncode(current.toJson()),
           scope: updateScope,
+          epoch: ctx.epoch,
         );
         if (!stillCurrent()) return;
       } else if (serverTx.targetContentSha256.isNotEmpty) {
@@ -973,6 +974,7 @@ class AppStore extends ChangeNotifier {
           _kPluginUpdateJournal,
           jsonEncode(current.toJson()),
           scope: updateScope,
+          epoch: ctx.epoch,
         );
         if (!stillCurrent()) return;
       }
@@ -1009,6 +1011,7 @@ class AppStore extends ChangeNotifier {
           _kPluginUpdateJournal,
           jsonEncode(pluginUpdateJournal!.toJson()),
           scope: updateScope,
+          epoch: ctx.epoch,
         );
         if (!stillCurrent()) return;
         pluginUpdateNotice = '电脑端插件已更新到 v$target';
@@ -1023,6 +1026,7 @@ class AppStore extends ChangeNotifier {
           _kPluginUpdateJournal,
           jsonEncode(pluginUpdateJournal!.toJson()),
           scope: updateScope,
+          epoch: ctx.epoch,
         );
         if (!stillCurrent()) return;
         _pluginUpdateTimer?.cancel();
@@ -1445,6 +1449,7 @@ class AppStore extends ChangeNotifier {
       _kPluginUpdateJournal,
       '',
       scope: context?.scope,
+      epoch: context?.epoch,
     );
   }
 
@@ -2596,7 +2601,10 @@ class AppStore extends ChangeNotifier {
       unawaited(refreshNotifs(notify: false));
       unawaited(refreshActions(notify: false));
       try {
-        catalog = await api.catalog();
+        final catalogStamp = _hostReadStamp();
+        final fetchedCatalog = await api.catalog();
+        if (!_hostReadStillCurrent(catalogStamp)) return;
+        catalog = fetchedCatalog;
         if (sessionId != null) {
           try {
             sessionConfig = await api.sessionConfig(sessionId!);
@@ -2625,8 +2633,10 @@ class AppStore extends ChangeNotifier {
   }
 
   Future<void> refreshWorkspaces({bool notify = true}) async {
+    final stamp = _hostReadStamp();
     try {
       final raw = await api.workspaces();
+      if (!_hostReadStillCurrent(stamp)) return;
       // v3.1.1(issue #5)：条目保留服务端原始路径（展示/回传 cwd 都用原始形态）——
       // 规范化只用于匹配比较（_normPath 统一 `/`/`\` 与大小写）；
       // 旧实现把 path 归一成 `\` 形态存入，WSL/Linux 上会被当作 cwd 发回服务端。
@@ -3130,9 +3140,26 @@ class AppStore extends ChangeNotifier {
   int unreadOf(String sessionId) =>
       notifs.where((n) => n.unread && n.sessionId == sessionId).length;
 
+  ({int epoch, String identity, String profile, String host}) _hostReadStamp() => (
+    epoch: api.connectionEpoch,
+    identity: api.connectionIdentity,
+    profile: api.profileId,
+    host: api.hostIdentity,
+  );
+
+  bool _hostReadStillCurrent(
+    ({int epoch, String identity, String profile, String host}) stamp,
+  ) =>
+      stamp.epoch == api.connectionEpoch &&
+      stamp.identity == api.connectionIdentity &&
+      stamp.profile == api.profileId &&
+      stamp.host == api.hostIdentity;
+
   Future<void> refreshNotifs({bool notify = true}) async {
+    final stamp = _hostReadStamp();
     try {
       final items = await api.notifications();
+      if (!_hostReadStillCurrent(stamp)) return;
       notifs = items;
       final u = items.where((n) => n.unread).length;
       // 未读增量对比：重连/离线期间新增的通知也能触发提示（不只靠实时事件）
@@ -3153,19 +3180,25 @@ class AppStore extends ChangeNotifier {
   }
 
   Future<void> refreshActions({bool notify = true}) async {
+    final stamp = _hostReadStamp();
     try {
-      actions = await api.actions();
+      final fetched = await api.actions();
+      if (!_hostReadStillCurrent(stamp)) return;
+      actions = fetched;
       if (notify) notifyListeners();
     } catch (_) {
-      actions = [];
+      if (_hostReadStillCurrent(stamp)) actions = [];
     }
   }
 
   Future<void> refreshSessionConfig() async {
     final id = sessionId;
     if (id == null) return;
+    final stamp = _hostReadStamp();
     try {
-      sessionConfig = await api.sessionConfig(id);
+      final config = await api.sessionConfig(id);
+      if (!_hostReadStillCurrent(stamp) || sessionId != id) return;
+      sessionConfig = config;
       notifyListeners();
     } catch (_) {}
   }
