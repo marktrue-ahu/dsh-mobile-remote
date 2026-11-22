@@ -116,7 +116,7 @@ final Api api = Api();
 typedef DirListing = ({List<String> dirs, List<String> files, String? sep});
 
 abstract interface class GitTagsApi {
-  Future<List<GitTag>> tags(String sessionId, String repositoryId);
+  Future<GitTagPage> tags(String sessionId, String repositoryId);
 }
 
 abstract interface class GitReadApi {
@@ -2408,18 +2408,21 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi, GitTagsApi {
 
   @override
   @override
-  Future<List<GitTag>> tags(String sessionId, String repositoryId) async {
+  Future<GitTagPage> tags(String sessionId, String repositoryId) async {
     final data = await getJson(
       _gitQuery('/api/git/tags', {
         'sessionId': sessionId,
         'repositoryId': repositoryId,
       }),
     );
-    return (data['tags'] as List? ?? const [])
-        .whereType<Map>()
-        .map((row) => GitTag.fromJson(Map<String, dynamic>.from(row)))
-        .where((tag) => tag.name.isNotEmpty && tag.shortName.isNotEmpty)
-        .toList();
+    return GitTagPage(
+      tags: (data['tags'] as List? ?? const [])
+          .whereType<Map>()
+          .map((row) => GitTag.fromJson(Map<String, dynamic>.from(row)))
+          .where((tag) => tag.name.isNotEmpty && tag.shortName.isNotEmpty)
+          .toList(),
+      truncated: data['truncated'] == true,
+    );
   }
 
   Future<List<GitBranch>> branches(

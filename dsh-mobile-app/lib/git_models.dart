@@ -185,6 +185,12 @@ class GitTag {
   }
 }
 
+class GitTagPage {
+  const GitTagPage({required this.tags, this.truncated = false});
+  final List<GitTag> tags;
+  final bool truncated;
+}
+
 class GitBranch {
   final String name;
   final String displayName;

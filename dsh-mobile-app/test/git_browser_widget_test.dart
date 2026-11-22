@@ -493,6 +493,82 @@ Future<GitBrowserController> mountSheet(
   return controller;
 }
 
+
+class TruncatedTagApi extends TagWidgetApi {
+  @override
+  Future<GitTagPage> tags(String sessionId, String repositoryId) async =>
+      GitTagPage(
+        tags: [
+          for (var i = 0; i < 5001; i++)
+            GitTag(
+              name: 'refs/tags/t$i',
+              shortName: 't$i',
+              refOid: 'r$i',
+              targetOid: 'c$i',
+            ),
+        ],
+        truncated: true,
+      );
+}
+
+class LongTagApi extends TagWidgetApi {
+  @override
+  Future<GitTagPage> tags(String sessionId, String repositoryId) async => const GitTagPage(tags: [
+    GitTag(
+      name: 'refs/tags/v-a',
+      shortName: 'v-a',
+      refOid: 'a',
+      targetOid: 'hist-40',
+    ),
+    GitTag(
+      name: 'refs/tags/v-b',
+      shortName: 'v-b',
+      refOid: 'b',
+      targetOid: 'hist-45',
+    ),
+  ]);
+
+  List<GitCommitSummary> _longCommits() => [
+    for (var i = 0; i < 60; i++)
+      GitCommitSummary(oid: 'hist-$i', subject: 'Commit $i'),
+  ];
+
+  @override
+  Future<GitGraphPage> graph(
+    String sessionId,
+    String repositoryId,
+    List<GitGraphTip> tips, {
+    String? snapshotId,
+    String? cursor,
+    int limit = 100,
+    Duration timeout = const Duration(seconds: 15),
+  }) async {
+    graphCalls++;
+    return GitGraphPage(snapshotId: 'long-snapshot', tips: tips, commits: _longCommits());
+  }
+
+  @override
+  Future<GitGraphPage> graphAll(
+    String sessionId,
+    String repositoryId, {
+    required bool all,
+    String? focus,
+    String? snapshotId,
+    String? cursor,
+    int limit = 16,
+    Duration timeout = const Duration(seconds: 35),
+  }) async {
+    graphCalls++;
+    return GitGraphPage(
+      snapshotId: 'long-all-snapshot',
+      focusOid: focus,
+      pageStart: 0,
+      tips: const [],
+      commits: _longCommits(),
+    );
+  }
+}
+
 class TagWidgetApi extends WidgetGitApi
     implements GitTagsApi, GitGraphAllApi {
   @override
@@ -530,8 +606,8 @@ class TagWidgetApi extends WidgetGitApi
   }
 
   @override
-  Future<List<GitTag>> tags(String sessionId, String repositoryId) async =>
-      const [
+  Future<GitTagPage> tags(String sessionId, String repositoryId) async =>
+      const GitTagPage(tags: [
         GitTag(
           name: 'refs/tags/v1.0.0',
           shortName: 'v1.0.0',
@@ -547,7 +623,7 @@ class TagWidgetApi extends WidgetGitApi
           annotated: true,
           date: 1700000000,
         ),
-      ];
+      ]);
 }
 
 void main() {
@@ -785,8 +861,13 @@ void main() {
       final controller = await mountSheet(tester, api);
       addTearDown(controller.dispose);
       expect(find.text('Local branches'), findsOneWidget);
-      expect(find.text('Remote branches'), findsOneWidget);
+      expect(find.text('Remote branches'), findsNothing);
       expect(find.text('origin/main  ↑2  ↓1'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('git-branch-subtab-1')));
+      await tester.pumpAndSettle();
+      expect(find.text('Remote branches'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('git-branch-subtab-0')));
+      await tester.pumpAndSettle();
       expect(find.byIcon(Icons.check_circle_outline), findsOneWidget);
       await tester.enterText(
         find.byKey(const Key('git-branch-search')),
@@ -1209,11 +1290,14 @@ void main() {
     );
   });
 
-  testWidgets('#159 旧宿主无 tags 能力：隐藏标签子 Tab', (tester) async {
+  testWidgets('#159 旧宿主无 tags 能力：标签子 Tab 显示明确降级', (tester) async {
     final controller = await mountSheet(tester, WidgetGitApi());
     addTearDown(controller.dispose);
-    expect(find.byKey(const Key('git-branch-subtab-2')), findsNothing);
-    expect(find.text('Local branches'), findsOneWidget);
+    expect(find.byKey(const Key('git-branch-subtab-2')), findsOneWidget);
+    await tester.tap(find.byKey(const Key('git-branch-subtab-2')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('git-tags-unsupported')), findsOneWidget);
+    expect(find.textContaining('not support tags'), findsOneWidget);
   });
 
   testWidgets('#159 320/深色/1.5×：标签子 Tab 不溢出', (tester) async {
@@ -1240,7 +1324,7 @@ void main() {
     await tester.pumpAndSettle();
     // TagWidgetApi.graphAll 返回 missing-oid，正好是 v2 tag 目标。
     expect(controller.state.commits.any((c) => c.oid == 'missing-oid'), isTrue);
-    await tester.tap(find.text('Branches'));
+    await tester.tap(find.descendant(of: find.byType(TabBar), matching: find.text('Branches')));
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('git-branch-subtab-2')));
     await tester.pumpAndSettle();
@@ -1254,5 +1338,78 @@ void main() {
       controller.state.selectedBranches.map((b) => b.name).toList(),
       selectionBefore,
     );
+  });
+
+  testWidgets('#159 selected 长图：tag 命中屏幕外滚动并高亮，同快照连续两个 tag', (tester) async {
+    final api = LongTagApi();
+    final controller = await mountSheet(tester, api);
+    addTearDown(controller.dispose);
+    await tester.tap(find.byKey(const Key('git-branch-refs/heads/main')));
+    await tester.pumpAndSettle();
+    expect(controller.state.commits.length, 60);
+
+    await tester.tap(find.descendant(of: find.byType(TabBar), matching: find.text('Branches')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('git-branch-subtab-2')));
+    await tester.pumpAndSettle();
+    final before = api.graphCalls;
+    await tester.tap(find.byKey(const Key('git-tag-v-a')));
+    await tester.pumpAndSettle();
+    expect(api.graphCalls, before, reason: '命中内存 commits 零网络');
+    final firstOffset = tester
+        .state<ScrollableState>(
+          find.descendant(
+            of: find.byKey(const Key('git-graph-vertical')),
+            matching: find.byType(Scrollable),
+          ),
+        )
+        .position
+        .pixels;
+    expect(firstOffset, greaterThan(0));
+    final firstHighlight = tester.widget<Container>(
+      find.byKey(const Key('git-tag-highlight-hist-40')),
+    );
+    expect(firstHighlight.color, isNotNull);
+
+    await tester.tap(find.descendant(of: find.byType(TabBar), matching: find.text('Branches')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('git-branch-subtab-2')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('git-tag-v-b')));
+    await tester.pumpAndSettle();
+    final secondHighlight = tester.widget<Container>(
+      find.byKey(const Key('git-tag-highlight-hist-45')),
+    );
+    expect(secondHighlight.color, isNotNull);
+  });
+
+  testWidgets('#159 默认 5 档 + 窗口外 tag：一次 all focus，选择集不变', (tester) async {
+    final api = TagWidgetApi();
+    final controller = await mountSheet(tester, api);
+    addTearDown(controller.dispose);
+    expect(controller.branchLimit, GitGraphBranchLimit.five);
+    await tester.tap(find.byKey(const Key('git-branch-subtab-2')));
+    await tester.pumpAndSettle();
+    final selectionBefore = controller.state.selectedBranches.map((b) => b.name).toList();
+    final before = api.graphCalls;
+    await tester.tap(find.byKey(const Key('git-tag-v2.0.0')));
+    await tester.pumpAndSettle();
+    expect(api.graphCalls, before + 1);
+    expect(controller.state.error, isNull);
+    expect(
+      controller.state.selectedBranches.map((b) => b.name).toList(),
+      selectionBefore,
+    );
+  });
+
+  testWidgets('#159 5001 标签 truncated：提示仅显示前 5000，不伪装完整', (tester) async {
+    final controller = await mountSheet(tester, TruncatedTagApi());
+    addTearDown(controller.dispose);
+    await tester.tap(find.byKey(const Key('git-branch-subtab-2')));
+    await tester.pumpAndSettle();
+    expect(controller.state.tags.length, 5001);
+    expect(controller.state.tagsTruncated, isTrue);
+    expect(find.byKey(const ValueKey('git-tags-truncated')), findsOneWidget);
+    expect(find.textContaining('5000'), findsOneWidget);
   });
 }

@@ -89,6 +89,9 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
   bool _defaultGraphRequested = false;
   bool _allGraphAutoRequested = false;
   int _branchSubTab = 0; // 0 本地 / 1 远程 / 2 标签（#159）
+  int _handledTagFocusSeq = 0;
+  String? _tagHighlightOid;
+  Timer? _tagHighlightTimer;
 
   /// 图行标签缓存：标签只在图数据变化时计算/测量一次（TextPainter 是 O(标签数)）。
   final Map<String, List<GitGraphLabel>> _rowLabels = {};
@@ -272,6 +275,7 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
   void dispose() {
     _freshnessTimer?.cancel();
     widget.scrollController.removeListener(_onGraphScroll);
+    _tagHighlightTimer?.cancel();
     _commitScroll.removeListener(_onCommitScroll);
     widget.controller.removeListener(_onState);
     _tabs.removeListener(_onTabControllerChanged);
@@ -823,7 +827,7 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
 
   Widget _branches(GitBrowserState state) {
     final supportsTags = state.capabilities?.tags == true;
-    final tab = supportsTags ? _branchSubTab : 0;
+    final tab = _branchSubTab;
     final branches = state.filteredBranches;
     final locals = branches.where((branch) => branch.isLocal).toList();
     final remotes = branches.where((branch) => branch.isRemote).toList();
@@ -838,8 +842,7 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
     final tags = state.filteredTags;
     return Column(
       children: [
-        if (supportsTags)
-          Padding(
+        Padding(
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
             child: Row(
               children: [
@@ -896,17 +899,17 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
               : ListView(
                   controller: _branchScroll,
                   children: [
-                    if (!supportsTags || tab == 0)
+                    if (tab == 0)
                       _branchGroup(
                         L10n.t('本地分支', 'Local branches'),
                         locals,
                       ),
-                    if (!supportsTags || tab == 1)
+                    if (tab == 1)
                       _branchGroup(
                         L10n.t('远程分支', 'Remote branches'),
                         remotes,
                       ),
-                    if (other.isNotEmpty && (tab == 0 || !supportsTags))
+                    if (other.isNotEmpty && tab == 0)
                       _branchGroup(L10n.t('其他', 'Other'), other),
                     if (branches.isEmpty)
                       Padding(
@@ -923,6 +926,18 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
   }
 
   Widget _tagList(GitBrowserState state, List<GitTag> tags) {
+    if (state.capabilities?.tags != true) {
+      return Center(
+        key: const ValueKey('git-tags-unsupported'),
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Text(
+            L10n.t('当前电脑端不支持标签列表', 'This desktop does not support tags'),
+            textAlign: TextAlign.center,
+          ),
+        ),
+      );
+    }
     if (state.loadingTags && !state.tagsLoaded) {
       return const Center(
         key: ValueKey('git-tags-loading'),
@@ -947,7 +962,24 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
         ),
       );
     }
-    return ListView.builder(
+    return Column(
+      children: [
+        if (state.tagsTruncated)
+          Container(
+            key: const ValueKey('git-tags-truncated'),
+            width: double.infinity,
+            color: DshColors.brandSoft(context),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Text(
+              L10n.t(
+                '仅显示前 5000 个标签，请缩小搜索范围',
+                'Showing the first 5000 tags; narrow your search',
+              ),
+              style: TextStyle(fontSize: 11.5, color: DshColors.ink2(context)),
+            ),
+          ),
+        Expanded(
+          child: ListView.builder(
       key: const ValueKey('git-tag-list'),
       controller: _branchScroll,
       itemCount: tags.length,
@@ -996,6 +1028,9 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
           onTap: () => _locateTag(tag),
         );
       },
+          ),
+        ),
+      ],
     );
   }
 
@@ -1706,6 +1741,34 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
 
   /// issue #93/#100：focus 页加载后滚动到 focus 行；动画完成前 `_graphFocusSettled`
   /// 保持 false，禁止 prev/next 预取。snapshot 变化时重算 focus，不依赖旧 target。
+  void _maybeScrollToTagFocus(GitBrowserState state, double rowHeight) {
+    final seq = state.tagFocusSeq;
+    final oid = state.tagFocusOid;
+    if (seq <= 0 || seq == _handledTagFocusSeq || oid == null) return;
+    final index = state.commits.indexWhere((commit) => commit.oid == oid);
+    if (index < 0) return;
+    _handledTagFocusSeq = seq;
+    _tagHighlightOid = oid;
+    _tagHighlightTimer?.cancel();
+    _tagHighlightTimer = Timer(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _tagHighlightOid = null);
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !widget.scrollController.hasClients) return;
+      final position = widget.scrollController.position;
+      final target = (index * rowHeight).clamp(
+        position.minScrollExtent,
+        position.maxScrollExtent,
+      );
+      widget.scrollController.animateTo(
+        target,
+        duration: const Duration(milliseconds: 220),
+        curve: Curves.easeOut,
+      );
+    });
+    setState(() {});
+  }
+
   void _maybeScrollToGraphFocus(GitBrowserState state, double rowHeight) {
     if (!widget.controller.graphAllMode) {
       // 普通 5/10 选择模式没有 all focus 滚动；首批提交稳定后允许正常分页。
@@ -1865,6 +1928,7 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
     );
     _maybeReconcilePrependAnchor(state, rowHeight);
     _maybeScrollToGraphFocus(state, rowHeight);
+    _maybeScrollToTagFocus(state, rowHeight);
     return Column(
       children: [
         Padding(
@@ -2251,7 +2315,12 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
                       _rowLabels[commit.oid] ?? const <GitGraphLabel>[];
                   return SizedBox(
                     height: rowHeight,
-                    child: InkWell(
+                    child: Container(
+                      key: Key('git-tag-highlight-${commit.oid}'),
+                      color: _tagHighlightOid == commit.oid
+                          ? DshColors.brandSoft(context)
+                          : null,
+                      child: InkWell(
                       key: Key('git-commit-${commit.oid}'),
                       onTap: () => _showCommit(commit.oid),
                       child: Row(
@@ -2301,6 +2370,7 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
                         ],
                       ),
                     ),
+                  ),
                   );
                 },
               ),

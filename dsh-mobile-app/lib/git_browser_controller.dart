@@ -19,6 +19,8 @@ class GitBrowserState {
   final bool tagsLoaded;
   final bool tagsTruncated;
   final String? tagsError;
+  final String? tagFocusOid;
+  final int tagFocusSeq;
   final String branchQuery;
   final List<GitBranch> selectedBranches;
   final List<GitCommitSummary> commits;
@@ -69,6 +71,8 @@ class GitBrowserState {
     this.tagsLoaded = false,
     this.tagsTruncated = false,
     this.tagsError,
+    this.tagFocusOid,
+    this.tagFocusSeq = 0,
     this.branchQuery = '',
     this.selectedBranches = const [],
     this.commits = const [],
@@ -131,6 +135,8 @@ class GitBrowserState {
     bool? tagsLoaded,
     bool? tagsTruncated,
     Object? tagsError = _keep,
+    Object? tagFocusOid = _keep,
+    int? tagFocusSeq,
     String? branchQuery,
     List<GitBranch>? selectedBranches,
     List<GitCommitSummary>? commits,
@@ -177,6 +183,10 @@ class GitBrowserState {
     tagsError: identical(tagsError, _keep)
         ? this.tagsError
         : tagsError as String?,
+    tagFocusOid: identical(tagFocusOid, _keep)
+        ? this.tagFocusOid
+        : tagFocusOid as String?,
+    tagFocusSeq: tagFocusSeq ?? this.tagFocusSeq,
     branchQuery: branchQuery ?? this.branchQuery,
     selectedBranches: selectedBranches == null
         ? this.selectedBranches
@@ -733,9 +743,14 @@ class GitBrowserController extends ChangeNotifier {
     final generation = _generation;
     _emit(_state.copyWith(loadingTags: true, tagsError: null));
     try {
-      final tags = await tagsApi.tags(_state.sessionId ?? '', repository.repositoryId);
+      final page = await tagsApi.tags(_state.sessionId ?? '', repository.repositoryId);
       if (generation != _generation) return;
-      _emit(_state.copyWith(tags: tags, loadingTags: false, tagsLoaded: true));
+      _emit(_state.copyWith(
+        tags: page.tags,
+        tagsTruncated: page.truncated,
+        loadingTags: false,
+        tagsLoaded: true,
+      ));
     } catch (e) {
       if (generation != _generation) return;
       _emit(_state.copyWith(loadingTags: false, tagsLoaded: true, tagsError: '$e'));
@@ -748,11 +763,22 @@ class GitBrowserController extends ChangeNotifier {
     if (target == null || target.isEmpty) return false;
     final index = _state.commits.indexWhere((commit) => commit.oid == target);
     if (index >= 0) {
-      _emit(_state.copyWith(graphFocusOid: target));
+      _emit(_state.copyWith(
+        graphFocusOid: target,
+        tagFocusOid: target,
+        tagFocusSeq: _state.tagFocusSeq + 1,
+      ));
       return true;
     }
-    await openAllGraph(focus: target);
-    return _state.error == null && _state.graphFocusOid == target;
+    await openAllGraph(focus: target, forceAll: true);
+    if (_state.error == null && _state.graphFocusOid == target) {
+      _emit(_state.copyWith(
+        tagFocusOid: target,
+        tagFocusSeq: _state.tagFocusSeq + 1,
+      ));
+      return true;
+    }
+    return false;
   }
 
   void setBranchQuery(String value) {
@@ -1169,9 +1195,9 @@ class GitBrowserController extends ChangeNotifier {
   }
 
   /// issue #93：打开全部分支图（首页或 focus 页）。
-  Future<void> openAllGraph({String? focus}) async {
+  Future<void> openAllGraph({String? focus, bool forceAll = false}) async {
     _resetPendingPrev();
-    if (!graphAllMode) return;
+    if (!graphAllMode && !forceAll) return;
     final generation = _generation;
     final graphGeneration = ++_graphGeneration;
     _graphPageRequest = null;
