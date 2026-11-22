@@ -1503,11 +1503,11 @@ class AppStore extends ChangeNotifier {
   void Function(AttentionEvent event)? onAttentionEvent;
 
   /// M1a：事件已结算（`approval/resolved` / `question/resolved`），参数是 identity。
-  void Function(String identity)? onAttentionResolved;
+  void Function(String identity, String profileId, String hostId)? onAttentionResolved;
 
   /// v3.3：重连时挂起帧回放后的完整待办快照（source, pendingKeys）——
   /// 只据此撤销该宿主已不在待办中的业务通知，不凭超时猜测。
-  void Function(String source, Set<String> pendingKeys)? onAttentionSnapshot;
+  void Function(String source, Set<String> pendingKeys, String profileId, String hostId)? onAttentionSnapshot;
 
   /// S1：用户打开了某个会话——调用方应清掉该会话的横幅并标已读。
   void Function(String sessionId)? onChatOpened;
@@ -2338,7 +2338,9 @@ class AppStore extends ChangeNotifier {
       // 旧连接代的失败不得轮换/影响新连接（Reviewer #16 P2 失败路径）。
       if (!current()) return false;
       // 连接不通：尝试轮换到下一个候选地址（黑洞快速切换）再探测一次
-      if (await api.rotateBaseUrlVerified()) {
+      final rotated = await api.rotateBaseUrlVerified();
+      if (!current()) return false;
+      if (rotated) {
         AppLog.instance.warn('刷新探测失败 → 切换地址 ${api.baseUrl}');
         final retryEpoch = api.connectionEpoch;
         final retryIdentity = api.connectionIdentity;
@@ -2640,6 +2642,15 @@ class AppStore extends ChangeNotifier {
 
   /// #152 P1：切宿主清空全部宿主投影；disposeBridge 会刻意保留根 running，不能复用。
   void _clearHostProjection() {
+    catalog = null;
+    sessionConfig = SessionConfig();
+    actions = [];
+    pluginUpdateJournal = null;
+    lastPluginUpdateOpId = '';
+    _pluginUpdateTimer?.cancel();
+    _pluginUpdateTimer = null;
+    updateChecking = false;
+    api.resetHostProjection();
     agentStatus = 'idle';
     agentStatusMap.clear();
     sessionAgentStatus.clear();
@@ -2658,6 +2669,15 @@ class AppStore extends ChangeNotifier {
   /// #152：staged 切换连接档案。失败时旧连接/旧页面状态保持不变。
   /// 所有激活入口（首次手动/扫码、设置添加/切换）的统一收口。
   Future<void> _finishActivation(ConnectionManager manager) async {
+    final oldScope = _profileScope;
+    if (oldScope.isNotEmpty && oldScope != manager.profileScope) {
+      // 首次绑定 hostId 会改变 scope：内存草稿随 prefs 一起迁移。
+      for (final key in _drafts.keys.toList(growable: false)) {
+        if (!key.contains('@$oldScope')) continue;
+        final moved = key.replaceFirst('@$oldScope', '@${manager.profileScope}');
+        _drafts[moved] = _drafts.remove(key)!;
+      }
+    }
     // Api 已经是新宿主；再销毁旧 SSE/重连/刷新代并清宿主态。
     disposeBridge();
     sessionId = null;
@@ -2717,6 +2737,24 @@ class AppStore extends ChangeNotifier {
       return e.message;
     } catch (e) {
       return '连接失败：$e';
+    }
+  }
+
+  /// 迁移/凭据恢复失败后的显式重试；成功后统一清态/重连。
+  Future<String?> retryConnectionLoad() async {
+    final manager = connections;
+    if (manager == null) return '连接档案未初始化';
+    try {
+      await manager.load();
+      if (!manager.configured) {
+        return manager.connectionStateError.isNotEmpty
+            ? manager.connectionStateError
+            : '安全凭据仍不可用，请重新输入口令';
+      }
+      await _finishActivation(manager);
+      return null;
+    } catch (e) {
+      return '恢复失败：$e';
     }
   }
 
@@ -3056,7 +3094,13 @@ class AppStore extends ChangeNotifier {
   }
 
   Future<void> _rotateVerifiedThenSchedule() async {
-    if (await api.rotateBaseUrlVerified()) {
+    final epoch = api.connectionEpoch;
+    final identity = api.connectionIdentity;
+    final rotated = await api.rotateBaseUrlVerified();
+    if (epoch != api.connectionEpoch || identity != api.connectionIdentity) {
+      return; // 旧 A 的候选验证已完成/超时，但当前已是 B：不切、不调度。
+    }
+    if (rotated) {
       AppLog.instance.warn('SSE: 超时视为黑洞 → 立即切换 ${api.baseUrl}');
       _retry = 0;
     }
@@ -3248,7 +3292,7 @@ class AppStore extends ChangeNotifier {
           ),
         );
       }
-      onAttentionSnapshot?.call(source, keys);
+      onAttentionSnapshot?.call(source, keys, api.profileId, api.hostIdentity);
       return;
     }
     if (type == 'mobile/frame') {
@@ -3287,6 +3331,9 @@ class AppStore extends ChangeNotifier {
           AttentionEvent(
             kind: AttentionKind.question,
             source: api.notificationScope,
+            profileId: api.profileId,
+            hostId: api.hostIdentity,
+            epoch: api.connectionEpoch,
             sessionId: request.sessionId,
             identity: request.rpcId,
             at: DateTime.now(),
@@ -3312,7 +3359,7 @@ class AppStore extends ChangeNotifier {
         _clearPendingQuestion(rid);
         if (hadPending) notifyListeners();
         if (rid is String && rid.isNotEmpty) {
-          onAttentionResolved?.call(rid);
+          onAttentionResolved?.call(rid, api.profileId, api.hostIdentity);
         }
         // 无条件转发：即使本地已在提交/取消时提前清空，聊天页也要据此收起卡片
         _emitChatEvent(
@@ -3347,6 +3394,9 @@ class AppStore extends ChangeNotifier {
           AttentionEvent(
             kind: AttentionKind.approval,
             source: api.notificationScope,
+            profileId: api.profileId,
+            hostId: api.hostIdentity,
+            epoch: api.connectionEpoch,
             sessionId: request.sessionId,
             identity: request.approvalId.isEmpty
                 ? request.rpcId
@@ -3377,7 +3427,7 @@ class AppStore extends ChangeNotifier {
         // M1a：按 identity 精确撤销对应系统通知（resolved 帧不带 sessionId，
         // 所以不能靠 sessionId 重建 key）。
         if (aid is String && aid.isNotEmpty) {
-          onAttentionResolved?.call(aid);
+          onAttentionResolved?.call(aid, api.profileId, api.hostIdentity);
         }
         // 无条件转发：聊天页据此收起审批卡片
         _emitChatEvent(
@@ -3600,7 +3650,12 @@ class AppStore extends ChangeNotifier {
             return;
           }
           // 当前地址连续失败：轮换到下一个已确认且 hostId 校验通过的候选。
-          if (await api.rotateBaseUrlVerified()) {
+          final rotated = await api.rotateBaseUrlVerified();
+          if (connectionEpoch != api.connectionEpoch ||
+              identity != api.connectionIdentity) {
+            return;
+          }
+          if (rotated) {
             AppLog.instance.log('连接切换地址 → ${api.baseUrl}');
             _retry = 0; // 新地址重新开始退避
           } else {

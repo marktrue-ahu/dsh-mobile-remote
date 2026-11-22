@@ -15,6 +15,9 @@ abstract class CredentialStore {
   Future<void> activate(String profileId);
   Future<void> deactivate();
   Future<CredentialStatus> status();
+
+  /// 同一 profile 的 base 地址轮换后通知原生按新 descriptor 重建 SSE。
+  Future<void> refreshNative();
 }
 
 class CredentialStatus {
@@ -66,6 +69,9 @@ class MethodChannelCredentialStore implements CredentialStore {
   Future<void> deactivate() => channel.invokeMethod<void>('deactivate');
 
   @override
+  Future<void> refreshNative() => channel.invokeMethod<void>('reload');
+
+  @override
   Future<CredentialStatus> status() async {
     final value = await channel.invokeMapMethod<String, dynamic>('status');
     return CredentialStatus(
@@ -112,6 +118,9 @@ class MemoryCredentialStore implements CredentialStore {
 
   @override
   Future<void> deactivate() async => _active = '';
+
+  @override
+  Future<void> refreshNative() async {}
 
   @override
   Future<CredentialStatus> status() async => CredentialStatus(

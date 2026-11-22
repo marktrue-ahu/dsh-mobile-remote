@@ -35,6 +35,8 @@ class _FakeSwitchStore extends AppStore {
     String? path,
   }) async => null;
 
+  String? lastEditedBase;
+
   @override
   Future<String?> editAndSwitchProfile(
     ConnectionProfile profile, {
@@ -42,7 +44,10 @@ class _FakeSwitchStore extends AppStore {
     String? token,
     String? displayName,
     bool allowInsecure = false,
-  }) async => null;
+  }) async {
+    lastEditedBase = baseUrl;
+    return null;
+  }
 }
 
 class _NoopApi extends Api {
@@ -215,5 +220,33 @@ void main() {
     await tester.pumpAndSettle();
     expect(tester.widget<TextField>(find.byType(TextField).at(1)).controller?.text, a.primaryBase);
     expect(find.byKey(const ValueKey('connection-profile-scan')), findsNothing);
+  });
+
+  testWidgets('编辑自定义挂载档案只改名称：path 保留，不被覆盖成 /m', (tester) async {
+    final fake = store as _FakeSwitchStore;
+    final custom = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: '自定义',
+      baseUrls: ['https://c.example.com'],
+      path: '/mobile-remote',
+      hostId: 'host-c',
+    );
+    manager.profiles.add(custom);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ConnectionProfileEditorScreen(
+          key: const ValueKey('editor-custom'),
+          store: store,
+          manager: manager,
+          profile: custom,
+        ),
+      ),
+    );
+    expect(tester.widget<TextField>(find.byType(TextField).at(1)).controller?.text,
+        'https://c.example.com/mobile-remote');
+    await tester.enterText(find.byType(TextField).at(0), '改名');
+    await tester.tap(find.byKey(const ValueKey('connection-profile-save')));
+    await tester.pumpAndSettle();
+    expect(fake.lastEditedBase, contains('/mobile-remote'));
   });
 }

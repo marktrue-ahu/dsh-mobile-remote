@@ -11,6 +11,7 @@ import '../l10n.dart';
 import '../store.dart';
 import '../scan_screen.dart';
 import '../theme.dart';
+import '../toast.dart';
 
 Future<bool> showConnectionProfilesScreen(
   BuildContext context,
@@ -251,9 +252,18 @@ class _ConnectionProfilesScreenState extends State<ConnectionProfilesScreen> {
     final manager = _manager;
     final ink3 = DshColors.ink3(context);
     return PopScope(
-      canPop: false,
+      // 切换提交中禁止离开：probe/commit 没有取消令牌，离开会让后台继续激活新宿主。
+      canPop: _switching == null,
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop && mounted) Navigator.of(context).pop(_changed);
+        if (didPop || !mounted) return;
+        if (_switching != null) {
+          showToast(
+            context,
+            L10n.t('正在切换电脑，请等待完成后再返回', 'Switching computers; wait for it to finish'),
+          );
+          return;
+        }
+        Navigator.of(context).pop(_changed);
       },
       child: Scaffold(
         appBar: AppBar(
@@ -413,7 +423,10 @@ class _ConnectionProfileEditorScreenState
     final profile = widget.profile;
     if (profile != null) {
       _name.text = profile.displayName;
-      _base.text = profile.primaryBase;
+      // 自定义挂载必须随编辑框往返；只改名称/口令不能把 /mobile-remote 覆盖成 /m。
+      _base.text = profile.path == '/m' || profile.path.isEmpty
+          ? profile.primaryBase
+          : '${profile.primaryBase}${profile.path}';
       _allowInsecure = profile.insecureConfirmed;
     }
     _base.addListener(_onEndpointChanged);

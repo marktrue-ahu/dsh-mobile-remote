@@ -331,6 +331,9 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
   /// 返回 false 的候选不得进入 baseUrls 或承载 token。
   bool Function(String candidate)? candidateAdmission;
   Future<bool> Function(String candidate)? candidateVerifier;
+
+  /// #152 P2：已验证候选的档案/descriptor 原子提交；false 表示不采用。
+  Future<bool> Function(String candidate)? candidateCommitter;
   static const _kBase = 'dsh_mr_base';
   static const _kPath = 'dsh_mr_path';
   static const _kToken = 'dsh_mr_token';
@@ -447,7 +450,28 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
       if (next == cur) continue;
       if (candidateAdmission?.call(next) == false) continue;
       final verify = candidateVerifier;
-      if (verify != null && !await verify(next)) continue;
+      if (verify != null) {
+        final epoch = connectionEpoch;
+        final identity = connectionIdentity;
+        final profile = profileId;
+        final host = hostIdentity;
+        bool same() =>
+            epoch == connectionEpoch &&
+            identity == connectionIdentity &&
+            profile == profileId &&
+            host == hostIdentity;
+        final verified = await verify(next);
+        // await 期间连接可能已切 B：旧 A 候选无论结果如何都不得改当前连接。
+        if (!same()) return false;
+        if (!verified) continue;
+        if (!same()) return false;
+        final commit = candidateCommitter;
+        if (commit != null) {
+          final committed = await commit(next);
+          if (!same()) return false;
+          if (!committed) continue;
+        }
+      }
       invalidateConnection();
       baseUrl = next;
       unawaited(() async {
@@ -459,6 +483,16 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
       return true;
     }
     return false;
+  }
+
+  /// #152：切换宿主时清空宿主投影（目录/更新/发布/身份），由 ConnectionManager/Store 调用。
+  void resetHostProjection() {
+    pluginContentSha256 = '';
+    pluginUpdate = const PluginUpdateStatus.unknown();
+    currentRelease = null;
+    updateTarget = null;
+    currentReleaseHealth = null;
+    appArtifact = null;
   }
 
   /// 合并新收集到的地址（去重、去回环置后、上限裁剪），当前可用地址保持第一位。
