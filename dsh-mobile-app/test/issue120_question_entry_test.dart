@@ -21,6 +21,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 const _session = 'session-120';
 const _otherSession = 'session-120-parent';
@@ -178,7 +179,9 @@ void _injectQuestion(
 
 void main() {
   setUp(() async {
+    SharedPreferences.setMockInitialValues({});
     await AppLog.instance.clear();
+    await AppLog.instance.setLevel(AppLogLevel.debug);
   });
 
   testWidgets(

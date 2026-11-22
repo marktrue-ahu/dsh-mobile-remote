@@ -88,7 +88,7 @@ const APPROVAL_FRAME = {
 function createHarness({ agents, goals, workspaceRegistry, frames = [] } = {}) {
 	const routes = [];
 	const provided = new Map();
-	const logs = { warn: [], info: [] };
+	const logs = { warn: [], info: [], debug: [] };
 	const rpcCalls = [];
 	const rpcDispatch = [];
 	if (agents !== undefined) provided.set("agents", agents);
@@ -119,7 +119,11 @@ function createHarness({ agents, goals, workspaceRegistry, frames = [] } = {}) {
 	});
 	const ctx = {
 		webServer: { host: "127.0.0.1", port: 43120, register(spec) { routes.push(spec); return () => {}; } },
-		logger: { warn: (m) => logs.warn.push(String(m)), info: (m) => logs.info.push(String(m)) },
+		logger: {
+			warn: (m) => logs.warn.push(String(m)),
+			info: (m) => logs.info.push(String(m)),
+			debug: (m) => logs.debug.push(String(m)),
+		},
 		get(name) { return provided.get(name); },
 		provide(name, value) { provided.set(name, value); },
 		on() { return () => {}; },
@@ -488,6 +492,21 @@ test("/files/upload：文件名黑名单含 NUL", async () => {
 		});
 		assert.equal(result.status, 400);
 		assert.equal(result.body.error, "invalid-name");
+	} finally {
+		harness.clean();
+	}
+});
+
+test("question debug logs carry ids without question text or options", async () => {
+	const harness = createHarness({ frames: [QUESTION_FRAME] });
+	try {
+		await waitForFrames(harness, 1);
+		const debug = harness.logs.debug.join("\n");
+		assert.match(debug, /question requested source=events sessionId=session-A eventId=ev-q/);
+		assert.match(debug, /ask replay stored kind=q rpcId=ev-q/);
+		assert.ok(debug.includes("questionId=session-A:ev-q"), "debug 应带 questionId");
+		assert.equal(debug.includes("Delete them?"), false, "不得记录题干");
+		assert.equal(debug.includes("Yes"), false, "不得记录选项");
 	} finally {
 		harness.clean();
 	}

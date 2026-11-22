@@ -644,6 +644,7 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi {
   /// 连接失效（切地址/关闭 bridge）：递增代号并清空能力位。
   void invalidateConnection() {
     _connectionEpoch++;
+    AppLog.instance.debug('连接代递增 epoch=$_connectionEpoch base=${baseUrl.isNotEmpty ? '已配置' : '空'}');
     resetCapabilities();
   }
 
