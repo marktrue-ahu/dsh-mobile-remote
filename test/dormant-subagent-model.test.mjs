@@ -162,17 +162,25 @@ test("P2 seeded 回退：从 readSurface header 取 cache-only 模型", async ()
   } finally { h.dispose?.(); }
 });
 
-test("P2 seeded 回退无可信 header：不读 cache，如实降级", async () => {
+test("P2 seeded 回退无可信 header：不读 cache，config/resume 都带降级标记", async () => {
   const h = harness({
     seeded: true,
-    events: [],
+    events: [{ seq: 1, type: "model/selection", data: pick("event", "event-model", "low") }],
     surface: new Error("surface unavailable"),
     cache: projection(pick("seed", "seed-model", "max"), pick("seed", "seed-model", "max"), 7),
   });
   try {
     const res = await request(h.route, "/m/api/session-config?sessionId=seeded-no-header");
-    assert.equal(res.body.config.model, undefined);
+    assert.equal(res.body.config.model, "event-model");
+    assert.equal(res.body.configDegraded, true, "header 未确认时即使事件回退成功也必须降级");
     assert.equal(h.cacheCalls.length, 0);
+
+    const send = await request(h.route, "/m/api/send", { sessionId: "seeded-no-header", text: "hi" });
+    assert.equal(send.status, 200);
+    assert.equal(send.body.configDegraded, true, "resume 响应必须带降级标记");
+    assert.deepEqual(h.resumeCalls[0].agentOptions, {
+      provider: "event", model: "event-model", reasoningEffort: "low",
+    });
   } finally { h.dispose?.(); }
 });
 
