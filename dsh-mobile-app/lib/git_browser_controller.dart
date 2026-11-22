@@ -8,6 +8,8 @@ import 'package:flutter/foundation.dart';
 import 'api.dart';
 import 'git_models.dart';
 
+enum TagLocateOutcome { located, failed, stale }
+
 class GitBrowserState {
   final String? sessionId;
   final GitReadCapabilities? capabilities;
@@ -784,8 +786,8 @@ class GitBrowserController extends ChangeNotifier {
       return;
     }
     final generation = _generation;
-    final graphGeneration = ++_graphGeneration;
-    _graphPageRequest = null;
+    // tag 请求不推进全局图代：避免作废用户正在进行的分页/loading 状态。
+    final graphGeneration = _graphGeneration;
     try {
       final page = await api.graphAll(
         sessionId,
@@ -824,13 +826,12 @@ class GitBrowserController extends ChangeNotifier {
   }
 
   /// 点击 tag：当前已加载 commits 命中则只设置 focus（零网络）；未命中一次 all=true focus。
-  Future<bool> locateTag(GitTag tag) async {
+  Future<TagLocateOutcome> locateTag(GitTag tag) async {
     final target = tag.targetOid;
-    if (target == null || target.isEmpty) return false;
+    if (target == null || target.isEmpty) return TagLocateOutcome.failed;
     final intent = ++_tagIntentGeneration;
     // 任何 tag 意图都作废旧 all 请求：先窗口外 A 挂起、再点窗口内 B 时，
-    // A 的迟到响应不得覆盖 B。
-    _graphGeneration++;
+    // A 的迟到响应不得覆盖 B；只递增独立 intent，不动全局图代/分页 loading。
     final index = _state.commits.indexWhere((commit) => commit.oid == target);
     if (index >= 0) {
       _emit(_state.copyWith(
@@ -838,12 +839,15 @@ class GitBrowserController extends ChangeNotifier {
         tagFocusOid: target,
         tagFocusSeq: _state.tagFocusSeq + 1,
       ));
-      return true;
+      return TagLocateOutcome.located;
     }
     await openTagFocus(target, intent: intent);
+    if (intent != _tagIntentGeneration) return TagLocateOutcome.stale;
     return _state.tagFocusError == null &&
-        _state.tagFocusOid == target &&
-        _state.graphFocusOid == target;
+            _state.tagFocusOid == target &&
+            _state.graphFocusOid == target
+        ? TagLocateOutcome.located
+        : TagLocateOutcome.failed;
   }
 
   void setBranchQuery(String value) {

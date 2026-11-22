@@ -1072,9 +1072,10 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
       );
       return;
     }
-    final ok = await widget.controller.locateTag(tag);
+    final outcome = await widget.controller.locateTag(tag);
     if (!mounted) return;
-    if (!ok) {
+    if (outcome == TagLocateOutcome.stale) return;
+    if (outcome != TagLocateOutcome.located) {
       _toast(
         widget.controller.state.tagFocusError == 'graph-focus-not-found'
             ? L10n.t(

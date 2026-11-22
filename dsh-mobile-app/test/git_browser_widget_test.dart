@@ -580,6 +580,36 @@ class Truncated5002TagApi extends TagWidgetApi {
       );
 }
 
+class PagingGateTagApi extends TagWidgetApi {
+  final pageGate = Completer<GitGraphPage>();
+  int allCalls = 0;
+
+  @override
+  Future<GitGraphPage> graphAll(
+    String sessionId,
+    String repositoryId, {
+    required bool all,
+    String? focus,
+    String? snapshotId,
+    String? cursor,
+    int limit = 16,
+    Duration timeout = const Duration(seconds: 35),
+  }) {
+    allCalls++;
+    if (allCalls == 1) {
+      return Future.value(GitGraphPage(
+        snapshotId: 'all-snap',
+        focusOid: focus,
+        pageStart: 0,
+        nextCursor: 'next-1',
+        tips: const [],
+        commits: const [GitCommitSummary(oid: 'tag-b', subject: 'B')],
+      ));
+    }
+    return pageGate.future;
+  }
+}
+
 class DeferredTagApi extends TagWidgetApi {
   final allGate = Completer<GitGraphPage>();
 
@@ -1590,7 +1620,7 @@ void main() {
     );
     final a = controller.locateTag(tagA);
     await tester.pump();
-    expect(await controller.locateTag(tagB), isTrue);
+    expect(await controller.locateTag(tagB), TagLocateOutcome.located);
     api.allGate.complete(GitGraphPage(
       snapshotId: 'stale-a',
       focusOid: 'outside-a',
@@ -1604,5 +1634,61 @@ void main() {
     expect(controller.state.commits.map((c) => c.oid), contains('main-oid'));
     expect(controller.state.commits.map((c) => c.oid), isNot(contains('outside-a')));
     expect(controller.state.selectedBranches.map((b) => b.name).toList(), selectionBefore);
+  });
+
+  testWidgets('#159 分页挂起时命中 tag：不清 loading，释放后仍可继续分页', (tester) async {
+    final api = PagingGateTagApi();
+    final controller = await mountSheet(tester, api);
+    addTearDown(controller.dispose);
+    await controller.openTagFocus('tag-b');
+    expect(controller.state.commits.map((c) => c.oid), contains('tag-b'));
+    final paging = controller.loadNextGraphPage();
+    await tester.pump();
+    expect(controller.state.loadingGraphPage, isTrue);
+    const tagB = GitTag(
+      name: 'refs/tags/b',
+      shortName: 'b',
+      refOid: 'b',
+      targetOid: 'tag-b',
+    );
+    expect(await controller.locateTag(tagB), TagLocateOutcome.located);
+    expect(controller.state.loadingGraphPage, isTrue);
+    api.pageGate.complete(const GitGraphPage(
+      snapshotId: 'all-snap',
+      tips: const [],
+      commits: [GitCommitSummary(oid: 'older-1', subject: 'Older')],
+    ));
+    await paging;
+    await tester.pumpAndSettle();
+    expect(controller.state.loadingGraphPage, isFalse);
+    expect(controller.state.commits.map((c) => c.oid), contains('older-1'));
+    expect(controller.state.tagFocusOid, 'tag-b');
+    // 仍可继续分页（未卡在 loading）。
+    expect(controller.state.graphNextCursor, isNull);
+  });
+
+  testWidgets('#159 A 窗口外挂起、B 命中后 A 迟到：不弹失败 toast', (tester) async {
+    final api = DeferredTagApi();
+    final controller = await mountSheet(tester, api);
+    addTearDown(controller.dispose);
+    await tester.tap(find.byKey(const Key('git-branch-refs/heads/main')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.descendant(of: find.byType(TabBar), matching: find.text('Branches')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('git-branch-subtab-2')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('git-tag-v2.0.0'))); // A：窗口外，挂起
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('git-tag-v1.0.0'))); // B：窗口内命中
+    await tester.pumpAndSettle();
+    api.allGate.complete(const GitGraphPage(
+      snapshotId: 'stale-a',
+      tips: const [],
+      commits: [GitCommitSummary(oid: 'missing-oid', subject: 'A')],
+    ));
+    await tester.pumpAndSettle();
+    expect(controller.state.tagFocusOid, 'main-oid');
+    expect(find.textContaining('Could not locate this tag'), findsNothing);
+    expect(find.textContaining('无法定位该标签'), findsNothing);
   });
 }
