@@ -39,6 +39,14 @@ class UpdateGate {
 
 final Api _defaultStoreApi = api;
 
+class _UpdateCtx {
+  const _UpdateCtx(this.epoch, this.scope, this.isCurrent);
+  final int epoch;
+  final String scope;
+  final bool Function() isCurrent;
+  bool get current => isCurrent();
+}
+
 class AppStore extends ChangeNotifier {
   AppStore({
     Api? apiClient,
@@ -429,6 +437,7 @@ class AppStore extends ChangeNotifier {
   int _updateEpoch = 0;
   Future<void> Function()? updateResumeGate;
   Future<void> Function(String key)? persistGate;
+  Future<void> Function()? continueGate;
 
   bool _updateStillCurrent(int epoch, String scope) =>
       epoch == _updateEpoch && scope == ProfileNamespace.scope;
@@ -878,9 +887,15 @@ class AppStore extends ChangeNotifier {
     if (existing != null) return existing;
     final future = _resumePluginUpdate(connected: connected);
     _resumingUpdate = future;
-    future.whenComplete(() {
-      if (identical(_resumingUpdate, future)) _resumingUpdate = null;
-    });
+    // 清理附在已处理的派生链上；不丢弃派生 Future，也不吞原错误。
+    unawaited(future.then<void>(
+      (_) {
+        if (identical(_resumingUpdate, future)) _resumingUpdate = null;
+      },
+      onError: (Object _, StackTrace __) {
+        if (identical(_resumingUpdate, future)) _resumingUpdate = null;
+      },
+    ));
     return future;
   }
 
@@ -1087,12 +1102,21 @@ class AppStore extends ChangeNotifier {
   ///
   /// - `plugin-confirmed`：插件健康后第一次确定 App 目标；
   /// - `app-pending`：安装器返回后的**首次启动复核**（§5.9）：核对真实安装版本/构建号与配对。
-  Future<void> _continueAppUpdateAfterPlugin() async {
-    final updateEpoch = _updateEpoch;
-    final updateScope = ProfileNamespace.scope;
-    bool current() => _updateStillCurrent(updateEpoch, updateScope);
+  Future<void> _continueAppUpdateAfterPlugin({_UpdateCtx? context}) async {
+    final ctx = context ??
+        _UpdateCtx(
+          _updateEpoch,
+          ProfileNamespace.scope,
+          () => _updateStillCurrent(_updateEpoch, ProfileNamespace.scope),
+        );
+    bool current() => ctx.current;
+    Future<void> abandon(String notice) =>
+        _abandonUpdate(notice, context: ctx);
     var journal = pluginUpdateJournal;
     if (journal == null || !current()) return;
+    // 测试/取消 guard：整条 continuation 对外部 gate 也保持同一连接代。
+    await continueGate?.call();
+    if (!current()) return;
     var release = journal.release;
     if (release == null) {
       final transaction = api.pluginUpdate.transaction;
@@ -1115,7 +1139,7 @@ class AppStore extends ChangeNotifier {
         currentRelease: api.currentRelease,
       );
       if (recovered == null) {
-        await _abandonUpdate(
+        await abandon(
           '电脑端没有与本次插件事务精确匹配的固定 App 发布；已退出本次更新（不会回退到 latest/GitHub）',
         );
         return;
@@ -1126,17 +1150,23 @@ class AppStore extends ChangeNotifier {
         appVersion: journal.appVersion.isEmpty ? recovered.app.version : null,
       );
       pluginUpdateJournal = journal;
-      await _persistPrefs(_kPluginUpdateJournal, jsonEncode(journal.toJson()));
+      await _persistPrefs(
+        _kPluginUpdateJournal,
+        jsonEncode(journal.toJson()),
+        scope: ctx.scope,
+      );
+      await continueGate?.call();
+      if (!current()) return;
       release = recovered;
     }
     // 来源接线（F19）：旧版本可能存下外部 Release 资产地址，新流程只认宿主固定目标。
     final urlIssue = fixedArtifactUrlIssue(release);
     if (urlIssue != null) {
-      await _abandonUpdate('$urlIssue；已退出旧目标，请重新检查两端版本');
+      await abandon('$urlIssue；已退出旧目标，请重新检查两端版本');
       return;
     }
     if (journal.phase == UpdatePhase.appPending) {
-      await _verifyInstalledApp(journal, release);
+      await _verifyInstalledApp(journal, release, context: ctx);
       return;
     }
     // 插件半边还在等（重启/旧实例仍在服务）：不推进 App，也不误判完成。
@@ -1147,7 +1177,7 @@ class AppStore extends ChangeNotifier {
       return;
     }
     if (_pairingBroken(release)) {
-      await _abandonUpdate('电脑端插件更新已回滚或失败，本次两端更新已结束；请重新检查两端版本（旧组合仍可继续使用）');
+      await abandon('电脑端插件更新已回滚或失败，本次两端更新已结束；请重新检查两端版本（旧组合仍可继续使用）');
       return;
     }
     if (!_pluginTargetHealthy(release)) {
@@ -1165,7 +1195,7 @@ class AppStore extends ChangeNotifier {
         notifyListeners();
         return;
       }
-      await _abandonUpdate(
+      await abandon(
         '${outcome.error ?? '无法确认 App 目标'}；已退出本次更新，请重新检查两端版本',
       );
       return;
@@ -1173,7 +1203,7 @@ class AppStore extends ChangeNotifier {
     if (outcome.verdict == UpdateVerdict.upToDate) {
       pluginUpdateNotice = '两端已更新到 v${candidate.version}';
       updateCandidate = null;
-      await _clearPluginUpdateJournal();
+      await _clearPluginUpdateJournal(context: ctx);
       notifyListeners();
       return;
     }
@@ -1187,13 +1217,15 @@ class AppStore extends ChangeNotifier {
       await _persistPrefs(
         _kPluginUpdateJournal,
         jsonEncode(pluginUpdateJournal!.toJson()),
+        scope: ctx.scope,
       );
+      if (!current()) return;
       updateCandidate = candidate;
       notifyListeners();
       return;
     }
     // remoteOlder：本机 App 已更高，不尝试降级。
-    await _abandonUpdate(
+    await abandon(
       '本机 App 已高于固定目标 v${release.app.version}；不会降级，请重新检查两端发布',
     );
   }
@@ -1209,21 +1241,36 @@ class AppStore extends ChangeNotifier {
   /// 请重新检查"，不自动降级、不静默继续。
   Future<void> _verifyInstalledApp(
     PluginUpdateJournal journal,
-    ReleaseSnapshot release,
-  ) async {
+    ReleaseSnapshot release, {
+    _UpdateCtx? context,
+  }) async {
+    final ctx = context ??
+        _UpdateCtx(
+          _updateEpoch,
+          ProfileNamespace.scope,
+          () => _updateStillCurrent(_updateEpoch, ProfileNamespace.scope),
+        );
+    bool stillCurrent() => ctx.current;
+    Future<void> abandon(String notice) =>
+        _abandonUpdate(notice, context: ctx);
     var current = journal;
     // appPending 的持久证明可能来自旧记录（升级前没有 pluginVerified 字段）：
     // 只要此刻插件目标健康，就补记这份"下载/安装前已确认"的证明。
     if (!current.pluginVerified && _pluginTargetHealthy(release)) {
       current = current.copyWith(pluginVerified: true);
       pluginUpdateJournal = current;
-      await _persistPrefs(_kPluginUpdateJournal, jsonEncode(current.toJson()));
+      await _persistPrefs(
+        _kPluginUpdateJournal,
+        jsonEncode(current.toJson()),
+        scope: ctx.scope,
+      );
+      if (!stillCurrent()) return;
     }
     final target = parseAppVersion(release.app.version);
     final local = await _localVersion();
-    if (_disposed || pluginUpdateJournal?.opId != current.opId) return;
+    if (!stillCurrent() || _disposed || pluginUpdateJournal?.opId != current.opId) return;
     if (target == null) {
-      await _abandonUpdate('固定快照的 App 版本不可解析；已退出本次更新，请重新检查两端版本');
+      await abandon('固定快照的 App 版本不可解析；已退出本次更新，请重新检查两端版本');
       return;
     }
     if (local == null || !local.buildSet) {
@@ -1244,7 +1291,7 @@ class AppStore extends ChangeNotifier {
         updateCandidate = null;
       } else if (_pairingBroken(release)) {
         // 装完首次启动复核发现配对已断：明确提示，不自动降级、不静默继续。
-        await _abandonUpdate(
+        await abandon(
           '两端不匹配：电脑端插件已回滚或运行内容与固定快照不符，请重新检查两端版本（不会自动降级 App）',
         );
         return;
@@ -1260,7 +1307,7 @@ class AppStore extends ChangeNotifier {
     }
     // 配对在安装前就断了（另一事务回滚/失败）：退出旧目标，给出重新检查出口。
     if (_pairingBroken(release)) {
-      await _abandonUpdate('本次 App 更新目标已失效：电脑端插件已回滚或事务失败；请重新检查两端版本（APK 不会先装）');
+      await abandon('本次 App 更新目标已失效：电脑端插件已回滚或事务失败；请重新检查两端版本（APK 不会先装）');
       return;
     }
     if (cmp < 0) {
@@ -1273,15 +1320,17 @@ class AppStore extends ChangeNotifier {
       return;
     }
     // 本机 App 已更高：不降级，退出并提示重新对齐。
-    await _abandonUpdate(
+    await abandon(
       '本机 App v$local 已高于固定目标 v${release.app.version}；不会降级，请重新检查两端发布',
     );
   }
 
   /// 退出旧目标并给出明确提示（不永久停在"更新进行中"）：清记录 + 清候选。
-  Future<void> _abandonUpdate(String notice) async {
+  Future<void> _abandonUpdate(String notice, {_UpdateCtx? context}) async {
+    if (context != null && !context.current) return;
     updateCandidate = null;
-    await _clearPluginUpdateJournal();
+    await _clearPluginUpdateJournal(context: context);
+    if (context != null && !context.current) return;
     pluginUpdateNotice = notice;
     notifyListeners();
   }
@@ -1385,11 +1434,16 @@ class AppStore extends ChangeNotifier {
     });
   }
 
-  Future<void> _clearPluginUpdateJournal() async {
+  Future<void> _clearPluginUpdateJournal({_UpdateCtx? context}) async {
+    if (context != null && !context.current) return;
     pluginUpdateJournal = null;
     _pluginUpdateTimer?.cancel();
     _pluginUpdateTimer = null;
-    await _persistPrefs(_kPluginUpdateJournal, '');
+    await _persistPrefs(
+      _kPluginUpdateJournal,
+      '',
+      scope: context?.scope,
+    );
   }
 
   int petHeight = 96; // 宠物画布高度 dp（56~160）

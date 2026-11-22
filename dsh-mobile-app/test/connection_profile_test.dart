@@ -998,7 +998,7 @@ void main() {
     expect(await manager.credentials.status().then((s) => s.activeProfileId), b.id);
   });
 
-  test('A update resume 挂起切 B：旧 continuation 不写 B journal/候选', () async {
+  test('A update continuation gate 暂停切 B：旧链不写 B journal/候选', () async {
     SharedPreferences.setMockInitialValues({
       'dsh_mr_base': 'https://a.example.com/m',
       'dsh_mr_token': 'a-token',
@@ -1033,7 +1033,7 @@ void main() {
     );
     final gate = Completer<void>();
     var entered = false;
-    store.updateResumeGate = () {
+    store.continueGate = () {
       entered = true;
       return gate.future;
     };
@@ -1140,5 +1140,33 @@ void main() {
     expect(api.connectionGeneration, oldGeneration);
     await Future<void>.delayed(const Duration(milliseconds: 20));
     expect(store.connState, isNot('offline'));
+  });
+
+  test('_resumePluginUpdate 抛错：调用者捕获且无 unhandled async error', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    final manager = ConnectionManager(
+      api: Api()..baseUrl = '',
+      credentials: MemoryCredentialStore(),
+    );
+    await manager.load();
+    final store = AppStore(apiClient: _StoreApi())..attachConnections(manager);
+    addTearDown(store.disposeBridge);
+    store.pluginUpdateJournal = PluginUpdateJournal(
+      opId: 'op-a',
+      targetVersion: '3.3.0',
+      targetContentSha256: 'a' * 64,
+      startedAt: DateTime.now().toUtc(),
+      phase: UpdatePhase.pluginConfirmed,
+    );
+    store.continueGate = () async => throw StateError('boom');
+    final unhandled = <Object>[];
+    await runZonedGuarded(() async {
+      await expectLater(store.resumePluginUpdate(), throwsA(isA<StateError>()));
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }, (error, _) => unhandled.add(error));
+    expect(unhandled, isEmpty);
   });
 }
