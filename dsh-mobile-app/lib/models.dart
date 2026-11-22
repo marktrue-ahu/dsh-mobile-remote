@@ -921,10 +921,12 @@ class AskQuestion {
 /// question/requested 帧整体：rpcId 用于应答回写。
 class QuestionRequest {
   final String rpcId;
+  final String? questionId;
   final String sessionId;
   final List<AskQuestion> questions;
   QuestionRequest({
     required this.rpcId,
+    this.questionId,
     required this.sessionId,
     required this.questions,
   });

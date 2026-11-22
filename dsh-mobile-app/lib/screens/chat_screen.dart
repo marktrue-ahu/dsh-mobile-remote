@@ -3918,10 +3918,13 @@ class _ChatScreenState extends State<ChatScreen> {
           ev.type == 'question/resolved' ||
           ev.type == 'approval/requested' ||
           ev.type == 'approval/resolved') {
-        AppLog.instance.log(
+        AppLog.instance.debug(
           '[120-debug] ${ev.type} dropped by page filter: '
           'frameSessionId=$eventSessionId mySessionId=${_mySessionId ?? ''} '
-          'storeSessionId=${widget.store.sessionId ?? ''} rpcId=${ev.data?['rpcId'] ?? ''}',
+          'storeSessionId=${widget.store.sessionId ?? ''} '
+          'rpcId=${ev.data?['rpcId'] ?? ''} '
+          'questionId=${ev.data?['questionId'] ?? ''} '
+          'epoch=${widget.store.api.connectionEpoch}',
         );
       }
       return false;
@@ -3986,12 +3989,15 @@ class _ChatScreenState extends State<ChatScreen> {
       }
       // issue #120：真机定位日志（只观测，不改变行为）。回答三件事：
       // 帧挂到哪个 session、本页绑定哪个 session、两者是否一致（matched）。
-      AppLog.instance.log(
+      AppLog.instance.debug(
         '[120-debug] question frame: '
         'frameSessionId=${eventSessionId ?? ''} '
         'mySessionId=${_mySessionId ?? ''} '
         'storeSessionId=${widget.store.sessionId ?? ''} '
-        'rpcId=${ev.data?['rpcId'] ?? ''} matched=$changed',
+        'rpcId=${ev.data?['rpcId'] ?? ''} '
+        'questionId=${ev.data?['questionId'] ?? ''} '
+        'epoch=${widget.store.api.connectionEpoch} '
+        'matched=$changed pendingCountAfter=${widget.store.pendingQuestionCount}',
       );
       return changed;
     }
@@ -4008,12 +4014,14 @@ class _ChatScreenState extends State<ChatScreen> {
         if (_transientFrameKeys.add(key)) _appendEvent(ev);
       });
       // issue #120：结算路径同样留痕（#120 要求覆盖 resolved 分支）。
-      AppLog.instance.log(
+      AppLog.instance.debug(
         '[120-debug] question resolved: '
         'frameSessionId=${eventSessionId ?? ''} '
         'mySessionId=${_mySessionId ?? ''} '
         'storeSessionId=${widget.store.sessionId ?? ''} '
-        'rpcId=${rid ?? ''} matched=$changed',
+        'rpcId=${rid ?? ''} questionId=${ev.data?['questionId'] ?? ''} '
+        'epoch=${widget.store.api.connectionEpoch} '
+        'matched=$changed pendingCountAfter=${widget.store.pendingQuestionCount}',
       );
       return changed;
     }

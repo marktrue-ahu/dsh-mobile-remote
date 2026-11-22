@@ -1478,6 +1478,12 @@ class AppStore extends ChangeNotifier {
       : _pendingApprovalsBySession[id] ??
             (pendingApproval?.sessionId == id ? pendingApproval : null);
 
+  /// 当前待答问询数（debug 取证用；按 rpcId 去重，兼容 legacy pendingQuestion）。
+  int get pendingQuestionCount => <String>{
+    for (final q in _pendingQuestionsBySession.values) q.rpcId,
+    if (pendingQuestion != null) pendingQuestion!.rpcId,
+  }.length;
+
   QuestionRequest? _questionForRpc(Object? rpcId) {
     for (final q in _pendingQuestionsBySession.values) {
       if (q.rpcId == rpcId) return q;
@@ -3002,6 +3008,10 @@ class AppStore extends ChangeNotifier {
     if (id == _refreshIdentity) return;
     _refreshIdentity = id;
     _refreshGeneration++;
+    AppLog.instance.debug(
+      '连接代切换 identity=$id generation=$_refreshGeneration '
+      'epoch=${api.connectionEpoch}',
+    );
     // 新代从零开始：旧地址的在途不再阻塞新地址的首屏刷新。
     _sessionsInFlight = false;
     _sessionsPending = false;
@@ -3267,7 +3277,9 @@ class AppStore extends ChangeNotifier {
         identity == api.connectionIdentity;
     _connecting = true;
     _setConnState('connecting');
-    AppLog.instance.log('SSE: connect → ${api.baseUrl}');
+    AppLog.instance.info(
+      'SSE: connect → ${api.baseUrl} generation=$generation epoch=$connectionEpoch',
+    );
     api.onSseKeepalive = _touchLiveness;
     _startWatchdog();
     _sub = api.eventsRaw().listen(
@@ -3278,7 +3290,9 @@ class AppStore extends ChangeNotifier {
       },
       onError: (e) {
         if (!current()) return;
-        AppLog.instance.warn('SSE: error $e');
+        AppLog.instance.warn(
+          'SSE: error generation=$generation epoch=$connectionEpoch $e',
+        );
         if ('$e'.contains('SSE HTTP 503')) _sseBusy = true;
         // 超时 = 黑洞地址（路由不可达，如手机关了组网 VPN）→ 立即轮换候选地址，
         // 不再白等 3×15 秒的重试循环（连接被拒/中断等瞬时错误仍走正常退避）
@@ -3290,7 +3304,9 @@ class AppStore extends ChangeNotifier {
       },
       onDone: () {
         if (!current()) return;
-        AppLog.instance.log('SSE: done（连接关闭）');
+        AppLog.instance.info(
+          'SSE: done（连接关闭）generation=$generation epoch=$connectionEpoch',
+        );
         _scheduleReconnect();
       },
       cancelOnError: true,
@@ -3396,6 +3412,11 @@ class AppStore extends ChangeNotifier {
       // 统一解析：bootstrap 与 SSE hello 同判据；hello 是当前连接的能力权威，
       // 缺失字段会清 false，避免新宿主→旧宿主时旧 true 跨连接残留（#16 P2）。
       api.applyCapabilities(frame['capabilities']);
+      AppLog.instance.debug(
+        'SSE: hello epoch=${api.connectionEpoch} host=${api.hostIdentity} '
+        'capabilities=${frame['capabilities'] is Map ? (frame['capabilities'] as Map).length : 0} '
+        'pendingQuestions=$pendingQuestionCount',
+      );
       _emitChatEvent(ChatEvent(type: '_capabilities', data: {}));
       _setConnState('connected');
       _catchup();
@@ -3416,6 +3437,10 @@ class AppStore extends ChangeNotifier {
         };
         if (pendingQuestion != null) questions.add(pendingQuestion!);
         if (pendingApproval != null) approvals.add(pendingApproval!);
+        AppLog.instance.debug(
+          'SSE: hello pending snapshot clearing questions=${questions.length} '
+          'approvals=${approvals.length} epoch=${api.connectionEpoch}',
+        );
         pendingQuestion = null;
         pendingApproval = null;
         _pendingQuestionsBySession.clear();
@@ -3511,6 +3536,7 @@ class AppStore extends ChangeNotifier {
       if (ftype == 'question/requested') {
         final request = QuestionRequest(
           rpcId: f['rpcId'] as String? ?? '',
+          questionId: f['questionId'] as String?,
           sessionId: f['sessionId'] as String? ?? sessionId ?? '',
           questions: (f['questions'] as List? ?? [])
               .map((q) => AskQuestion.fromJson(q as Map<String, dynamic>))
@@ -3520,19 +3546,24 @@ class AppStore extends ChangeNotifier {
         pendingQuestion = request; // legacy single-pending compatibility
         // issue #120：真机定位日志（只观测）——记录问询实际挂到哪个 session、
         // 帧自身携带的 sessionId、以及 store 当前会话，便于与 ChatScreen 的日志对账。
-        AppLog.instance.log(
+        AppLog.instance.debug(
           '[120-debug] question pending stored: '
+          'rpcId=${request.rpcId} questionId=${request.questionId ?? ''} '
           'sessionId=${request.sessionId} '
           'frameSessionId=${f['sessionId'] ?? ''} '
           'storeSessionId=${sessionId ?? ''} '
-          'rpcId=${request.rpcId}',
+          'epoch=${api.connectionEpoch} pendingAfter=$pendingQuestionCount',
         );
         notifyListeners();
         _emitChatEvent(
           ChatEvent(
             type: 'question/requested',
             sessionId: request.sessionId,
-            data: {'rpcId': request.rpcId, 'sessionId': request.sessionId},
+            data: {
+              'rpcId': request.rpcId,
+              'questionId': request.questionId,
+              'sessionId': request.sessionId,
+            },
           ),
         );
         onAttentionEvent?.call(
@@ -3550,8 +3581,10 @@ class AppStore extends ChangeNotifier {
                 : request.questions.first.question,
           ),
         );
-        AppLog.instance.log(
-          '通知：问询帧到达 rpc=${request.rpcId} session=${request.sessionId}（已交给本地通知）',
+        AppLog.instance.debug(
+          '通知：问询帧到达 rpc=${request.rpcId} questionId=${request.questionId ?? ''} '
+          'session=${request.sessionId} epoch=${api.connectionEpoch} '
+          'pendingAfter=$pendingQuestionCount（已交给本地通知）',
         );
         return;
       }
@@ -3569,12 +3602,21 @@ class AppStore extends ChangeNotifier {
         if (rid is String && rid.isNotEmpty) {
           onAttentionResolved?.call(rid, api.profileId, api.hostIdentity);
         }
+        AppLog.instance.debug(
+          'question/resolved rpcId=${rid ?? ''} questionId=${f['questionId'] ?? ''} '
+          'sessionId=${resolvedSessionId ?? ''} hadPending=$hadPending '
+          'epoch=${api.connectionEpoch} pendingAfter=$pendingQuestionCount',
+        );
         // 无条件转发：即使本地已在提交/取消时提前清空，聊天页也要据此收起卡片
         _emitChatEvent(
           ChatEvent(
             type: 'question/resolved',
             sessionId: resolvedSessionId,
-            data: {'rpcId': rid, 'sessionId': resolvedSessionId},
+            data: {
+              'rpcId': rid,
+              'questionId': f['questionId'],
+              'sessionId': resolvedSessionId,
+            },
           ),
         );
         return;
@@ -3819,6 +3861,10 @@ class AppStore extends ChangeNotifier {
   }
 
   void _scheduleReconnect() {
+    AppLog.instance.debug(
+      'SSE: reconnect scheduled retry=$_retry busy=$_sseBusy '
+      'epoch=${api.connectionEpoch}',
+    );
     _sub?.cancel();
     _sub = null;
     _connecting = false;
