@@ -42,7 +42,7 @@ test("capabilities and repository are read-only and authorized only through a se
     const caps = await service.capabilitiesForSession('session-1');
     assert.equal(caps.available, true);
     assert.equal(caps.readOnly, true);
-    assert.deepEqual(caps.features, { repository: true, branches: true, graph: true, commit: true, worktree: true, preview: true, refsDetail: true, fileHistory: true });
+    assert.deepEqual(caps.features, { repository: true, branches: true, graph: true, commit: true, worktree: true, preview: true, refsDetail: true, fileHistory: true, tags: true });
     const repository = await service.repositoryForSession("session-1");
     assert.match(repository.repositoryId, /^repo_[A-Za-z0-9_-]+$/);
     assert.equal(repository.name, root.split("/").at(-1));
@@ -980,4 +980,73 @@ test("branches service returns stale-upstream rows as 0/null without failing", a
     rmSync(root, { recursive: true, force: true });
     rmSync(remote, { recursive: true, force: true });
   }
+});
+
+test("tags list: lightweight/annotated peel, sorted, non-commit hint, repository scoped", async () => {
+  const root = mkdtempSync(`${tmpdir()}/git-read-tags-`);
+  try {
+    fixture(root);
+    writeFileSync(join(root, "a.txt"), "a\n");
+    git(root, "add", "a.txt"); git(root, "commit", "-m", "first");
+    git(root, "tag", "v1.0.0");
+    git(root, "tag", "-a", "v2.0.0", "-m", "annotated subject");
+    const blob = git(root, "hash-object", "-w", "--stdin");
+    git(root, "tag", "blob-tag", blob);
+    const service = createGitReadService(context(root));
+    const repository = await service.repositoryForSession("session-1");
+    const caps = await service.capabilitiesForSession("session-1");
+    assert.equal(caps.features.tags, true);
+    const result = await service.tags("session-1", repository.repositoryId);
+    assert.equal(result.repositoryId, repository.repositoryId);
+    assert.equal(result.truncated, false);
+    assert.deepEqual(result.tags.map((tag) => tag.shortName), ["blob-tag", "v1.0.0", "v2.0.0"]);
+    const light = result.tags.find((tag) => tag.shortName === "v1.0.0");
+    assert.equal(light.annotated, false);
+    assert.equal(light.targetOid, light.refOid);
+    const annotated = result.tags.find((tag) => tag.shortName === "v2.0.0");
+    assert.equal(annotated.annotated, true);
+    assert.equal(annotated.peeled, true);
+    assert.notEqual(annotated.refOid, annotated.targetOid);
+    assert.equal(annotated.subject, "annotated subject");
+    const blobTag = result.tags.find((tag) => tag.shortName === "blob-tag");
+    assert.equal(blobTag.targetOid, null);
+    assert.equal(blobTag.hint, "non-commit-target");
+    await assert.rejects(() => service.tags("missing", repository.repositoryId), (e) => e.code === "repository-not-authorized" && e.status === 403);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("tags 5000 boundary: exactly 5000 is complete, 5001 sets truncated", async () => {
+  const root = mkdtempSync(`${tmpdir()}/git-read-tags-cap-`);
+  try {
+    const session = { id: "session-1", header: { cwd: root } };
+    const rows = (count) => Array.from({ length: count }, (_, i) => ({
+      kind: "tag", name: `refs/tags/t${String(i).padStart(5, "0")}`, shortName: `t${String(i).padStart(5, "0")}`,
+      oid: "a".repeat(40), commitOid: "a".repeat(40), annotated: false,
+    }));
+    for (const [count, expectedTruncated] of [[5000, false], [5001, true]]) {
+      const provider = {
+        contractVersion: "1.0.0",
+        capabilities: () => ({ available: true }),
+        repositoryRoot: async () => root,
+        branches: async () => [],
+        resolveTip: async () => null,
+        graph: async () => ({ commits: [], refsDetail: [], tagsDetail: [] }),
+        commit: async () => null,
+        refs: async () => rows(count),
+      };
+      const ctx = {
+        get(name) {
+          if (name === "sessions") return { get: (id) => id === session.id ? session : undefined };
+          if (name === "workspaceRegistry") return { list: () => [{ path: root }] };
+          if (name === "gitReadProvider") return provider;
+          return undefined;
+        },
+      };
+      const service = createGitReadService(ctx);
+      const repository = await service.repositoryForSession(session.id);
+      const result = await service.tags(session.id, repository.repositoryId);
+      assert.equal(result.tags.length, 5000);
+      assert.equal(result.truncated, expectedTruncated);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

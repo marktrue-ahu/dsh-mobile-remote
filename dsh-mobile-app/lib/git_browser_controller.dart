@@ -8,11 +8,22 @@ import 'package:flutter/foundation.dart';
 import 'api.dart';
 import 'git_models.dart';
 
+enum TagLocateOutcome { located, failed, stale }
+
 class GitBrowserState {
   final String? sessionId;
   final GitReadCapabilities? capabilities;
   final GitRepository? repository;
   final List<GitBranch> branches;
+  final List<GitTag> tags;
+  final String tagQuery;
+  final bool loadingTags;
+  final bool tagsLoaded;
+  final bool tagsTruncated;
+  final String? tagsError;
+  final String? tagFocusOid;
+  final int tagFocusSeq;
+  final String? tagFocusError;
   final String branchQuery;
   final List<GitBranch> selectedBranches;
   final List<GitCommitSummary> commits;
@@ -57,6 +68,15 @@ class GitBrowserState {
     this.capabilities,
     this.repository,
     this.branches = const [],
+    this.tags = const [],
+    this.tagQuery = '',
+    this.loadingTags = false,
+    this.tagsLoaded = false,
+    this.tagsTruncated = false,
+    this.tagsError,
+    this.tagFocusOid,
+    this.tagFocusSeq = 0,
+    this.tagFocusError,
     this.branchQuery = '',
     this.selectedBranches = const [],
     this.commits = const [],
@@ -86,6 +106,18 @@ class GitBrowserState {
     this.graphPageTimedOutNewer = false,
   });
 
+  List<GitTag> get filteredTags {
+    final query = tagQuery.trim().toLowerCase();
+    if (query.isEmpty) return tags;
+    return UnmodifiableListView(
+      tags.where(
+        (tag) =>
+            tag.shortName.toLowerCase().contains(query) ||
+            tag.name.toLowerCase().contains(query),
+      ),
+    );
+  }
+
   List<GitBranch> get filteredBranches {
     final query = branchQuery.trim().toLowerCase();
     if (query.isEmpty) return branches;
@@ -101,6 +133,15 @@ class GitBrowserState {
     Object? capabilities = _keep,
     Object? repository = _keep,
     List<GitBranch>? branches,
+    List<GitTag>? tags,
+    String? tagQuery,
+    bool? loadingTags,
+    bool? tagsLoaded,
+    bool? tagsTruncated,
+    Object? tagsError = _keep,
+    Object? tagFocusOid = _keep,
+    int? tagFocusSeq,
+    Object? tagFocusError = _keep,
     String? branchQuery,
     List<GitBranch>? selectedBranches,
     List<GitCommitSummary>? commits,
@@ -139,6 +180,21 @@ class GitBrowserState {
         ? this.repository
         : repository as GitRepository?,
     branches: branches == null ? this.branches : UnmodifiableListView(branches),
+    tags: tags == null ? this.tags : UnmodifiableListView(tags),
+    tagQuery: tagQuery ?? this.tagQuery,
+    loadingTags: loadingTags ?? this.loadingTags,
+    tagsLoaded: tagsLoaded ?? this.tagsLoaded,
+    tagsTruncated: tagsTruncated ?? this.tagsTruncated,
+    tagsError: identical(tagsError, _keep)
+        ? this.tagsError
+        : tagsError as String?,
+    tagFocusOid: identical(tagFocusOid, _keep)
+        ? this.tagFocusOid
+        : tagFocusOid as String?,
+    tagFocusSeq: tagFocusSeq ?? this.tagFocusSeq,
+    tagFocusError: identical(tagFocusError, _keep)
+        ? this.tagFocusError
+        : tagFocusError as String?,
     branchQuery: branchQuery ?? this.branchQuery,
     selectedBranches: selectedBranches == null
         ? this.selectedBranches
@@ -220,6 +276,7 @@ class GitBrowserController extends ChangeNotifier {
   int _worktreeCheckGeneration = 0;
   int _previewGeneration = 0;
   Future<void>? _graphPageRequest;
+  int _tagIntentGeneration = 0;
   bool _graphPageWantedNewer = false;
   // issue #100：prev 预取先缓存，不立即前插；用户真实到顶才应用。
   GitGraphPage? _pendingPrevPage;
@@ -240,11 +297,14 @@ class GitBrowserController extends ChangeNotifier {
   /// issue #93：可选全部分支能力（旧宿主/旧 fake 不实现 → 回退选择档）。
   GitGraphAllApi? get _allApi => _api is GitGraphAllApi ? _api as GitGraphAllApi : null;
 
-  /// issue #93：不限档 + 宿主声明 graphAll → 真正的全部分支模式。
-  bool get graphAllMode =>
-      _branchLimit.isUnlimited &&
-      (_state.capabilities?.graphAll ?? false) &&
-      _allApi != null;
+  bool get supportsAllGraph =>
+      (_state.capabilities?.graphAll ?? false) && _allApi != null;
+
+  /// 用户当前的「不限档」是否可走全部分支图（默认 5 档为 false）。
+  bool get allModeCapable => _branchLimit.isUnlimited && supportsAllGraph;
+
+  /// 当前**图数据**是否来自 all 快照；分页/显示必须据此判断，不能只看档位。
+  bool get graphAllMode => _state.graphAll && supportsAllGraph;
 
   int get graphAllPageSize =>
       _state.capabilities?.graphAllPageSize ?? graphPageSize;
@@ -378,7 +438,10 @@ class GitBrowserController extends ChangeNotifier {
     if (_state.sessionId == null || _state.repository == null) return;
     // issue #95：all 模式重试必须回到 all=true + focus 当前分支，绝不回退选择集。
     if (graphAllMode) {
-      await openAllGraph(focus: _state.repository?.currentBranch);
+      await openAllGraph(
+        focus: _state.repository?.currentBranch,
+        forceAll: true,
+      );
       return;
     }
     if (_state.selectedBranches.isEmpty) return;
@@ -675,6 +738,121 @@ class GitBrowserController extends ChangeNotifier {
       if (branch.isRemote) return branch;
     }
     return null;
+  }
+
+  void setTagQuery(String value) {
+    _emit(_state.copyWith(tagQuery: value));
+  }
+
+  Future<void> loadTags({bool force = false}) async {
+    if (_state.loadingTags) return;
+    if (_state.tagsLoaded && !force) return;
+    final api = _api;
+    final tagsApi = api is GitTagsApi ? api as GitTagsApi : null;
+    if (tagsApi == null) {
+      _emit(_state.copyWith(tagsLoaded: true, tagsError: 'unsupported'));
+      return;
+    }
+    final repository = _state.repository;
+    if (repository == null) return;
+    final generation = _generation;
+    _emit(_state.copyWith(loadingTags: true, tagsError: null));
+    try {
+      final page = await tagsApi.tags(_state.sessionId ?? '', repository.repositoryId);
+      if (generation != _generation) return;
+      _emit(_state.copyWith(
+        tags: page.tags,
+        tagsTruncated: page.truncated,
+        loadingTags: false,
+        tagsLoaded: true,
+      ));
+    } catch (e) {
+      if (generation != _generation) return;
+      _emit(_state.copyWith(loadingTags: false, tagsLoaded: true, tagsError: '$e'));
+    }
+  }
+
+  /// 窗口外 tag：staged 请求成功后才原子切换图状态；失败保留原图/选择集/滚动。
+  Future<void> openTagFocus(String focus, {int? intent}) async {
+    final myIntent = intent ?? ++_tagIntentGeneration;
+    final api = _allApi;
+    final sessionId = _state.sessionId;
+    final repository = _state.repository;
+    if (api == null ||
+        sessionId == null ||
+        repository == null ||
+        !supportsAllGraph) {
+      _emit(_state.copyWith(tagFocusError: 'graph-focus-invalid'));
+      return;
+    }
+    final generation = _generation;
+    // tag 请求不推进全局图代：避免作废用户正在进行的分页/loading 状态。
+    final graphGeneration = _graphGeneration;
+    try {
+      final page = await api.graphAll(
+        sessionId,
+        repository.repositoryId,
+        all: true,
+        focus: focus,
+        snapshotId: null,
+        cursor: null,
+        limit: graphAllPageSize,
+        timeout: const Duration(seconds: 35),
+      );
+      if (generation != _generation ||
+          graphGeneration != _graphGeneration ||
+          myIntent != _tagIntentGeneration) {
+        return;
+      }
+      _cancelGraphTimeout();
+      // 成功提交新图才推进图代：作废旧分页/预取，防止旧 snapshot 页 append 到新图。
+      _graphGeneration++;
+      _graphPageRequest = null;
+      _resetPendingPrev();
+      _applyAllGraphPage(page, initial: true, newer: false);
+      _emit(_state.copyWith(
+        tagFocusOid: focus,
+        tagFocusSeq: _state.tagFocusSeq + 1,
+        tagFocusError: null,
+        loadingGraphPage: false,
+      ));
+    } catch (error) {
+      if (generation != _generation ||
+          graphGeneration != _graphGeneration ||
+          myIntent != _tagIntentGeneration) {
+        return;
+      }
+      _cancelGraphTimeout();
+      final apiError = error is ApiException ? error : null;
+      _emit(_state.copyWith(
+        tagFocusError: apiError?.code ?? 'graph-focus-not-found',
+      ));
+    }
+  }
+
+  /// 点击 tag：当前已加载 commits 命中则只设置 focus（零网络）；未命中一次 all=true focus。
+  Future<TagLocateOutcome> locateTag(GitTag tag) async {
+    final target = tag.targetOid;
+    if (target == null || target.isEmpty) return TagLocateOutcome.failed;
+    final intent = ++_tagIntentGeneration;
+    // 任何 tag 意图都作废旧 all 请求：先窗口外 A 挂起、再点窗口内 B 时，
+    // A 的迟到响应不得覆盖 B；只递增独立 intent，不动全局图代/分页 loading。
+    final index = _state.commits.indexWhere((commit) => commit.oid == target);
+    if (index >= 0) {
+      _emit(_state.copyWith(
+        graphFocusOid: target,
+        tagFocusOid: target,
+        tagFocusSeq: _state.tagFocusSeq + 1,
+      ));
+      return TagLocateOutcome.located;
+    }
+    await openTagFocus(target, intent: intent);
+    if (intent != _tagIntentGeneration) return TagLocateOutcome.stale;
+    return _state.tagFocusError == null &&
+            _state.tagFocusOid == target &&
+            _state.graphFocusOid == target
+        ? TagLocateOutcome.located
+        : TagLocateOutcome.failed;
   }
 
   void setBranchQuery(String value) {
@@ -1091,9 +1269,9 @@ class GitBrowserController extends ChangeNotifier {
   }
 
   /// issue #93：打开全部分支图（首页或 focus 页）。
-  Future<void> openAllGraph({String? focus}) async {
+  Future<void> openAllGraph({String? focus, bool forceAll = false}) async {
     _resetPendingPrev();
-    if (!graphAllMode) return;
+    if (!allModeCapable && !forceAll) return;
     final generation = _generation;
     final graphGeneration = ++_graphGeneration;
     _graphPageRequest = null;
