@@ -1083,14 +1083,15 @@ void main() {
     expect(api.requests, requestsAfterB, reason: '旧 A continuation 不得额外请求 B');
   });
 
-  test('A resume 停在首次 journal 持久化→切 B：B prefs/journal 不变', () async {
+  test('A→B→A 后旧 A journal 写入不得覆盖新 A sentinel', () async {
     SharedPreferences.setMockInitialValues({
       'dsh_mr_base': 'https://a.example.com/m',
       'dsh_mr_token': 'a-token',
     });
     var host = 'host-a';
+    final api = _StoreApi();
     final manager = ConnectionManager(
-      api: Api()..baseUrl = '',
+      api: api,
       credentials: MemoryCredentialStore(),
       probeBootstrap: (_) async => {'plugin': {'hostId': host}},
     );
@@ -1106,10 +1107,10 @@ void main() {
     );
     manager.profiles.add(b);
     await manager.credentials.writeToken(b.id, 'b-token');
-    final store = AppStore(apiClient: _StoreApi())..attachConnections(manager);
+    final store = AppStore(apiClient: api)..attachConnections(manager);
     addTearDown(store.disposeBridge);
     store.pluginUpdateJournal = PluginUpdateJournal(
-      opId: 'op-a',
+      opId: 'op-a-old',
       targetVersion: '3.3.0',
       targetContentSha256: 'a' * 64,
       startedAt: DateTime.now().toUtc(),
@@ -1128,11 +1129,27 @@ void main() {
     expect(entered, isTrue);
     host = 'host-b';
     expect(await store.switchProfile(b.id), isNull);
+    host = 'host-a';
+    expect(await store.switchProfile(a.id), isNull);
+    // A 新一代 sentinel：旧 A persist 若只看 scope（A→B→A 后仍相同）会覆盖它。
+    final sentinel = PluginUpdateJournal(
+      opId: 'op-a-new',
+      targetVersion: '3.3.1',
+      targetContentSha256: 'n' * 64,
+      startedAt: DateTime.now().toUtc(),
+      phase: UpdatePhase.pluginRetry,
+    );
+    store.pluginUpdateJournal = sentinel;
+    store.pluginUpdateNotice = 'A new sentinel';
+    final sentinelPrefs = await SharedPreferences.getInstance();
+    await sentinelPrefs.setString(
+      'dsh_mr_plugin_update_journal.${a.id}:host-a',
+      jsonEncode(sentinel.toJson()),
+    );
     gate.complete();
     await resume;
-    expect(store.pluginUpdateJournal, isNull);
-    final prefs = await SharedPreferences.getInstance();
-    expect(prefs.getString('dsh_mr_plugin_update_journal.${b.id}:host-b'), isNull);
+    expect(identical(store.pluginUpdateJournal, sentinel), isTrue);
+    expect(store.pluginUpdateNotice, 'A new sentinel');
   });
 
   test('persist 失败发生在 apply B 后：回滚 A generation 并重建 A SSE', () async {

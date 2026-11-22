@@ -1153,6 +1153,7 @@ class AppStore extends ChangeNotifier {
         _kPluginUpdateJournal,
         jsonEncode(journal.toJson()),
         scope: ctx.scope,
+        epoch: ctx.epoch,
       );
       await continueGate?.call();
       if (!current()) return;
@@ -1217,6 +1218,7 @@ class AppStore extends ChangeNotifier {
         _kPluginUpdateJournal,
         jsonEncode(pluginUpdateJournal!.toJson()),
         scope: ctx.scope,
+        epoch: ctx.epoch,
       );
       if (!current()) return;
       updateCandidate = candidate;
@@ -1257,6 +1259,7 @@ class AppStore extends ChangeNotifier {
         _kPluginUpdateJournal,
         jsonEncode(current.toJson()),
         scope: ctx.scope,
+        epoch: ctx.epoch,
       );
       if (!stillCurrent()) return;
     }
@@ -1275,12 +1278,17 @@ class AppStore extends ChangeNotifier {
     final cmp = compareAppVersion(local, target);
     if (cmp == 0) {
       if (_pluginTargetHealthy(release)) {
+        if (!stillCurrent()) return;
         pluginUpdateJournal = current.copyWith(phase: UpdatePhase.done);
         await _persistPrefs(
           _kPluginUpdateJournal,
           jsonEncode(pluginUpdateJournal!.toJson()),
+          scope: ctx.scope,
+        epoch: ctx.epoch,
         );
-        await _clearPluginUpdateJournal();
+        if (!stillCurrent()) return;
+        await _clearPluginUpdateJournal(context: ctx);
+        if (!stillCurrent()) return;
         pluginUpdateNotice = '两端已更新到 v${release.app.version}';
         updateCandidate = null;
       } else if (_pairingBroken(release)) {
@@ -1918,12 +1926,15 @@ class AppStore extends ChangeNotifier {
     String key,
     Object? value, {
     String? scope,
+    int? epoch,
   }) async {
     final capturedScope = scope ?? _profileScope;
+    bool stillCurrent() =>
+        capturedScope == _profileScope &&
+        (epoch == null || epoch == _updateEpoch);
     if (key == _kPluginUpdateJournal) {
       await persistGate?.call(key);
-      // gate/await 后已换档案：旧 A 不得再写任何 profile key。
-      if (capturedScope != _profileScope) return;
+      if (!stillCurrent()) return;
     }
     key = scope == null
         ? _scopedKey(key)
@@ -1931,6 +1942,8 @@ class AppStore extends ChangeNotifier {
               ? '$key.$scope'
               : key);
     final prefs = await SharedPreferences.getInstance();
+    // getInstance 也是 await：真正写前再核验 epoch+scope（A→B→A 同 scope 不同代）。
+    if (!stillCurrent()) return;
     if (value is String) {
       await prefs.setString(key, value);
     } else if (value is bool) {
