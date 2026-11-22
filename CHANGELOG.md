@@ -1,5 +1,36 @@
 # Changelog
 
+## v3.3.1-alpha.1（build 64，issues #150/#152/#160/#161）— 多连接与子代理树候选
+
+> 插件 `3.3.1-alpha.1` / App `3.3.1+64` / 载体 `3.3.1-alpha.1-app`。
+
+### 新功能
+
+- **#152 多连接档案 + 单活动宿主**：profileId 主键、hostId 连接后绑定；staged switch；Android Keystore 原生凭据库 + MethodChannel；FloatingBubbleService 同源迁移；缓存按 `(profileId,hostId)` 隔离；设置页「连接」自包含入口；单活动、多宿主通知延后。
+- **#160 子代理树批准稿**：无 tree rail/连接线；0/14/28dp 缩进 + L4/L5；56dp 展开井（大 chevron + 数量）；展开/正文/中断独立命中；模型 + 本地化 effort 第三行；保留语义 tap 修复。
+- **#150 密集任务卡贴底**：最后一条实际可见消息去掉多余 12dp 尾距，保留 6dp 设计底距；无 50 行分批/隐藏内容。
+- **#161 Git stale upstream fail-soft**：单个本地分支 upstream 被删不再让整个分支列表 `git-command-failed`。
+
+### 未包含/后续 alpha
+
+- #151 提问卡缺失 debug 取证
+- #155 设置页 5 Tab
+- #159 Git tags
+- #158 上下文抽屉
+- #157 图片预览
+- #153 插件三 Tab
+- #154 日志记录/显示拆分
+- #106 DSH 设置只读
+
+### 已接受/已知未验证
+
+- #152 的 Keystore 升级迁移、后台悬浮球/原生 SSE、系统通知撤销、真实慢响应切档未真机验证。
+- #160 的触控命中/TalkBack 未真机验证；截图来自 widget render。
+- #150 未做真机像素验收；几何测试走真实 SliverList 路径。
+- `origin/upstream/*` 已清理；本地 upstream 分支统一跟踪 `github/upstream/*`。
+- #113 等 3.3.0 收尾项不重复。
+
+
 ## v3.3.0-alpha.1（build 61，issues #105/#107/#117/#125/#136/#138）— 3.3.0 功能候选
 
 > 插件 `3.3.0-alpha.1` / App `3.3.0+61` / 载体 `3.3.0-alpha.1-app`。
