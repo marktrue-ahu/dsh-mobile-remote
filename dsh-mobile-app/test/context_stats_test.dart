@@ -277,4 +277,65 @@ void main() {
     final stillNew = merged.snapshot.mergeRefresh(legacyOlder);
     expect(stillNew.snapshot.pressure?.pressureTokens, 200);
   });
+
+  test('global cut 固化到现存块：缺 token 不继承新 global，后续 token115 仍被接受', () {
+    final current = ContextStatsSnapshot.fromJson({
+      'pressure': {'pressureTokens': 100, 'contextWindow': 1000},
+      'tokenUsage': {
+        'uncachedInput': 100,
+        'output': 10,
+        'cacheRead': 0,
+        'cacheWrite': 0,
+      },
+      'asOfSeq': 100,
+    });
+    final global120 = ContextStatsSnapshot.fromJson({
+      'pressure': {'pressureTokens': 200, 'contextWindow': 1000},
+      'asOfSeq': 120,
+    });
+    final first = current.mergeRefresh(global120);
+    expect(first.snapshot.cutOf('pressure'), 120);
+    expect(
+      first.snapshot.cutOf('tokenUsage'),
+      100,
+      reason: '缺失 token 不得继承新 global',
+    );
+    expect(first.snapshot.tokenUsage?.uncachedInput, 100);
+    expect(first.staleBlocks, contains('tokenUsage'));
+
+    final token115 = ContextStatsSnapshot.fromJson({
+      'tokenUsage': {
+        'uncachedInput': 115,
+        'output': 11,
+        'cacheRead': 0,
+        'cacheWrite': 0,
+      },
+      'asOfSeqByBlock': {'tokenUsage': 115},
+    });
+    final second = first.snapshot.mergeRefresh(token115);
+    expect(
+      second.snapshot.tokenUsage?.uncachedInput,
+      115,
+      reason: '115 > 旧固化 cut 100，应接受',
+    );
+    expect(second.snapshot.cutOf('tokenUsage'), 115);
+    expect(second.snapshot.pressure?.pressureTokens, 200);
+
+    final token110 = ContextStatsSnapshot.fromJson({
+      'tokenUsage': {
+        'uncachedInput': 110,
+        'output': 10,
+        'cacheRead': 0,
+        'cacheWrite': 0,
+      },
+      'asOfSeqByBlock': {'tokenUsage': 110},
+    });
+    final third = second.snapshot.mergeRefresh(token110);
+    expect(
+      third.snapshot.tokenUsage?.uncachedInput,
+      115,
+      reason: '110 < 115 必须拒绝',
+    );
+    expect(third.snapshot.cutOf('tokenUsage'), 115);
+  });
 }

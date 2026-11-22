@@ -318,8 +318,23 @@ class ContextStatsSnapshot {
       incomingValue: incoming.timing,
     );
 
-    // 逐块 watermark 与实际接受值绑定：只有接受新值的块才更新 cut。
+    // 逐块 watermark 与实际保留/接受值绑定：
+    // 先把 current 的 global cut 固化到每个**现存块**（缺失块不得继承新 global），
+    // 再让实际被接受的块更新自己的 cut。被接受但无 cut 的块不得回填旧 global。
     final cuts = <String, int>{...current.asOfSeqByBlock};
+    if (current.asOfSeq != null) {
+      final present = <String>{
+        if (current.pressure != null) 'pressure',
+        if (current.breakdown != null) 'breakdown',
+        if (current.tokenUsage != null) 'tokenUsage',
+        if (current.timing != null) 'timing',
+      };
+      for (final block in present) {
+        if (!acceptedCuts.containsKey(block)) {
+          cuts.putIfAbsent(block, () => current.asOfSeq!);
+        }
+      }
+    }
     for (final entry in acceptedCuts.entries) {
       final cut = entry.value;
       if (cut != null) {
