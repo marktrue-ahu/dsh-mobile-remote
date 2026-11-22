@@ -1,10 +1,11 @@
 // issue #136：应用日志查看/复制弹层。
-//
-// 设计要点：
-//   - 级别阈值同时决定展示行（写入侧已由 AppLog 过滤）；
-//   - 单块 SelectableText.rich 渲染 800 行，不逐行建组件；
-//   - 复制当前（过滤后）/ 复制全部（含低级别与旧格式）明确计数；
+// issue #154：记录级别（AppLog 写入阈值）与显示筛选拆分——
+//   - 头部同时展示 `记录 ≥`（只读）与 `显示 ≥`（本地筛选 chip）；
+//   - 显示筛选只影响本页，记住上次但绝不写 app_log_level、不改记录级别；
+//   - 复制当前只含筛选后行，复制全部含所有已记录行；
 //   - 旧格式无级别行原样显示，按 info 过滤/计数。
+//
+// 渲染仍用单块 SelectableText.rich（800 行不逐行建组件），文件/清理语义不变。
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -35,7 +36,10 @@ class _LogSheetBodyState extends State<_LogSheetBody> {
   );
   String? _text;
   List<AppLogEntry> _all = const [];
-  AppLogLevel _level = AppLog.instance.level;
+  AppLogLevel _displayLevel = AppLog.defaultDisplayLevel;
+
+  /// 记录级别只读：只能在设置页修改，日志页不得改写。
+  AppLogLevel get _recordLevel => AppLog.instance.level;
 
   @override
   void initState() {
@@ -44,6 +48,7 @@ class _LogSheetBodyState extends State<_LogSheetBody> {
   }
 
   Future<void> _load() async {
+    final display = await AppLog.instance.loadDisplayLevel();
     String text;
     try {
       text = await widget.read;
@@ -54,62 +59,60 @@ class _LogSheetBodyState extends State<_LogSheetBody> {
     setState(() {
       _text = text;
       _all = AppLog.parseLines(text);
+      _displayLevel = display;
     });
   }
 
-  Future<void> _pickLevel() async {
+  Future<void> _pickDisplayLevel() async {
     final msgr = ScaffoldMessenger.of(context);
     showChoiceSheet(
       context,
-      title: L10n.t('日志记录级别', 'Log level'),
+      title: L10n.t('日志显示筛选', 'Log display filter'),
       items: [
         (
           id: AppLogLevel.debug.name,
           name: L10n.t('调试（debug）', 'Debug'),
           sub: L10n.t(
-            '记录所有日志，包括高频排障信息；可能增加日志体积',
-            'Record everything, including high-frequency troubleshooting data; may increase log size',
+            '显示所有已记录日志；不会补记未写入的 debug',
+            'Show all recorded logs; debug lines that were not recorded cannot be recovered',
           ),
         ),
         (
           id: AppLogLevel.info.name,
           name: L10n.t('信息（info）', 'Info'),
-          sub: L10n.t(
-            '默认；启动、连接、关键动作',
-            'Default; startup, connection, key actions',
-          ),
+          sub: L10n.t('显示信息及以上', 'Show info and above'),
         ),
         (
           id: AppLogLevel.warn.name,
           name: L10n.t('警告（warn）', 'Warning'),
-          sub: L10n.t('仅警告与错误', 'Warnings and errors only'),
+          sub: L10n.t('仅显示警告与错误', 'Show warnings and errors only'),
         ),
         (
           id: AppLogLevel.error.name,
           name: L10n.t('错误（error）', 'Error'),
-          sub: L10n.t('仅错误', 'Errors only'),
+          sub: L10n.t('仅显示错误', 'Show errors only'),
         ),
       ],
-      selectedId: _level.name,
+      selectedId: _displayLevel.name,
       footnote: L10n.t(
-        '只影响之后写入与日志页展示；已有日志不删除。低于当前级别的历史行会被隐藏。',
-        'Affects future writes and this view only; existing logs are not deleted. Older lines below the level are hidden.',
+        '仅筛选显示，不改变记录级别；未记录的低级别日志无法补回。',
+        'Display filter only; does not change the recording level. Lower-level lines that were not recorded cannot be recovered.',
       ),
       onPick: (id) async {
-        final level = AppLogLevel.tryParse(id) ?? AppLogLevel.info;
-        final failure = await AppLog.instance.setLevel(level);
+        final level = AppLogLevel.tryParse(id) ?? AppLog.defaultDisplayLevel;
+        final failure = await AppLog.instance.setDisplayLevel(level);
         if (!mounted) return;
         if (failure != null) {
           showToastAt(msgr, '${L10n.t('设置失败：', 'Failed: ')}$failure');
           return;
         }
-        setState(() => _level = level);
+        setState(() => _displayLevel = level);
       },
     );
   }
 
   List<AppLogEntry> get _displayed =>
-      AppLog.filterEntries(_all, _level).reversed.toList();
+      AppLog.filterEntries(_all, _displayLevel).reversed.toList();
 
   void _copyCurrent() {
     final msgr = ScaffoldMessenger.of(context);
@@ -119,8 +122,8 @@ class _LogSheetBodyState extends State<_LogSheetBody> {
     showToastAt(
       msgr,
       L10n.t(
-        '已复制 ${rows.length} 行（≥ ${_level.label}）',
-        'Copied ${rows.length} lines (≥ ${_level.label})',
+        '已复制 ${rows.length} 行（显示 ≥ ${_displayLevel.label}）',
+        'Copied ${rows.length} lines (display ≥ ${_displayLevel.label})',
       ),
     );
   }
@@ -164,56 +167,85 @@ class _LogSheetBodyState extends State<_LogSheetBody> {
     final displayed = _displayed;
     final hasLegacy = _all.any((entry) => !entry.hasLevel);
     final hiddenBelow = _all.length - displayed.length;
+    final displayBelowRecord = _displayLevel.rank < _recordLevel.rank;
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        Semantics(
+          excludeSemantics: true,
+          label: L10n.t(
+            '当前记录级别 ${_recordLevel.label}；最近 ${_all.length} 行',
+            'Recording level ${_recordLevel.label}; last ${_all.length} lines',
+          ),
+          child: Text(
+            L10n.t(
+              '最近 ${_all.length} 行 · 记录 ≥ ${_recordLevel.label}',
+              'Last ${_all.length} lines · recording ≥ ${_recordLevel.label}',
+            ),
+            key: const ValueKey('log-summary'),
+            style: TextStyle(fontSize: 11, color: ink3),
+          ),
+        ),
+        const SizedBox(height: 4),
         Row(
           children: [
-            Expanded(
-              child: Text(
-                L10n.t(
-                  '最近 ${_all.length} 行 · 显示 ≥ ${_level.label}',
-                  'Last ${_all.length} lines · showing ≥ ${_level.label}',
-                ),
-                key: const ValueKey('log-summary'),
-                style: TextStyle(fontSize: 11, color: ink3),
-              ),
+            Text(
+              L10n.t('显示 ≥', 'Display ≥'),
+              style: TextStyle(fontSize: 11.5, color: ink3),
             ),
-            const SizedBox(width: 8),
+            const SizedBox(width: 6),
             Semantics(
               button: true,
+              excludeSemantics: true,
               label: L10n.t(
-                '日志级别，当前 ${_level.label}',
-                'Log level, currently ${_level.label}',
+                '日志显示筛选，当前 ${_displayLevel.label}；仅筛选显示',
+                'Log display filter, currently ${_displayLevel.label}; view only',
               ),
-              child: InkWell(
-                key: const ValueKey('log-level-chip'),
-                onTap: _pickLevel,
-                borderRadius: BorderRadius.circular(999),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 10,
-                    vertical: 6,
-                  ),
-                  decoration: BoxDecoration(
-                    color: DshColors.brandSoft(context),
-                    borderRadius: BorderRadius.circular(999),
-                    border: Border.all(color: DshColors.brand(context)),
-                  ),
-                  child: Text(
-                    '${_level.label} ▾',
-                    maxLines: 1,
-                    style: TextStyle(
-                      fontSize: 11,
-                      fontWeight: FontWeight.w600,
-                      color: DshColors.brand(context),
+              onTap: _pickDisplayLevel,
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(minWidth: 44, minHeight: 44),
+                child: InkWell(
+                  key: const ValueKey('log-level-chip'),
+                  onTap: _pickDisplayLevel,
+                  borderRadius: BorderRadius.circular(999),
+                  child: Center(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: DshColors.brandSoft(context),
+                        borderRadius: BorderRadius.circular(999),
+                        border: Border.all(color: DshColors.brand(context)),
+                      ),
+                      child: Text(
+                        '${_displayLevel.label} ▾',
+                        maxLines: 1,
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          color: DshColors.brand(context),
+                        ),
+                      ),
                     ),
                   ),
                 ),
               ),
             ),
           ],
+        ),
+        Padding(
+          padding: const EdgeInsets.only(top: 2),
+          child: Text(
+            L10n.t(
+              '仅筛选显示，不改变记录级别',
+              'Display filter only; recording level is unchanged',
+            ),
+            key: const ValueKey('log-filter-hint'),
+            style: TextStyle(fontSize: 11, color: ink3),
+          ),
         ),
         if (hasLegacy)
           Padding(
@@ -227,21 +259,50 @@ class _LogSheetBodyState extends State<_LogSheetBody> {
               style: TextStyle(fontSize: 11, color: ink3),
             ),
           ),
+        if (displayBelowRecord)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(
+              L10n.t(
+                '显示级别低于记录级别；更详细日志未被记录',
+                'Display level is below the recording level; more detailed lines were not recorded',
+              ),
+              key: const ValueKey('log-display-below-record'),
+              style: TextStyle(fontSize: 11, color: DshColors.warn(context)),
+            ),
+          ),
         const SizedBox(height: 8),
         ConstrainedBox(
           constraints: const BoxConstraints(maxHeight: 300),
           child: SingleChildScrollView(
             child: displayed.isEmpty
-                ? Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 20),
-                    child: Text(
-                      _all.isEmpty
-                          ? L10n.t('（暂无日志）', '(No logs)')
-                          : L10n.t('当前级别下没有日志', 'No logs at the current level'),
-                      key: const ValueKey('log-empty'),
-                      textAlign: TextAlign.center,
-                      style: TextStyle(fontSize: 11.5, color: ink3),
-                    ),
+                ? Column(
+                    children: [
+                      Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 20),
+                        child: Text(
+                          _all.isEmpty
+                              ? L10n.t('（暂无日志）', '(No logs)')
+                              : L10n.t(
+                                  '当前显示级别下没有日志',
+                                  'No logs at the current display level',
+                                ),
+                          key: const ValueKey('log-empty'),
+                          textAlign: TextAlign.center,
+                          style: TextStyle(fontSize: 11.5, color: ink3),
+                        ),
+                      ),
+                      if (_all.isNotEmpty)
+                        Text(
+                          L10n.t(
+                            '调低显示筛选可查看更多已记录日志',
+                            'Lower the display filter to see more recorded logs',
+                          ),
+                          key: const ValueKey('log-empty-hint'),
+                          textAlign: TextAlign.center,
+                          style: TextStyle(fontSize: 11, color: ink3),
+                        ),
+                    ],
                   )
                 : SelectableText.rich(
                     TextSpan(
@@ -272,10 +333,20 @@ class _LogSheetBodyState extends State<_LogSheetBody> {
         Row(
           children: [
             Expanded(
-              child: OutlinedButton(
-                key: const ValueKey('log-copy-all'),
-                onPressed: _all.isEmpty ? null : _copyAll,
-                child: Text(L10n.t('复制全部', 'Copy all')),
+              child: Semantics(
+                button: true,
+                excludeSemantics: true,
+                enabled: _all.isNotEmpty,
+                label: L10n.t(
+                  '复制全部，已记录 ${_all.length} 行（含显示筛选外）',
+                  'Copy all ${_all.length} recorded lines (including filtered out)',
+                ),
+                onTap: _all.isEmpty ? null : _copyAll,
+                child: OutlinedButton(
+                  key: const ValueKey('log-copy-all'),
+                  onPressed: _all.isEmpty ? null : _copyAll,
+                  child: Text(L10n.t('复制全部', 'Copy all')),
+                ),
               ),
             ),
             const SizedBox(width: 10),
@@ -293,8 +364,8 @@ class _LogSheetBodyState extends State<_LogSheetBody> {
             padding: const EdgeInsets.only(top: 4),
             child: Text(
               L10n.t(
-                '复制全部含 $hiddenBelow 行低于当前级别/旧格式日志',
-                'Copy all includes $hiddenBelow lines below the current level or legacy',
+                '复制全部含 $hiddenBelow 行被显示筛选隐藏（含旧格式）',
+                'Copy all includes $hiddenBelow lines hidden by the display filter (including legacy)',
               ),
               textAlign: TextAlign.center,
               style: TextStyle(fontSize: 11, color: ink3),
