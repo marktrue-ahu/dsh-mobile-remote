@@ -370,7 +370,7 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
         state.capabilities?.available != true) {
       return;
     }
-    if (widget.controller.graphAllMode) {
+    if (widget.controller.allModeCapable) {
       // issue #93：全部分支模式不需要选择集；首屏直接 all=true + focus 当前分支。
       if (_allGraphAutoRequested) return;
       _allGraphAutoRequested = true;
@@ -411,7 +411,7 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
       if (_graphTabIndex >= 0) _tabs.animateTo(_graphTabIndex);
     });
     _defaultGraphRequested = true;
-    if (widget.controller.graphAllMode) {
+    if (widget.controller.allModeCapable) {
       widget.controller.openAllGraph(focus: branch.name);
     } else {
       widget.controller.openBranch(branch);
@@ -953,6 +953,37 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
       );
     }
     if (tags.isEmpty) {
+      if (state.tagsTruncated && state.tagQuery.trim().isNotEmpty) {
+        return Column(
+          children: [
+            Container(
+              key: const ValueKey('git-tags-truncated'),
+              width: double.infinity,
+              color: DshColors.brandSoft(context),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              child: Text(
+                L10n.t(
+                  '本地仅搜索已加载的前 5000 个标签，结果不完整；请缩小搜索范围',
+                  'Only the first 5000 loaded tags are searched locally; results are incomplete',
+                ),
+                style: TextStyle(fontSize: 11.5, color: DshColors.ink2(context)),
+              ),
+            ),
+            Expanded(
+              child: Center(
+                child: Text(
+                  L10n.t(
+                    '前 5000 个标签中没有匹配；后 1 个未加载，不能断言仓库无匹配',
+                    'No match in the first 5000 tags; the remaining tags are not loaded',
+                  ),
+                  key: const ValueKey('git-tags-empty'),
+                  textAlign: TextAlign.center,
+                ),
+              ),
+            ),
+          ],
+        );
+      }
       return Center(
         child: Text(
           state.tagQuery.trim().isEmpty
@@ -972,8 +1003,8 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
             child: Text(
               L10n.t(
-                '仅显示前 5000 个标签，请缩小搜索范围',
-                'Showing the first 5000 tags; narrow your search',
+                '仅显示前 5000 个标签；本地搜索只覆盖已加载部分，请缩小搜索范围',
+                'Showing the first 5000 tags; local search covers only loaded tags',
               ),
               style: TextStyle(fontSize: 11.5, color: DshColors.ink2(context)),
             ),
@@ -1045,7 +1076,7 @@ class _GitBrowserSheetState extends State<GitBrowserSheet>
     if (!mounted) return;
     if (!ok) {
       _toast(
-        widget.controller.state.error == 'graph-focus-not-found'
+        widget.controller.state.tagFocusError == 'graph-focus-not-found'
             ? L10n.t(
                 '标签目标超出全部分支图扫描范围（5000 条/20 秒软超时），未定位',
                 'Tag target is outside the 5000-commit/20s scan limit',

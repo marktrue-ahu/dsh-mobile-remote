@@ -499,7 +499,7 @@ class TruncatedTagApi extends TagWidgetApi {
   Future<GitTagPage> tags(String sessionId, String repositoryId) async =>
       GitTagPage(
         tags: [
-          for (var i = 0; i < 5001; i++)
+          for (var i = 0; i < 5000; i++)
             GitTag(
               name: 'refs/tags/t$i',
               shortName: 't$i',
@@ -509,6 +509,58 @@ class TruncatedTagApi extends TagWidgetApi {
         ],
         truncated: true,
       );
+}
+
+class FailingTagApi extends TagWidgetApi {
+  @override
+  Future<GitGraphPage> graphAll(
+    String sessionId,
+    String repositoryId, {
+    required bool all,
+    String? focus,
+    String? snapshotId,
+    String? cursor,
+    int limit = 16,
+    Duration timeout = const Duration(seconds: 35),
+  }) async {
+    throw ApiException('focus not found', code: 'graph-focus-not-found');
+  }
+}
+
+class PagingTagApi extends TagWidgetApi {
+  int allCalls = 0;
+
+  @override
+  Future<GitGraphPage> graphAll(
+    String sessionId,
+    String repositoryId, {
+    required bool all,
+    String? focus,
+    String? snapshotId,
+    String? cursor,
+    int limit = 16,
+    Duration timeout = const Duration(seconds: 35),
+  }) async {
+    allCalls++;
+    if (allCalls == 1) {
+      return GitGraphPage(
+        snapshotId: 'all-snap',
+        focusOid: focus,
+        pageStart: 0,
+        nextCursor: 'next-1',
+        prevCursor: 'prev-1',
+        tips: const [],
+        commits: const [
+          GitCommitSummary(oid: 'missing-oid', subject: 'Tag target'),
+        ],
+      );
+    }
+    return GitGraphPage(
+      snapshotId: 'all-snap',
+      tips: const [],
+      commits: const [GitCommitSummary(oid: 'older-1', subject: 'Older')],
+    );
+  }
 }
 
 class LongTagApi extends TagWidgetApi {
@@ -1407,9 +1459,54 @@ void main() {
     addTearDown(controller.dispose);
     await tester.tap(find.byKey(const Key('git-branch-subtab-2')));
     await tester.pumpAndSettle();
-    expect(controller.state.tags.length, 5001);
+    expect(controller.state.tags.length, 5000);
     expect(controller.state.tagsTruncated, isTrue);
     expect(find.byKey(const ValueKey('git-tags-truncated')), findsOneWidget);
-    expect(find.textContaining('5000'), findsOneWidget);
+    expect(find.textContaining('5000'), findsWidgets);
+
+    await tester.enterText(
+      find.byKey(const Key('git-branch-search-2')),
+      't5000',
+    );
+    await tester.pumpAndSettle();
+    // 第 5001 个标签未加载：不能显示“没有匹配”并抹掉截断提示。
+    expect(find.byKey(const ValueKey('git-tags-truncated')), findsOneWidget);
+    expect(find.byKey(const ValueKey('git-tags-empty')), findsOneWidget);
+    expect(find.textContaining('not loaded'), findsOneWidget);
+  });
+
+  testWidgets('#159 默认 5 档窗口外 tag 失败：保留原图/选择集/滚动', (tester) async {
+    final api = FailingTagApi();
+    final controller = await mountSheet(tester, api);
+    addTearDown(controller.dispose);
+    await tester.tap(find.byKey(const Key('git-branch-refs/heads/main')));
+    await tester.pumpAndSettle();
+    final commitsBefore = controller.state.commits.map((c) => c.oid).toList();
+    final selectionBefore = controller.state.selectedBranches.map((b) => b.name).toList();
+    await tester.tap(find.descendant(of: find.byType(TabBar), matching: find.text('Branches')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('git-branch-subtab-2')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('git-tag-v2.0.0')));
+    await tester.pumpAndSettle();
+    expect(controller.state.commits.map((c) => c.oid).toList(), commitsBefore);
+    expect(controller.state.selectedBranches.map((b) => b.name).toList(), selectionBefore);
+    expect(controller.state.tagFocusError, 'graph-focus-not-found');
+  });
+
+  testWidgets('#159 默认 5 档 force all 后可继续下一页，选择集不变', (tester) async {
+    final api = PagingTagApi();
+    final controller = await mountSheet(tester, api);
+    addTearDown(controller.dispose);
+    final selectionBefore = controller.state.selectedBranches.map((b) => b.name).toList();
+    await controller.openTagFocus('missing-oid');
+    expect(controller.state.graphAll, isTrue);
+    expect(controller.state.graphNextCursor, 'next-1');
+    await controller.loadNextGraphPage();
+    expect(api.allCalls, 2);
+    expect(controller.state.commits.map((c) => c.oid), contains('older-1'));
+    await controller.loadPrevGraphPage();
+    expect(api.allCalls, 3);
+    expect(controller.state.selectedBranches.map((b) => b.name).toList(), selectionBefore);
   });
 }
