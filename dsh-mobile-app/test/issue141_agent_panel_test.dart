@@ -625,4 +625,102 @@ void main() {
       ]);
     });
   });
+
+  group('#160 子代理树命中区/层级', () {
+    List<Map<String, dynamic>> deepTree() => [
+      _row('c1', name: 'a1', depth: 1, parent: _root, title: '一级'),
+      _row('c2', name: 'a2', depth: 2, parent: 'c1', title: '二级'),
+      _row('c3', name: 'a3', depth: 3, parent: 'c2', title: '三级'),
+      _row('c4', name: 'a4', depth: 4, parent: 'c3', title: '四级'),
+      _row('c5', name: 'a5', depth: 5, parent: 'c4', title: '五级'),
+    ];
+
+    testWidgets('展开区 44×44：点边缘只展开，不打开；正文点击才进会话', (tester) async {
+      final backend = _Backend(deepTree());
+      final store = await _mountPanel(tester, backend);
+      final expand = find.byKey(const ValueKey('agent-expand-c1'));
+      expect(tester.getSize(expand), const Size(44, 44));
+      await tester.tapAt(tester.getTopLeft(expand) + const Offset(3, 3));
+      await _settle(tester);
+      expect(
+        find.byKey(const ValueKey('agent-row-c2')),
+        findsOneWidget,
+        reason: '44dp 命中区任意位置都应展开',
+      );
+      expect(store.sessionId, _root);
+      expect(find.byType(ChatScreen), findsNothing);
+
+      await tester.tap(find.byKey(const ValueKey('agent-body-c1')));
+      await _settle(tester);
+      expect(find.byType(ChatScreen), findsOneWidget);
+    });
+
+    testWidgets('level>3：停在 28dp、副行 L{n}、rail 缺口语义“显示封顶”', (tester) async {
+      final backend = _Backend(deepTree());
+      await _mountPanel(tester, backend);
+      for (final id in ['c1', 'c2', 'c3', 'c4']) {
+        await tester.tap(find.byKey(ValueKey('agent-expand-$id')));
+        await _settle(tester);
+      }
+      final x3 = tester
+          .getTopLeft(find.byKey(const ValueKey('agent-body-c3')))
+          .dx;
+      final x4 = tester
+          .getTopLeft(find.byKey(const ValueKey('agent-body-c4')))
+          .dx;
+      final x5 = tester
+          .getTopLeft(find.byKey(const ValueKey('agent-body-c5')))
+          .dx;
+      expect(x4, closeTo(x3, 0.1), reason: 'level 4 必须停在第 3 级缩进');
+      expect(x5, closeTo(x3, 0.1), reason: 'level 5 必须停在第 3 级缩进');
+      expect(find.textContaining('L4'), findsOneWidget);
+      expect(find.textContaining('L5'), findsOneWidget);
+      final semantics = tester.ensureSemantics();
+      expect(find.bySemanticsLabel(RegExp(r'第 5 层（显示封顶在第三级）')), findsOneWidget);
+      semantics.dispose();
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('320/深色/2.0x：深层树不溢出，L{n} 仍可见', (tester) async {
+      final backend = _Backend(deepTree());
+      await _mountPanel(
+        tester,
+        backend,
+        size: const Size(320, 700),
+        textScaler: const TextScaler.linear(2.0),
+        theme: DshTheme.dark(),
+      );
+      for (final id in ['c1', 'c2', 'c3', 'c4']) {
+        await tester.tap(find.byKey(ValueKey('agent-expand-$id')));
+        await _settle(tester);
+      }
+      expect(tester.takeException(), isNull);
+      expect(find.textContaining('L4'), findsOneWidget);
+      expect(find.textContaining('L5'), findsOneWidget);
+      final expand = find.byKey(const ValueKey('agent-expand-c1'));
+      expect(tester.getSize(expand), const Size(44, 44));
+    });
+
+    testWidgets('降级 multiLevelUnavailable：不渲染展开区/胶囊，行体仍可打开', (tester) async {
+      final backend = _Backend([
+        _row('old', name: 'old-agent', depth: 1, parent: _root, title: '旧宿主'),
+      ], multiLevelUnavailable: true);
+      final store = await _mountPanel(tester, backend);
+      expect(
+        find.byKey(const ValueKey('agent-expand-old')),
+        findsOneWidget,
+        reason: '保留 44dp 占位布局',
+      );
+      expect(
+        find.byKey(const ValueKey('agent-count-old')),
+        findsNothing,
+        reason: '降级不得渲染胶囊/展开三角形',
+      );
+      expect(find.textContaining('仅提供直接子代理'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('agent-body-old')));
+      await _settle(tester);
+      expect(find.byType(ChatScreen), findsOneWidget);
+      expect(store.sessionId, 'old');
+    });
+  });
 }
