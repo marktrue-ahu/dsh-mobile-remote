@@ -1565,9 +1565,17 @@ class _ChatScreenState extends State<ChatScreen> {
   ///
   /// 键身份是**边界持久 seq**，不是轮次号：同一轮号可以有多个相邻的 `turn/start`
   /// （重试边界），按轮号分配会让它们共用同一个 GlobalKey。
-  Widget _buildItemWithTurnKey(_MsgItem item, {bool historyView = false}) {
+  Widget _buildItemWithTurnKey(
+    _MsgItem item, {
+    bool historyView = false,
+    bool lastInList = false,
+  }) {
     final seq = item.seq;
-    final child = _buildItemWithTurnKeyBody(item, historyView: historyView);
+    final child = _buildItemWithTurnKeyBody(
+      item,
+      historyView: historyView,
+      lastInList: lastInList,
+    );
     // 过程块锚在该轮过程行实际出现的位置（提示词之后），而不是 turn/start 分隔条。
     final blocks = seq == null
         ? null
@@ -1584,17 +1592,29 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  Widget _buildItemWithTurnKeyBody(_MsgItem item, {required bool historyView}) {
+  Widget _buildItemWithTurnKeyBody(
+    _MsgItem item, {
+    required bool historyView,
+    required bool lastInList,
+  }) {
     final seq = item.seq;
     final turn = seq == null ? null : _turnOfStartSeq[seq];
     Widget child;
     if (turn == null || seq == null || item.kind != _MsgKind.divider) {
-      child = _buildItem(item, historyView: historyView);
+      child = _buildItem(
+        item,
+        historyView: historyView,
+        lastInList: lastInList,
+      );
     } else {
       final key = _turnKeysBySeq.putIfAbsent(seq, () => GlobalKey());
       child = KeyedSubtree(
         key: key,
-        child: _buildItem(item, historyView: historyView),
+        child: _buildItem(
+          item,
+          historyView: historyView,
+          lastInList: lastInList,
+        ),
       );
     }
     if (seq != null) {
@@ -1611,6 +1631,32 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     }
     return child;
+  }
+
+  /// issue #150：最后一个**实际可见**的消息子项（隐藏注入/噪声行不算）。
+  ///
+  /// 隐藏行在 SliverList 里是零高度，但它仍是子项；贴底尾距只能根据真正可见的
+  /// 最后一项判定，否则「最后一张任务卡 + 隐藏注入」依旧保留 12dp 空白。
+  bool _tailVisible(_MsgItem item) {
+    if (_isNoiseText(item.text)) return false;
+    if (item.injected && !widget.store.timelineDebug) {
+      return _isTriggerSourceKind(item.sourceKind);
+    }
+    return true;
+  }
+
+  /// [newestFirst]：live `_items` 采用最新在前；视觉最后一项是最小下标。
+  int _lastVisibleItemIndex(List<_MsgItem> list, {bool newestFirst = false}) {
+    if (newestFirst) {
+      for (var i = 0; i < list.length; i++) {
+        if (_tailVisible(list[i])) return i;
+      }
+      return -1;
+    }
+    for (var i = list.length - 1; i >= 0; i--) {
+      if (_tailVisible(list[i])) return i;
+    }
+    return -1;
   }
 
   /// 当前阅读的轮次。
@@ -3564,6 +3610,10 @@ class _ChatScreenState extends State<ChatScreen> {
         'Chat: build itemCount=$itemCount streaming=$_streaming draftLen=${_draft.length} items=${_items.length + _olderItems.length}',
       );
     }
+    // #150：贴底尾距只在最后一条可见消息上收紧；草稿存在时草稿才是最后一项。
+    final liveLastVisible = hasDraft
+        ? -1
+        : _lastVisibleItemIndex(_items, newestFirst: true);
     // v3.1.5（issue #15）：整条消息流包一层 SelectionArea —— 普通 Text 也能长按选中复制，
     // 且不引入 SelectableText（后者在部分 Android 设备上长文本换行/重叠渲染异常，见 md.dart 注释）。
     return SelectionArea(
@@ -3620,6 +3670,9 @@ class _ChatScreenState extends State<ChatScreen> {
                       return _buildItemWithTurnKey(
                         _items[_items.length - 1 - dataIndex],
                         historyView: false,
+                        lastInList:
+                            !hasDraft &&
+                            _items.length - 1 - dataIndex == liveLastVisible,
                       );
                     }
                     if (hasDraft) {
@@ -3708,6 +3761,7 @@ class _ChatScreenState extends State<ChatScreen> {
                     itemBuilder: (context, index) => _buildItemWithTurnKey(
                       _histItems[index],
                       historyView: true,
+                      lastInList: index == _lastVisibleItemIndex(_histItems),
                     ),
                   ),
                 ),
@@ -9809,7 +9863,11 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  Widget _buildItem(_MsgItem item, {bool historyView = false}) {
+  Widget _buildItem(
+    _MsgItem item, {
+    bool historyView = false,
+    bool lastInList = false,
+  }) {
     switch (item.kind) {
       case _MsgKind.user:
         // v3.1.4（issue #12）：系统注入消息（内核 source.kind ≠ "user"）不当普通气泡铺屏，
@@ -9831,7 +9889,9 @@ class _ChatScreenState extends State<ChatScreen> {
               ) ??
               false;
           return Padding(
-            padding: const EdgeInsets.only(bottom: 12),
+            // issue #150：列表最后一项不再保留 12dp 尾距，否则贴底后仍有
+            // 「最后一张任务卡 → 视口底部」空白（设计底距 6dp 由 SliverPadding 保留）。
+            padding: EdgeInsets.only(bottom: lastInList ? 0 : 12),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
