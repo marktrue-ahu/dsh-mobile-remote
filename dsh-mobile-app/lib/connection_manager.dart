@@ -560,6 +560,7 @@ class ConnectionManager {
             profile: restored.id,
             hostIdentity: restored.hostId,
             urls: restored.baseUrls,
+            generation: oldGeneration,
           );
         }
       }

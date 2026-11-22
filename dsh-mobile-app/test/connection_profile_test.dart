@@ -1049,4 +1049,96 @@ void main() {
     expect(store.pluginUpdateJournal, isNull, reason: 'B 不得恢复 A 的未完成 journal');
     expect(store.updateCandidate, isNull);
   });
+
+  test('A resume 停在首次 journal 持久化→切 B：B prefs/journal 不变', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    var host = 'host-a';
+    final manager = ConnectionManager(
+      api: Api()..baseUrl = '',
+      credentials: MemoryCredentialStore(),
+      probeBootstrap: (_) async => {'plugin': {'hostId': host}},
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    a.hostId = 'host-a';
+    manager.profiles[0] = a;
+    final b = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: 'B',
+      baseUrls: ['https://b.example.com/m'],
+      hostId: 'host-b',
+    );
+    manager.profiles.add(b);
+    await manager.credentials.writeToken(b.id, 'b-token');
+    final store = AppStore(apiClient: _StoreApi())..attachConnections(manager);
+    addTearDown(store.disposeBridge);
+    store.pluginUpdateJournal = PluginUpdateJournal(
+      opId: 'op-a',
+      targetVersion: '3.3.0',
+      targetContentSha256: 'a' * 64,
+      startedAt: DateTime.now().toUtc(),
+      phase: UpdatePhase.pluginConfirmed,
+    );
+    final gate = Completer<void>();
+    var entered = false;
+    store.persistGate = (_) {
+      entered = true;
+      return gate.future;
+    };
+    final resume = store.resumePluginUpdate();
+    for (var i = 0; i < 100 && !entered; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+    expect(entered, isTrue);
+    host = 'host-b';
+    expect(await store.switchProfile(b.id), isNull);
+    gate.complete();
+    await resume;
+    expect(store.pluginUpdateJournal, isNull);
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getString('dsh_mr_plugin_update_journal.${b.id}:host-b'), isNull);
+  });
+
+  test('persist 失败发生在 apply B 后：回滚 A generation 并重建 A SSE', () async {
+    SharedPreferences.setMockInitialValues({
+      'dsh_mr_base': 'https://a.example.com/m',
+      'dsh_mr_token': 'a-token',
+    });
+    var host = 'host-a';
+    final api = _StoreApi();
+    final manager = ConnectionManager(
+      api: api,
+      credentials: MemoryCredentialStore(),
+      probeBootstrap: (_) async => {'plugin': {'hostId': host}},
+    );
+    await manager.load();
+    final a = manager.profiles.single;
+    a.hostId = 'host-a';
+    manager.profiles[0] = a;
+    final oldGeneration = manager.generation;
+    final b = ConnectionProfile(
+      id: ConnectionProfile.newId(),
+      displayName: 'B',
+      baseUrls: ['https://b.example.com/m'],
+      hostId: 'host-b',
+    );
+    manager.profiles.add(b);
+    await manager.credentials.writeToken(b.id, 'b-token');
+    final store = AppStore(apiClient: api)..attachConnections(manager);
+    addTearDown(store.disposeBridge);
+    manager.persistOverride = () async => throw StateError('prefs-full');
+    host = 'host-b';
+    final error = await store.switchProfile(b.id);
+    expect(error, isNotNull);
+    expect(manager.activeProfileId, a.id);
+    expect(api.baseUrl, 'https://a.example.com');
+    expect(api.token, 'a-token');
+    expect(manager.generation, oldGeneration);
+    expect(api.connectionGeneration, oldGeneration);
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(store.connState, isNot('offline'));
+  });
 }

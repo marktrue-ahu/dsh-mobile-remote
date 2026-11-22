@@ -428,6 +428,7 @@ class AppStore extends ChangeNotifier {
   /// #152：更新操作的连接代；切换时递增，迟到 continuation 必须丢弃。
   int _updateEpoch = 0;
   Future<void> Function()? updateResumeGate;
+  Future<void> Function(String key)? persistGate;
 
   bool _updateStillCurrent(int epoch, String scope) =>
       epoch == _updateEpoch && scope == ProfileNamespace.scope;
@@ -872,9 +873,16 @@ class AppStore extends ChangeNotifier {
 
   /// 接续判定：宿主重启造成的断线是**正常环节**（评审 R7/R8）。
   /// 判定依据是电脑端下发的事务 + **正在运行的内容标识**，不是版本号。
-  Future<void> resumePluginUpdate({bool connected = true}) =>
-      _resumingUpdate ??= _resumePluginUpdate(connected: connected)
-          .whenComplete(() => _resumingUpdate = null);
+  Future<void> resumePluginUpdate({bool connected = true}) {
+    final existing = _resumingUpdate;
+    if (existing != null) return existing;
+    final future = _resumePluginUpdate(connected: connected);
+    _resumingUpdate = future;
+    future.whenComplete(() {
+      if (identical(_resumingUpdate, future)) _resumingUpdate = null;
+    });
+    return future;
+  }
 
   Future<void> _resumePluginUpdate({required bool connected}) async {
     final updateEpoch = _updateEpoch;
@@ -927,7 +935,9 @@ class AppStore extends ChangeNotifier {
         await _persistPrefs(
           _kPluginUpdateJournal,
           jsonEncode(current.toJson()),
+          scope: updateScope,
         );
+        if (!stillCurrent()) return;
       } else if (serverTx.targetContentSha256.isNotEmpty) {
         current = journal.copyWith(
           targetVersion: serverTx.targetVersion.isEmpty
@@ -943,7 +953,9 @@ class AppStore extends ChangeNotifier {
         await _persistPrefs(
           _kPluginUpdateJournal,
           jsonEncode(current.toJson()),
+          scope: updateScope,
         );
+        if (!stillCurrent()) return;
       }
     }
     final decision = decidePluginUpdateResume(
@@ -958,6 +970,7 @@ class AppStore extends ChangeNotifier {
         _armPluginUpdateTimer(); // 继续等；超时由独立定时器推进
         return;
       case ResumeAction.completed:
+        if (!stillCurrent()) return;
         final tx = api.pluginUpdate.transaction;
         final target = tx?.targetVersion ?? current.targetVersion;
         pluginUpdateJournal = current.copyWith(
@@ -976,18 +989,23 @@ class AppStore extends ChangeNotifier {
         await _persistPrefs(
           _kPluginUpdateJournal,
           jsonEncode(pluginUpdateJournal!.toJson()),
+          scope: updateScope,
         );
+        if (!stillCurrent()) return;
         pluginUpdateNotice = '电脑端插件已更新到 v$target';
         if (!stillCurrent()) return;
         await _continueAppUpdateAfterPlugin();
       case ResumeAction.rolledBack:
       case ResumeAction.failed:
       case ResumeAction.timedOut:
+        if (!stillCurrent()) return;
         pluginUpdateJournal = journal.copyWith(phase: UpdatePhase.pluginRetry);
         await _persistPrefs(
           _kPluginUpdateJournal,
           jsonEncode(pluginUpdateJournal!.toJson()),
+          scope: updateScope,
         );
+        if (!stillCurrent()) return;
         _pluginUpdateTimer?.cancel();
         pluginUpdateNotice =
             '插件目标未确认（${decision.reason}），APK 不会先装；可在设置页重新检查并重试，旧组合仍可继续使用';
@@ -1848,8 +1866,22 @@ class AppStore extends ChangeNotifier {
       ? '$key.$_profileScope'
       : key;
 
-  Future<void> _persistPrefs(String key, Object? value) async {
-    key = _scopedKey(key);
+  Future<void> _persistPrefs(
+    String key,
+    Object? value, {
+    String? scope,
+  }) async {
+    final capturedScope = scope ?? _profileScope;
+    if (key == _kPluginUpdateJournal) {
+      await persistGate?.call(key);
+      // gate/await 后已换档案：旧 A 不得再写任何 profile key。
+      if (capturedScope != _profileScope) return;
+    }
+    key = scope == null
+        ? _scopedKey(key)
+        : (_profileScopedKeys.contains(key)
+              ? '$key.$scope'
+              : key);
     final prefs = await SharedPreferences.getInstance();
     if (value is String) {
       await prefs.setString(key, value);
@@ -2735,6 +2767,14 @@ class AppStore extends ChangeNotifier {
     unawaited(refreshAll());
   }
 
+  /// 提交失败回滚后旧 Api 已被临时替换过：旧 SSE epoch 也失效，必须重建保活。
+  void _restoreCurrentConnectionAfterFailedSwitch(ConnectionManager manager) {
+    if (!manager.configured || manager.active == null) return;
+    disposeBridge();
+    connect();
+    unawaited(refreshAll());
+  }
+
   /// #152：staged 切换连接档案。失败时旧连接/旧页面状态保持不变。
   Future<String?> switchProfile(
     String profileId, {
@@ -2764,8 +2804,10 @@ class AppStore extends ChangeNotifier {
       );
       return null;
     } on ConnectionSwitchException catch (e) {
+      _restoreCurrentConnectionAfterFailedSwitch(manager);
       return e.message;
     } catch (e) {
+      _restoreCurrentConnectionAfterFailedSwitch(manager);
       return '切换失败：$e';
     }
   }
@@ -2798,8 +2840,10 @@ class AppStore extends ChangeNotifier {
       );
       return null;
     } on ConnectionSwitchException catch (e) {
+      _restoreCurrentConnectionAfterFailedSwitch(manager);
       return e.message;
     } catch (e) {
+      _restoreCurrentConnectionAfterFailedSwitch(manager);
       return '连接失败：$e';
     }
   }
@@ -2843,8 +2887,10 @@ class AppStore extends ChangeNotifier {
       await _finishActivation(manager);
       return null;
     } on ConnectionSwitchException catch (e) {
+      _restoreCurrentConnectionAfterFailedSwitch(manager);
       return e.message;
     } catch (e) {
+      _restoreCurrentConnectionAfterFailedSwitch(manager);
       return '保存失败：$e';
     }
   }
