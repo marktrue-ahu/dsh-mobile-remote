@@ -18,6 +18,7 @@ import '../api.dart';
 import '../fmt.dart';
 import '../l10n.dart';
 import '../message_index.dart';
+import '../models.dart';
 import '../store.dart';
 import '../team.dart';
 import '../team_tasks.dart';
@@ -87,6 +88,13 @@ class _AgentPanelScreenState extends State<AgentPanelScreen>
   final Set<String> _expanded = <String>{};
   final Set<String> _interruptBusy = <String>{};
   final ValueNotifier<int> _refreshTick = ValueNotifier<int>(0);
+
+  // #160：ADR 0032 /session-config 视口懒加载；最多 3 个并发，旧宿主失败不伪造。
+  final Map<String, SessionConfig?> _sessionConfigs =
+      <String, SessionConfig?>{};
+  final Set<String> _sessionConfigLoading = <String>{};
+  final List<String> _sessionConfigQueue = <String>[];
+  int _sessionConfigActive = 0;
 
   // #143：只读任务板（按页签懒加载；旧宿主 unsupported，团队未启用时显示引导）。
   TeamTaskBoard? _taskBoard;
@@ -184,6 +192,87 @@ class _AgentPanelScreenState extends State<AgentPanelScreen>
         _loading = false;
       });
     }
+  }
+
+  void _ensureSessionConfig(String id) {
+    if (_sessionConfigs.containsKey(id) || _sessionConfigLoading.contains(id)) {
+      return;
+    }
+    _sessionConfigLoading.add(id);
+    _sessionConfigQueue.add(id);
+    _pumpSessionConfigs();
+  }
+
+  void _pumpSessionConfigs() {
+    while (_sessionConfigActive < 3 && _sessionConfigQueue.isNotEmpty) {
+      final id = _sessionConfigQueue.removeAt(0);
+      _sessionConfigActive++;
+      _loadSessionConfig(id);
+    }
+  }
+
+  Future<void> _loadSessionConfig(String id) async {
+    try {
+      final config = await _api.sessionConfig(id);
+      if (!mounted) return;
+      setState(() => _sessionConfigs[id] = config);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _sessionConfigs[id] = null);
+    } finally {
+      _sessionConfigActive = math.max(0, _sessionConfigActive - 1);
+      _sessionConfigLoading.remove(id);
+      if (mounted) _pumpSessionConfigs();
+    }
+  }
+
+  _AgentModelMeta? _modelMetaFor(AgentNode node) {
+    final config = _sessionConfigs[node.id];
+    if (config == null) return null;
+    final catalog = widget.store.catalog;
+    CatalogModel? model;
+    if (catalog != null) {
+      for (final candidate in catalog.models) {
+        if (candidate.id == config.model &&
+            (config.provider == null ||
+                candidate.provider == config.provider)) {
+          model = candidate;
+          break;
+        }
+      }
+    }
+    final modelLabel = (model?.name.trim().isNotEmpty ?? false)
+        ? model!.name
+        : (config.model ?? '').trim();
+    final effortId = (config.reasoningEffort ?? '').trim();
+    String effortLabel = '';
+    if (effortId.isNotEmpty) {
+      for (final effort
+          in model?.reasoning?.efforts ?? const <ReasoningEffort>[]) {
+        if (effort.id == effortId) {
+          effortLabel = effort.name;
+          break;
+        }
+      }
+      if (effortLabel.isEmpty) {
+        effortLabel = switch (effortId) {
+          'high' => L10n.t('高', 'High'),
+          'medium' => L10n.t('中', 'Medium'),
+          'low' => L10n.t('低', 'Low'),
+          _ => effortId,
+        };
+      }
+    }
+    final parts = [
+      if (modelLabel.isNotEmpty) modelLabel,
+      if (effortLabel.isNotEmpty) effortLabel,
+    ];
+    if (parts.isEmpty) return null;
+    return _AgentModelMeta(
+      model: modelLabel,
+      effort: effortLabel,
+      semantics: parts.join('，'),
+    );
   }
 
   Future<void> _interrupt(AgentNode node) async {
@@ -410,6 +499,10 @@ class _AgentPanelScreenState extends State<AgentPanelScreen>
                   itemBuilder: (context, index) {
                     final entry = visible[index];
                     final node = entry.node;
+                    if (!degraded && !node.isDiagnostic) {
+                      _ensureSessionConfig(node.id);
+                    }
+                    final modelMeta = _modelMetaFor(node);
                     return _AgentTreeRow(
                       key: ValueKey<String>('agent-row-${node.id}'),
                       node: node,
@@ -421,6 +514,7 @@ class _AgentPanelScreenState extends State<AgentPanelScreen>
                       onOpen: () => _openChild(node),
                       onInterrupt: () => _interrupt(node),
                       danger: danger,
+                      modelMeta: modelMeta,
                     );
                   },
                 ),
@@ -1244,6 +1338,21 @@ class _TeamTabState extends State<_TeamTab> {
   }
 }
 
+class _AgentModelMeta {
+  final String model;
+  final String effort;
+  final String semantics;
+  const _AgentModelMeta({
+    required this.model,
+    required this.effort,
+    required this.semantics,
+  });
+
+  bool get hasEffort => effort.isNotEmpty;
+  String get display =>
+      [if (model.isNotEmpty) model, if (effort.isNotEmpty) effort].join(' · ');
+}
+
 class _AgentTreeRow extends StatelessWidget {
   final AgentNode node;
   final int level;
@@ -1254,6 +1363,7 @@ class _AgentTreeRow extends StatelessWidget {
   final VoidCallback onOpen;
   final VoidCallback onInterrupt;
   final Color danger;
+  final _AgentModelMeta? modelMeta;
 
   const _AgentTreeRow({
     super.key,
@@ -1266,9 +1376,10 @@ class _AgentTreeRow extends StatelessWidget {
     required this.onOpen,
     required this.onInterrupt,
     required this.danger,
+    this.modelMeta,
   });
 
-  /// 所有尺寸/字号统一 cap 3；level>3 仅用 L{n} 注记 + rail 缺口表达真实深度。
+  /// 所有尺寸/字号统一 cap 3；level>3 仅用 L{n} 注记表达真实深度，无 rail。
   int get _cappedLevel => math.min(level, 3);
   bool get _capped => level > 3;
   double get _indent => (_cappedLevel - 1) * 14.0;
@@ -1278,10 +1389,13 @@ class _AgentTreeRow extends StatelessWidget {
     final ink2 = DshColors.ink2(context);
     final ink3 = DshColors.ink3(context);
     final brand = DshColors.brand(context);
-    final rail = DshColors.ink2(context).withValues(alpha: 0.78);
     final released = !node.isRunning && !node.isDiagnostic;
     final factor = MediaQuery.textScalerOf(context).scale(1.0);
-    final rowHeight = 54 + 20 * (factor - 1).clamp(0.0, 1.2);
+    // 标题/状态/模型三行：1.0×72、1.5×82、2.0×92，命中区不缩。
+    final rowHeight =
+        72 +
+        20 * (factor - 1).clamp(0.0, 1.2) +
+        (modelMeta != null ? 14 * factor : 0);
     final statusText = _statusText(node);
     final levelHint = _capped
         ? L10n.t(
@@ -1300,172 +1414,243 @@ class _AgentTreeRow extends StatelessWidget {
             '展开 ${node.children.length} 个子代理',
             'Expand ${node.children.length} subagents',
           );
+    final statusColor = node.isDiagnostic
+        ? ink3
+        : node.isRunning
+        ? DshColors.ok(context)
+        : ink3;
+    final metaText = [
+      statusText,
+      if (_capped) 'L$level',
+      node.isDiagnostic
+          ? _diagnosticText(node.status)
+          : _subtitleAgentName(node),
+      if (node.createdAt != null) relTime(node.createdAt!),
+    ].join(' · ');
 
-    // 三段独立命中：展开 44｜正文打开｜中断 44（仅 running）。树轨不响应手势。
     return Semantics(
       container: true,
       child: SizedBox(
         height: rowHeight,
-        child: Row(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            SizedBox(
-              width: _indent + 4,
-              height: double.infinity,
-              child: CustomPaint(
-                painter: _TreeRailPainter(
-                  levels: _cappedLevel - 1,
-                  color: rail,
-                  capped: _capped,
-                ),
-              ),
-            ),
-            SizedBox(
-              key: ValueKey<String>('agent-expand-${node.id}'),
-              width: 44,
-              height: 44,
-              child: canExpand
-                  ? Semantics(
-                      key: ValueKey<String>(
-                        'agent-expand-semantics-${node.id}',
-                      ),
-                      button: true,
-                      label: expandLabel,
-                      onTap: onToggle,
-                      child: ExcludeSemantics(
-                        child: InkWell(
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                SizedBox(width: _indent),
+                SizedBox(
+                  key: ValueKey<String>('agent-expand-${node.id}'),
+                  width: 56,
+                  height: 48,
+                  child: canExpand
+                      ? Semantics(
+                          key: ValueKey<String>(
+                            'agent-expand-semantics-${node.id}',
+                          ),
+                          button: true,
+                          label: expandLabel,
                           onTap: onToggle,
-                          borderRadius: BorderRadius.circular(8),
-                          child: Center(
-                            child: FittedBox(
-                              fit: BoxFit.scaleDown,
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  CustomPaint(
-                                    size: const Size(12, 12),
-                                    painter: _AgentTrianglePainter(
-                                      expanded: expanded,
-                                      color: ink2,
+                          child: ExcludeSemantics(
+                            child: Material(
+                              color: DshColors.brandSoft(context),
+                              borderRadius: BorderRadius.circular(10),
+                              child: InkWell(
+                                onTap: onToggle,
+                                borderRadius: BorderRadius.circular(10),
+                                child: Center(
+                                  child: FittedBox(
+                                    fit: BoxFit.scaleDown,
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(
+                                          expanded
+                                              ? Icons.expand_more
+                                              : Icons.chevron_right,
+                                          size: 22,
+                                          color: ink2,
+                                        ),
+                                        const SizedBox(width: 2),
+                                        Container(
+                                          key: ValueKey<String>(
+                                            'agent-count-${node.id}',
+                                          ),
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 6,
+                                            vertical: 1,
+                                          ),
+                                          decoration: BoxDecoration(
+                                            color: DshColors.surface(context),
+                                            borderRadius: BorderRadius.circular(
+                                              8,
+                                            ),
+                                          ),
+                                          child: Text(
+                                            '${node.children.length}',
+                                            style: TextStyle(
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.w700,
+                                              color: brand,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
                                     ),
                                   ),
-                                  Container(
-                                    key: ValueKey<String>(
-                                      'agent-count-${node.id}',
-                                    ),
-                                    margin: const EdgeInsets.only(left: 4),
-                                    padding: const EdgeInsets.symmetric(
-                                      horizontal: 6,
-                                      vertical: 1,
-                                    ),
-                                    decoration: BoxDecoration(
-                                      color: DshColors.brandSoft(context),
-                                      borderRadius: BorderRadius.circular(8),
-                                    ),
-                                    child: Text(
-                                      '${node.children.length}',
-                                      style: TextStyle(
-                                        fontSize: 10.5,
-                                        fontWeight: FontWeight.w600,
-                                        color: brand,
-                                      ),
-                                    ),
-                                  ),
-                                ],
+                                ),
                               ),
                             ),
                           ),
+                        )
+                      : const SizedBox.shrink(),
+                ),
+                Icon(
+                  Icons.polyline_outlined,
+                  size: 17,
+                  color: released ? ink3 : brand,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Semantics(
+                    key: ValueKey<String>('agent-body-semantics-${node.id}'),
+                    button: !node.isDiagnostic,
+                    label: node.isDiagnostic
+                        ? _diagnosticText(node.status)
+                        : [
+                            node.title,
+                            _subtitleAgentName(node),
+                            statusText,
+                            levelHint,
+                            if (modelMeta != null)
+                              L10n.t(
+                                '模型 ${modelMeta!.semantics}',
+                                'Model ${modelMeta!.semantics}',
+                              ),
+                          ].join('，'),
+                    onTap: node.isDiagnostic ? null : onOpen,
+                    child: ExcludeSemantics(
+                      child: InkWell(
+                        key: ValueKey<String>('agent-body-${node.id}'),
+                        onTap: node.isDiagnostic ? null : onOpen,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Text(
+                              node.title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 13.5,
+                                fontWeight: FontWeight.w600,
+                                color: node.isDiagnostic ? ink3 : null,
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            Row(
+                              children: [
+                                SizedBox(
+                                  width: 16,
+                                  child: Center(
+                                    child: Icon(
+                                      Icons.circle,
+                                      size: 8,
+                                      color: statusColor,
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Text(
+                                    metaText,
+                                    key: ValueKey<String>(
+                                      'agent-subtitle-${node.id}',
+                                    ),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontSize: 11.5,
+                                      color: ink3,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
                         ),
                       ),
-                    )
-                  : const SizedBox.shrink(),
-            ),
-            Icon(
-              Icons.polyline_outlined,
-              size: 17,
-              color: released ? ink3 : brand,
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Semantics(
-                key: ValueKey<String>('agent-body-semantics-${node.id}'),
-                button: !node.isDiagnostic,
-                label: node.isDiagnostic
-                    ? _diagnosticText(node.status)
-                    : '${node.title}，${_subtitleAgentName(node)}，$statusText，$levelHint',
-                onTap: node.isDiagnostic ? null : onOpen,
-                child: ExcludeSemantics(
-                  child: InkWell(
-                    key: ValueKey<String>('agent-body-${node.id}'),
-                    onTap: node.isDiagnostic ? null : onOpen,
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          node.title,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 13.5,
-                            fontWeight: FontWeight.w600,
-                            color: node.isDiagnostic ? ink3 : null,
+                    ),
+                  ),
+                ),
+                if (node.isRunning)
+                  SizedBox(
+                    key: ValueKey<String>('agent-interrupt-${node.id}'),
+                    width: 48,
+                    height: 48,
+                    child: Semantics(
+                      key: ValueKey<String>(
+                        'agent-interrupt-semantics-${node.id}',
+                      ),
+                      button: true,
+                      enabled: !interrupting,
+                      label: L10n.t(
+                        '中断子代理 ${node.title}',
+                        'Interrupt subagent ${node.title}',
+                      ),
+                      onTap: interrupting ? null : onInterrupt,
+                      child: ExcludeSemantics(
+                        child: IconButton(
+                          onPressed: interrupting ? null : onInterrupt,
+                          padding: EdgeInsets.zero,
+                          constraints: const BoxConstraints.tightFor(
+                            width: 48,
+                            height: 48,
+                          ),
+                          tooltip: L10n.t('中断子代理', 'Interrupt subagent'),
+                          icon: Icon(
+                            Icons.stop_circle_outlined,
+                            size: 19,
+                            color: interrupting ? ink3 : danger,
                           ),
                         ),
-                        const SizedBox(height: 2),
-                        Text(
-                          [
-                            if (_capped) 'L$level',
-                            node.isDiagnostic
-                                ? _diagnosticText(node.status)
-                                : _subtitleAgentName(node),
-                            if (node.createdAt != null)
-                              relTime(node.createdAt!),
-                          ].join(' · '),
-                          key: ValueKey<String>('agent-subtitle-${node.id}'),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(fontSize: 11.5, color: ink3),
-                        ),
+                      ),
+                    ),
+                  )
+                else
+                  const SizedBox(width: 4),
+              ],
+            ),
+            if (modelMeta != null && !node.isDiagnostic)
+              Padding(
+                padding: EdgeInsets.only(left: _indent + 105, right: 4),
+                child: InkWell(
+                  onTap: onOpen,
+                  child: ExcludeSemantics(
+                    child: Row(
+                      children: [
+                        if (modelMeta!.model.isNotEmpty)
+                          Flexible(
+                            child: Text(
+                              modelMeta!.model,
+                              key: ValueKey<String>('agent-model-${node.id}'),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(fontSize: 11.5, color: ink3),
+                            ),
+                          ),
+                        if (modelMeta!.hasEffort)
+                          Text(
+                            '${modelMeta!.model.isNotEmpty ? ' · ' : ''}${modelMeta!.effort}',
+                            key: ValueKey<String>('agent-effort-${node.id}'),
+                            maxLines: 1,
+                            style: TextStyle(fontSize: 11.5, color: ink3),
+                          ),
                       ],
                     ),
                   ),
                 ),
               ),
-            ),
-            if (node.isRunning)
-              SizedBox(
-                key: ValueKey<String>('agent-interrupt-${node.id}'),
-                width: 44,
-                height: 44,
-                child: Semantics(
-                  key: ValueKey<String>('agent-interrupt-semantics-${node.id}'),
-                  button: true,
-                  enabled: !interrupting,
-                  label: L10n.t(
-                    '中断子代理 ${node.title}',
-                    'Interrupt subagent ${node.title}',
-                  ),
-                  onTap: interrupting ? null : onInterrupt,
-                  child: ExcludeSemantics(
-                    child: IconButton(
-                      onPressed: interrupting ? null : onInterrupt,
-                      padding: EdgeInsets.zero,
-                      constraints: const BoxConstraints.tightFor(
-                        width: 44,
-                        height: 44,
-                      ),
-                      tooltip: L10n.t('中断子代理', 'Interrupt subagent'),
-                      icon: Icon(
-                        Icons.stop_circle_outlined,
-                        size: 19,
-                        color: interrupting ? ink3 : danger,
-                      ),
-                    ),
-                  ),
-                ),
-              )
-            else
-              const SizedBox(width: 4),
           ],
         ),
       ),
@@ -1489,70 +1674,6 @@ class _AgentTreeRow extends StatelessWidget {
     'unavailable' => L10n.t('目录不可用', 'Catalog unavailable'),
     _ => L10n.t('不受支持的子代理', 'Unsupported subagent'),
   };
-}
-
-class _TreeRailPainter extends CustomPainter {
-  final int levels;
-  final Color color;
-
-  /// level>3：最深一级 rail 画 6dp 缺口，提示“显示封顶”，不新增缩进层级。
-  final bool capped;
-  const _TreeRailPainter({
-    required this.levels,
-    required this.color,
-    this.capped = false,
-  });
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = color
-      ..strokeWidth = 1;
-    for (var i = 0; i < levels; i++) {
-      final x = 7.0 + i * 14.0;
-      if (capped && i == levels - 1) {
-        final mid = size.height / 2;
-        canvas.drawLine(Offset(x, 0), Offset(x, mid - 3), paint);
-        canvas.drawLine(Offset(x, mid + 3), Offset(x, size.height), paint);
-      } else {
-        canvas.drawLine(Offset(x, 0), Offset(x, size.height), paint);
-      }
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant _TreeRailPainter old) =>
-      old.levels != levels || old.color != color || old.capped != capped;
-}
-
-class _AgentTrianglePainter extends CustomPainter {
-  final bool expanded;
-  final Color color;
-  const _AgentTrianglePainter({required this.expanded, required this.color});
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()..color = color;
-    final path = Path();
-    if (expanded) {
-      path
-        ..moveTo(2, 3.5)
-        ..lineTo(size.width - 2, 3.5)
-        ..lineTo(size.width / 2, size.height - 3)
-        ..close();
-    } else {
-      path
-        ..moveTo(3.5, 2)
-        ..lineTo(3.5, size.height - 2)
-        ..lineTo(size.width - 3, size.height / 2)
-        ..close();
-    }
-    canvas.drawPath(path, paint);
-  }
-
-  @override
-  bool shouldRepaint(covariant _AgentTrianglePainter old) =>
-      old.expanded != expanded || old.color != color;
 }
 
 class _TaskSummary extends StatelessWidget {

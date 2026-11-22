@@ -69,6 +69,12 @@ class _Backend {
   int failSubagents = 0;
   Completer<http.Response>? holdSubagents;
   final List<Map<String, dynamic>> interrupts = [];
+  final Map<String, Map<String, dynamic>> sessionConfigs = {};
+  final List<String> sessionConfigRequested = [];
+  int sessionConfigCalls = 0;
+  int sessionConfigActive = 0;
+  int sessionConfigMaxActive = 0;
+  int sessionConfigDelayMs = 0;
 
   late final Api api = Api(client: MockClient(_handle))
     ..baseUrl = 'http://agent-panel.test'
@@ -93,6 +99,28 @@ class _Backend {
         if (multiLevelUnavailable) 'multiLevelUnavailable': true,
         'subagents': rows,
       });
+    }
+    if (path == '/m/api/session-config') {
+      final id = request.url.queryParameters['sessionId'] ?? '';
+      sessionConfigCalls++;
+      sessionConfigRequested.add(id);
+      sessionConfigActive++;
+      if (sessionConfigActive > sessionConfigMaxActive) {
+        sessionConfigMaxActive = sessionConfigActive;
+      }
+      try {
+        if (sessionConfigDelayMs > 0) {
+          await Future<void>.delayed(
+            Duration(milliseconds: sessionConfigDelayMs),
+          );
+        }
+        return _json({
+          'ok': true,
+          'config': sessionConfigs[id] ?? <String, dynamic>{},
+        });
+      } finally {
+        sessionConfigActive--;
+      }
     }
     if (path == '/m/api/subagents/interrupt') {
       interrupts.add(jsonDecode(request.body) as Map<String, dynamic>);
@@ -125,11 +153,13 @@ Future<AppStore> _mountPanel(
   Size size = const Size(390, 844),
   TextScaler textScaler = TextScaler.noScaling,
   ThemeData? theme,
+  Catalog? catalog,
 }) async {
   SharedPreferences.setMockInitialValues({});
   final store = AppStore()
     ..sessionId = _root
     ..sessions = [Session(id: _root, title: '主会话', cwd: null, createdAt: 1)];
+  if (catalog != null) store.catalog = catalog;
   await tester.binding.setSurfaceSize(size);
   addTearDown(() => tester.binding.setSurfaceSize(null));
   await tester.pumpWidget(
@@ -640,7 +670,7 @@ void main() {
       final backend = _Backend(deepTree());
       final store = await _mountPanel(tester, backend);
       final expand = find.byKey(const ValueKey('agent-expand-c1'));
-      expect(tester.getSize(expand), const Size(44, 44));
+      expect(tester.getSize(expand), const Size(56, 48));
       await tester.tapAt(tester.getTopLeft(expand) + const Offset(3, 3));
       await _settle(tester);
       expect(
@@ -682,14 +712,40 @@ void main() {
       expect(tester.takeException(), isNull);
     });
 
-    testWidgets('320/深色/2.0x：深层树不溢出，L{n} 仍可见', (tester) async {
-      final backend = _Backend(deepTree());
+    testWidgets('320/深色/2.0x：深层树不溢出，L{n} 与 effort 仍可见', (tester) async {
+      final backend = _Backend(deepTree())
+        ..sessionConfigs.addAll({
+          for (final id in ['c1', 'c2', 'c3', 'c4', 'c5'])
+            id: {
+              'model': 'a-very-long-model-name-that-needs-ellipsis',
+              'provider': 'p',
+              'reasoningEffort': 'high',
+            },
+        });
+      final catalog = Catalog(
+        models: [
+          CatalogModel(
+            provider: 'p',
+            id: 'a-very-long-model-name-that-needs-ellipsis',
+            name: 'A very long model name that needs ellipsis',
+            reasoning: const ModelReasoning(
+              efforts: [ReasoningEffort(id: 'high', name: '高')],
+            ),
+          ),
+        ],
+        permissionPresets: const [],
+        agentPresets: const [],
+        defaults: const {},
+        rechargeUrl: '',
+        providers: const [],
+      );
       await _mountPanel(
         tester,
         backend,
         size: const Size(320, 700),
         textScaler: const TextScaler.linear(2.0),
         theme: DshTheme.dark(),
+        catalog: catalog,
       );
       for (final id in ['c1', 'c2', 'c3', 'c4']) {
         await tester.tap(find.byKey(ValueKey('agent-expand-$id')));
@@ -698,8 +754,9 @@ void main() {
       expect(tester.takeException(), isNull);
       expect(find.textContaining('L4'), findsOneWidget);
       expect(find.textContaining('L5'), findsOneWidget);
+      expect(find.textContaining('高'), findsWidgets);
       final expand = find.byKey(const ValueKey('agent-expand-c1'));
-      expect(tester.getSize(expand), const Size(44, 44));
+      expect(tester.getSize(expand), const Size(56, 48));
     });
 
     testWidgets('Semantics：展开/打开有 tap action，performAction 能真正触发', (
@@ -775,6 +832,91 @@ void main() {
       await _settle(tester);
       expect(backend.interrupts, hasLength(1));
       semantics.dispose();
+    });
+
+    testWidgets('模型/effort 第三行：本地化、左对齐 105/119/133、懒加载且不伪造旧宿主', (tester) async {
+      final backend =
+          _Backend([
+              _row('c1', name: 'a1', depth: 1, parent: _root, title: '一级'),
+              _row('c2', name: 'a2', depth: 2, parent: 'c1', title: '二级'),
+              _row('c3', name: 'a3', depth: 3, parent: 'c2', title: '三级'),
+            ])
+            ..sessionConfigs.addAll({
+              'c1': {'model': 'm1', 'provider': 'p', 'reasoningEffort': 'high'},
+              'c2': {'model': 'm1', 'provider': 'p', 'reasoningEffort': 'high'},
+              'c3': {'model': 'm1', 'provider': 'p', 'reasoningEffort': 'high'},
+            });
+      final catalog = Catalog(
+        models: [
+          CatalogModel(
+            provider: 'p',
+            id: 'm1',
+            name: 'GPT-5',
+            reasoning: const ModelReasoning(
+              efforts: [ReasoningEffort(id: 'high', name: '高')],
+            ),
+          ),
+        ],
+        permissionPresets: const [],
+        agentPresets: const [],
+        defaults: const {},
+        rechargeUrl: '',
+        providers: const [],
+      );
+      await _mountPanel(tester, backend, catalog: catalog);
+      // 默认折叠：只加载根级直接子代理，孙/曾孙不请求。
+      expect(backend.sessionConfigRequested, ['c1']);
+      await tester.tap(find.byKey(const ValueKey('agent-expand-c1')));
+      await _settle(tester);
+      await tester.tap(find.byKey(const ValueKey('agent-expand-c2')));
+      await _settle(tester);
+      expect(backend.sessionConfigRequested, containsAll(['c1', 'c2', 'c3']));
+      expect(find.text('GPT-5'), findsNWidgets(3));
+      expect(find.text(' · 高'), findsNWidgets(3));
+      final x1 = tester
+          .getTopLeft(find.byKey(const ValueKey('agent-model-c1')))
+          .dx;
+      final x2 = tester
+          .getTopLeft(find.byKey(const ValueKey('agent-model-c2')))
+          .dx;
+      final x3 = tester
+          .getTopLeft(find.byKey(const ValueKey('agent-model-c3')))
+          .dx;
+      expect(x1, closeTo(105, 0.5));
+      expect(x2, closeTo(119, 0.5));
+      expect(x3, closeTo(133, 0.5));
+      // 第二行元信息与第三行同起点。
+      expect(
+        tester.getTopLeft(find.byKey(const ValueKey('agent-subtitle-c1'))).dx,
+        closeTo(105, 0.5),
+      );
+      final semantics = tester.ensureSemantics();
+      final body = tester.getSemantics(
+        find.byKey(const ValueKey('agent-body-semantics-c1')),
+      );
+      expect(body.getSemanticsData().label, contains('模型 GPT-5，高'));
+      semantics.dispose();
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('旧宿主/缺字段：不伪造模型第三行；3 并发懒加载上限', (tester) async {
+      final backend =
+          _Backend([
+              _row('c1', name: 'a1', depth: 1, parent: _root, title: '一级'),
+              _row('c2', name: 'a2', depth: 1, parent: _root, title: '二级'),
+              _row('c3', name: 'a3', depth: 1, parent: _root, title: '三级'),
+              _row('c4', name: 'a4', depth: 1, parent: _root, title: '四级'),
+              _row('c5', name: 'a5', depth: 1, parent: _root, title: '五级'),
+            ])
+            ..sessionConfigDelayMs = 30
+            ..sessionConfigs['c1'] = const {};
+      await _mountPanel(tester, backend);
+      await _settle(tester);
+      expect(backend.sessionConfigMaxActive, lessThanOrEqualTo(3));
+      expect(backend.sessionConfigCalls, 5);
+      expect(find.byKey(const ValueKey('agent-model-c1')), findsNothing);
+      expect(find.textContaining('模型 '), findsNothing);
+      expect(tester.takeException(), isNull);
     });
 
     testWidgets('Semantics：diagnostic 行不可打开（无 tap action）', (tester) async {
