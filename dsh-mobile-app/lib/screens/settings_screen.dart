@@ -32,6 +32,7 @@ import '../update_flow.dart';
 import '../updater.dart';
 import '../version_alignment.dart';
 import 'sheets.dart';
+import 'connection_profiles_screen.dart';
 import 'log_sheet.dart';
 import 'providers_screen.dart';
 import 'plugin_inventory_screen.dart';
@@ -2245,6 +2246,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       _ => ink3,
                     },
                   ),
+                ),
+                IconButton(
+                  key: const ValueKey('settings-manage-connections'),
+                  tooltip: L10n.t('连接档案', 'Connections'),
+                  onPressed: () => showConnectionProfilesScreen(context, store),
+                  icon: const Icon(Icons.list_alt, size: 18),
+                  visualDensity: VisualDensity.compact,
                 ),
               ],
             ),
