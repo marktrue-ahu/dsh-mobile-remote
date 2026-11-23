@@ -27,7 +27,11 @@
 | Flutter 构建环境 | Flutter 3.35+（Dart SDK ^3.13） |
 | 插件自更新通道（v3.5） | 按**能力**分两条通道，不按宿主版本号门禁：宿主提供 `pluginManager.updateBundle` 且本插件可被它更新 → **`host-manager`**（进程内热更新，**不重启宿主**；HMR 可用时立即生效，否则装完需重启）；否则退回传统通道（改依赖 → pnpm install → 重启 → 健康确认），再不行给人工指引。`0.2.2` 之前的宿主没有该服务，自动走传统通道，行为与旧版一致 |
 
-**声明式兼容范围（`peerDependencies`）**：`@deepseek-ai/dsh-{credentials,llm,sandbox-policy,scope}` 声明 `>=0.1.0-rc.6 <=0.2.2 || >=0.2.0-0 <0.2.0 || >=0.2.1-0 <0.2.1 || >=0.2.2-0 <0.2.2`。稳定版上限为 `0.2.2`；三个显式预发布分支分别纳入已发布的 `0.2.0-rc.*`、`0.2.1-rc.*`、`0.2.2-alpha/rc.*` 系列（npm 默认 semver 语义不会把裸 `<=0.2.2` 认作覆盖预发布版本）。`0.2.3+` 与 `0.3.0+` 会被判为不兼容。
+**声明式兼容范围（`peerDependencies`）**：`@deepseek-ai/dsh-{credentials,llm,sandbox-policy,scope}` 声明 `>=0.1.0-rc.6 <=0.2.3 || >=0.2.0-0 <0.2.0 || >=0.2.1-0 <0.2.1 || >=0.2.2-0 <0.2.2 || >=0.2.3-0 <0.2.3`。稳定版上限为 `0.2.3`；四个显式预发布分支分别纳入已发布的 `0.2.0-rc.*`、`0.2.1-rc.*`、`0.2.2-alpha/rc.*`、`0.2.3-alpha/rc.*` 系列（npm 默认 semver 语义不会把裸 `<=0.2.3` 认作覆盖预发布版本）。`0.3.0+` 会被判为不兼容。
+
+> **上界放宽记录（issue #166，2026-11-23）**：原上界为 `<=0.2.2`，且 `test/host-compat-022.test.mjs` 显式断言 `0.2.3` 必须被拒（"must cap the stable line at 0.2.2"）。用户裁决按方案 B 放宽到 `0.2.3`，该保护随之移除 —— **代价明确**：日后 `0.2.3` 若引入破坏性变更，peer 范围不再拦截，只能靠 canary 与运行时能力探测（ADR 0017）暴露。`0.3.0` 边界仍由测试守住。
+
+> **Node 门槛**：DSH `0.2.3` 把 Node 要求提高到 `24.22.3`，而本插件**不声明 `engines`**（用户裁决）。因此版本过低时不会在 `npm install` 阶段被拦，而是在宿主启动时由 DSH 自己报错。
 
 注意两条判定通道语义不同：宿主 `@deepseek-ai/dsh-app-boot` 的 `evaluatePluginCompatibility()` 用 `semver.satisfies(runtimeVersion, range, { includePrerelease: true })`（运行时放行预发布）；npm / pnpm 安装期的 peer 解析用默认语义，所以预发布宿主必须在范围里显式出现。上界**只用于声明可安装边界**，功能路径仍按能力探测（ADR 0017），不按版本号做功能门禁。
 
