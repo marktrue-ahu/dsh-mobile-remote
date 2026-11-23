@@ -27,3 +27,6 @@ dsh-mobile-app/android/.kotlin/
 
 # Python 工具缓存（宠物资源脚本）
 __pycache__/
+
+# 本机临时产物与草稿（验收清单、本地报告等；只在本机保留，不进版本库）
+tmp/
