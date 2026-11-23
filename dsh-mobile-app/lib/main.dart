@@ -1143,6 +1143,7 @@ class AppDrawer extends StatelessWidget {
                 L10n.t('插件', 'Plugins'),
                 onOpenPlugins!,
                 key: const ValueKey('drawer-plugins'),
+                semanticsLabel: L10n.t('插件', 'Plugins'),
               ),
             _drawerItem(
               context,
@@ -1169,36 +1170,17 @@ class AppDrawer extends StatelessWidget {
     );
   }
 
-  /// 仅文字「连接」入口；不根据主机/连接状态隐藏（无主机时也能进入添加页）。
+  /// 「连接」一级入口：与「插件」共用 [_drawerAction]，图标/间距/命中高度与其它
+  /// 一级入口一致。动作型入口，不显示选中态。不根据主机/连接状态隐藏
+  /// （无主机时也能进入添加页）。
   Widget _connectionItem(BuildContext context) {
-    final ink2 = DshColors.ink2(context);
-    void open() {
-      Navigator.of(context).pop();
-      onOpenConnections();
-    }
-
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 1),
-      child: Semantics(
-        button: true,
-        excludeSemantics: true,
-        label: L10n.t('连接', 'Connections'),
-        onTap: open,
-        child: InkWell(
-          key: const ValueKey('drawer-connection'),
-          borderRadius: BorderRadius.circular(10),
-          onTap: open,
-          child: Container(
-            constraints: const BoxConstraints(minHeight: 44),
-            alignment: Alignment.centerLeft,
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
-            child: Text(
-              L10n.t('连接', 'Connections'),
-              style: TextStyle(fontSize: 14.5, color: ink2),
-            ),
-          ),
-        ),
-      ),
+    return _drawerAction(
+      context,
+      Icons.computer_outlined,
+      L10n.t('连接', 'Connections'),
+      onOpenConnections,
+      key: const ValueKey('drawer-connection'),
+      semanticsLabel: L10n.t('连接', 'Connections'),
     );
   }
 
@@ -1245,13 +1227,17 @@ class AppDrawer extends StatelessWidget {
     );
   }
 
-  /// 非 Tab 的一级入口（如「插件」）：点击关抽屉后 push 独立页面，不改当前 Tab。
+  /// 非 Tab 的一级入口（如「插件」「连接」）：点击关抽屉后执行动作，不改当前 Tab。
+  ///
+  /// [semanticsLabel] 非空时包一层 `Semantics`：动作型入口没有可见的选中态，读屏需要
+  /// 明确的按钮语义与标签（issue #168）。不传则不包，保持既有调用方行为不变。
   Widget _drawerAction(
     BuildContext context,
     IconData icon,
     String label,
     VoidCallback onTap, {
     Key? key,
+    String? semanticsLabel,
   }) {
     final ink2 = DshColors.ink2(context);
     void open() {
@@ -1259,7 +1245,7 @@ class AppDrawer extends StatelessWidget {
       onTap();
     }
 
-    return Padding(
+    final item = Padding(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 1),
       child: InkWell(
         key: key,
@@ -1280,6 +1266,14 @@ class AppDrawer extends StatelessWidget {
           ),
         ),
       ),
+    );
+    if (semanticsLabel == null) return item;
+    return Semantics(
+      button: true,
+      excludeSemantics: true,
+      label: semanticsLabel,
+      onTap: open,
+      child: item,
     );
   }
 

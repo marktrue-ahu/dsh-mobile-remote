@@ -8,7 +8,7 @@
 
 - **#157 会话文件图片预览**：文件列表识别 PNG/JPEG/WebP/GIF（图片行改用图片图标），点按进全屏查看器；共享查看器壳 `widgets/image_viewer_shell.dart` 同时服务于附件图库与会话文件（图库侧净删约 130 行重复），`InteractiveViewer` 0.5–4x + 双击、加载/失败/不支持状态面板、底部元信息条；大图按视口物理宽×2 降采样（封顶 4096）；图片字节只走 `/workspace-image`（sessionId + cwd 相对路径），复用既有会话作用域校验/realpath/O_NOFOLLOW/magic 嗅探/8MiB·8192px·40MP 限制；SVG/HEIC/AVIF 显式提示不支持；新增 ETag/304 条件请求与按 profile/session/path 的 LRU 缓存；下载复用 #138。能力位双门控 `files.imagePreview` + `files.sessionRelative`，旧宿主回退文本预览。
 - **#158 输入区上下文三 Tab 抽屉**：上下文圆环/百分比可点开底部抽屉，三 Tab「上下文构成 / Token 用量 / 会话统计」；三个分项（system/tools/messages）各自独立水平条，明确不堆叠成 pressure 总条；无 breakdown 时只显示 pressure + 「当前电脑端未提供构成」，不伪造分项；不展示 prompt 正文与工具 schema。
-- **#155 设置页 5 Tab**：设置页按分组拆 Tab，降低单页长度。
+- **#155 设置页分组 Tab**：设置页按任务分组拆 Tab，降低单页长度。最终为 **4 Tab：对话 / 外观 / 通知 / 通用** —— #155 最初交付 5 Tab（含「连接」），随后 #163 按「移动语义」把连接管理从设置页移除、只留 Drawer「连接」，故「连接」Tab 不再存在。
 - **#163 连接入口移至 Drawer**：连接入口从首页收进 Drawer，统一添加/编辑表单并补主机名称。
 - **#159 Git tags 三 Tab + 定位**：Git 分支列表增加 tags 与三 Tab，支持点击定位到分支图；tag 意图不打断分页，stale 不弹失败。
 
@@ -46,7 +46,7 @@
 ### 未包含/后续 alpha
 
 - #151 提问卡缺失 debug 取证
-- #155 设置页 5 Tab
+- #155 设置页分组 Tab（已在 alpha.2 交付，最终 4 Tab）
 - #159 Git tags
 - #158 上下文抽屉
 - #157 图片预览
