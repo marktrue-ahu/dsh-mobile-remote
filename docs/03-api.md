@@ -1595,15 +1595,28 @@ POST 请求体：`{"sessionId","repositoryId","tips":[...],"limit"?,"snapshotId"
   "degraded": false,
   "reason": "",
   "host": { "id": "<宿主稳定身份>", "pluginVersion": "3.3.0", "restartSupported": false },
+  "classification": {
+    "tableVersion": "2026.11", "targetDsh": "0.2.2", "dshVersion": "0.2.2-rc.5",
+    "matched": true, "source": "static-table"
+  },
   "plugins": [{
     "id": "@scope/pkg", "name": "@scope/pkg", "title": { "zh": "显示名", "en": "Display" },
     "description": null, "packageName": "@scope/pkg", "version": "1.2.3",
     "source": { "kind": "builtin|local|git|registry|entry|unknown", "label": "内置|本地|Git|配置渠道|配置条目|未知" },
+    "official": true, "optional": false, "availability": "installation|profile|missing",
+    "installed": true, "hidden": false,
+    "category": { "kind": "builtin|experimental|custom|unclassified", "label": "内置|实验性|自定义|已安装（未分类）", "reason": "" },
     "enabled": true, "current": true, "independent": false,
     "health": { "state": "ok|starting|disabled|failed|unknown", "reasonCode": "runtime-starting|runtime-unknown|runtime-start-failed|…" },
     "compatibility": { "ok": null, "state": "ok|incompatible|unknown", "requirements": "engines.dsh: >=0.3.0" },
     "updateAvailable": null,
     "management": { "readOnly": true }
+  }],
+  "installable": [{
+    "id": "@scope/new", "name": "@scope/new", "packageName": "@scope/new", "version": "0.7.0",
+    "source": { "kind": "registry", "label": "配置渠道" },
+    "category": { "kind": "experimental", "label": "实验性", "reason": "" }, "hidden": false,
+    "installed": false
   }]
 }
 ```
@@ -1617,15 +1630,41 @@ POST 请求体：`{"sessionId","repositoryId","tips":[...],"limit"?,"snapshotId"
 - **`host.restartSupported`（bool，始终下发；issue #156）**：当前宿主形态是否允许手机触发重启（`restartFormOf() !== "unsupported"`）。仅作为能力位，供 App 在 `restartRequired` 时决定是否显示「重启电脑端」；实际重启仍走 `POST /plugin-inventory/restart`（#147，需显式 confirm）。旧宿主缺字段时 App 按 `false` 处理。
 - `updateAvailable` 固定 `null`：更新候选检查属于 #146/#147，本端点不触网检查 registry。
 
+#### 6.25.1 插件三分类与隐藏项（v3.3.1，issue #153）
+
+分类**事实由宿主下发**，App 只渲染、不重算：分类谓词与 `EXPERIMENTAL_BUNDLES` 静态表都在插件宿主侧（`lib/experimental-bundles.js`），因为 App 拿不到当前 DSH 版本。
+
+- 每个行（`plugins[]` 与 `installable[]`）新增**顶层**字段 `official`/`optional`（`boolean|null`，取宿主 `BundleInfo` 同名字段）、`availability`（`installation|profile|missing|null`）、`installed`（`boolean|null`）、`hidden`（`boolean`）、`category`（`{kind,label,reason}`）。**不得塞进 `source`**：`source` 是既有契约（App 与测试都按形状断言）。
+- 分类谓词（互斥，一行只落一个 kind；优先级自上而下）：
+  | kind | 判据 |
+  |---|---|
+  | `unclassified` | `official`/`optional` 任一为 `null` → `reason:"host-facts-missing"`；或 `independent:true` → `reason:"independent-entry"` |
+  | `experimental` | 包名命中宿主的 `EXPERIMENTAL_BUNDLES` 静态表（**即使随安装附带也算实验性**） |
+  | `builtin` | `availability === "installation"` |
+  | `custom` | 其余已安装 profile bundle |
+- **降级写死**：`official === null || optional === null` → `unclassified` + `host-facts-missing`；独立配置条目 → `unclassified` + `independent-entry`。**不得按包名前缀 / `optional` / 名称猜分类**。
+- `hidden`：没有插件页的 bundle（内置模板、常驻终端、独立 worktree 工具，共 8 项）标 `hidden:true`。App 默认不展示，提供「显示隐藏项」开关；**过滤只发生在客户端展示层，不改变 `complete`/`supported` 语义，也不从清单里删行**。
+- 根级 `classification`：`{tableVersion,targetDsh,dshVersion,matched,source:"static-table"}`。`dshVersion` 取宿主 `profileContext.installAnchor` 指向的 `package.json` version，读不到为 `""`（fail-closed）；`matched` 只比较 core 版本（忽略 prerelease/build）。`matched === false` 时 App 显示「分类表与当前 DSH 版本不匹配」提示，但**仍按分类展示**（不改判、不挪 Tab）。
+- 旧宿主缺 `category` 字段 → App 退回单列表「已安装（未分类）」并提示，不伪造三 Tab。
+
 ### 6.26 插件安装/升级（v3.3，issue #146）
 
-只使用宿主**已配置渠道**：App 不传任意 registry/Git/路径；安装候选与升级目标均来自宿主 `listBundles()/listVersions()`。宿主 `installBundle/updateBundle` 负责事务与失败回滚；本插件只做参数校验、同插件互斥、进度投影与结果归一，不自行改 profile。
+只使用宿主**已配置渠道**：App 不传任意 Git/路径；安装候选与升级目标均来自宿主 `listBundles()/listVersions()`。宿主 `installBundle/updateBundle` 负责事务与失败回滚；本插件只做参数校验、同插件互斥、进度投影与结果归一，不自行改 profile。
 
-- `GET /m/api/plugin-inventory/versions?name=<name>`：检查已安装 registry bundle 的更新。返回 `{status:"listed",installedVersion,versions:[{version,prerelease,deprecated,bundle,incompatible:{requirements}}],omitted}` 或 `{status:"refused",problem,reason}`；Git/内置/不可升级 → 409（稳定码 `git-update-desktop-required`/`plugin-not-updatable`）。
-- `POST /m/api/plugin-inventory/install` `{name}`：仅接受宿主清单里带 `installTarget` 的候选；spec 由宿主决定，`expected` 固定目标版本。返回 `{ok,operation}`。
-- `POST /m/api/plugin-inventory/update` `{name,version}`：仅接受 `update:"registry"` 的已安装 bundle；App 不能传 `spec`。返回 `{ok,operation}`。
-- `GET /m/api/plugin-inventory/op?opId=`：轮询操作快照：`status(running|succeeded|failed|cancelled)`、`steps[{key,state}]`、`version/fromVersion`、`restartRequired`、`rolledBack`、`rollbackFailed`、`unchanged`、`outcomeUnknown`、`cancelled`、`errorCode`。
+- `GET /m/api/plugin-inventory/versions?name=<name>&registry=<url>`：检查已安装 registry bundle 的更新。返回 `{status:"listed",installedVersion,versions:[{version,prerelease,deprecated,bundle,incompatible:{requirements}}],omitted,requestedRegistry,answeredRegistry,attempts:[{registry,problem}]}` 或 `{status:"refused",problem,reason,requestedRegistry,answeredRegistry,attempts}`；Git/内置/不可升级 → 409（稳定码 `git-update-desktop-required`/`plugin-not-updatable`）。
+- `POST /m/api/plugin-inventory/install` `{name, registry?}`：仅接受宿主清单里带 `installTarget` 的候选；spec 由宿主决定，`expected` 固定目标版本。返回 `{ok,operation}`。
+- `POST /m/api/plugin-inventory/update` `{name,version, registry?}`：仅接受 `update:"registry"` 的已安装 bundle；App 不能传 `spec`。返回 `{ok,operation}`。
+- `GET /m/api/plugin-inventory/op?opId=`：轮询操作快照：`status(running|succeeded|failed|cancelled)`、`steps[{key,state}]`、`version/fromVersion`、`restartRequired`、`rolledBack`、`rollbackFailed`、`unchanged`、`outcomeUnknown`、`cancelled`、`errorCode`，以及 issue #153 的源归因 `registries:[url]`、`attempt:{index,total}|null`、`answeredRegistry:url|null`（卸载/启停恒为空/null）。
 - `POST /m/api/plugin-inventory/op/cancel` `{opId}`：委托宿主 `cancelInstall`；返回 `{cancel:"cancelled|too-late|not-running",operation}`。
+
+#### 6.26.1 安装源（registry）选择（v3.3.1，issue #153）
+
+- `GET /m/api/plugin-inventory/registries`（只读，GET/HEAD）：返回 `{ok,supported,complete,reason,writable:false,registries:[{id,kind,url,display,role}]}`。`kind ∈ registry|pnpm`，`role ∈ primary|fallback|resolved`。旧宿主无 `pluginManager.registries()` 或其抛错 → **HTTP 200** + `supported:false`、`reason:"host-registry-unavailable"`、`registries:[]`（不是 404/500）。非 GET/HEAD → 405。`writable` 恒 `false`：App 不能增删电脑端 registry。
+- **凭据安全**：带 `username`/`password`/`query`/`fragment` 的条目**整条丢弃**（不做脱敏回显）；被丢弃时 `complete:false` + `reason:"registry-entries-dropped"`。`display` 只给 host+pathname。
+- `registry` 参数（`versions` 的 query、`install`/`update` 的 body 字段）只影响**本次**解析用的源，**不持久化**（不写 profile `package.json`/`pnpm-lock.yaml`/`.npmrc`，不写插件状态目录）。安装 spec 仍由宿主 `installTarget` 决定 —— 手动 URL **不能安装任意包**。
+- 校验器（`validateRegistryUrl`，三处共用）：失败一律 `400 registry-invalid`，`detail` 只给类别（`not-string|empty|too-long|control-char|whitespace|unparsable|unsupported-protocol|missing-host|has-credentials|has-fragment|has-query`），**不回显原文**。规范化：pathname 末尾补 `/`，输出 `href`（与宿主 `normalizeRegistry` 幂等）。
+- 允许 localhost/私网（内网 Verdaccio/Nexus 是合法用例），不加私网黑名单；风险记录见 `docs/04-security.md`。
+- 不静默换源：`versions` 与操作快照都带 `requestedRegistry`/`answeredRegistry`/`attempts`；失败时 `answeredRegistry` 为 `null`（不能声称某个源答了）。
 
 口径：
 - 安装失败/取消：宿主恢复 profile，`rolledBack:true`；异常逃逸 → `outcomeUnknown:true`（不断言回滚成功）。

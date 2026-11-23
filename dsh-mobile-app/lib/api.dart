@@ -1626,27 +1626,62 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi, GitTagsApi {
   }
 
   /// #146：检查某个已安装 registry bundle 的可用新版本（只读；不触发安装）。
-  Future<PluginVersionCheck> pluginVersions(String name) async {
+  ///
+  /// #153：`registry` 可选，只影响本次解析的源（不持久化）；响应带逐项源归因。
+  Future<PluginVersionCheck> pluginVersions(
+    String name, {
+    String? registry,
+  }) async {
+    final query = <String>['name=${Uri.encodeQueryComponent(name)}'];
+    if (registry != null && registry.isNotEmpty) {
+      query.add('registry=${Uri.encodeQueryComponent(registry)}');
+    }
     final data = await getJson(
-      '/api/plugin-inventory/versions?name=${Uri.encodeQueryComponent(name)}',
+      '/api/plugin-inventory/versions?${query.join('&')}',
       timeout: const Duration(seconds: 30),
     );
     return PluginVersionCheck.fromJson(data);
   }
 
+  /// #153：当前宿主会问哪些安装源（只读）。旧宿主无该端点 → supported:false（不当作失败）。
+  Future<PluginRegistryList> pluginRegistries() async {
+    try {
+      final data = await getJson(
+        '/api/plugin-inventory/registries',
+        timeout: const Duration(seconds: 8),
+      );
+      return PluginRegistryList.fromJson(data);
+    } on ApiException catch (e) {
+      if (e.status == 404 || e.status == 405) {
+        return PluginRegistryList.unsupported('endpoint-missing');
+      }
+      rethrow;
+    }
+  }
+
   /// #146：从宿主配置渠道安装一个 bundle（spec 由宿主清单决定，App 只传 name）。
-  Future<PluginOperation> pluginInstall(String name) async {
+  ///
+  /// #153：`registry` 只改变解析该 spec 的源，**不能**安装任意包。
+  Future<PluginOperation> pluginInstall(String name, {String? registry}) async {
     final data = await postJson('/api/plugin-inventory/install', {
       'name': name,
+      if (registry != null && registry.isNotEmpty) 'registry': registry,
     }, timeout: const Duration(seconds: 30));
     return PluginOperation.fromJson(data['operation']);
   }
 
   /// #146：升级一个 registry 来源 bundle 到宿主确认的精确版本。
-  Future<PluginOperation> pluginUpgrade(String name, String version) async {
+  ///
+  /// #153：`registry` 与「检查更新」用的源一致，避免“检查到的版本装不上”。
+  Future<PluginOperation> pluginUpgrade(
+    String name,
+    String version, {
+    String? registry,
+  }) async {
     final data = await postJson('/api/plugin-inventory/update', {
       'name': name,
       'version': version,
+      if (registry != null && registry.isNotEmpty) 'registry': registry,
     }, timeout: const Duration(seconds: 30));
     return PluginOperation.fromJson(data['operation']);
   }
