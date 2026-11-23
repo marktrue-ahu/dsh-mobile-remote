@@ -34,6 +34,7 @@ import '../version_alignment.dart';
 import 'sheets.dart';
 import 'log_sheet.dart';
 import 'providers_screen.dart';
+import 'host_settings_screen.dart';
 import 'plugin_inventory_screen.dart';
 import 'usage_screen.dart';
 
@@ -2574,6 +2575,28 @@ class _SettingsScreenState extends State<SettingsScreen>
                     trailing: DshSwitch(
                       value: widget.store.showHiddenFiles,
                       onChanged: (v) => widget.store.setShowHiddenFiles(v),
+                    ),
+                  ),
+                ]),
+              if (_tabIndex == 3)
+                _card(L10n.t('电脑端设置', 'Computer settings'), [
+                  // #106：DSH 设置只读查看器（唯一主入口；固定白名单 + 全链脱敏）。
+                  _row(
+                    key: const Key('settings-host-settings'),
+                    leading: const Icon(Icons.tune_outlined),
+                    title: L10n.t('电脑端设置（只读）', 'Computer settings (read-only)'),
+                    sub: L10n.t(
+                      '查看当前电脑允许查看的 DSH 设置；本页不修改任何配置',
+                      'View the DSH settings this computer allows; nothing is modified',
+                    ),
+                    trailing: Text(
+                      L10n.t('查看 ▸', 'View ▸'),
+                      style: TextStyle(fontSize: 12, color: brand),
+                    ),
+                    onTap: () => Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => HostSettingsScreen(store: widget.store),
+                      ),
                     ),
                   ),
                 ]),
