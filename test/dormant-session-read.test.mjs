@@ -351,6 +351,14 @@ test("/send：seeded 缺陷时用 listEvents/readEvent 恢复历史配置（mode
 	const resumeCalls = [];
 	const query = {
 		readSession: async () => { throw SEEDED_ERROR; },
+		// issue #165：本用例断言的是「配置**恢复成功**时不降级」，因此必须提供可核验的
+		// session lifecycle header。282a445（#162 review P2）起，seeded 回退拿不到可信
+		// header 时会如实降级（即便 listEvents/readEvent 成功）—— 那种场景由
+		// test/dormant-subagent-model.test.mjs 的「无可信 header」用例单独覆盖。
+		readSurface: async (id) => ({
+			events: [],
+			session: { id, version: 1, createdAt: 1, cwd: "/tmp", isSeeded: false },
+		}),
 		listEvents: async () => ([
 			{ type: "model/selection", seq: 5 },
 			{ type: "agent-preset/selected", seq: 6 },
