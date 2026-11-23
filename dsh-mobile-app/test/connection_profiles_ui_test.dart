@@ -251,7 +251,13 @@ void main() {
       isEmpty,
       reason: '编辑页不回显明文口令',
     );
-    expect(find.byKey(const ValueKey('connection-profile-scan')), findsNothing);
+    // issue #171：编辑态也提供扫码（文案为「扫码替换」，会覆盖地址/口令但不改名称）。
+    expect(
+      find.byKey(const ValueKey('connection-profile-scan')),
+      findsOneWidget,
+      reason: '编辑态必须能直接扫码替换连接',
+    );
+    expect(find.text('扫码替换'), findsOneWidget);
   });
 
   testWidgets('编辑自定义挂载档案只改名称：path 保留，不被覆盖成 /m', (tester) async {
@@ -455,4 +461,64 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('添加电脑'), findsNothing);
   });
+
+// ── issue #171：编辑态扫码 ──────────────────────────────────────────────────
+testWidgets('#171 编辑态点扫码：有输入时先确认，取消则表单不变', (tester) async {
+  await tester.pumpWidget(
+    MaterialApp(
+      home: ConnectionProfileEditorScreen(
+        store: store,
+        manager: manager,
+        profile: a,
+      ),
+    ),
+  );
+  await tester.pumpAndSettle();
+
+  final baseField = tester.widget<TextField>(find.byType(TextField).at(1));
+  final before = baseField.controller?.text;
+
+  // 编辑态已有 base 输入 → 点扫码应先弹确认。
+  await tester.tap(find.byKey(const ValueKey('connection-profile-scan')));
+  await tester.pumpAndSettle();
+  expect(
+    find.byKey(const ValueKey('connection-scan-confirm')),
+    findsOneWidget,
+    reason: '当前输入非空时必须确认，避免误扫覆盖',
+  );
+
+  // 取消：不进入扫码页，表单保持原值。
+  await tester.tap(find.byKey(const ValueKey('connection-scan-cancel')));
+  await tester.pumpAndSettle();
+  expect(find.byKey(const ValueKey('connection-scan-confirm')), findsNothing);
+  expect(
+    tester.widget<TextField>(find.byType(TextField).at(1)).controller?.text,
+    before,
+  );
+});
+
+testWidgets('#171 编辑态扫码文案为「扫码替换」且按钮可用', (tester) async {
+  await tester.pumpWidget(
+    MaterialApp(
+      home: ConnectionProfileEditorScreen(
+        store: store,
+        manager: manager,
+        profile: a,
+      ),
+    ),
+  );
+  await tester.pumpAndSettle();
+
+  expect(find.text('扫码替换'), findsOneWidget);
+  expect(find.text('扫码添加'), findsNothing, reason: '编辑态不应显示添加文案');
+  // 按钮可交互：key 命中且能找到扫码图标（未禁用时 onPressed 非空由上一行文案同源保证）。
+  expect(
+    find.descendant(
+      of: find.byKey(const ValueKey('connection-profile-scan')),
+      matching: find.byIcon(Icons.qr_code_scanner),
+    ),
+    findsOneWidget,
+  );
+});
+
 }
