@@ -35,7 +35,6 @@ import 'sheets.dart';
 import 'log_sheet.dart';
 import 'providers_screen.dart';
 import 'host_settings_screen.dart';
-import 'plugin_inventory_screen.dart';
 import 'usage_screen.dart';
 
 /// issue #116：宿主拒绝后的稳定动作 → 可执行文案（未知动作返回空串，由调用方回退到 reason 文案）。
@@ -2374,6 +2373,47 @@ class _SettingsScreenState extends State<SettingsScreen>
                     ),
                   ),
                 ]),
+              // #176：Git / 文件浏览都是「内容与浏览」相关的行为设置，从「通用」移入「对话」，
+              // 顺序为 对话行为 → Git → 文件浏览 → 外观与交互。
+              if (_tabIndex == 0)
+                _card(L10n.t('Git', 'Git'), [
+                  _row(
+                    leading: const Icon(Icons.tab_outlined),
+                    title: L10n.t('Git 标签页', 'Git tabs'),
+                    sub: _gitTabsSummary,
+                    onTap: _pickGitTabs,
+                  ),
+                  _row(
+                    key: const Key('settings-git-graph-limit'),
+                    leading: const Icon(Icons.account_tree_outlined),
+                    title: L10n.t('Git 分支图上限', 'Git branch graph limit'),
+                    sub: _gitGraphLimitSub,
+                    trailing: Text(
+                      _gitGraphLimitSummary,
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: brand,
+                      ),
+                    ),
+                    onTap: _pickGitGraphLimit,
+                  ),
+                ]),
+              if (_tabIndex == 0)
+                _card(L10n.t('文件浏览', 'File browsing'), [
+                  _row(
+                    leading: const Icon(Icons.visibility_outlined),
+                    title: L10n.t('显示隐藏文件', 'Show hidden files'),
+                    sub: L10n.t(
+                      '会话文件浏览中显示点开头的文件与目录（.git 始终隐藏；不影响目录选择器）',
+                      'Show dot-prefixed files and folders in session file browsing (.git stays hidden; directory picker unaffected)',
+                    ),
+                    trailing: DshSwitch(
+                      value: widget.store.showHiddenFiles,
+                      onChanged: (v) => widget.store.setShowHiddenFiles(v),
+                    ),
+                  ),
+                ]),
               if (_tabIndex == 1)
                 _card(L10n.t('外观与交互', 'Appearance & interaction'), [
                   _row(
@@ -2540,45 +2580,6 @@ class _SettingsScreenState extends State<SettingsScreen>
                     ),
                 ]),
               if (_tabIndex == 3)
-                _card(L10n.t('Git', 'Git'), [
-                  _row(
-                    leading: const Icon(Icons.tab_outlined),
-                    title: L10n.t('Git 标签页', 'Git tabs'),
-                    sub: _gitTabsSummary,
-                    onTap: _pickGitTabs,
-                  ),
-                  _row(
-                    key: const Key('settings-git-graph-limit'),
-                    leading: const Icon(Icons.account_tree_outlined),
-                    title: L10n.t('Git 分支图上限', 'Git branch graph limit'),
-                    sub: _gitGraphLimitSub,
-                    trailing: Text(
-                      _gitGraphLimitSummary,
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
-                        color: brand,
-                      ),
-                    ),
-                    onTap: _pickGitGraphLimit,
-                  ),
-                ]),
-              if (_tabIndex == 3)
-                _card(L10n.t('文件浏览', 'File browsing'), [
-                  _row(
-                    leading: const Icon(Icons.visibility_outlined),
-                    title: L10n.t('显示隐藏文件', 'Show hidden files'),
-                    sub: L10n.t(
-                      '会话文件浏览中显示点开头的文件与目录（.git 始终隐藏；不影响目录选择器）',
-                      'Show dot-prefixed files and folders in session file browsing (.git stays hidden; directory picker unaffected)',
-                    ),
-                    trailing: DshSwitch(
-                      value: widget.store.showHiddenFiles,
-                      onChanged: (v) => widget.store.setShowHiddenFiles(v),
-                    ),
-                  ),
-                ]),
-              if (_tabIndex == 3)
                 _card(L10n.t('电脑端设置', 'Computer settings'), [
                   // #106：DSH 设置只读查看器（唯一主入口；固定白名单 + 全链脱敏）。
                   _row(
@@ -2596,27 +2597,6 @@ class _SettingsScreenState extends State<SettingsScreen>
                     onTap: () => Navigator.of(context).push(
                       MaterialPageRoute(
                         builder: (_) => HostSettingsScreen(store: widget.store),
-                      ),
-                    ),
-                  ),
-                ]),
-              if (_tabIndex == 3)
-                _card(L10n.t('插件', 'Plugins'), [
-                  _row(
-                    leading: const Icon(Icons.extension_outlined),
-                    title: L10n.t('插件管理', 'Plugins'),
-                    sub: L10n.t(
-                      '当前电脑的插件清单、版本与健康（只读）',
-                      'Installed plugins, versions and health on this computer (read-only)',
-                    ),
-                    trailing: Text(
-                      L10n.t('查看 ▸', 'View ▸'),
-                      style: TextStyle(fontSize: 12, color: brand),
-                    ),
-                    onTap: () => Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (_) =>
-                            PluginInventoryScreen(store: widget.store),
                       ),
                     ),
                   ),

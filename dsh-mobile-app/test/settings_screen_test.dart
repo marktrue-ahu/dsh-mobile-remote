@@ -39,7 +39,8 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
-    await selectSettingsTab(tester, '通用');
+    // #176：Git 卡已从「通用」移到「对话」。
+    await selectSettingsTab(tester, '对话');
     final gitTabsIcon = find.byIcon(Icons.tab_outlined);
     await tester.scrollUntilVisible(
       gitTabsIcon,
@@ -58,7 +59,9 @@ void main() {
       .map((tile) => (tile.title! as Text).data)
       .toList();
 
-  testWidgets('issue #145：设置页有只读插件管理入口', (tester) async {
+  // #176：设置页的「插件」快捷入口已删除——插件页只保留 Drawer 一级入口
+  // （覆盖见 issue153_plugin_management_api_test.dart 的 drawer-plugins）。
+  testWidgets('issue #176：设置页四个 Tab 都不再有插件管理卡', (tester) async {
     final store = await makeStore();
     await tester.pumpWidget(
       MaterialApp(
@@ -68,17 +71,20 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
-    await selectSettingsTab(tester, '通用');
-    final scrollable = find.byType(Scrollable).first;
-    await tester.scrollUntilVisible(
-      find.text('插件管理'),
-      320,
-      scrollable: scrollable,
-    );
-    await tester.pumpAndSettle();
-    expect(find.text('插件管理'), findsOneWidget);
-    expect(find.textContaining('当前电脑的插件清单、版本与健康（只读）'), findsOneWidget);
-    expect(find.text('查看 ▸'), findsWidgets);
+    for (final tab in ['对话', '外观', '通知', '通用']) {
+      await selectSettingsTab(tester, tab);
+      await tester.pumpAndSettle();
+      expect(
+        find.text('插件管理'),
+        findsNothing,
+        reason: '「$tab」Tab 不应再有插件管理入口',
+      );
+      expect(
+        find.textContaining('当前电脑的插件清单、版本与健康（只读）'),
+        findsNothing,
+        reason: '「$tab」Tab 不应再有插件卡副标题',
+      );
+    }
   });
 
   testWidgets('notification permission recovery opens system settings', (
@@ -640,7 +646,8 @@ void main() {
 
     final rowText = find.text('显示隐藏文件');
     // #155：目标项在对应 Tab，真实切换到该 Tab 后再滚动。
-    await selectSettingsTab(tester, '通用');
+    // #176：文件浏览卡已从「通用」移到「对话」。
+    await selectSettingsTab(tester, '对话');
     await tester.scrollUntilVisible(
       rowText,
       300,
