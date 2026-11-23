@@ -424,8 +424,10 @@
       "carrierVersion": "3.3.1-alpha.3-app",
       "build": 66,
       "integrity": "sha512-fiLOuKdqHV/CNH2w1bAYtfmQQAMiTQ749iax2VCvt/cs3cf7rHsvNc9W0xsaUSu/Fh12kYsfnwX29cGpYFyapw==",
-      "status": "submitted",
-      "createdAt": "2026-11-23T10:39:40.336Z"
+      "status": "published",
+      "createdAt": "2026-11-23T10:39:40.336Z",
+      "note": "dist-tags verified",
+      "updatedAt": "2026-11-23T10:49:57.377Z"
     }
   ]
 }
