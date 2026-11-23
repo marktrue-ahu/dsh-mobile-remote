@@ -26,7 +26,7 @@ main 是发布线，remote main 仍为 1ff8b0388998b2a0fce6a23c40d63b3d0fc6ff46�
 
 ## 2026-11-06 最新进展
 
-DSH 最新 prerelease 为 `0.2.2-rc.1`；四项 peer prerelease 范围此前实际拒绝 0.2.x RC，已修复。47 项代际兼容测试、针对上游 API 形状的源码核对及 npm `--dry-run` 真实解析 20 项依赖通过。全量 Node 282 项、Python 8 项、npm run check 和 Flutter 3.47.0 analyze 均通过。Node 下限随 DSH 宿主提升至 24.9；本机为 24.15。`readSession()` seeded 旧日志缺陷仍在，#20 按维护者要求不处理。上游 `master` 为 `fcc0ad4`，即该 RC 发布合并，没有发现更新的公开发行版。详见 [DSH 0.2.2 兼容审查](20-dsh-022-compatibility-2026-11-05.md)。
+DSH 最新 prerelease 为 `0.2.2-rc.1`；四项 peer prerelease 范围此前实际拒绝 0.2.x RC，已修复。47 项代际兼容测试、针对上游 API 形状的源码核对及 npm `--dry-run` 真实解析 20 项依赖通过。全量 Node 282 项、Python 8 项、npm run check 和 Flutter 3.47.0 analyze 均通过。Node 下限随 DSH 宿主提升至 24.9；本机为 24.15。`readSession()` seeded 旧日志缺陷仍在，#20 按维护者要求不处理。上游 `master` 为 `fcc0ad4`，即该 RC 发布合并，没有发现更新的公开发行版。详见 [DSH 0.2.2 兼容审查](../20-dsh-022-compatibility-2026-11-05.md)。
 
 scoped npm 安装身份修复已完成：helper 用 profile 实际依赖名核对安装结果，带 scope 的 profile 不会在装完新代码后误报 `installed-plugin-version-mismatch`；npm 错误仍只暴露稳定错误码。真实隔离 registry 的 npm view / pack / 离线安装及 15 项更新器定向测试通过。
 
