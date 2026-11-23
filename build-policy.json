@@ -406,6 +406,15 @@
       "createdAt": "2026-11-22T05:41:11.400Z",
       "note": "dist-tags verified",
       "updatedAt": "2026-11-22T05:47:34.666Z"
+    },
+    {
+      "tag": "v3.3.1-alpha.2",
+      "pluginVersion": "3.3.1-alpha.2",
+      "carrierVersion": "3.3.1-alpha.2-app",
+      "build": 65,
+      "integrity": "sha512-ACdH0suzfXK2BjIzDIdLUUO/PWnRJJ5JDRt4MEbmMPgcNubpqrZgYAHVslVhKRFC6J9Uk1FuM8vkZq+5niLxhg==",
+      "status": "submitted",
+      "createdAt": "2026-11-23T00:59:00.024Z"
     }
   ]
 }
