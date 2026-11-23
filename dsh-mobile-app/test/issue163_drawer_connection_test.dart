@@ -100,8 +100,9 @@ Future<_Harness> _pumpDrawer(
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+  _issue168Tests();
 
-  testWidgets('无主机时 Drawer 仍显示仅文字「连接」，点击进入连接入口', (tester) async {
+  testWidgets('无主机时 Drawer 显示带图标的「连接」，点击进入连接入口', (tester) async {
     final store = await _store(withHost: false);
     addTearDown(store.disposeBridge);
     final harness = await _pumpDrawer(tester, store);
@@ -109,11 +110,11 @@ void main() {
     final entry = find.byKey(const ValueKey('drawer-connection'));
     expect(entry, findsOneWidget);
     expect(find.text('连接'), findsOneWidget);
-    expect(
-      find.descendant(of: entry, matching: find.byType(Icon)),
-      findsNothing,
-      reason: '入口是仅文字（不加图标/主机摘要）',
-    );
+    // issue #168：补齐图标，与「首页」「会话」「插件」「设置」一级入口一致。
+    // 仍不显示主机摘要文字（那是 #163 的既有约束）。
+    final icon = find.descendant(of: entry, matching: find.byType(Icon));
+    expect(icon, findsOneWidget, reason: '一级入口必须有图标');
+    expect(tester.widget<Icon>(icon).size, 20, reason: '图标尺寸与兄弟项一致');
     final entrySize = tester.getSize(entry);
     expect(entrySize.height, greaterThanOrEqualTo(44));
     expect(entrySize.width, greaterThanOrEqualTo(44));
@@ -223,5 +224,47 @@ void main() {
     );
     expect(find.byKey(const ValueKey('drawer-connection')), findsOneWidget);
     expect(tester.takeException(), isNull);
+  });
+}
+
+// ── issue #168：「连接」补齐图标后与兄弟一级入口视觉对齐 ────────────────────
+void _issue168Tests() {
+  testWidgets('#168「连接」与「插件」「首页」的一级入口图标/间距一致', (tester) async {
+    final store = await _store(withHost: true);
+    addTearDown(store.disposeBridge);
+    await _pumpDrawer(tester, store);
+
+    final connection = find.byKey(const ValueKey('drawer-connection'));
+    expect(connection, findsOneWidget);
+    // 该 harness 不注入 onOpenPlugins，「插件」按设计不渲染；用「首页」作图标尺寸对照。
+    final siblings = [connection];
+
+    // 「连接」不是 Tab：不得出现选中底色（动作型入口）。
+    final container = tester.widget<Container>(
+      find.descendant(of: connection, matching: find.byType(Container)).first,
+    );
+    final decoration = container.decoration as BoxDecoration?;
+    expect(decoration?.color, isNull, reason: '动作型入口不应有选中底色');
+
+    // 「连接」图标与兄弟一级入口同尺寸（20dp）。
+    final icon = find.descendant(of: connection, matching: find.byType(Icon));
+    expect(icon, findsOneWidget, reason: '一级入口必须有图标');
+    expect(tester.widget<Icon>(icon).size, 20, reason: '与兄弟项一致');
+    final homeIcon = find.descendant(
+      of: find.byKey(const ValueKey('drawer-home')),
+      matching: find.byType(Icon),
+    );
+    if (homeIcon.evaluate().isNotEmpty) {
+      expect(tester.widget<Icon>(homeIcon).size, 20);
+    }
+    expect(siblings, isNotEmpty);
+
+    // 命中高度 ≥44（可点区域不缩小）。
+    expect(tester.getSize(connection).height, greaterThanOrEqualTo(44));
+
+    // 点击仍关闭抽屉并进入连接页。
+    await tester.tap(connection);
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('drawer-connection')), findsNothing);
   });
 }
