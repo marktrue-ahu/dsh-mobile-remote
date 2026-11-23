@@ -17,6 +17,7 @@ import 'context_stats.dart';
 import 'models.dart';
 import 'team_tasks.dart';
 import 'plugin_inventory.dart';
+import 'host_settings.dart';
 import 'turn_tail.dart';
 import 'git_models.dart';
 import 'turn_outline.dart';
@@ -1654,6 +1655,26 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi, GitTagsApi {
     } on ApiException catch (e) {
       if (e.status == 404 || e.status == 405) {
         return PluginRegistryList.unsupported('endpoint-missing');
+      }
+      rethrow;
+    }
+  }
+
+  /// issue #106：电脑端 DSH 设置（只读）。
+  ///
+  /// **白名单在宿主侧冻结**：本方法不做任何字段筛选、不猜 schema、不补默认值；
+  /// 响应里没有的项就是不可见。旧宿主没有该端点（404/405）→ `unsupported`
+  /// 整页降级，**不当作网络失败**（与 pluginRegistries 一致）。
+  Future<HostSettingsView> hostSettings() async {
+    try {
+      final data = await getJson(
+        '/api/host-settings',
+        timeout: const Duration(seconds: 12),
+      );
+      return HostSettingsView.fromJson(data);
+    } on ApiException catch (e) {
+      if (e.status == 404 || e.status == 405) {
+        return HostSettingsView.unsupported('endpoint-missing');
       }
       rethrow;
     }
