@@ -64,7 +64,8 @@
 | 长期手册 | `01-PRD`、`02-architecture`、`03-api`、`04-security`、`06-install-run`、`09-compatibility`、`10-release` | 长期维护 |
 | 决策记录 | `docs/adr/`（38 篇） | 长期只增 |
 | Agent 约定 | `docs/agents/`（3 篇） | 长期 |
-| **一次性窗口/验收记录** | `13-…2026-11-03`、`16-…2026-11-04`、`17-…`、`18-…`、`19-…`、`20-dsh-022-compatibility-2026-11-05` | **历史快照**，不再更新 |
+| **一次性窗口/验收记录** | `13-…2026-11-03`、`16-…2026-11-04`、`17-…`、`18-…`、`19-…` | **历史快照**，不再更新；归 `docs/history/`（ADR 0039） |
+| **兼容性事实依据** | `20-dsh-022-compatibility-2026-11-05.md` | 名字带日期但**仍需回看**（CHANGELOG 引用、后续兼容决策依据）；**留顶层** |
 | 设计稿 | `docs/design/`（7 篇） | 部分已被 ADR 取代 |
 
 `docs/screenshots/` 只有 9 张早期截图（含应用商店图），与 `/tmp` 的 mockup 工程分属两套，边界模糊。
@@ -81,6 +82,10 @@
 
 `/tmp/3.3.1-ui-design.md` 与 `/tmp/3.3.1-ui-mockups/`（含可重渲染的 Flutter mockup 工程）是跨会话依赖，但 `/tmp` 随时可能被清理。本轮 #153 就依赖它们。
 
+> **已裁决（ADR 0039）**：设计稿与 mockup **均不入库**。权威位置是 GitLab issue 的 note（永久、按 issue 归类）。
+> 理由：单张 PNG 约 200–300KB，36 张约 10MB，一旦提交就永久留在 Git 历史；且仓库副本会与 issue 版本漂移，
+> 产生「哪份是批准稿」的歧义。mockup 工程依赖特定 Flutter 版本与本机字体，入库也不可复现。
+
 ## 3. 目标结构（建议，**未执行**）
 
 **原则：不做 `apps/` + `packages/` 大重构。** 理由：现有布局已稳定运行（CI、release-meta、worktree 生命周期、38 篇 ADR 的引用全部指向现有路径），大改的收益远低于打断发布链的风险。只做**低风险归位**。
@@ -88,10 +93,13 @@
 ### 3.1 第一批（低风险，纯新增/移动文档）
 
 1. `docs/` 内按寿命分组（**仅移动，不改内容**）：
-   - `docs/history/` ← `13-`、`16-`、`17-`、`18-`、`19-`、`20-` 这类带日期的窗口记录
-   - 长期手册保持 `docs/` 顶层不动（`03-api.md` 等被代码注释与 ADR 大量引用，移动成本最高）
-2. 新增 `docs/README.md`：一页说明"读哪个文档"，含 `AGENTS.md` / `AGENT-RULES.md` / `CONTEXT.md` / `docs/` 的分工表。
-3. 把本轮及以后的设计稿从 `/tmp` 收进仓库：`docs/design/3.3.1/`（mockup **工程**保留在仓库外，只入库最终 PNG 与 `manifest.md`）。
+   - `docs/history/` ← `13-`、`16-`、`17-`、`18-`、`19-` 这些**不再更新**的窗口记录
+   - **`20-dsh-022-compatibility-2026-11-05.md` 留顶层**：名字带日期但它是 0.2.2 兼容范围的**事实依据**，
+     `CHANGELOG.md` 引用它，后续兼容性决策（如 #166）也会回看它。判断标准是「是否还会变化」，不是「名字里有没有日期」。
+   - 长期手册保持 `docs/` 顶层不动（`03-api.md` 实测 22 处引用、`04-security.md` 15 处，移动成本最高）
+2. 新增 `docs/README.md`：一页**索引**说明「读哪个文档」，含 `AGENTS.md` / `AGENT-RULES.md` / `CONTEXT.md` / `docs/` 的分工表。
+   **只做导航、不复述规则** —— 权威仍在 `AGENT-RULES.md`（不入库），本页要明确写这一点。
+3. **设计稿不入库**（ADR 0039）：权威位置是 GitLab issue note。仓库内最多记录「某批设计稿在哪个 issue」的索引，不放二进制。
 
 ### 3.2 第二批（中风险，需同步引用）
 
@@ -99,7 +107,9 @@
    - `tools/gates/` ← 契约检查类（`timeline-contract-check`、`account-usage-check`、`account-usage-adversarial-check`、`e2e-check`、**`hotfix07-unit-check`**）
    - `tools/release/` ← `release-gate`、`prepare-release`、`next-build`、`release-meta-bootstrap`、`npm-drill`、`lib/npm-drill/*`、`lib/release-*`
    - `tools/worktree/` ← `worktree.sh`、`worktree-selftest.sh`
-   - `tools/archive/` ← 无引用的一次性取证脚本（`verify-413-precheck`、`verify-64k-fix`、`verify-no-model-session` 三个实测零引用）
+   - `tools/archive/` ← **目录保留但首版为空**；实测零外部引用的历史取证脚本
+     `verify-413-precheck`、`verify-64k-fix`、`verify-no-model-session` 按 ADR 0039 **直接删除**
+     （问题已修复且有回归测试覆盖，脚本本身不是可复用工具；需要时用 `git log --diff-filter=D -- <path>` 找回）
    - `tools/` 根保留：`proxy-env.sh`（必须稳定路径）
 
    **必须同步的引用点**：`.github/workflows/*.yml`、`tools/worktree.sh`（`REQUIRED_GATES` 里的脚本名）、`tools/timeline-contract-check.mjs`（require `hotfix07-unit-check`）、`AGENT-RULES.md`、`docs/10-release.md`、`README.md`。
@@ -107,7 +117,7 @@
 ### 3.3 第三批（低风险，仓库外）
 
 5. 工作树清理：已合并的 11 棵按 `tools/worktree.sh cleanup <issue> <PR>` 核验后清理（**需用户单独授权**，见 AGENT-RULES）。
-6. `/tmp` 设计资产的长期归宿：入库最终产物 + 在 `docs/design/` 记录重渲染方法。
+6. `/tmp` 设计资产：**不入库**（ADR 0039），权威在 GitLab issue note。仓库内不保存评审图片。
 
 ## 4. 明确不做
 
