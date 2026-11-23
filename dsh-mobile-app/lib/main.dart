@@ -28,6 +28,7 @@ import 'screens/sessions_screen.dart';
 import 'screens/settings_screen.dart';
 import 'screens/connection_profiles_screen.dart';
 import 'screens/notifications_screen.dart';
+import 'screens/plugin_inventory_screen.dart';
 import 'screens/sheets.dart';
 import 'screens/usage_screen.dart';
 import 'toast.dart';
@@ -900,6 +901,18 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
     unawaited(showConnectionProfilesScreen(context, _store));
   }
 
+  /// #153：插件页是**一级全屏页**（push），不是第四个 IndexedStack Tab；
+  /// 设置页里的同一入口只是快捷方式，页面只有一个。
+  void _openPlugins() {
+    unawaited(
+      Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (_) => PluginInventoryScreen(store: _store),
+        ),
+      ),
+    );
+  }
+
   void _openNewSession() {
     showNewSessionSheet(context, _store, (id) async {
       // Phase 2(A4)：openChat 内统一 setSession+refreshSessionConfig+push，这里只刷列表
@@ -1002,6 +1015,7 @@ class _RootScreenState extends State<RootScreen> with WidgetsBindingObserver {
         onSelect: (index) => setState(() => _index = index),
         onNewSession: _openNewSession,
         onOpenConnections: _openConnections,
+        onOpenPlugins: _openPlugins,
       ),
       body: _configured
           ? IndexedStack(
@@ -1045,6 +1059,7 @@ class AppDrawer extends StatelessWidget {
     required this.onSelect,
     required this.onNewSession,
     required this.onOpenConnections,
+    this.onOpenPlugins,
   });
 
   final AppStore store;
@@ -1052,6 +1067,9 @@ class AppDrawer extends StatelessWidget {
   final ValueChanged<int> onSelect;
   final VoidCallback onNewSession;
   final VoidCallback onOpenConnections;
+
+  /// #153：Drawer 一级「插件」入口；为 null 时不渲染（旧调用方/测试不受影响）。
+  final VoidCallback? onOpenPlugins;
 
   @override
   Widget build(BuildContext context) {
@@ -1118,6 +1136,14 @@ class AppDrawer extends StatelessWidget {
               L10n.t('会话', 'Sessions'),
               1,
             ),
+            if (onOpenPlugins != null)
+              _drawerAction(
+                context,
+                Icons.extension_outlined,
+                L10n.t('插件', 'Plugins'),
+                onOpenPlugins!,
+                key: const ValueKey('drawer-plugins'),
+              ),
             _drawerItem(
               context,
               Icons.settings_outlined,
@@ -1211,6 +1237,44 @@ class AppDrawer extends StatelessWidget {
                   color: selected ? brand : ink2,
                   fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
                 ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 非 Tab 的一级入口（如「插件」）：点击关抽屉后 push 独立页面，不改当前 Tab。
+  Widget _drawerAction(
+    BuildContext context,
+    IconData icon,
+    String label,
+    VoidCallback onTap, {
+    Key? key,
+  }) {
+    final ink2 = DshColors.ink2(context);
+    void open() {
+      Navigator.of(context).pop();
+      onTap();
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 1),
+      child: InkWell(
+        key: key,
+        borderRadius: BorderRadius.circular(10),
+        onTap: open,
+        child: Container(
+          constraints: const BoxConstraints(minHeight: 44),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
+          child: Row(
+            children: [
+              Icon(icon, size: 20, color: ink2),
+              const SizedBox(width: 12),
+              Text(
+                label,
+                style: TextStyle(fontSize: 14.5, color: ink2),
               ),
             ],
           ),

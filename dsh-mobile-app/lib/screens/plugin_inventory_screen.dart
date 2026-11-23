@@ -11,9 +11,16 @@ import '../l10n.dart';
 import '../plugin_inventory.dart';
 import '../store.dart';
 import '../theme.dart';
+import 'plugin_install_source_screen.dart';
+import 'plugin_management_widgets.dart';
+import 'plugin_update_scan.dart';
 import 'sheets.dart';
 
 /// #146：安装/升级动作依赖（默认走真实 API；测试可注入 fake）。
+///
+/// #153 的 `registry` 透传**不改动既有三个函数签名**，而是新增一组可选 `*At` 钩子：
+/// 既有 fake（`Function(String)` / `Function(String, String)`）无需改动仍可赋值，
+/// 而需要验证源透传的调用方注入 `*At`。只影响本次解析的源，不持久化。
 class PluginInventoryActions {
   final Future<PluginVersionCheck> Function(String name) checkVersions;
   final Future<PluginOperation> Function(String name) install;
@@ -24,6 +31,26 @@ class PluginInventoryActions {
   final Future<PluginOperation> Function(String opId) poll;
   final Future<String> Function(String opId) cancel;
 
+  /// #153：带安装源的版本检查（`registry == null` 表示沿用宿主自己的解析顺序）。
+  final Future<PluginVersionCheck> Function(String name, String? registry)?
+  checkVersionsAt;
+
+  /// #153：带安装源的安装（`registry == null` 表示沿用宿主自己的解析顺序）。
+  final Future<PluginOperation> Function(String name, String? registry)?
+  installAt;
+
+  /// #153：带安装源的升级（避免“检查到的版本装不上”）。
+  final Future<PluginOperation> Function(
+    String name,
+    String version,
+    String? registry,
+  )?
+  upgradeAt;
+
+  /// #153：宿主只读安装源投影（旧宿主无该端点 → supported:false）。
+  /// 未注入时安装走原有确认框（没有源可选，多一跳没有信息增益）。
+  final Future<PluginRegistryList> Function()? registries;
+
   const PluginInventoryActions({
     required this.checkVersions,
     required this.install,
@@ -33,6 +60,10 @@ class PluginInventoryActions {
     required this.restartHost,
     required this.poll,
     required this.cancel,
+    this.checkVersionsAt,
+    this.installAt,
+    this.upgradeAt,
+    this.registries,
   });
 
   factory PluginInventoryActions.fromApi(Api api) => PluginInventoryActions(
@@ -44,7 +75,48 @@ class PluginInventoryActions {
     restartHost: api.pluginRestartHost,
     poll: api.pluginOperation,
     cancel: api.pluginCancelOperation,
+    checkVersionsAt: (name, registry) =>
+        api.pluginVersions(name, registry: registry),
+    installAt: (name, registry) => api.pluginInstall(name, registry: registry),
+    upgradeAt: (name, version, registry) =>
+        api.pluginUpgrade(name, version, registry: registry),
+    registries: api.pluginRegistries,
   );
+
+  /// 检查更新（有 `*At` 钩子时带源，否则退回无源版本）。
+  Future<PluginVersionCheck> checkVersionsWith(
+    String name, {
+    String? registry,
+  }) {
+    final at = checkVersionsAt;
+    if (at != null && (registry == null || registry.isEmpty)) {
+      return at(name, null);
+    }
+    if (at != null) return at(name, registry);
+    return checkVersions(name);
+  }
+
+  /// 安装（有 `*At` 钩子时带源，否则退回无源版本）。
+  Future<PluginOperation> installWith(String name, {String? registry}) {
+    final at = installAt;
+    if (at != null) {
+      return at(name, registry == null || registry.isEmpty ? null : registry);
+    }
+    return install(name);
+  }
+
+  /// 升级（有 `*At` 钩子时带源，否则退回无源版本）。
+  Future<PluginOperation> upgradeWith(
+    String name,
+    String version, {
+    String? registry,
+  }) {
+    final at = upgradeAt;
+    if (at != null) {
+      return at(name, version, registry == null || registry.isEmpty ? null : registry);
+    }
+    return upgrade(name, version);
+  }
 }
 
 String pluginOperationErrorText(String code) {
@@ -80,6 +152,11 @@ String pluginOperationErrorText(String code) {
     'plugin-versions-unavailable' => L10n.t(
       '无法检查更新，请检查网络或电脑端状态',
       'Could not check for updates; check the network or desktop',
+    ),
+    // #153：安装源校验失败——明确归因，不静默换源。
+    'registry-invalid' => L10n.t(
+      '安装源地址无效：只接受 http(s) 地址，不接受凭据、查询参数、片段或本地路径',
+      'Invalid registry URL: only http(s) addresses are accepted, without credentials, query or fragment',
     ),
     'plugin-inventory-unavailable' => L10n.t(
       '读取插件清单失败',
@@ -137,6 +214,19 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
   bool _restartPending = false;
   String? _restartError;
 
+  /// #153：当前 Tab（`builtin`/`experimental`/`custom`；扁平降级时不使用）。
+  String _tab = pluginCategoryOrder.first;
+
+  /// 搜索只作用当前 Tab（本地过滤，不打服务端搜索）。
+  final _searchController = TextEditingController();
+  String _search = '';
+
+  /// 默认不展示 HIDDEN 项（无插件页的 bundle）。
+  bool _showHidden = false;
+
+  PluginUpdateScanController? _scanner;
+  PluginUpdateScan _scan = const PluginUpdateScan();
+
   PluginInventoryActions get _actions =>
       widget.actions ?? PluginInventoryActions.fromApi(widget.store.api);
 
@@ -146,6 +236,8 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
   @override
   void dispose() {
     _operationTimer?.cancel();
+    _scanner?.cancel();
+    _searchController.dispose();
     super.dispose();
   }
 
@@ -183,13 +275,44 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final compact =
+        MediaQuery.sizeOf(context).width <= 340 ||
+        MediaQuery.textScalerOf(context).scale(14) >= 1.4;
+    final canScan = _inventory?.supported == true && !_scan.running;
     return Scaffold(
       appBar: AppBar(
         title: Text(
-          L10n.t('插件管理', 'Plugins'),
+          L10n.t('插件', 'Plugins'),
           style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
         ),
         actions: [
+          // 「检查全部更新」：App 侧有界并发，不创建宿主事务、不自动安装。
+          if (compact)
+            IconButton(
+              key: const ValueKey('plugin-check-all'),
+              tooltip: L10n.t('检查全部更新', 'Check all for updates'),
+              icon: _scan.running
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.sync, size: 20),
+              onPressed: canScan ? _startScan : null,
+            )
+          else
+            TextButton.icon(
+              key: const ValueKey('plugin-check-all'),
+              onPressed: canScan ? _startScan : null,
+              icon: _scan.running
+                  ? const SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.sync, size: 16),
+              label: Text(L10n.t('检查全部更新', 'Check updates')),
+            ),
           IconButton(
             tooltip: L10n.t('刷新插件清单', 'Refresh plugins'),
             icon: _loading
@@ -210,6 +333,55 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
         ),
       ),
     );
+  }
+
+  /// 开始「检查全部更新」：只查 `canUpdate` 的行，Git 来源跳过、不创建任何宿主事务。
+  void _startScan() {
+    final inventory = _inventory;
+    if (inventory == null) return;
+    _scanner?.cancel();
+    final controller = PluginUpdateScanController(
+      checkVersions: _actions.checkVersionsWith,
+      onUpdate: (scan) {
+        if (!mounted) return;
+        setState(() => _scan = scan);
+      },
+    );
+    _scanner = controller;
+    unawaited(controller.start(inventory));
+  }
+
+  void _cancelScan() {
+    _scanner?.cancel();
+    if (mounted) setState(() => _scan = _scanner?.scan ?? _scan.copyWith(running: false));
+  }
+
+  /// 单项重试：只在完成后的 banner 里点失败行触发；不创建宿主事务。
+  void _rescanOne(String name) {
+    final inventory = _inventory;
+    final plugin = inventory?.plugins.where((p) => p.name == name).firstOrNull;
+    if (plugin == null) return;
+    unawaited(() async {
+      PluginUpdateCheckResult result;
+      try {
+        final check = await _actions.checkVersionsWith(plugin.name);
+        result = pluginScanResultOf(plugin, check);
+      } catch (e) {
+        final code = e is ApiException ? (e.code ?? '') : '';
+        result = PluginUpdateCheckResult(
+          name: plugin.name,
+          state: 'failed',
+          installed: plugin.version,
+          errorCode: code.isEmpty ? 'check-failed' : code,
+        );
+      }
+      if (!mounted) return;
+      setState(() {
+        _scan = _scan.copyWith(
+          results: Map.unmodifiable({..._scan.results, plugin.name: result}),
+        );
+      });
+    }());
   }
 
   Future<bool> _confirm({
@@ -237,7 +409,45 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
     return result == true;
   }
 
+  /// #153：安装先进入**安装源选择页**（三选一 + 手动 URL），由该页完成校验、安装与
+  /// 进度/回滚/取消展示。
+  ///
+  /// 降级：宿主/注入方没有安装源信息（`actions.registries == null`，例如旧宿主或
+  /// 只注入安装能力的调用方）时，回到原有的确认对话框——此时页面上唯一可选项就是
+  /// 「宿主默认源」，多一次跳转没有信息增益。
   Future<void> _startInstall(PluginInstallable item) async {
+    if (_actions.registries == null) {
+      await _startInstallWithDialog(item);
+      return;
+    }
+    final spec = item.version.isEmpty
+        ? item.packageName
+        : '${item.packageName}@${item.version}';
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => PluginInstallSourceScreen(
+          packageName: item.packageName,
+          displayName: item.displayName,
+          packageSpec: spec,
+          version: item.version,
+          category: item.hasCategory ? item.category : null,
+          restartHint: true,
+          loadRegistries: _actions.registries,
+          onInstall: (registry) =>
+              _actions.installWith(item.name, registry: registry),
+          poll: _actions.poll,
+          cancel: _actions.cancel,
+        ),
+      ),
+    );
+    if (!mounted) return;
+    // 返回后用一次刷新对齐版本/健康/能力（安装可能已改宿主状态）。
+    await _refresh();
+    unawaited((widget.refreshAll ?? widget.store.refreshAll)());
+  }
+
+  /// 无安装源信息时的确认框安装路径（保留 #146 的语义与文案）。
+  Future<void> _startInstallWithDialog(PluginInstallable item) async {
     final version = item.version.isEmpty ? '' : ' v${item.version}';
     final ok = await _confirm(
       title: L10n.t(
@@ -441,8 +651,10 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
   }
 
   Widget _buildList(BuildContext context, PluginInventory inventory) {
-    final plugins = inventory.plugins;
     final partial = inventory.isPartial;
+    // 三 Tab 只在宿主**每一行**都给了 category 时启用；否则退回原来的单列表。
+    final categorized = inventory.hasCategories;
+    final selectedTab = _tab;
     return RefreshIndicator(
       onRefresh: _refresh,
       child: ListView(
@@ -494,37 +706,44 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
               actionLabel: L10n.t('重试', 'Retry'),
               onAction: _refresh,
             ),
-          const SizedBox(height: 16),
-          _SectionTitle(
-            title: L10n.t('已安装插件', 'Installed plugins'),
-            count: plugins.length,
-          ),
-          if (plugins.isEmpty)
-            _EmptyState(onRetry: _refresh)
-          else ...[
-            for (final plugin in plugins)
-              _PluginRow(
-                plugin: plugin,
-                actions: _actions,
-                onUpgrade: _startUpgrade,
-                onToggle: _startToggle,
-                onUninstall: _startUninstall,
-              ),
-          ],
-          if (inventory.installable.isNotEmpty) ...[
-            const SizedBox(height: 18),
-            _SectionTitle(
-              title: L10n.t('可安装（配置渠道）', 'Available (configured source)'),
-              count: inventory.installable.length,
+          if (categorized) ...[
+            if (inventory.classificationMismatch)
+              PluginClassificationNotice(classification: inventory.classification),
+            const SizedBox(height: 12),
+            PluginCategoryTabs(
+              selected: selectedTab,
+              counts: {
+                for (final kind in pluginCategoryOrder)
+                  kind: _tabVisiblePlugins(inventory, kind).length +
+                      _tabVisibleInstallable(inventory, kind).length,
+              },
+              onSelect: _selectTab,
             ),
-            for (final item in inventory.installable)
-              _InstallableRow(item: item, onInstall: () => _startInstall(item)),
+            const SizedBox(height: 10),
+            _searchField(context, selectedTab),
+            if (selectedTab == 'experimental')
+              PluginExperimentalNotice(
+                tableVersion: inventory.classification.tableVersion,
+              ),
+            if (_scan.running || _scan.results.isNotEmpty)
+              PluginUpdateScanBanner(scan: _scan, onCancel: _cancelScan),
+            _hiddenToggle(context, inventory),
+            ..._tabContent(context, inventory, selectedTab),
+          ] else ...[
+            if (inventory.supported)
+              const PluginCategoryUnavailableNotice(),
+            _searchField(context, ''),
+            if (_scan.running || _scan.results.isNotEmpty)
+              PluginUpdateScanBanner(scan: _scan, onCancel: _cancelScan),
+            _hiddenToggle(context, inventory),
+            ..._flatContent(context, inventory),
           ],
           const SizedBox(height: 18),
           Text(
             L10n.t(
-              '仅显示当前电脑上的插件。安装/升级只使用电脑端已配置的渠道；失败会自动回滚；不提供卸载、启停或重启。',
-              'Only plugins on this computer are shown. Install/update use only configured desktop sources and roll back on failure; remove, enable/disable and restart are not available.',
+              '仅显示当前电脑上的插件。安装/升级只使用电脑端已配置的渠道（可在安装时选择本次来源）；失败会自动回滚。',
+              'Only plugins on this computer are shown. Install/update use configured desktop sources '
+                  '(the source can be chosen per installation); a failure rolls back automatically.',
             ),
             style: TextStyle(
               fontSize: 11.5,
@@ -536,6 +755,254 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
       ),
     );
   }
+
+  /// 某 Tab 下（过滤搜索/HIDDEN 后）的已安装行。
+  List<PluginInfo> _tabVisiblePlugins(PluginInventory inventory, String kind) {
+    final query = _search.trim().toLowerCase();
+    return inventory
+        .pluginsFor(kind, showHidden: _showHidden)
+        .where((p) => _matchesQuery(p, query))
+        .toList();
+  }
+
+  List<PluginInstallable> _tabVisibleInstallable(
+    PluginInventory inventory,
+    String kind,
+  ) {
+    final query = _search.trim().toLowerCase();
+    return inventory
+        .installableFor(kind, showHidden: _showHidden)
+        .where((i) => _matchesInstallableQuery(i, query))
+        .toList();
+  }
+
+  /// 本地搜索：标题/描述/包名（与 ADR 0037 的已安装搜索口径一致）。
+  bool _matchesQuery(PluginInfo plugin, String query) {
+    if (query.isEmpty) return true;
+    final title = plugin.displayName.toLowerCase();
+    final package = plugin.packageName.toLowerCase();
+    final name = plugin.name.toLowerCase();
+    return title.contains(query) || package.contains(query) || name.contains(query);
+  }
+
+  bool _matchesInstallableQuery(PluginInstallable item, String query) {
+    if (query.isEmpty) return true;
+    return item.displayName.toLowerCase().contains(query) ||
+        item.packageName.toLowerCase().contains(query) ||
+        item.name.toLowerCase().contains(query);
+  }
+
+  void _selectTab(String kind) {
+    setState(() {
+      _tab = kind;
+      _search = '';
+      _searchController.clear();
+    });
+  }
+
+  Widget _searchField(BuildContext context, String kind) {
+    return TextField(
+      key: const ValueKey('plugin-search'),
+      controller: _searchController,
+      onChanged: (value) => setState(() => _search = value),
+      decoration: InputDecoration(
+        isDense: true,
+        hintText: kind.isEmpty
+            ? L10n.t('搜索插件', 'Search plugins')
+            : pluginSearchHint(kind),
+        prefixIcon: const Icon(Icons.search, size: 18),
+        suffixIcon: _search.isEmpty
+            ? null
+            : IconButton(
+                tooltip: L10n.t('清除搜索', 'Clear search'),
+                icon: const Icon(Icons.close, size: 16),
+                onPressed: () => setState(() {
+                  _search = '';
+                  _searchController.clear();
+                }),
+              ),
+      ),
+    );
+  }
+
+  Widget _hiddenToggle(BuildContext context, PluginInventory inventory) {
+    final hiddenCount = inventory.plugins.where((p) => p.hidden).length;
+    if (hiddenCount == 0) return const SizedBox.shrink();
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: PluginHiddenToggle(
+        value: _showHidden,
+        hiddenCount: hiddenCount,
+        onChanged: (value) => setState(() => _showHidden = value),
+      ),
+    );
+  }
+
+  List<Widget> _tabContent(
+    BuildContext context,
+    PluginInventory inventory,
+    String kind,
+  ) {
+    final plugins = _tabVisiblePlugins(inventory, kind);
+    final installable = _tabVisibleInstallable(inventory, kind);
+    final searching = _search.trim().isNotEmpty;
+    final widgets = <Widget>[const SizedBox(height: 4)];
+    if (plugins.isEmpty && installable.isEmpty) {
+      widgets.add(
+        _tabEmptyState(
+          context,
+          searching
+              ? L10n.t('没有匹配的插件', 'No matching plugins')
+              : pluginTabEmptyText(kind),
+          searching: searching,
+        ),
+      );
+      return widgets;
+    }
+    if (plugins.isEmpty) {
+      if (!searching) {
+        widgets.add(_tabEmptyState(context, pluginTabEmptyText(kind)));
+      }
+    } else {
+      widgets.add(
+        _SectionTitle(
+          title: L10n.t('已安装', 'Installed'),
+          count: plugins.length,
+        ),
+      );
+      for (final plugin in plugins) {
+        widgets.add(
+          _PluginRow(
+            plugin: plugin,
+            actions: _actions,
+            onUpgrade: _startUpgrade,
+            onToggle: _startToggle,
+            onUninstall: _startUninstall,
+            scanResult: _scan.results[plugin.name],
+            onRetryScan: _rescanOne,
+          ),
+        );
+      }
+    }
+    if (installable.isNotEmpty) {
+      widgets.add(const SizedBox(height: 18));
+      widgets.add(
+        _SectionTitle(
+          title: L10n.t('可安装', 'Available'),
+          count: installable.length,
+        ),
+      );
+      for (final item in installable) {
+        widgets.add(
+          _InstallableRow(item: item, onInstall: () => _startInstall(item)),
+        );
+      }
+    } else if (!searching && plugins.isNotEmpty) {
+      widgets.add(const SizedBox(height: 10));
+      widgets.add(
+        Text(
+          pluginTabNoInstallableText(kind),
+          style: TextStyle(
+            fontSize: 11.5,
+            height: 1.4,
+            color: DshColors.ink3(context),
+          ),
+        ),
+      );
+    }
+    return widgets;
+  }
+
+  List<Widget> _flatContent(BuildContext context, PluginInventory inventory) {
+    final query = _search.trim().toLowerCase();
+    final plugins = inventory
+        .visiblePlugins(showHidden: _showHidden)
+        .where((p) => _matchesQuery(p, query))
+        .toList();
+    final installable = inventory.installable
+        .where((i) => _showHidden || !i.hidden)
+        .where((i) => _matchesInstallableQuery(i, query))
+        .toList();
+    final searching = query.isNotEmpty;
+    final widgets = <Widget>[const SizedBox(height: 16)];
+    if (plugins.isEmpty && installable.isEmpty && searching) {
+      widgets.add(_tabEmptyState(context, L10n.t('没有匹配的插件', 'No matching plugins'), searching: true));
+      return widgets;
+    }
+    widgets.add(
+      _SectionTitle(
+        title: inventory.hasCategories
+            ? L10n.t('已安装插件', 'Installed plugins')
+            : L10n.t('已安装（未分类）', 'Installed (unclassified)'),
+        count: plugins.length,
+      ),
+    );
+    if (plugins.isEmpty) {
+      widgets.add(_EmptyState(onRetry: _refresh));
+    } else {
+      for (final plugin in plugins) {
+        widgets.add(
+          _PluginRow(
+            plugin: plugin,
+            actions: _actions,
+            onUpgrade: _startUpgrade,
+            onToggle: _startToggle,
+            onUninstall: _startUninstall,
+            scanResult: _scan.results[plugin.name],
+            onRetryScan: _rescanOne,
+          ),
+        );
+      }
+    }
+    if (installable.isNotEmpty) {
+      widgets.add(const SizedBox(height: 18));
+      widgets.add(
+        _SectionTitle(
+          title: L10n.t('可安装（配置渠道）', 'Available (configured source)'),
+          count: installable.length,
+        ),
+      );
+      for (final item in installable) {
+        widgets.add(
+          _InstallableRow(item: item, onInstall: () => _startInstall(item)),
+        );
+      }
+    }
+    return widgets;
+  }
+
+  Widget _tabEmptyState(
+    BuildContext context,
+    String text, {
+    bool searching = false,
+  }) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 26),
+    child: Column(
+      children: [
+        Icon(
+          searching ? Icons.search_off : Icons.extension_off_outlined,
+          size: 26,
+          color: DshColors.ink2(context),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          text,
+          textAlign: TextAlign.center,
+          style: TextStyle(fontSize: 12.5, color: DshColors.ink3(context)),
+        ),
+        if (searching) ...[
+          const SizedBox(height: 6),
+          TextButton(
+            onPressed: () => setState(() {
+              _search = '';
+              _searchController.clear();
+            }),
+            child: Text(L10n.t('清除搜索', 'Clear search')),
+          ),
+        ],
+      ],
+    ),
+  );
 }
 
 class _CenterLoading extends StatelessWidget {
@@ -550,15 +1017,6 @@ class _CenterLoading extends StatelessWidget {
   );
 }
 
-String _pluginStepLabel(String key) => switch (key) {
-  'prepare' => L10n.t('准备', 'Prepare'),
-  'install' => L10n.t('安装', 'Install'),
-  'enable' => L10n.t('启用', 'Enable'),
-  'check' => L10n.t('检查版本', 'Check version'),
-  'remove' => L10n.t('停止并移除旧版本', 'Stop and remove old version'),
-  'restore' => L10n.t('恢复旧版本', 'Restore old version'),
-  _ => key,
-};
 
 class _OperationBanner extends StatelessWidget {
   final PluginOperation operation;
@@ -671,7 +1129,7 @@ class _OperationStepChip extends StatelessWidget {
         Icon(icon, size: 12, color: color),
         const SizedBox(width: 3),
         Text(
-          _pluginStepLabel(step.key),
+          pluginStepLabel(step.key),
           style: TextStyle(fontSize: 11, color: color),
         ),
       ],
@@ -1376,12 +1834,19 @@ class _PluginRow extends StatelessWidget {
   onUpgrade;
   final Future<void> Function(PluginInfo plugin, bool enabled) onToggle;
   final Future<void> Function(PluginInfo plugin) onUninstall;
+
+  /// #153：本行的「检查全部更新」结果（未检查 → null）。
+  final PluginUpdateCheckResult? scanResult;
+  final ValueChanged<String>? onRetryScan;
+
   const _PluginRow({
     required this.plugin,
     required this.actions,
     required this.onUpgrade,
     required this.onToggle,
     required this.onUninstall,
+    this.scanResult,
+    this.onRetryScan,
   });
 
   String get _versionLabel => plugin.version.isEmpty
@@ -1442,8 +1907,19 @@ class _PluginRow extends StatelessWidget {
     final name = plugin.displayName;
     final versionLabel = _versionLabel;
     final sourceLabel = plugin.source.displayLabel;
+    final categoryLabel = plugin.hasCategory
+        ? plugin.category.displayLabel
+        : '';
+    final scanLabel = switch (scanResult?.state) {
+      'available' => L10n.t('，可更新 v${scanResult!.latest}', '，v${scanResult!.latest} available'),
+      'current' => L10n.t('，已是最新', '，up to date'),
+      'skipped' => L10n.t('，跳过检查', '，check skipped'),
+      'failed' => L10n.t('，检查失败', '，check failed'),
+      _ => '',
+    };
     final semantics =
-        '$name，$versionLabel，$statusLabel${plugin.current ? '，当前连接' : ''}';
+        '$name，$versionLabel${categoryLabel.isEmpty ? '' : '，$categoryLabel'}，'
+        '$statusLabel${plugin.current ? '，当前连接' : ''}$scanLabel';
 
     final rightStatus = Row(
       mainAxisSize: MainAxisSize.min,
@@ -1464,6 +1940,19 @@ class _PluginRow extends StatelessWidget {
         ),
       ],
     );
+
+    // #153：分类标签 + 检查结果标签（文字 + tone，不靠颜色区分）。
+    final trailingTags = <Widget>[
+      if (plugin.hasCategory) PluginCategoryTag(category: plugin.category),
+      if (scanResult != null)
+        PluginScanResultTag(
+          result: scanResult!,
+          compact: compact,
+          onRetry: onRetryScan == null
+              ? null
+              : () => onRetryScan!.call(plugin.name),
+        ),
+    ];
 
     return Semantics(
       container: true,
@@ -1563,6 +2052,7 @@ class _PluginRow extends StatelessWidget {
                           crossAxisAlignment: WrapCrossAlignment.center,
                           children: [
                             rightStatus,
+                            ...trailingTags,
                             if (plugin.current) const _CurrentTag(),
                           ],
                         ),
@@ -1575,6 +2065,15 @@ class _PluginRow extends StatelessWidget {
                   Column(
                     crossAxisAlignment: CrossAxisAlignment.end,
                     children: [
+                      if (trailingTags.isNotEmpty) ...[
+                        Wrap(
+                          spacing: 4,
+                          runSpacing: 2,
+                          alignment: WrapAlignment.end,
+                          children: trailingTags,
+                        ),
+                        const SizedBox(height: 4),
+                      ],
                       rightStatus,
                       if (plugin.current) ...[
                         const SizedBox(height: 4),

@@ -91,6 +91,17 @@
 
 已知/接受边界：hardlink 与 bind-mount 的同用户场景不在本端点威胁模型内；8 MiB/8192px/40MP 上限；HEAD 仍完整读取以生成强 ETag。通用文件下载 `/files` 已按 #16 收紧；上传与目录选择器的边界见上节，三者不可混用。
 
+### 插件安装源选择（`/m/api/plugin-inventory/registries` 与 `registry` 参数，issue #153）
+
+手机端「安装源选择」**只改变本次解析用的 registry**，不是新的安装通道：
+
+- **只读**：`GET /m/api/plugin-inventory/registries` 投影宿主 `pluginManager.registries()`（首选源、回退源、pnpm 自身解析出的源），`writable` 恒 `false`；App 不能新增/删除/改写电脑端 registry，不写 profile `package.json`、`pnpm-lock.yaml`、`.npmrc` 或插件状态目录。
+- **凭据安全（P0）**：出网前统一剥离 `username`/`password`/`search`/`hash`；**带凭据的条目整条丢弃**，不做“只去密码”的脱敏回显——回显保留用户名/主机关系，下游容易误当成可复用源。响应只给 `display`（host + pathname），日志不使用原始 URL。
+- **手动 URL 校验**：只接受 `http(s)`；拒绝非字符串/空/超 2048 字节、控制字符与空白、`new URL` 失败（裸路径、`file:`/`data:`/`git+ssh:`/`ftp:` 等非 http(s)）、带 userinfo、带 query、带 fragment、hostname 为空。失败一律 `400 registry-invalid`，`detail` **只给类别**、不回显原文（原文可能含凭据）。通过后与宿主 `normalizeRegistry` 幂等：pathname 末尾补 `/`。
+- **允许 localhost 与私网**：内网 Verdaccio/Nexus 是合法用例，因此**不加私网/回环黑名单**。代价是已认证用户可以让宿主向指定 http(s) 主机发 registry 查询/安装请求；这与他本就能在电脑端配置 registry 等价，但**扩大了从手机发起的内网请求面**（可被用作端口/服务存在性探测：错误码与耗时能区分“无服务”“非 registry”）。缓解：端点需要移动端口令；安装 spec 仍由宿主 `installTarget` 决定，手动 URL **不能安装任意包**；不持久化，不会长期改变后续行为。
+- **不静默换源**：`versions` 返回 `requestedRegistry`/`answeredRegistry`/`attempts[{registry,problem}]`，安装/升级操作快照带 `registries`/`attempt{index,total}`/`answeredRegistry`。失败时 `answeredRegistry` 留空——不能声称“某个源答了”。
+- **旧宿主降级**：无 `registries()`/抛错 → HTTP 200 + `supported:false`（不是 404/500），App 只显示「当前电脑端不提供安装源信息」，仍可在宿主默认源安装。
+
 ### 持久化与投递
 
 - 插件**持久化仅限最小移动端状态**（`~/.dsh/mobile-remote/`：通知已读 id、会话最近活跃时间），不含会话内容；口令只存在于 profile 配置。
