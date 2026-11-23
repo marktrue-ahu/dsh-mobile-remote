@@ -603,7 +603,51 @@ class _ConnectionProfileEditorScreenState
     return null;
   }
 
+  /// #171：添加与编辑共用扫码；扫码结果会**覆盖**地址/口令输入框。
+  ///
+  /// 名称只在原本为空时用 host 兜底 —— 编辑态的档案名是用户刻意命名的，
+  /// 不能被扫码悄悄改掉。
+  ///
+  /// 当前输入非空时先确认：扫码会丢弃手填内容，误扫不该无提示覆盖。
   Future<void> _scan() async {
+    final hasInput = _base.text.trim().isNotEmpty || _token.text.trim().isNotEmpty;
+    if (hasInput) {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          key: const ValueKey('connection-scan-confirm'),
+          title: Text(
+            _editing
+                ? L10n.t('用扫码结果替换？', 'Replace with the scanned values?')
+                : L10n.t('用扫码结果填入？', 'Fill in the scanned values?'),
+          ),
+          content: Text(
+            _editing
+                ? L10n.t(
+                    '当前填写的地址与访问口令会被扫码结果覆盖；主机名称保持不变。',
+                    'The address and access token you entered will be replaced by the scan. The name is kept.',
+                  )
+                : L10n.t(
+                    '当前填写的地址与访问口令会被扫码结果覆盖。',
+                    'The address and access token you entered will be replaced by the scan.',
+                  ),
+          ),
+          actions: [
+            TextButton(
+              key: const ValueKey('connection-scan-cancel'),
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: Text(L10n.t('取消', 'Cancel')),
+            ),
+            FilledButton(
+              key: const ValueKey('connection-scan-confirm-ok'),
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: Text(L10n.t('替换', 'Replace')),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !mounted) return;
+    }
     await Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (_) => ScanScreen(
@@ -614,6 +658,12 @@ class _ConnectionProfileEditorScreenState
               final host = Uri.tryParse(base)?.host ?? '';
               if (host.isNotEmpty) _name.text = host;
             }
+            // 扫码填入的地址仍要过既有表单校验（协议/格式/未加密确认），
+            // 不因为来自扫码就放行。
+            setState(() {
+              _baseError = null;
+              _tokenError = null;
+            });
             if (mounted) Navigator.of(context).pop();
           },
         ),
@@ -696,15 +746,19 @@ class _ConnectionProfileEditorScreenState
               errorText: _tokenError,
             ),
           ),
-          if (!_editing) ...[
-            const SizedBox(height: 8),
-            OutlinedButton.icon(
-              key: const ValueKey('connection-profile-scan'),
-              onPressed: _busy ? null : _scan,
-              icon: const Icon(Icons.qr_code_scanner),
-              label: Text(L10n.t('扫码添加', 'Scan to add')),
+          // #171：添加与编辑都提供扫码；编辑态文案用「扫码替换」，
+          // 准确表达会覆盖当前输入的地址/口令（名称不覆盖）。
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            key: const ValueKey('connection-profile-scan'),
+            onPressed: _busy ? null : _scan,
+            icon: const Icon(Icons.qr_code_scanner),
+            label: Text(
+              _editing
+                  ? L10n.t('扫码替换', 'Scan to replace')
+                  : L10n.t('扫码添加', 'Scan to add'),
             ),
-          ],
+          ),
           if (_showInsecure) ...[
             const SizedBox(height: 8),
             CheckboxListTile(
