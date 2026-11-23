@@ -1,5 +1,37 @@
 # Changelog
 
+## v3.3.1-alpha.2（build 65，issues #151/#154/#155/#157/#158/#159/#162/#163）— 3.3.1 功能候选
+
+> 插件 `3.3.1-alpha.2` / App `3.3.1+65` / 载体 `3.3.1-alpha.2-app`。
+
+### 新功能
+
+- **#157 会话文件图片预览**：文件列表识别 PNG/JPEG/WebP/GIF（图片行改用图片图标），点按进全屏查看器；共享查看器壳 `widgets/image_viewer_shell.dart` 同时服务于附件图库与会话文件（图库侧净删约 130 行重复），`InteractiveViewer` 0.5–4x + 双击、加载/失败/不支持状态面板、底部元信息条；大图按视口物理宽×2 降采样（封顶 4096）；图片字节只走 `/workspace-image`（sessionId + cwd 相对路径），复用既有会话作用域校验/realpath/O_NOFOLLOW/magic 嗅探/8MiB·8192px·40MP 限制；SVG/HEIC/AVIF 显式提示不支持；新增 ETag/304 条件请求与按 profile/session/path 的 LRU 缓存；下载复用 #138。能力位双门控 `files.imagePreview` + `files.sessionRelative`，旧宿主回退文本预览。
+- **#158 输入区上下文三 Tab 抽屉**：上下文圆环/百分比可点开底部抽屉，三 Tab「上下文构成 / Token 用量 / 会话统计」；三个分项（system/tools/messages）各自独立水平条，明确不堆叠成 pressure 总条；无 breakdown 时只显示 pressure + 「当前电脑端未提供构成」，不伪造分项；不展示 prompt 正文与工具 schema。
+- **#155 设置页 5 Tab**：设置页按分组拆 Tab，降低单页长度。
+- **#163 连接入口移至 Drawer**：连接入口从首页收进 Drawer，统一添加/编辑表单并补主机名称。
+- **#159 Git tags 三 Tab + 定位**：Git 分支列表增加 tags 与三 Tab，支持点击定位到分支图；tag 意图不打断分页，stale 不弹失败。
+
+### 修复
+
+- **#162 inactive 子代理模型/effort**：dormant/inactive 子代理不再丢失模型与 effort 投影；宿主 `readSession` 缺 header 或 seeded header 未确认时保留降级，不伪造模型。
+- **#154 日志记录级别/显示筛选拆分**：记录级别与显示筛选解耦，两套语义独立。
+
+### 取证/内部
+
+- **#151 提问卡 debug 取证**：Web 端弹卡而手机端偶发不显示的全链路 debug 日志（本版起包含，alpha.1 无）。
+
+### 已接受/已知未验证
+
+- **#157 无真机验证**：320/深色/1.5x/2.0x 只有 widget 级断言；大 GIF 内存峰值与 40MP 大图未实测。
+- **#157 EXIF Orientation 未处理**：按设计稿不读/不显示 EXIF，但 `Image.memory` 不会按 EXIF 自动旋转，竖拍 JPEG 真机可能横向显示——需真机确认后再决定是否加解析。
+- **#157 超大图二次确认未做**：设计稿「图片较大先确认」与宿主 fail-fast（>8MiB/>8192px/>40MP 直接 `image-too-large`）重叠，改为「宿主拒绝 + 错误态可下载原图」。
+- #152 的 Keystore 升级迁移、后台悬浮球/原生 SSE、系统通知撤销、真实慢响应切档仍未真机验证（alpha.1 起）。
+- #160 的触控命中/TalkBack 仍未真机验证。
+- 3.3.1 各功能真机验收大多待做：#155/#163 触控与 2.0x 视觉、#158 真实宿主 contextPressure/breakdown 端到端、#159 真机滚动/大字号。
+- **npmmirror 插件版本仍未同步**（carrier 已同步）：`alpha` 指针仍为 `3.3.0-alpha.1`，多次 PUT sync 返回 success 但版本未落，影响国内插件安装。
+
+
 ## v3.3.1-alpha.1（build 64，issues #150/#152/#160/#161）— 多连接与子代理树候选
 
 > 插件 `3.3.1-alpha.1` / App `3.3.1+64` / 载体 `3.3.1-alpha.1-app`。
