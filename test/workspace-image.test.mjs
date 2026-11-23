@@ -27,6 +27,30 @@ const PNG_1X1 = Buffer.from(
 );
 const JPEG_HEAD = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00]);
 
+/**
+ * issue #170：**尺寸可解析**的最小 JPEG（4×3）。
+ *
+ * `JPEG_HEAD` 只够 magic 嗅探，解析不出 SOF 尺寸；旧测试靠它验证"嗅探不符即 415"，
+ * 那种 case 在放宽后会落到"尺寸解析失败"分支，测不到真正想测的东西。
+ * 这里按宿主 `imageDimensions` 的偏移口径构造：APP0(len 16) → SOF0(len 11, h@+5, w@+7)。
+ */
+function parsableJpeg(width = 4, height = 3) {
+	const app0Length = 16;
+	const app0 = Buffer.alloc(2 + app0Length);
+	app0[0] = 0xff; app0[1] = 0xe0; app0.writeUInt16BE(app0Length, 2);
+	const sof = Buffer.alloc(2 + 2 + 11);
+	sof[0] = 0xff; sof[1] = 0xc0; sof.writeUInt16BE(11, 2);
+	sof[5] = 8; sof.writeUInt16BE(height, 5); sof.writeUInt16BE(width, 7);
+	sof[9] = 1; sof[10] = 1; sof[11] = 0x11; sof[12] = 0;
+	return Buffer.concat([
+		Buffer.from([0xff, 0xd8]),
+		app0,
+		sof,
+		Buffer.alloc(8),
+		Buffer.from([0xff, 0xd9]),
+	]);
+}
+
 class FakeResponse extends EventEmitter {
 	constructor() { super(); this.headersSent = false; this.chunks = []; }
 	writeHead(statusCode, headers = {}) { this.statusCode = statusCode; this.headers = headers; this.headersSent = true; }
@@ -438,5 +462,59 @@ test("issue #98：consent 不绕过类型/大小/像素限制；HEAD 复用授�
 		// 旧行为回归：cwd 内图片不带 consent 仍然 200。
 		const inside = await request(h.route, `sessionId=s1&path=${encodeURIComponent("pic.png")}`);
 		assert.equal(inside.status, 200);
+	} finally { rmSync(root, { recursive: true, force: true }); h.clean(); }
+});
+
+// ── issue #170：扩展名与内容不符的受支持图片 ─────────────────────────────────
+//
+// magic 嗅探的目的就是不信任扩展名。日常里 `.png` 里装 JPEG 极常见（截图工具、
+// 浏览器另存、下载重命名、IM 转存）。既已用 magic 确认是受支持图片，就不能再因为
+// 扩展名不符而拒绝——但扩展名白名单与"嗅探必须成功"这两道安全边界一条不降。
+test("issue #170：.png 装 JPEG / .jpg 装 PNG → 200 + 按内容声明类型（不 415）", async () => {
+	const root = mkdtempSync(join(tmpdir(), "workspace-image-mismatch-"));
+	const cwd = join(root, "project");
+	mkdirSync(cwd, { recursive: true });
+	const jpegBytes = parsableJpeg(4, 3);
+	writeFileSync(join(cwd, "jpeg-as-png.png"), jpegBytes);
+	writeFileSync(join(cwd, "png-as-jpg.jpg"), PNG_1X1);
+	const h = harness({ cwd });
+	try {
+		const a = await request(h.route, `sessionId=s1&path=${encodeURIComponent("jpeg-as-png.png")}`);
+		assert.equal(a.status, 200, JSON.stringify(a.json));
+		assert.equal(a.headers["content-type"], "image/jpeg", "必须按 magic 嗅探值声明类型");
+		assert.equal(a.headers["x-image-type-mismatch"], "true");
+		assert.deepEqual(a.bytes, jpegBytes);
+
+		const b = await request(h.route, `sessionId=s1&path=${encodeURIComponent("png-as-jpg.jpg")}`);
+		assert.equal(b.status, 200, JSON.stringify(b.json));
+		assert.equal(b.headers["content-type"], "image/png");
+		assert.equal(b.headers["x-image-type-mismatch"], "true");
+
+		// 类型一致时不带 mismatch 诊断头（不制造噪音）。
+		writeFileSync(join(cwd, "real.png"), PNG_1X1);
+		const c = await request(h.route, `sessionId=s1&path=${encodeURIComponent("real.png")}`);
+		assert.equal(c.status, 200);
+		assert.equal(c.headers["x-image-type-mismatch"], undefined);
+	} finally { rmSync(root, { recursive: true, force: true }); h.clean(); }
+});
+
+test("issue #170 负例：嗅探不出图片 / 扩展名不在白名单 → 仍 415（安全边界不降）", async () => {
+	const root = mkdtempSync(join(tmpdir(), "workspace-image-mismatch-neg-"));
+	const cwd = join(root, "project");
+	mkdirSync(cwd, { recursive: true });
+	// 非图片内容改成 .png：嗅探失败，必须拒绝（不得因放宽而放行）。
+	writeFileSync(join(cwd, "not-image.png"), Buffer.from("this is definitely not an image payload"));
+	// 真图片但扩展名不在白名单：仍拒绝。
+	writeFileSync(join(cwd, "real-as-svg.svg"), PNG_1X1);
+	writeFileSync(join(cwd, "real-as-heic.heic"), PNG_1X1);
+	const h = harness({ cwd });
+	try {
+		const fake = await request(h.route, `sessionId=s1&path=${encodeURIComponent("not-image.png")}`);
+		assert.equal(fake.status, 415);
+		assert.equal(fake.json.error, "unsupported-image-type");
+		for (const name of ["real-as-svg.svg", "real-as-heic.heic"]) {
+			const r = await request(h.route, `sessionId=s1&path=${encodeURIComponent(name)}`);
+			assert.equal(r.status, 415, `${name} 必须被拒绝`);
+		}
 	} finally { rmSync(root, { recursive: true, force: true }); h.clean(); }
 });
