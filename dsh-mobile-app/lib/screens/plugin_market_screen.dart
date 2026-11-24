@@ -100,8 +100,13 @@ class _PluginMarketScreenState extends State<PluginMarketScreen> {
 
   final _searchController = TextEditingController();
   String _text = '';
-  /// 分类筛选（首版只支持空值=全部；保留字段以便后续扩展，当前不可改）。
-  final String _category = '';
+  /// 分类筛选（空 = 全部）。取值来自**已见过**的条目 category，不写死枚举——
+  /// 分类词汇属于索引文档，App 不重算（与 #153「分类事实来自宿主」一致）。
+  String _category = '';
+
+  /// 本次会话里见过的分类（随每次搜索结果累积）。
+  /// 不能只看当前页：切换筛选后页面会被清空，chips 会跟着消失。
+  final Set<String> _knownCategories = {};
 
   PluginMarketPage? _page;
   bool _loadingPage = false;
@@ -171,6 +176,9 @@ class _PluginMarketScreenState extends State<PluginMarketScreen> {
       setState(() {
         _loadingPage = false;
         _loadingMore = false;
+        for (final entry in page.entries) {
+          if (entry.category.isNotEmpty) _knownCategories.add(entry.category);
+        }
         _page = reset || _page == null
             ? page
             : PluginMarketPage(
@@ -361,6 +369,7 @@ class _PluginMarketScreenState extends State<PluginMarketScreen> {
           const SizedBox(height: 10),
           _searchBar(context),
           const SizedBox(height: 10),
+          ..._categoryChips(context),
           if (_pageError != null) _notice(context, Icons.warning_amber_outlined, _pageError!),
           if (_loadingPage)
             const Padding(
@@ -454,6 +463,48 @@ class _PluginMarketScreenState extends State<PluginMarketScreen> {
           ),
       ],
     );
+  }
+
+  /// 分类筛选 chips：取值来自**当前已返回条目**的 category（不写死枚举）。
+  ///
+  /// 只有出现 2 个以上不同分类时才渲染——否则一个 chip 只是噪声。
+  List<Widget> _categoryChips(BuildContext context) {
+    // 用累积集合而不是当前页：切筛选会清空 `_page`，否则 chips 会闪没。
+    if (_knownCategories.length < 2) return const [];
+    final ordered = _knownCategories.toList()..sort();
+    return [
+      Wrap(
+        spacing: 6,
+        runSpacing: 6,
+        children: [
+          ChoiceChip(
+            key: const ValueKey('market-category-all'),
+            label: Text(L10n.t('全部', 'All'), style: const TextStyle(fontSize: 11.5)),
+            selected: _category.isEmpty,
+            onSelected: (_) => _selectCategory(''),
+          ),
+          for (final category in ordered)
+            ChoiceChip(
+              key: ValueKey('market-category-$category'),
+              label: Text(
+                PluginCategory(kind: category, label: category).displayLabel,
+                style: const TextStyle(fontSize: 11.5),
+              ),
+              selected: _category == category,
+              onSelected: (_) => _selectCategory(category),
+            ),
+        ],
+      ),
+      const SizedBox(height: 8),
+    ];
+  }
+
+  void _selectCategory(String category) {
+    setState(() {
+      _category = category;
+      _page = null;
+    });
+    unawaited(_search(reset: true));
   }
 
   Widget _searchBar(BuildContext context) {

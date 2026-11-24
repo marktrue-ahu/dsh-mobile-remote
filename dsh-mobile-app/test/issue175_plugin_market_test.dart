@@ -365,6 +365,46 @@ void main() {
       expect(find.text('已安装'), findsOneWidget);
     });
 
+    testWidgets('分类筛选：出现 2+ 分类时渲染 chips，点击把 category 透传给搜索', (tester) async {
+      final backend = FakeMarket(
+        pageFor: (url, {offset = 0, limit = 20, text = '', category = ''}) {
+          final all = [
+            entry('dsh-a', title: 'A', category: 'builtin'),
+            entry('dsh-b', title: 'B', category: 'custom'),
+          ];
+          final filtered = category.isEmpty
+              ? all
+              : all.where((row) => row.category == category).toList();
+          return page(filtered, url: url);
+        },
+      );
+      await pumpMarket(tester, backend: backend);
+      expect(find.byKey(const ValueKey('market-category-all')), findsOneWidget);
+      expect(find.byKey(const ValueKey('market-category-builtin')), findsOneWidget);
+      expect(find.byKey(const ValueKey('market-category-custom')), findsOneWidget);
+
+      await tester.tap(find.byKey(const ValueKey('market-category-custom')));
+      await tester.pumpAndSettle();
+      expect(backend.searchArgs.last.$5, 'custom', reason: 'category 必须透传给宿主搜索');
+      expect(find.byKey(const ValueKey('market-entry-dsh-b')), findsOneWidget);
+      expect(find.byKey(const ValueKey('market-entry-dsh-a')), findsNothing);
+
+      await tester.tap(find.byKey(const ValueKey('market-category-all')));
+      await tester.pumpAndSettle();
+      expect(backend.searchArgs.last.$5, '', reason: '「全部」= 空串（不传分类）');
+    });
+
+    testWidgets('只有一个分类时不渲染筛选 chips（避免噪声）', (tester) async {
+      final backend = FakeMarket(
+        pageFor: (url, {offset = 0, limit = 20, text = '', category = ''}) => page([
+          entry('dsh-a', title: 'A', category: 'builtin'),
+          entry('dsh-b', title: 'B', category: 'builtin'),
+        ], url: url),
+      );
+      await pumpMarket(tester, backend: backend);
+      expect(find.byKey(const ValueKey('market-category-all')), findsNothing);
+    });
+
     testWidgets('可更新条目的按钮文案是「升级」', (tester) async {
       final backend = FakeMarket(
         pageFor: (url, {offset = 0, limit = 20, text = '', category = ''}) => page([
