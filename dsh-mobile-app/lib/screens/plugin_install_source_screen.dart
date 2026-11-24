@@ -11,6 +11,7 @@ import 'package:flutter/material.dart';
 
 import '../l10n.dart';
 import '../plugin_inventory.dart';
+import '../store.dart';
 import '../theme.dart';
 import 'plugin_inventory_screen.dart' show pluginOperationErrorText;
 import 'plugin_management_widgets.dart';
@@ -196,6 +197,10 @@ class PluginInstallSourceScreen extends StatefulWidget {
   final Future<PluginOperation> Function(String opId)? poll;
   final Future<String> Function(String opId)? cancel;
 
+  /// issue #175 P1：本机偏好（记住上次选择的源）。`null` = 不记忆
+  /// （测试/独立用法；此时行为与 #153 完全一致，每次从「宿主默认源」开始）。
+  final AppStore? store;
+
   const PluginInstallSourceScreen({
     super.key,
     required this.packageName,
@@ -208,6 +213,7 @@ class PluginInstallSourceScreen extends StatefulWidget {
     required this.onInstall,
     this.poll,
     this.cancel,
+    this.store,
   });
 
   @override
@@ -225,10 +231,77 @@ class _PluginInstallSourceScreenState extends State<PluginInstallSourceScreen> {
   PluginOperation? _operation;
   bool _cancelPending = false;
 
+  /// issue #175 P1：手动 URL 是否「记住此地址」（默认不记）。
+  bool _rememberManualUrl = false;
+
+  /// 是否已用手动 URL 的记忆值初始化过（`_restoreSelection` 只跑一次）。
+  /// 晚到的 registry 列表只校验有效性，不覆盖用户已做的选择。
+  bool _restoredSelection = false;
+
   @override
   void initState() {
     super.initState();
+    _restoreSelection();
     _loadRegistries();
+  }
+
+  /// issue #175 P1：用上次记住的选择作初始值（**失效则回退 `'host'`**）。
+  ///
+  /// 偏好存在 App 本地（`AppStore.pluginInstallSource` / `pluginManualRegistryUrl`），
+  /// 不写电脑端配置。此时 registry 列表可能还没读回来，因此这里只做**字面**恢复，
+  /// 有效性校验在 `_loadRegistries` 完成后进行。
+  void _restoreSelection() {
+    if (_restoredSelection) return;
+    _restoredSelection = true;
+    final store = widget.store;
+    if (store == null) return;
+    // 显式记住的手动地址优先于枚举记忆：它是用户明确勾选的「记住此地址」，
+    // 语义上比「上次在列表里点了哪一项」更强。
+    final manual = store.pluginManualRegistryUrl;
+    if (manual.isNotEmpty) {
+      _urlController.text = manual;
+      _rememberManualUrl = true;
+      _selectedRegistryKey = 'manual';
+      return;
+    }
+    final saved = store.pluginInstallSource;
+    if (saved.isNotEmpty) _selectedRegistryKey = saved;
+  }
+
+  /// 记住当前选择（**切换时立即保存**，不等点安装；取消安装也不该丢）。
+  Future<void> _rememberSelection(String key) async {
+    final store = widget.store;
+    if (store == null) return;
+    // 「手动」本身不进记忆：手动地址是自由文本，默认不留存（可能含内网主机）。
+    // 只有用户勾了「记住此地址」才单独存进 manual 字段（见 `_syncManualMemory`）。
+    if (key == 'manual') return;
+    await store.setPluginInstallSource(key);
+  }
+
+  /// 把手动 URL 的**勾选状态 + 输入内容**镜像到本机偏好。
+  ///
+  /// 规则刻意做得可预期，避免「清空输入后下次又冒出旧地址」这类幽灵值：
+  ///   - 未勾选 → 清掉；
+  ///   - 勾选且地址通过客户端预校验 → 存该地址；
+  ///   - 勾选但地址为空/非法 → 清掉（不保存一个用不了的值）。
+  Future<void> _syncManualMemory() async {
+    final store = widget.store;
+    if (store == null) return;
+    if (!_rememberManualUrl) {
+      await store.setPluginManualRegistryUrl('');
+      return;
+    }
+    final url = _urlController.text.trim();
+    if (pluginRegistryUrlError(url).isNotEmpty) {
+      await store.setPluginManualRegistryUrl('');
+      return;
+    }
+    await store.setPluginManualRegistryUrl(url);
+  }
+
+  void _setRememberManual(bool remember) {
+    setState(() => _rememberManualUrl = remember);
+    unawaited(_syncManualMemory());
   }
 
   @override
@@ -247,12 +320,42 @@ class _PluginInstallSourceScreenState extends State<PluginInstallSourceScreen> {
       setState(() {
         _registries = list;
         _loadingRegistries = false;
+        // issue #175 P1：存的值仍在宿主列表里才继续用它；否则回退「宿主默认源」。
+        // 不崩、也不显示幽灵选项（列表里没有的 URL 根本不渲染）。
+        _selectedRegistryKey = _validatedSelection(list);
       });
     } catch (_) {
       if (!mounted) return;
       // 读取失败不阻断安装：退回“宿主默认源”一项。
-      setState(() => _loadingRegistries = false);
+      setState(() {
+        _loadingRegistries = false;
+        // 列表读不到就无法校验存值，回退默认源比继续用一个无法证实的值安全。
+        if (_selectedRegistryKey != 'manual') _selectedRegistryKey = 'host';
+      });
     }
+  }
+
+  /// 校验存下的选择在当前宿主列表里仍然有效；无效则回退 `'host'`。
+  ///
+  /// `'host'` 恒有效；`'manual'` 单独通路（只要有记住的手动地址就仍可用）；
+  /// 其余必须是列表里真实存在的 registry URL。
+  ///
+  /// 特别注意**列表里第一个源**：UI 把它渲染成「宿主配置渠道」（不可单独选中，
+  /// 因为 `registry: null` 与「请求配置的首选源」在宿主解析顺序里等效）。因此存值
+  /// 恰为首个源的 URL 时归一成 `'host'`——否则页面上不会有一行是选中态。
+  String _validatedSelection(PluginRegistryList list) {
+    final key = _selectedRegistryKey;
+    if (key == 'host') return 'host';
+    if (key == 'manual') {
+      return _urlController.text.trim().isEmpty ? 'host' : 'manual';
+    }
+    final first = list.registries.isEmpty ? null : list.registries.first.url;
+    if (first != null && first == key) return 'host';
+    for (final entry in list.registries) {
+      if (entry.url == key) return key;
+    }
+    // 存的值失效（registry 从宿主列表消失）：静默回退，不弹错、不崩。
+    return 'host';
   }
 
   bool get _installing => _operation != null && _operation!.running;
@@ -520,8 +623,8 @@ class _PluginInstallSourceScreenState extends State<PluginInstallSourceScreen> {
         key: 'manual',
         title: L10n.t('手动 http(s) URL', 'Manual http(s) URL'),
         subtitle: L10n.t(
-          '仅本次安装生效；不写入电脑端配置，不默认记住',
-          'Applies to this installation only; never written to the desktop or remembered',
+          '仅本次安装生效；不写入电脑端配置，默认不记住',
+          'Applies to this installation only; never written to the desktop, not remembered by default',
         ),
         selected: _selectedRegistryKey == 'manual',
       ),
@@ -577,10 +680,14 @@ class _PluginInstallSourceScreenState extends State<PluginInstallSourceScreen> {
           borderRadius: BorderRadius.circular(12),
           onTap: _installing
               ? null
-              : () => setState(() {
-                  _selectedRegistryKey = key;
-                  _submitError = null;
-                }),
+              : () {
+                  setState(() {
+                    _selectedRegistryKey = key;
+                    _submitError = null;
+                  });
+                  // issue #175 P1：**切换即保存**（不等点安装；取消安装也不该丢）。
+                  unawaited(_rememberSelection(key));
+                },
           child: Container(
             constraints: const BoxConstraints(minHeight: 64),
             padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
@@ -648,30 +755,105 @@ class _PluginInstallSourceScreenState extends State<PluginInstallSourceScreen> {
   }
 
   Widget _manualUrlField(BuildContext context) {
+    final store = widget.store;
     return Padding(
       padding: const EdgeInsets.only(bottom: 8),
-      child: TextField(
-        key: const ValueKey('install-source-url'),
-        controller: _urlController,
-        enabled: !_installing,
-        keyboardType: TextInputType.url,
-        autocorrect: false,
-        decoration: InputDecoration(
-          hintText: 'https://npm.example.com/',
-          errorText: _urlError,
-          prefixIcon: const Icon(Icons.link, size: 18),
-          suffixIcon: _urlController.text.isEmpty
-              ? null
-              : IconButton(
-                  tooltip: L10n.t('清空', 'Clear'),
-                  icon: const Icon(Icons.close, size: 16),
-                  onPressed: () => setState(() {
-                    _urlController.clear();
-                    _urlError = null;
-                  }),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          TextField(
+            key: const ValueKey('install-source-url'),
+            controller: _urlController,
+            enabled: !_installing,
+            keyboardType: TextInputType.url,
+            autocorrect: false,
+            decoration: InputDecoration(
+              hintText: 'https://npm.example.com/',
+              errorText: _urlError,
+              prefixIcon: const Icon(Icons.link, size: 18),
+              suffixIcon: _urlController.text.isEmpty
+                  ? null
+                  : IconButton(
+                      tooltip: L10n.t('清空', 'Clear'),
+                      icon: const Icon(Icons.close, size: 16),
+                      onPressed: () => setState(() {
+                        _urlController.clear();
+                        _urlError = null;
+                      }),
+                    ),
+            ),
+            onChanged: (_) => setState(() {
+              _urlError = null;
+              // 勾选状态下地址改了：把记忆同步成新地址（清空/非法 ⇒ 清掉记忆，
+              // 不留下一个下次会冒出来的旧地址）。
+              if (_rememberManualUrl) unawaited(_syncManualMemory());
+            }),
+          ),
+          // issue #175 P1：手动 URL **默认不记住**（可能是内网地址，长期留存不合适）。
+          // 只有用户显式勾选才存到本机，并在文案里说清存到哪。
+          if (store != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: InkWell(
+                key: const ValueKey('install-source-remember'),
+                borderRadius: BorderRadius.circular(8),
+                onTap: _installing
+                    ? null
+                    : () => _setRememberManual(!_rememberManualUrl),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 4,
+                    vertical: 6,
+                  ),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: Checkbox(
+                          value: _rememberManualUrl,
+                          materialTapTargetSize:
+                              MaterialTapTargetSize.shrinkWrap,
+                          visualDensity: VisualDensity.compact,
+                          onChanged: _installing
+                              ? null
+                              : (value) => _setRememberManual(value == true),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              L10n.t('记住此地址', 'Remember this address'),
+                              style: const TextStyle(
+                                fontSize: 12,
+                                height: 1.3,
+                              ),
+                            ),
+                            const SizedBox(height: 1),
+                            Text(
+                              L10n.t(
+                                '地址会保存在本机（不写入电脑端配置）',
+                                'Saved on this phone only, not on the desktop',
+                              ),
+                              style: TextStyle(
+                                fontSize: 10.5,
+                                height: 1.3,
+                                color: DshColors.ink3(context),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
-        ),
-        onChanged: (_) => setState(() => _urlError = null),
+              ),
+            ),
+        ],
       ),
     );
   }

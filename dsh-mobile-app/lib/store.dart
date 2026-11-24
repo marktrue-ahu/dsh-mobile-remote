@@ -268,6 +268,22 @@ class AppStore extends ChangeNotifier {
   GitGraphBranchLimit gitGraphBranchLimit = GitGraphBranchLimit.fallback;
   TurnFoldTiming turnFoldTiming = TurnFoldTiming.afterAnswer;
 
+  /// issue #175 P1：记住上次选择的安装源（**只存手机本地**，不写电脑端配置）。
+  ///
+  /// 取值语义与 `plugin_install_source_screen.dart` 的 `_selectedRegistryKey` 一致：
+  /// `'host'` = 宿主默认源；某个 registry 的 URL = 该源；**空串 = 没有记住任何值**
+  /// （首次使用）。「手动 URL」按设计**不记进这里**（可能是内网地址，见该页注释），
+  /// 除非用户显式勾选「记住此地址」并校验通过 —— 那种情况存进
+  /// [pluginManualRegistryUrl] 单独一个字段，与这里的枚举值分开。
+  String pluginInstallSource = '';
+
+  /// issue #175 P1：用户显式勾选「记住此地址」后的手动 URL（**默认空 = 不记**）。
+  ///
+  /// 与 [pluginInstallSource] 分开存：手动地址是自由文本，混进同一个键会让
+  /// 「合法 registry URL」和「哨兵值 `host`」共用一个命名空间，容易把用户输入的
+  /// `host` 误当哨兵。
+  String pluginManualRegistryUrl = '';
+
   /// 思维链折叠手动状态（会话 -> 消息key -> 手动展开值；滚动/重进/重启持久，null=跟随设置默认）
   Map<String, Map<String, bool>> reasoningOverrides = {};
   String language = 'zh'; // zh | en（v2.7：界面语言，持久化）
@@ -1662,6 +1678,10 @@ class AppStore extends ChangeNotifier {
   static const _kTimelineDebug = 'dsh_mr_timeline_debug';
   static const _kStepDisplayMode = 'dsh_mr_step_display_mode';
   static const _kGitGraphBranchLimit = 'dsh_mr_git_graph_branch_limit';
+  /// issue #175 P1：上次选择的安装源（本机偏好，不写电脑端配置）。
+  static const _kPluginInstallSource = 'dsh_mr_plugin_install_source';
+  /// issue #175 P1：用户显式勾选「记住此地址」的手动 URL（默认不记）。
+  static const _kPluginManualRegistryUrl = 'dsh_mr_plugin_manual_registry_url';
   static const _kTurnFoldTiming = 'dsh_mr_turn_fold_timing';
   static const _kReasoningOverrides = 'dsh_mr_reasoning_overrides';
   static const _kWorkspace = 'dsh_mr_workspace';
@@ -1735,6 +1755,10 @@ class AppStore extends ChangeNotifier {
     gitGraphBranchLimit = GitGraphBranchLimit.fromStorage(
       prefs.getString(_kGitGraphBranchLimit),
     );
+    // issue #175 P1：上次选择的安装源（默认空串 = 没记住，页面自行回退「宿主默认源」）。
+    pluginInstallSource = prefs.getString(_kPluginInstallSource) ?? '';
+    pluginManualRegistryUrl =
+        prefs.getString(_kPluginManualRegistryUrl) ?? '';
     final foldTiming = prefs.getString(_kTurnFoldTiming);
     turnFoldTiming = foldTiming == 'onNewMessage'
         ? TurnFoldTiming.onNewMessage
@@ -2387,6 +2411,31 @@ class AppStore extends ChangeNotifier {
     gitGraphBranchLimit = limit;
     notifyListeners();
     await _persistPrefs(_kGitGraphBranchLimit, limit.storageValue);
+  }
+
+  /// issue #175 P1：记住上次选择的安装源（**只写手机本地**，不写电脑端配置）。
+  ///
+  /// 只接受来自宿主 registry 列表的值或哨兵 `'host'`；「手动 URL」走
+  /// [setPluginManualRegistryUrl] 单独一条，避免与哨兵值共用命名空间。
+  /// 传空串表示清除记忆（下次打开回退「宿主默认源」）。
+  Future<void> setPluginInstallSource(String value) async {
+    final next = value.trim();
+    if (pluginInstallSource == next) return;
+    pluginInstallSource = next;
+    notifyListeners();
+    await _persistPrefs(_kPluginInstallSource, next);
+  }
+
+  /// issue #175 P1：记住用户**显式勾选**的手动安装源地址（空串 = 不记）。
+  ///
+  /// 默认不记住任何自定义地址（可能是内网地址）；只有用户勾了「记住此地址」
+  /// 并过了 host 侧 `validateRegistryUrl` 同判据的客户端预校验才会走到这里。
+  Future<void> setPluginManualRegistryUrl(String url) async {
+    final next = url.trim();
+    if (pluginManualRegistryUrl == next) return;
+    pluginManualRegistryUrl = next;
+    notifyListeners();
+    await _persistPrefs(_kPluginManualRegistryUrl, next);
   }
 
   /// issue #52：收起时机两档（回答结束后 / 下次有新消息时）——改动即时重算。

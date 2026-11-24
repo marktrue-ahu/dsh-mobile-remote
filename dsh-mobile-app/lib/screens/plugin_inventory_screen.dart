@@ -444,6 +444,8 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
               _actions.installWith(item.name, registry: registry),
           poll: _actions.poll,
           cancel: _actions.cancel,
+          // issue #175 P1：记住上次选择的源（只存手机本地，不写电脑端配置）。
+          store: widget.store,
         ),
       ),
     );
