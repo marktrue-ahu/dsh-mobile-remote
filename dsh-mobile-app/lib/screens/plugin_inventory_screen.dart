@@ -275,9 +275,12 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // issue #174：原判定用 `scale(14)`（缩放后的**像素值**，正常倍率下恒为 14）去比
+    // 倍率 1.4，条件恒真 → 「宽屏保留文字按钮」的分支永远不会渲染，于是两个动作
+    // 都是同等权重的纯图标。这里改成按**倍率**判断：390 正常字号才真的走宽屏分支。
     final compact =
         MediaQuery.sizeOf(context).width <= 340 ||
-        MediaQuery.textScalerOf(context).scale(14) >= 1.4;
+        MediaQuery.textScalerOf(context).scale(1) >= 1.4;
     final canScan = _inventory?.supported == true && !_scan.running;
     return Scaffold(
       appBar: AppBar(
@@ -286,9 +289,12 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
           style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
         ),
         actions: [
-          // 「检查全部更新」：App 侧有界并发，不创建宿主事务、不自动安装。
+          // issue #174：两者原来的 `Icons.sync` / `Icons.refresh` 都是圆形循环箭头，
+          // 形状几乎一样、权重也相同，分不出「查更新」和「刷清单」。
+          // 现在：「检查全部更新」= `system_update_alt`（与详情页「检查更新」同图标）
+          // 且带 tonal 底色（主要动作）；「刷新清单」= 纯图标 `refresh`（次要动作）。
           if (compact)
-            IconButton(
+            IconButton.filledTonal(
               key: const ValueKey('plugin-check-all'),
               tooltip: L10n.t('检查全部更新', 'Check all for updates'),
               icon: _scan.running
@@ -297,11 +303,11 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
                       height: 18,
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
-                  : const Icon(Icons.sync, size: 20),
+                  : const Icon(Icons.system_update_alt, size: 20),
               onPressed: canScan ? _startScan : null,
             )
           else
-            TextButton.icon(
+            FilledButton.tonalIcon(
               key: const ValueKey('plugin-check-all'),
               onPressed: canScan ? _startScan : null,
               icon: _scan.running
@@ -310,10 +316,11 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
                       height: 14,
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
-                  : const Icon(Icons.sync, size: 16),
+                  : const Icon(Icons.system_update_alt, size: 16),
               label: Text(L10n.t('检查全部更新', 'Check updates')),
             ),
           IconButton(
+            key: const ValueKey('plugin-refresh'),
             tooltip: L10n.t('刷新插件清单', 'Refresh plugins'),
             icon: _loading
                 ? const SizedBox(
@@ -611,9 +618,27 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
 
   void _handleTerminalOperation(PluginOperation operation) {
     _operationTimer?.cancel();
+    // issue #174：清单重拉只改清单里的 `version`，scan 里旧结果的 `latest` 还在，
+    // 行渲染同时看两者 → 升级成功后仍显示「可更新 vX」。
+    // 这里**只**让该插件的扫描结果失效（其他插件的结果继续有效，不必重扫）：
+    //   - 成功：版本/可更新状态确实变了；
+    //   - 结果未知（outcomeUnknown）：可能已改，不能继续声称「可更新」。
+    // 失败且已回滚/未变更时版本未变，保留原结果（不制造无谓的「未扫描」态）。
+    if (operation.succeeded || operation.outcomeUnknown) {
+      _invalidateScanResult(operation.name);
+    }
     // 安装/升级成功或回滚后都重拉清单：版本/健康/能力以宿主为准。
     unawaited(_refresh());
     unawaited((widget.refreshAll ?? widget.store.refreshAll)());
+  }
+
+  /// issue #174：让单个插件的批量检查结果失效（同时作废其在飞结果）。
+  void _invalidateScanResult(String name) {
+    if (name.isEmpty) return;
+    _scanner?.invalidate([name]);
+    final next = _scan.withoutResult(name);
+    if (identical(next, _scan)) return;
+    setState(() => _scan = next);
   }
 
   Future<void> _cancelOperation() async {
@@ -1398,12 +1423,18 @@ class _PluginDetailSheet extends StatefulWidget {
   onUpgrade;
   final Future<void> Function(PluginInfo plugin, bool enabled) onToggle;
   final Future<void> Function(PluginInfo plugin) onUninstall;
+
+  /// issue #174：列表侧「检查全部更新」已拿到的该插件结果（未扫描 → null）。
+  /// 传进来后详情页直接显示升级入口，不必再点一次「检查更新」。
+  final PluginUpdateCheckResult? scanResult;
+
   const _PluginDetailSheet({
     required this.plugin,
     required this.actions,
     required this.onUpgrade,
     required this.onToggle,
     required this.onUninstall,
+    this.scanResult,
   });
 
   @override
@@ -1413,7 +1444,20 @@ class _PluginDetailSheet extends StatefulWidget {
 class _PluginDetailSheetState extends State<_PluginDetailSheet> {
   bool _checking = false;
   PluginVersionCheck? _check;
+
+  /// 由列表结果回灌的初始检查（null = 该插件尚未被扫描过）。
+  PluginVersionCheck? _scanSeeded;
   String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _scanSeeded = pluginVersionCheckFromScan(widget.scanResult);
+    _check = _scanSeeded;
+  }
+
+  /// 本次详情是否直接复用了列表侧结果（用于给用户一个来源提示）。
+  bool get _reusedScan => _scanSeeded != null && identical(_check, _scanSeeded);
 
   Future<void> _checkUpdates() async {
     setState(() {
@@ -1611,43 +1655,73 @@ class _PluginDetailSheetState extends State<_PluginDetailSheet> {
               style: TextStyle(fontSize: 12, color: DshColors.ink2(context)),
             )
           else ...[
-            for (final version in _check!.versions.take(6))
-              Padding(
-                padding: const EdgeInsets.only(bottom: 4),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        'v${version.version}${version.prerelease ? L10n.t('（预发布）', ' (prerelease)') : ''}',
-                        style: const TextStyle(fontSize: 12.5),
-                      ),
+            // issue #174：结果来自列表侧「检查全部更新」——直接给主按钮「升级到 vX」，
+            // 不再列版本清单要求二次检查（列表只记一个 latest，本来也没有更多候选）。
+            if (_reusedScan) ...[
+              Align(
+                alignment: Alignment.centerLeft,
+                child: FilledButton.icon(
+                  key: const ValueKey('plugin-detail-upgrade'),
+                  onPressed: () {
+                    final target = _check!.usableVersions.first;
+                    Navigator.of(context).pop();
+                    unawaited(widget.onUpgrade(plugin, target));
+                  },
+                  icon: const Icon(Icons.system_update_alt, size: 17),
+                  label: Text(
+                    L10n.t(
+                      '升级到 v${_check!.usableVersions.first.version}',
+                      'Update to v${_check!.usableVersions.first.version}',
                     ),
-                    if (!version.usable)
-                      Expanded(
-                        child: Text(
-                          version.incompatibleRequirements.isEmpty
-                              ? L10n.t('不可用', 'Unavailable')
-                              : L10n.t(
-                                  '不兼容（${version.incompatibleRequirements}）',
-                                  'Incompatible (${version.incompatibleRequirements})',
-                                ),
-                          style: TextStyle(
-                            fontSize: 11,
-                            color: DshColors.danger(context),
-                          ),
-                        ),
-                      )
-                    else
-                      TextButton(
-                        onPressed: () {
-                          Navigator.of(context).pop();
-                          unawaited(widget.onUpgrade(plugin, version));
-                        },
-                        child: Text(L10n.t('升级', 'Update')),
-                      ),
-                  ],
+                  ),
                 ),
               ),
+              const SizedBox(height: 2),
+              Text(
+                L10n.t(
+                  '版本来自列表的「检查全部更新」，无需再次检查。',
+                  'This version came from “Check all for updates”; no extra check needed.',
+                ),
+                style: TextStyle(fontSize: 11.5, color: DshColors.ink3(context)),
+              ),
+            ] else
+              for (final version in _check!.versions.take(6))
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 4),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          'v${version.version}${version.prerelease ? L10n.t('（预发布）', ' (prerelease)') : ''}',
+                          style: const TextStyle(fontSize: 12.5),
+                        ),
+                      ),
+                      if (!version.usable)
+                        Expanded(
+                          child: Text(
+                            version.incompatibleRequirements.isEmpty
+                                ? L10n.t('不可用', 'Unavailable')
+                                : L10n.t(
+                                    '不兼容（${version.incompatibleRequirements}）',
+                                    'Incompatible (${version.incompatibleRequirements})',
+                                  ),
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: DshColors.danger(context),
+                            ),
+                          ),
+                        )
+                      else
+                        TextButton(
+                          onPressed: () {
+                            Navigator.of(context).pop();
+                            unawaited(widget.onUpgrade(plugin, version));
+                          },
+                          child: Text(L10n.t('升级', 'Update')),
+                        ),
+                    ],
+                  ),
+                ),
             TextButton(
               onPressed: _checking ? null : _checkUpdates,
               child: Text(L10n.t('重新检查', 'Check again')),
@@ -1892,6 +1966,8 @@ class _PluginRow extends StatelessWidget {
         onUpgrade: onUpgrade,
         onToggle: onToggle,
         onUninstall: onUninstall,
+        // issue #174：把本行已知的扫描结果带进详情页，避免再检查一次。
+        scanResult: scanResult,
       ),
     ]);
   }

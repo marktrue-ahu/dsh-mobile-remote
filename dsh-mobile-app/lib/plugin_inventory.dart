@@ -825,4 +825,22 @@ class PluginUpdateScan {
     dispatched: dispatched ?? this.dispatched,
     running: running ?? this.running,
   );
+
+  /// issue #174：让**单项**的扫描结果失效（其余项原样保留）。
+  ///
+  /// 升级/卸载/启停成功后版本或可更新状态已变，旧结果里的 `latest` 会让该行继续
+  /// 显示「可更新 vX」；只丢这一项即可，其他插件不必重扫。
+  PluginUpdateScan withoutResult(String name) => withoutResults([name]);
+
+  /// issue #174：批量失效（保持其余项与其顺序）。
+  PluginUpdateScan withoutResults(Iterable<String> names) {
+    final drop = names.where((value) => value.isNotEmpty).toSet();
+    if (drop.isEmpty) return this;
+    final kept = <String, PluginUpdateCheckResult>{};
+    for (final entry in results.entries) {
+      if (!drop.contains(entry.key)) kept[entry.key] = entry.value;
+    }
+    if (kept.length == results.length) return this;
+    return copyWith(results: Map.unmodifiable(kept));
+  }
 }
