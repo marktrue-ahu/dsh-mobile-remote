@@ -391,7 +391,8 @@ void main() {
       ),
     );
     await tester.pump(const Duration(milliseconds: 100));
-    await selectSettingsTab(tester, '通用');
+    // #176：Git 卡已从「通用」移到「对话」。
+    await selectSettingsTab(tester, '对话');
     final row = find.byKey(const Key('settings-git-graph-limit'));
     await tester.scrollUntilVisible(
       row,
