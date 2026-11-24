@@ -1691,6 +1691,49 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi, GitTagsApi {
     return PluginOperation.fromJson(data['operation']);
   }
 
+  /// issue #175 P2：安装**任意 spec**（npm 包名 / Git 地址 / 宿主机绝对路径 / tarball）。
+  ///
+  /// spec **原样**交给宿主：App 不拼接、不解析、不判断形态——那是宿主
+  /// `parseInstallSpec()` 的职责，在客户端重复实现必然与宿主漂移。
+  /// `registry` 只影响本次解析用的源（复用 #153 的选源语义）。
+  ///
+  /// 400 时抛 `ApiException`；其 `body` 里有 `error`（`invalid-spec` / `spec-refused` /
+  /// `bad-request`）、`detail`（输入形态类别）或 `problem`（宿主拒绝码），
+  /// 用 [PluginSpecError.fromJson] 解析后转人话。
+  Future<PluginOperation> pluginInstallBySpec(
+    String spec, {
+    String? registry,
+  }) async {
+    final data = await postJson('/api/plugin-inventory/install', {
+      'spec': spec,
+      if (registry != null && registry.isNotEmpty) 'registry': registry,
+    }, timeout: const Duration(seconds: 30));
+    return PluginOperation.fromJson(data['operation']);
+  }
+
+  /// issue #175 P2：安装前预校验（只读；宿主不写 profile、不安装）。
+  ///
+  /// 旧宿主无该端点时返回 404/405 → `supported:false`（不当作网络失败，与
+  /// [pluginRegistries] 一致）。400 的输入形态错误会抛 `ApiException`，
+  /// 由调用方用 [PluginSpecError.fromJson] 转文案。
+  Future<PluginSpecInspection> pluginInspectSpec(
+    String spec, {
+    String? registry,
+  }) async {
+    try {
+      final data = await postJson('/api/plugin-inventory/inspect', {
+        'spec': spec,
+        if (registry != null && registry.isNotEmpty) 'registry': registry,
+      }, timeout: const Duration(seconds: 45));
+      return PluginSpecInspection.fromJson(data);
+    } on ApiException catch (e) {
+      if (e.status == 404 || e.status == 405) {
+        return PluginSpecInspection.unsupported('endpoint-missing');
+      }
+      rethrow;
+    }
+  }
+
   /// #146：升级一个 registry 来源 bundle 到宿主确认的精确版本。
   ///
   /// #153：`registry` 与「检查更新」用的源一致，避免“检查到的版本装不上”。

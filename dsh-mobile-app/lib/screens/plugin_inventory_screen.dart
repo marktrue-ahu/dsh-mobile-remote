@@ -13,6 +13,7 @@ import '../store.dart';
 import '../theme.dart';
 import 'plugin_install_source_screen.dart';
 import 'plugin_management_widgets.dart';
+import 'plugin_spec_install_screen.dart';
 import 'plugin_update_scan.dart';
 import 'sheets.dart';
 
@@ -51,6 +52,15 @@ class PluginInventoryActions {
   /// 未注入时安装走原有确认框（没有源可选，多一跳没有信息增益）。
   final Future<PluginRegistryList> Function()? registries;
 
+  /// issue #175 P2：任意 spec 的安装前预校验（`null` = 当前宿主/注入方不支持，
+  /// 插件页不显示「手动安装」入口，而不是给一个点了会失败的按钮）。
+  final Future<PluginSpecInspection> Function(String spec, String? registry)?
+  inspectSpec;
+
+  /// issue #175 P2：按任意 spec 安装（`null` = 不支持手动安装）。
+  final Future<PluginOperation> Function(String spec, String? registry)?
+  installBySpec;
+
   const PluginInventoryActions({
     required this.checkVersions,
     required this.install,
@@ -64,6 +74,8 @@ class PluginInventoryActions {
     this.installAt,
     this.upgradeAt,
     this.registries,
+    this.inspectSpec,
+    this.installBySpec,
   });
 
   factory PluginInventoryActions.fromApi(Api api) => PluginInventoryActions(
@@ -81,7 +93,15 @@ class PluginInventoryActions {
     upgradeAt: (name, version, registry) =>
         api.pluginUpgrade(name, version, registry: registry),
     registries: api.pluginRegistries,
+    inspectSpec: (spec, registry) =>
+        api.pluginInspectSpec(spec, registry: registry),
+    installBySpec: (spec, registry) =>
+        api.pluginInstallBySpec(spec, registry: registry),
   );
+
+  /// issue #175 P2：宿主/注入方是否支持「手动安装任意 spec」。
+  bool get supportsManualInstall =>
+      inspectSpec != null && installBySpec != null;
 
   /// 检查更新（有 `*At` 钩子时带源，否则退回无源版本）。
   Future<PluginVersionCheck> checkVersionsWith(
@@ -289,6 +309,15 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
           style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
         ),
         actions: [
+          // issue #175 P2：手动安装任意 spec（包名 / Git / 电脑绝对路径 / tarball）。
+          // 只在注入方支持时出现——旧宿主不支持时不给一个点了会失败的入口。
+          if (_actions.supportsManualInstall)
+            IconButton(
+              key: const ValueKey('plugin-manual-install'),
+              tooltip: L10n.t('手动安装（包名/地址/路径）', 'Install manually (name/URL/path)'),
+              icon: const Icon(Icons.add_circle_outline, size: 20),
+              onPressed: _loading ? null : _openManualInstall,
+            ),
           // issue #174：两者原来的 `Icons.sync` / `Icons.refresh` 都是圆形循环箭头，
           // 形状几乎一样、权重也相同，分不出「查更新」和「刷清单」。
           // 现在：「检查全部更新」= `system_update_alt`（与详情页「检查更新」同图标）
@@ -340,6 +369,32 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
         ),
       ),
     );
+  }
+
+  /// issue #175 P2：打开手动安装页（任意 spec）。安装成功后刷新清单与能力。
+  ///
+  /// 安装源选择、进度/取消/回滚都由该页承担；这里只负责在返回后对齐状态。
+  Future<void> _openManualInstall() async {
+    final actions = _actions;
+    final inspect = actions.inspectSpec;
+    final installBySpec = actions.installBySpec;
+    if (inspect == null || installBySpec == null) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => PluginSpecInstallScreen(
+          store: widget.store,
+          inspect: (spec, {registry}) => inspect(spec, registry),
+          onInstall: (spec, {registry}) => installBySpec(spec, registry),
+          loadRegistries: actions.registries,
+          poll: actions.poll,
+          cancel: actions.cancel,
+        ),
+      ),
+    );
+    if (!mounted) return;
+    // 与 #146/#153 一致：安装可能已改宿主状态，返回后对齐清单与能力。
+    await _refresh();
+    unawaited((widget.refreshAll ?? widget.store.refreshAll)());
   }
 
   /// 开始「检查全部更新」：只查 `canUpdate` 的行，Git 来源跳过、不创建任何宿主事务。

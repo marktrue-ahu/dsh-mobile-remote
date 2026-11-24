@@ -601,6 +601,16 @@ class PluginOperation {
   final int attemptTotal;
   final String answeredRegistry;
 
+  /// issue #175 P2：`name` = 从宿主配置渠道装（#153 路径）；
+  /// `spec` = 用户手动指定的任意 spec。旧宿主无该字段 → 按 `name` 处理。
+  final String installSource;
+
+  /// issue #175 P2：pnpm 拦下的安装脚本包名（**只有名字**）。
+  ///
+  /// 非空意味着 `errorCode == "build-blocked"`：需要在**电脑端**授权后重装。
+  /// 手机端刻意不提供批准入口（安装脚本可执行任意代码）。
+  final List<String> pendingBuilds;
+
   const PluginOperation({
     required this.opId,
     required this.action,
@@ -622,6 +632,8 @@ class PluginOperation {
     this.attemptIndex = 0,
     this.attemptTotal = 0,
     this.answeredRegistry = '',
+    this.installSource = 'name',
+    this.pendingBuilds = const [],
   });
 
   factory PluginOperation.fromJson(Object? json) {
@@ -647,6 +659,13 @@ class PluginOperation {
       outcomeUnknown: json['outcomeUnknown'] == true,
       cancelled: json['cancelled'] == true,
       errorCode: (json['errorCode'] as String?)?.trim() ?? '',
+      installSource: ((json['source'] as String?)?.trim().isNotEmpty ?? false)
+          ? (json['source'] as String).trim()
+          : 'name',
+      pendingBuilds: (json['pendingBuilds'] as List? ?? const [])
+          .map((value) => value?.toString().trim() ?? '')
+          .where((value) => value.isNotEmpty)
+          .toList(),
       registries: (json['registries'] as List? ?? const [])
           .map((value) => value?.toString().trim() ?? '')
           .where((value) => value.isNotEmpty)
@@ -842,5 +861,192 @@ class PluginUpdateScan {
     }
     if (kept.length == results.length) return this;
     return copyWith(results: Map.unmodifiable(kept));
+  }
+}
+
+/// issue #175 P2：一次**任意 spec** 的安装前预校验结果。
+///
+/// 事实全部来自宿主 `pluginManager.inspect()`；App **不解析 spec**（不判形态、不拼路径），
+/// 只渲染宿主给的 `kind`/`name`/`version` 与拒绝原因码。
+///
+/// `spec` 原文刻意**不放进模型**：它可能含 token 或内网/家目录路径，进入 UI 状态与
+/// 日志即泄露。界面需要展示的是「宿主解析出了什么」，而不是用户输入的原文。
+class PluginSpecInspection {
+  /// 宿主是否**提供**预校验能力（旧宿主无 `inspect()` → false）。
+  final bool supported;
+
+  /// `accepted` / `refused`。
+  final String status;
+
+  /// `registry` / `git` / `path` / `tarball`；拒绝时可能为空。
+  final String kind;
+
+  final String name;
+  final String version;
+  final String description;
+
+  /// 宿主该形态是否声明 `dsh.bundle`；`null` 表示预校验阶段还读不到（git/tarball）。
+  final bool? bundle;
+
+  /// 本次解析会先问的源（已由宿主规范化、剥离凭据）。
+  final String registry;
+
+  /// git / tarball 的拉取主机；registry/path 为空。
+  final String host;
+
+  /// 稳定拒绝码：`invalid-spec` / `already-installed` / `not-found` /
+  /// `not-a-package` / `not-a-bundle` / `network` / `unknown`。
+  final String problem;
+
+  /// 宿主给的固定短句（已由宿主侧白名单收敛，不含路径/凭据）；可能为空。
+  final String reason;
+
+  const PluginSpecInspection({
+    this.supported = false,
+    this.status = 'refused',
+    this.kind = '',
+    this.name = '',
+    this.version = '',
+    this.description = '',
+    this.bundle,
+    this.registry = '',
+    this.host = '',
+    this.problem = '',
+    this.reason = '',
+  });
+
+  factory PluginSpecInspection.fromJson(Object? json) {
+    if (json is! Map) {
+      return const PluginSpecInspection(problem: 'unknown');
+    }
+    final status = (json['status'] as String?)?.trim() ?? '';
+    return PluginSpecInspection(
+      supported: json['supported'] == true,
+      status: status.isEmpty ? 'refused' : status,
+      kind: (json['kind'] as String?)?.trim() ?? '',
+      name: (json['name'] as String?)?.trim() ?? '',
+      version: (json['version'] as String?)?.trim() ?? '',
+      description: (json['description'] as String?)?.trim() ?? '',
+      bundle: json['bundle'] is bool ? json['bundle'] as bool : null,
+      registry: (json['registry'] as String?)?.trim() ?? '',
+      host: (json['host'] as String?)?.trim() ?? '',
+      problem: (json['problem'] as String?)?.trim() ?? '',
+      reason: (json['reason'] as String?)?.trim() ?? '',
+    );
+  }
+
+  /// 旧宿主没有预校验能力。App 据此说明「本机无法预校验」，而不是假装通过了。
+  factory PluginSpecInspection.unsupported(String reason) =>
+      PluginSpecInspection(supported: false, problem: reason);
+
+  bool get accepted => status == 'accepted';
+  bool get refused => !accepted;
+
+  /// 形态的人话标签（`kind` 是宿主词汇，UI 统一在这里翻译）。
+  String get kindLabel => switch (kind) {
+    'registry' => L10n.t('npm 包', 'npm package'),
+    'git' => L10n.t('Git 仓库', 'Git repository'),
+    'path' => L10n.t('电脑上的本地目录', 'Local directory on the desktop'),
+    'tarball' => L10n.t('tarball 包', 'Tarball'),
+    _ => L10n.t('未识别', 'Unrecognized'),
+  };
+
+  /// 拒绝原因的人话文案。**必须**覆盖宿主全部稳定码，未知码给通用兜底（不臆测原因）。
+  String get problemText => switch (problem) {
+    'invalid-spec' => L10n.t(
+      '无法识别的安装地址：请填写 npm 包名、GitHub/Git 地址、电脑上的绝对路径或 tarball 链接。'
+          '本地路径必须是电脑上的绝对路径（如 /Users/name/plugin），不能是手机的。',
+      'Unrecognized install address: use an npm package name, a Git URL, an absolute path '
+          'on the desktop, or a tarball URL. A local path must be an absolute path on the '
+          'desktop (e.g. /Users/name/plugin), not on the phone.',
+    ),
+    'already-installed' => L10n.t(
+      '这个插件已经安装在电脑上了；要换版本请在插件详情里升级。',
+      'This plugin is already installed on the desktop; update it from its details instead.',
+    ),
+    'not-found' => L10n.t(
+      '在电脑端配置的安装源里找不到这个包。',
+      'No such package in the sources configured on the desktop.',
+    ),
+    'not-a-package' => L10n.t(
+      '这个地址不是可安装的包：本地路径必须存在且含 package.json，tarball 必须存在。',
+      'This address is not an installable package: a local path must exist and contain '
+          'package.json, and a tarball must exist.',
+    ),
+    'not-a-bundle' => L10n.t(
+      '这个包没有声明 dsh.bundle，不是 DSH 插件。',
+      'This package declares no dsh.bundle, so it is not a DSH plugin.',
+    ),
+    'network' => L10n.t(
+      '电脑端访问安装源时网络失败，请检查电脑端的网络或安装源设置。',
+      'The desktop could not reach the source; check its network or source settings.',
+    ),
+    _ => L10n.t(
+      '无法完成预校验，请检查填写内容或电脑端状态后重试。',
+      'Could not verify this address; check the input or the desktop and retry.',
+    ),
+  };
+
+  /// 由宿主协议映射来源（`registry`/`git`/`path`/`tarball`），供 UI 展示。
+  String get sourceLabel {
+    if (host.isNotEmpty) return '$kindLabel · $host';
+    if (registry.isNotEmpty) return kindLabel;
+    return kindLabel;
+  }
+}
+
+/// issue #175 P2：`inspect` 拒绝时宿主给的整体错误（HTTP 400 `invalid-spec` /
+/// `spec-refused`），或安装提交阶段的错误。
+class PluginSpecError {
+  /// 稳定错误码：`invalid-spec` / `spec-refused` / `registry-invalid` / `bad-request`。
+  final String code;
+
+  /// 输入形态问题的类别（`too-long` / `control-char` / `empty` / `not-string`）。
+  final String detail;
+
+  /// `spec-refused` 时的宿主拒绝原因码。
+  final String problem;
+
+  final String reason;
+
+  const PluginSpecError({
+    this.code = '',
+    this.detail = '',
+    this.problem = '',
+    this.reason = '',
+  });
+
+  factory PluginSpecError.fromJson(Object? json) {
+    if (json is! Map) return const PluginSpecError();
+    return PluginSpecError(
+      code: (json['error'] as String?)?.trim() ?? '',
+      detail: (json['detail'] as String?)?.trim() ?? '',
+      problem: (json['problem'] as String?)?.trim() ?? '',
+      reason: (json['reason'] as String?)?.trim() ?? '',
+    );
+  }
+
+  /// 人话文案：优先后端给的 `problem`（语义更准），其次输入形态 `detail`，最后通用。
+  String text() {
+    if (problem.isNotEmpty) {
+      return PluginSpecInspection(problem: problem).problemText;
+    }
+    return switch (detail) {
+      'too-long' => L10n.t('安装地址太长（上限 2048 字符）。', 'The install address is too long (2048 characters max).'),
+      'control-char' => L10n.t('安装地址含控制字符，请重新输入。', 'The install address contains control characters; retype it.'),
+      'empty' => L10n.t('请填写安装地址。', 'Enter an install address.'),
+      'not-string' => L10n.t('安装地址格式无效。', 'The install address is invalid.'),
+      _ => switch (code) {
+        'registry-invalid' => L10n.t(
+          '安装源地址无效：只接受 http(s) 地址，不接受凭据、查询参数、片段或本地路径',
+          'Invalid registry URL: only http(s) addresses are accepted, without credentials, query or fragment',
+        ),
+        'spec-refused' => L10n.t(
+          '电脑端拒绝了这次安装。',
+          'The desktop refused this installation.',
+        ),
+        _ => L10n.t('安装请求未能提交，请重试。', 'The install request could not be submitted; retry.'),
+      },
+    };
   }
 }
