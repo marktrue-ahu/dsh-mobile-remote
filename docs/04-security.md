@@ -98,9 +98,32 @@
 - **只读**：`GET /m/api/plugin-inventory/registries` 投影宿主 `pluginManager.registries()`（首选源、回退源、pnpm 自身解析出的源），`writable` 恒 `false`；App 不能新增/删除/改写电脑端 registry，不写 profile `package.json`、`pnpm-lock.yaml`、`.npmrc` 或插件状态目录。
 - **凭据安全（P0）**：出网前统一剥离 `username`/`password`/`search`/`hash`；**带凭据的条目整条丢弃**，不做“只去密码”的脱敏回显——回显保留用户名/主机关系，下游容易误当成可复用源。响应只给 `display`（host + pathname），日志不使用原始 URL。
 - **手动 URL 校验**：只接受 `http(s)`；拒绝非字符串/空/超 2048 字节、控制字符与空白、`new URL` 失败（裸路径、`file:`/`data:`/`git+ssh:`/`ftp:` 等非 http(s)）、带 userinfo、带 query、带 fragment、hostname 为空。失败一律 `400 registry-invalid`，`detail` **只给类别**、不回显原文（原文可能含凭据）。通过后与宿主 `normalizeRegistry` 幂等：pathname 末尾补 `/`。
-- **允许 localhost 与私网**：内网 Verdaccio/Nexus 是合法用例，因此**不加私网/回环黑名单**。代价是已认证用户可以让宿主向指定 http(s) 主机发 registry 查询/安装请求；这与他本就能在电脑端配置 registry 等价，但**扩大了从手机发起的内网请求面**（可被用作端口/服务存在性探测：错误码与耗时能区分“无服务”“非 registry”）。缓解：端点需要移动端口令；安装 spec 仍由宿主 `installTarget` 决定，手动 URL **不能安装任意包**；不持久化，不会长期改变后续行为。
+- **允许 localhost 与私网**：内网 Verdaccio/Nexus 是合法用例，因此**不加私网/回环黑名单**。代价是已认证用户可以让宿主向指定 http(s) 主机发 registry 查询/安装请求；这与他本就能在电脑端配置 registry 等价，但**扩大了从手机发起的内网请求面**（可被用作端口/服务存在性探测：错误码与耗时能区分“无服务”“非 registry”）。缓解：端点需要移动端口令；registry 参数只改变解析源，**不能指定包**（指定包的能力见下节 P2，边界同样是“等价于电脑端操作”）；不持久化，不会长期改变后续行为。
 - **不静默换源**：`versions` 返回 `requestedRegistry`/`answeredRegistry`/`attempts[{registry,problem}]`，安装/升级操作快照带 `registries`/`attempt{index,total}`/`answeredRegistry`。失败时 `answeredRegistry` 留空——不能声称“某个源答了”。
 - **旧宿主降级**：无 `registries()`/抛错 → HTTP 200 + `supported:false`（不是 404/500），App 只显示「当前电脑端不提供安装源信息」，仍可在宿主默认源安装。
+
+### 任意 spec 安装（`/m/api/plugin-inventory/inspect` 与 `install {spec}`，issue #175 P2）
+
+手机端可以**触发宿主任意 spec 安装**。威胁模型与显式接受的边界如下——这一节是「#153 手动 URL 不能安装任意包」之后的能力扩张，**必须**与它一起读。
+
+**能力等价性（接受该风险的理由）**：`spec` 交给宿主 `pluginManager.installBundle()`，与在电脑端运行 `dsh plugin install <spec>` 等价。已认证的移动端用户本就能操作该电脑端，因此这不是**权限**提升；提升的是**从手机侧发起**的便利面：不必回到电脑端键盘。
+
+**硬约束（实现必须保持）**：
+
+- **插件侧不解析 spec**：形态判定（`registry`/`git`/`path`/`tarball`）、路径合法性、git 地址、tarball 一律交宿主 `parseInstallSpec()` 与 `pluginManager.inspect()`。插件侧只做与语义无关的线性输入防御：非字符串/空/超 2048 字节/含控制字符（`\u0000-\u001f\u007f`）→ `400 invalid-spec`，`detail` 只给类别。**重复实现解析器必然与宿主漂移**，且会绕过宿主的合法性判断。
+- **`path` 只接受宿主机绝对路径**：相对路径由宿主 `parseInstallSpec()` 拒绝。UI 明确提示「填电脑上的路径，不是手机的」——手机没有电脑文件系统访问权，路径**只能手输**，App 不提供也不应该提供目录浏览。
+- **不回显原始 spec（P0）**：spec 可能含访问 token、内网主机名或家目录路径。因此：错误响应/`detail`/日志/操作快照的 `name` 都不得出现 spec 原文；预校验成功时 op 用**包名**，失败占位用固定串 `install-spec`。宿主 `inspect()` 的 `reason` 对 `path` 会拼入文件系统错误（含绝对路径）、对 registry 会回传原源错误，**必须经白名单收敛**后才可透出（只保留宿主固定短句，其余置空，由 App 按 `problem` 出人话）。
+- **`name` 与 `spec` 互斥**：同传 → `400 bad-request`。不替用户二选一——那会在“以为按配置渠道装”时实际装了任意包。
+- **`name` 路径不变**：`{name}` 仍只从宿主 `installable` 清单取 `installTarget.spec`（#153 三分类 UI 依赖它）。op 快照带 `source: "name" | "spec"` 以便区分。
+- **并发**：同一时刻只允许一个 `spec` 安装，第二个 → `409 plugin-install-in-progress`；不排队（排队只会让手机端长时间无反馈）。`name` 路径不受此限，仍按 `name` 去重。
+
+**安装脚本授权（明确的「不做」）**：pnpm 可能拦截 build scripts（脚本可执行任意代码），宿主有 `approvedBuilds` 授权机制。**手机端不提供该授权通道**：遇到拦截只回报 `errorCode: "build-blocked"` + `pendingBuilds`（**只有包名**），App 显示「需要在电脑端完成安装脚本授权」+ 指引，**不渲染任何批准按钮**。理由：批准安装脚本等于允许任意代码在电脑上执行，该决定必须发生在能看到完整脚本与上下文的电脑端。`pendingBuilds` 在插件侧再做一次**包名形状**校验（排除 `/` 开头的路径、空白与控制字符），避免把路径透到手机屏幕上。
+
+**宿主失败类别的真实来源**：宿主 `installBundle()` 在 pnpm 失败时 `throw new Error(run.output)`，`change()` 把它折成 `error.code: "operation-error"`——**`build-blocked` 不在 `error.code` 里**，只在 `result.packageResult.kind`（由 `classifyInstallFailure()` 判出）。因此插件侧从 `packageResult.kind` 还原 `build-blocked`，而非读 `error.code`。这一点若按“错误码直读”实现会静默失效（表现为永远显示通用的 `operation-error`）。
+
+**旧宿主降级**：无 `inspect()` → `200 + supported:false`（不是 404/500），预校验不可用；安装仍可提交，`installBundle` 自己会做完整校验。
+
+**已知残余风险**：`path`/`git`/`tarball` 三类在**首次**安装时由 pnpm 在电脑端执行，等于让手机输入决定了电脑端要拉取/执行的包。宿主的 bundle 校验（`dsh.bundle` 声明）与本仓库的预校验只降低误操作，不构成代码审计——与 `dsh plugin install` 同等级。这也是「手机端不做 build scripts 授权」这条边界存在的原因。
 
 ### 持久化与投递
 

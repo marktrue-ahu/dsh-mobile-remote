@@ -10,6 +10,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../l10n.dart';
+import '../plugin_install_source.dart';
 import '../plugin_inventory.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -56,46 +57,10 @@ class PluginRegistryChoiceManual extends PluginRegistryChoice {
 
 /// 手动 URL 的客户端预校验。
 ///
-/// 与宿主 `validateRegistryUrl` **同类判据**（App 只做即时反馈；权威判定仍在宿主，
-/// 不因为客户端通过就跳过服务端 400）。返回空串表示通过，否则返回可读原因。
-String pluginRegistryUrlError(String raw) {
-  final value = raw.trim();
-  if (value.isEmpty) return L10n.t('请输入安装源地址', 'Enter a registry URL');
-  if (value.length > 2048) {
-    return L10n.t('地址过长', 'The address is too long');
-  }
-  if (RegExp(r'\s').hasMatch(value)) {
-    return L10n.t('地址不能包含空格', 'The address must not contain spaces');
-  }
-  final uri = Uri.tryParse(value);
-  if (uri == null) {
-    return L10n.t('地址无效', 'Invalid address');
-  }
-  // 先判协议：`file:`/`data:`/`git+ssh:` 的 host 可能为空，
-  // 若先判 host 会给出“地址无效”而掩盖真正原因（与宿主 detail 类别一致）。
-  if (uri.scheme != 'http' && uri.scheme != 'https') {
-    return L10n.t(
-      '只接受 http(s) 地址',
-      'Only http(s) addresses are accepted',
-    );
-  }
-  if (uri.host.isEmpty) {
-    return L10n.t('地址无效', 'Invalid address');
-  }
-  if (uri.userInfo.isNotEmpty) {
-    return L10n.t(
-      '地址不能包含凭据（用户名/密码）',
-      'The address must not contain credentials',
-    );
-  }
-  if (uri.hasQuery) {
-    return L10n.t('地址不能包含查询参数', 'The address must not contain a query');
-  }
-  if (uri.hasFragment) {
-    return L10n.t('地址不能包含片段', 'The address must not contain a fragment');
-  }
-  return '';
-}
+/// 实现已下沉到 [pluginManualUrlError]（`lib/plugin_install_source.dart`），
+/// 供 P1 的选源页与 P2 的手动 spec 安装页共用**同一份**判据；
+/// 这里保留旧名字，既有调用方与测试无需改动。
+String pluginRegistryUrlError(String raw) => pluginManualUrlError(raw);
 
 /// 展示「将执行的安装」摘要（让用户看清 App 传了什么、宿主负责什么）。
 class PluginInstallSummaryCard extends StatelessWidget {
@@ -231,12 +196,12 @@ class _PluginInstallSourceScreenState extends State<PluginInstallSourceScreen> {
   PluginOperation? _operation;
   bool _cancelPending = false;
 
+  /// issue #175 P1/P2：选源「记住上次选择」的共享实现。
+  /// P2 的手动 spec 安装页用同一份逻辑，避免两处语义漂移。
+  late final PluginInstallSourceMemory _memory = PluginInstallSourceMemory();
+
   /// issue #175 P1：手动 URL 是否「记住此地址」（默认不记）。
   bool _rememberManualUrl = false;
-
-  /// 是否已用手动 URL 的记忆值初始化过（`_restoreSelection` 只跑一次）。
-  /// 晚到的 registry 列表只校验有效性，不覆盖用户已做的选择。
-  bool _restoredSelection = false;
 
   @override
   void initState() {
@@ -251,52 +216,25 @@ class _PluginInstallSourceScreenState extends State<PluginInstallSourceScreen> {
   /// 不写电脑端配置。此时 registry 列表可能还没读回来，因此这里只做**字面**恢复，
   /// 有效性校验在 `_loadRegistries` 完成后进行。
   void _restoreSelection() {
-    if (_restoredSelection) return;
-    _restoredSelection = true;
     final store = widget.store;
-    if (store == null) return;
-    // 显式记住的手动地址优先于枚举记忆：它是用户明确勾选的「记住此地址」，
-    // 语义上比「上次在列表里点了哪一项」更强。
-    final manual = store.pluginManualRegistryUrl;
-    if (manual.isNotEmpty) {
-      _urlController.text = manual;
+    if (store != null) _memory.restore(store);
+    _selectedRegistryKey = _memory.selectedKey;
+    if (_memory.manualUrl.isNotEmpty) {
+      _urlController.text = _memory.manualUrl;
       _rememberManualUrl = true;
-      _selectedRegistryKey = 'manual';
-      return;
     }
-    final saved = store.pluginInstallSource;
-    if (saved.isNotEmpty) _selectedRegistryKey = saved;
   }
 
   /// 记住当前选择（**切换时立即保存**，不等点安装；取消安装也不该丢）。
   Future<void> _rememberSelection(String key) async {
-    final store = widget.store;
-    if (store == null) return;
-    // 「手动」本身不进记忆：手动地址是自由文本，默认不留存（可能含内网主机）。
-    // 只有用户勾了「记住此地址」才单独存进 manual 字段（见 `_syncManualMemory`）。
-    if (key == 'manual') return;
-    await store.setPluginInstallSource(key);
+    _memory.selectedKey = key;
+    await _memory.remember(widget.store, key);
   }
 
   /// 把手动 URL 的**勾选状态 + 输入内容**镜像到本机偏好。
-  ///
-  /// 规则刻意做得可预期，避免「清空输入后下次又冒出旧地址」这类幽灵值：
-  ///   - 未勾选 → 清掉；
-  ///   - 勾选且地址通过客户端预校验 → 存该地址；
-  ///   - 勾选但地址为空/非法 → 清掉（不保存一个用不了的值）。
   Future<void> _syncManualMemory() async {
-    final store = widget.store;
-    if (store == null) return;
-    if (!_rememberManualUrl) {
-      await store.setPluginManualRegistryUrl('');
-      return;
-    }
-    final url = _urlController.text.trim();
-    if (pluginRegistryUrlError(url).isNotEmpty) {
-      await store.setPluginManualRegistryUrl('');
-      return;
-    }
-    await store.setPluginManualRegistryUrl(url);
+    _memory.manualUrl = _urlController.text;
+    await _memory.syncManualMemory(widget.store, _rememberManualUrl);
   }
 
   void _setRememberManual(bool remember) {
@@ -337,25 +275,13 @@ class _PluginInstallSourceScreenState extends State<PluginInstallSourceScreen> {
 
   /// 校验存下的选择在当前宿主列表里仍然有效；无效则回退 `'host'`。
   ///
-  /// `'host'` 恒有效；`'manual'` 单独通路（只要有记住的手动地址就仍可用）；
-  /// 其余必须是列表里真实存在的 registry URL。
-  ///
-  /// 特别注意**列表里第一个源**：UI 把它渲染成「宿主配置渠道」（不可单独选中，
-  /// 因为 `registry: null` 与「请求配置的首选源」在宿主解析顺序里等效）。因此存值
-  /// 恰为首个源的 URL 时归一成 `'host'`——否则页面上不会有一行是选中态。
+  /// 判定本身在 [PluginInstallSourceMemory.validate]（P1/P2 共用同一实现）；
+  /// 这里只把当前 UI 状态同步进去。
   String _validatedSelection(PluginRegistryList list) {
-    final key = _selectedRegistryKey;
-    if (key == 'host') return 'host';
-    if (key == 'manual') {
-      return _urlController.text.trim().isEmpty ? 'host' : 'manual';
-    }
-    final first = list.registries.isEmpty ? null : list.registries.first.url;
-    if (first != null && first == key) return 'host';
-    for (final entry in list.registries) {
-      if (entry.url == key) return key;
-    }
-    // 存的值失效（registry 从宿主列表消失）：静默回退，不弹错、不崩。
-    return 'host';
+    _memory
+      ..selectedKey = _selectedRegistryKey
+      ..manualUrl = _urlController.text;
+    return _memory.validate(list);
   }
 
   bool get _installing => _operation != null && _operation!.running;
