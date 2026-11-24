@@ -82,6 +82,39 @@ PluginVersionInfo? _latestUsable(PluginVersionCheck check) {
   return null;
 }
 
+/// issue #174：把「检查全部更新」已拿到的单项结果**回灌**成一次检查结果。
+///
+/// 详情 sheet 原来只看自己发起的检查，于是列表行已经显示「可更新 vX」时，点开还要
+/// 再点一次「检查更新」。这里把列表已知的结果变成 `_check` 的初始值，让详情页直接
+/// 呈现升级入口，不再要求二次检查。
+///
+/// 只有 `available` / `current` 能回灌：
+/// - `available` → 一个可用版本（`pluginScanResultOf` 只取过 `usable` 版本）；
+/// - `current` → 空版本列表（渲染为「已是最新版本」）；
+/// - `failed` / `skipped` → 返回 null，保留「检查更新」按钮供用户重试（失败不该被
+///   当成“已检查过”）。
+PluginVersionCheck? pluginVersionCheckFromScan(PluginUpdateCheckResult? result) {
+  if (result == null) return null;
+  switch (result.state) {
+    case 'available':
+      if (result.latest.isEmpty) return null;
+      return PluginVersionCheck(
+        status: 'listed',
+        installedVersion: result.installed,
+        answeredRegistry: result.answeredRegistry,
+        versions: [PluginVersionInfo(version: result.latest)],
+      );
+    case 'current':
+      return PluginVersionCheck(
+        status: 'listed',
+        installedVersion: result.installed,
+        answeredRegistry: result.answeredRegistry,
+      );
+    default:
+      return null;
+  }
+}
+
 /// 一次「检查全部更新」的运行句柄：有界并发、可取消、结果增量落地。
 class PluginUpdateScanController {
   final Future<PluginVersionCheck> Function(String name) checkVersions;
@@ -91,6 +124,12 @@ class PluginUpdateScanController {
   PluginUpdateScan _scan = const PluginUpdateScan();
   final Map<String, PluginUpdateCheckResult> _results = {};
   final Set<String> _cancelledTokens = {};
+
+  /// issue #174：已被操作（升级/卸载/启停）作废的插件名。
+  ///
+  /// 只作废**这些**项：作废发生在升级成功之后，若该项的检查还在飞，
+  /// 迟到的结果也必须丢弃，否则旧 `latest` 会重新贴回「可更新」。
+  final Set<String> _invalidated = {};
   bool _running = false;
   int _token = 0;
   int _dispatched = 0;
@@ -115,12 +154,31 @@ class PluginUpdateScanController {
     onUpdate(_scan);
   }
 
+  /// issue #174：让指定插件的扫描结果失效（**只丢这些项，其余项保留**）。
+  ///
+  /// 用于升级/卸载/启停成功后：版本或可更新状态已变，旧 `latest` 会让行继续显示
+  /// 「可更新 vX」。同时把名字记进作废集合，使该轮仍在飞的结果到达后被丢弃。
+  /// 返回是否有变化（无变化时不触发 `onUpdate`）。
+  bool invalidate(Iterable<String> names) {
+    final drop = names.where((value) => value.isNotEmpty).toSet();
+    if (drop.isEmpty) return false;
+    _invalidated.addAll(drop);
+    final before = _results.length;
+    _results.removeWhere((key, _) => drop.contains(key));
+    if (_results.length == before) return false;
+    _scan = _scan.copyWith(results: Map.unmodifiable(_results));
+    onUpdate(_scan);
+    return true;
+  }
+
   /// 开始检查（同一时刻只跑一轮；再次调用先取消旧轮）。
   Future<void> start(PluginInventory inventory) async {
     if (_running) cancel();
     _token += 1;
     final token = _token;
     _results.clear();
+    // 新一轮是完整的重查：上一轮被操作作废的项也要重新采信。
+    _invalidated.clear();
     _cancelledTokens.removeWhere((value) => value != '$token');
     final candidates = pluginUpdateScanCandidates(inventory);
     _targets = pluginUpdateScanTargets(inventory);
@@ -197,6 +255,9 @@ class PluginUpdateScanController {
       }
       // 取消后到达的结果直接丢弃（不写进已完成集合，也不触发 UI 更新）。
       if (!_isCurrent(token)) return;
+      // issue #174：该项已被操作作废（升级/卸载/启停已完成）→ 迟到的结果同样丢弃，
+      // 不能把过期的「可更新」贴回该行；**只丢这一项**，其他项照常落结果。
+      if (_invalidated.contains(plugin.name)) continue;
       _results[plugin.name] = result;
       _scan = _scan.copyWith(results: Map.unmodifiable(_results));
       onUpdate(_scan);
