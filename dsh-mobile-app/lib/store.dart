@@ -3606,6 +3606,20 @@ class AppStore extends ChangeNotifier {
       if (f is! Map<String, dynamic>) return;
       final ftype = f['type'];
       if (ftype == 'question/requested') {
+        // issue #177：反向诊断。帧**到了**但 sessionId 为空/异常时，卡片无法归属到任何
+        // 会话（页面按 session 过滤 → 用户看不到卡）。这是与「帧根本没到」完全不同的断点，
+        // 必须能区分，所以单独 warn（默认级别可见），字段只含标识、不含题干/选项。
+        final rawFrameSessionId = f['sessionId'];
+        final frameSessionId =
+            rawFrameSessionId is String ? rawFrameSessionId.trim() : '';
+        if (frameSessionId.isEmpty) {
+          AppLog.instance.warn(
+            '[177] question/requested 帧到达但 sessionId 缺失，无法归属会话：'
+            'rpcId=${f['rpcId'] ?? ''} questionId=${f['questionId'] ?? ''} '
+            'storeSessionId=${sessionId ?? ''} epoch=${api.connectionEpoch} '
+            '⤷ 卡片不会显示在任何会话页（宿主侧应检查 broadcast 日志的 session 字段）',
+          );
+        }
         final request = QuestionRequest(
           rpcId: f['rpcId'] as String? ?? '',
           questionId: f['questionId'] as String?,
