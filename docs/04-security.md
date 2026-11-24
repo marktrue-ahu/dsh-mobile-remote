@@ -125,6 +125,48 @@
 
 **已知残余风险**：`path`/`git`/`tarball` 三类在**首次**安装时由 pnpm 在电脑端执行，等于让手机输入决定了电脑端要拉取/执行的包。宿主的 bundle 校验（`dsh.bundle` 声明）与本仓库的预校验只降低误操作，不构成代码审计——与 `dsh plugin install` 同等级。这也是「手机端不做 build scripts 授权」这条边界存在的原因。
 
+### 插件市场索引与搜索（`/m/api/plugin-inventory/market/*`，issue #175 P3）
+
+**这一节的能力比前面几节更强：手机端可以修改「电脑端」的插件市场配置。** 请与 #153 的只读 registry 投影区分开。
+
+#### 可写边界（唯一的写操作）
+
+- `POST /plugin-inventory/market/indexes` 调宿主 `pluginMarket.setIndexes(urls)`，内部走 **`settings.update(entryId, { indexes })`**。`plugin-market` 的 Config 里 `indexes` 带 **`.volatile()`**，所以这条路**成立**——与 `pluginManager.registry` 不同（后者零 volatile，P1 因此绕开）。若宿主将来去掉 `.volatile()`，本端点会以 `409 settings-write-unavailable` fail-closed，不会静默成功。
+- **写的是电脑端 profile 配置**（`configEditor` 的 plugin entry），不再是「只影响本次」的临时参数。App **必须**在写前弹显式确认，文案明确写「修改电脑端」。
+- 白名单之外没有写入口：`writable` 由运行时探测决定（有 `setIndexes` 且 `settings.update` 存在），不可写时端点返回 `409`，UI 不渲染保存按钮。
+
+#### SSRF（P0，本节的核心理由）
+
+`pluginMarket.search(url)` 会**真的去抓那个 URL**。因此：
+
+- **`url` 必须是宿主当前已配置索引之一**，逐字比对（含 scheme、host、port、path），**不做**前缀/子串/规范化后模糊匹配。不在列表 → `400 unknown-index`，**且不发起任何抓取**。这条是本端点的安全前提：不做它等于给手机一个「让电脑端替我请求任意 URL」的通道（内网探测、云元数据 `169.254.169.254`、本机 `127.0.0.1` 服务）。
+- 宿主 `document()` 内部也做同样检查（`plugin-market/unknown-index`），插件侧仍**显式前置**校验：错误码稳定、且不依赖宿主版本行为。
+- **配置即授权**：用户把某个 URL 写进索引列表，等于明确授权抓取该源；因此写入后即可搜索。这也是为什么「写」必须显式确认——它同时扩大了可抓取面。
+- 索引被宿主标记 `error`（配置写坏/上次读取失败）→ `409 index-unusable`，不抓取。
+- 失败一律**不回显原始 URL 的敏感部分**：只给 `unknown-index` / `index-invalid` / `index-fetch-failed` 等稳定码，宿主错误原文（可能含内网地址、`ECONNREFUSED` 等）不进响应。
+
+#### 索引 URL 的校验语义（与 registry **不同**）
+
+- 只接受绝对 `http(s)`；拒绝凭据、fragment、**query**（索引 URL 带 query 多为签名/一次性令牌，且会进错误回显）、控制字符、空白、超 2048 字节。
+- **数量上限 8 条**，去重保序。
+- **不补尾斜杠**：`normalizeRegistry` 的「pathname 末尾补 `/`」对索引 URL 是**错的**——索引路径有意义（`/index.json` 与 `/index.json/` 指向不同资源）。这里只做 `href` 规范化，与宿主 `normalizeIndexUrl` 等价。
+
+#### 结果投影
+
+- 条目字段**逐字段白名单构造**（name/title/description/category/labels/versions/installation），**不投影**宿主文档的 `metadata`（任意内容，可能含内部字段）。
+- 安装目标 `versions[].install = {spec, registry}` 由宿主 `marketInstallTarget()` 算好，App **原样透传**给 P2 的 `install {spec}` 路径，**不自己拼 spec**。
+- 移除非 http(s) 的本地路径线索；响应里不出现宿主绝对路径。
+
+#### 旧宿主降级
+
+无 `pluginMarket` / 无 `listIndexes` → 读端点 `200 + supported:false`（不是 404/500）；写端点 `409 plugin-market-unavailable`。App 整块降级，不显示市场入口。
+
+#### 明确不做
+
+- **手机端 build scripts 授权**（同 P2）：从市场装到带安装脚本的包时，仍只提示去电脑端授权。
+- 多索引聚合搜索（首版按单索引搜）。
+- `readEntryDetail` 的完整详情页（首版只做列表 + 搜索 + 安装）。
+
 ### 持久化与投递
 
 - 插件**持久化仅限最小移动端状态**（`~/.dsh/mobile-remote/`：通知已读 id、会话最近活跃时间），不含会话内容；口令只存在于 profile 配置。

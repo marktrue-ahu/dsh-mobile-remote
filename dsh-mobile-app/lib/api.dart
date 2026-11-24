@@ -1711,6 +1711,62 @@ class Api implements GitReadApi, GitGraphPostApi, GitGraphAllApi, GitTagsApi {
     return PluginOperation.fromJson(data['operation']);
   }
 
+  /// issue #175 P3：已配置的插件市场索引（只读投影；`writable` 决定能否改）。
+  ///
+  /// 旧宿主无该端点 → `supported:false`（不当作网络失败，与 [pluginRegistries] 一致）。
+  Future<PluginMarketIndexes> pluginMarketIndexes() async {
+    try {
+      final data = await getJson(
+        '/api/plugin-inventory/market/indexes',
+        timeout: const Duration(seconds: 12),
+      );
+      return PluginMarketIndexes.fromJson(data);
+    } on ApiException catch (e) {
+      if (e.status == 404 || e.status == 405) {
+        return PluginMarketIndexes.unsupported('endpoint-missing');
+      }
+      rethrow;
+    }
+  }
+
+  /// issue #175 P3：**修改电脑端**的插件市场索引。
+  ///
+  /// 这是本项目里唯一会写电脑端配置的市场能力（走宿主 `settings.update`）。
+  /// 调用方必须先显式确认；本方法不做二次确认（那是 UI 的职责）。
+  /// 400 时抛 `ApiException`，`body` 里有 `error`/`detail`/`index`；
+  /// 409 表示宿主不可写（`settings-write-unavailable` / `plugin-market-unavailable`）。
+  Future<PluginMarketIndexes> pluginMarketSetIndexes(List<String> urls) async {
+    final data = await postJson('/api/plugin-inventory/market/indexes', {
+      'urls': urls,
+    }, timeout: const Duration(seconds: 20));
+    return PluginMarketIndexes.fromJson(data);
+  }
+
+  /// issue #175 P3：在**已配置的**索引里搜索。
+  ///
+  /// `url` 由调用方从 [pluginMarketIndexes] 的结果里选；宿主会拒绝任何未配置的 URL
+  /// （SSRF 防护）。App **不得**自行拼 URL 或接受用户手输 url。
+  Future<PluginMarketPage> pluginMarketSearch(
+    String url, {
+    int offset = 0,
+    int limit = 20,
+    String text = '',
+    String category = '',
+  }) async {
+    final query = <String>[
+      'url=${Uri.encodeQueryComponent(url)}',
+      'offset=$offset',
+      'limit=$limit',
+      if (text.isNotEmpty) 'text=${Uri.encodeQueryComponent(text)}',
+      if (category.isNotEmpty) 'category=${Uri.encodeQueryComponent(category)}',
+    ];
+    final data = await getJson(
+      '/api/plugin-inventory/market/search?${query.join('&')}',
+      timeout: const Duration(seconds: 45),
+    );
+    return PluginMarketPage.fromJson(data);
+  }
+
   /// issue #175 P2：安装前预校验（只读；宿主不写 profile、不安装）。
   ///
   /// 旧宿主无该端点时返回 404/405 → `supported:false`（不当作网络失败，与
