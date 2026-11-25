@@ -84,7 +84,9 @@
 | `sessionController`（`prompt`） | 冷会话恢复：不在 live agent 注册表里的持久会话发送 | 冷会话路径依赖 | 宿主若不支持该调用则发送失败；当前诊断不提供该能力的独立布尔字段 |
 | `apiProxy`（旧代，0.1.1-rc.2 及更早） | 问询/审批帧桥 + 应答回写 | **弃用通道**（ADR 0001） | **两代宿主（0.1.5 / 0.2.0）内核树内均 0 命中**，插件侧的探测与帧桥代码**已于 v3.1.6 整块删除**（issue #19）：保留它的唯一效果是让读者以为存在一条可用的旧代降级通道 |
 
-> ⚠ **approvalMode（v3.1.3，issue #9）语义**：`both`（默认）= 桌面 GUI 与手机同时弹卡、任一端先答即生效、另一端自动收卡；`mobile` = 手机在线独占应答（v3.1.2 行为），离线交桌面 GUI；`desktop` = 一律交桌面 GUI（手机不弹卡）。手机在场时待办 120s 无应答 fail-close（`unavailable` / 问询跳过）。配置于 `cordis.patch.yml` → mobile-remote 行 `config.approvalMode`，重启生效。
+> ⚠ **approvalMode（v3.1.3，issue #9）语义**：`both`（默认）= 桌面 GUI 与手机同时弹卡、任一端先答即生效、另一端自动收卡；`mobile` = 手机在线独占应答（v3.1.2 行为），离线交桌面 GUI；`desktop` = 一律交桌面 GUI（手机不弹卡）。手机在场时待办按 `config.pendingTimeoutMs`（默认 1 小时）无应答 fail-close（`unavailable` / 问询跳过）。配置于 `cordis.patch.yml` → mobile-remote 行 `config.approvalMode`，重启生效。
+
+> ⚠ **手机离线时的待答条目没有时间上限（issue #177 方案 A）**：早期版本（v3.1.4 / issue #14）对离线条目设 70 分钟自动回收，到期**成对删除条目与回放帧**且不结算、不通知——用户实测「手机离开 2 小时后回来，提问卡不见了」。该行为比 DSH 本体激进得多：网关 `pendingRemoteEvents` **无 TTL**（只在结算/取消/Agent Context 释放时删），内核 `ask_user_question` 超时也只是「先返回 pending 结果给模型」，**提问本身仍然有效、可随时补答**。现改为**跟随本体语义**：离线条目与回放帧长期保留，直到被 `/respond` 结算、另一端先答（`$events` cancel 帧）、Agent Context 释放或插件卸载。内存由容量上限兜底（`pendingQuestions`/`pendingApprovals` 各 200 条，超限按插入序逐出最旧，且**条目与回放帧成对清理**，避免 issue #14 的「幽灵卡」）。在线 fail-close 行为不变。
 
 ### 2.2 事件与 RPC
 
