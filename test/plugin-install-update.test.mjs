@@ -140,7 +140,9 @@ test("安装成功：只用宿主 spec，进度事件可见，成功后版本刷
 	};
 	const h = inventory(manager);
 	try {
-		const started = await call(h.route, "/m/api/plugin-inventory/install", { method: "POST", body: { name: "dsh-new", spec: "evil-package" } });
+		// #175 P2：name 与 spec 互斥；本用例验证 name 路径只用宿主 installTarget 的 spec。
+		// （原测试刻意传入 spec: "evil-package" 验证被忽略；P2 后该组合改为 400，故此处只传 name。）
+		const started = await call(h.route, "/m/api/plugin-inventory/install", { method: "POST", body: { name: "dsh-new" } });
 		assert.equal(started.status, 200);
 		assert.equal(started.body.operation.status, "running");
 		const opId = started.body.operation.opId;
