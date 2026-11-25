@@ -1050,3 +1050,231 @@ class PluginSpecError {
     };
   }
 }
+
+/// issue #175 P3：一条已配置的插件市场索引。
+///
+/// `url` 会显示在索引管理页——它本来就是**电脑端已配置**的项，用户必须看到自己配了
+/// 什么才能删改；这与「不回显用户刚输入的待校验 spec」是两回事。
+class PluginMarketIndex {
+  final String url;
+  final String title;
+  final String description;
+
+  /// 宿主给的不允许原因（配置写坏/上次读取失败）；空串 = 可用。
+  final String error;
+
+  const PluginMarketIndex({
+    required this.url,
+    this.title = '',
+    this.description = '',
+    this.error = '',
+  });
+
+  factory PluginMarketIndex.fromJson(Object? json) {
+    if (json is! Map) return const PluginMarketIndex(url: '');
+    return PluginMarketIndex(
+      url: (json['url'] as String?)?.trim() ?? '',
+      title: (json['title'] as String?)?.trim() ?? '',
+      description: (json['description'] as String?)?.trim() ?? '',
+      error: (json['error'] as String?)?.trim() ?? '',
+    );
+  }
+
+  bool get usable => error.isEmpty;
+
+  /// 展示标题：宿主给了 title 就用，否则退到主机名（不显示完整路径，避免长 URL 撑爆窄屏）。
+  String get displayLabel {
+    if (title.isNotEmpty) return title;
+    final uri = Uri.tryParse(url);
+    if (uri == null || uri.host.isEmpty) return url;
+    return uri.host;
+  }
+}
+
+/// issue #175 P3：索引列表 + 是否可写（写 = 修改**电脑端**配置）。
+class PluginMarketIndexes {
+  final bool supported;
+  final bool writable;
+  final String reason;
+  final List<PluginMarketIndex> indexes;
+
+  const PluginMarketIndexes({
+    this.supported = false,
+    this.writable = false,
+    this.reason = '',
+    this.indexes = const [],
+  });
+
+  factory PluginMarketIndexes.fromJson(Object? json) {
+    if (json is! Map) {
+      return const PluginMarketIndexes(reason: 'plugin-market-unavailable');
+    }
+    return PluginMarketIndexes(
+      supported: json['supported'] == true,
+      writable: json['writable'] == true,
+      reason: (json['reason'] as String?)?.trim() ?? '',
+      indexes: (json['indexes'] as List? ?? const [])
+          .map(PluginMarketIndex.fromJson)
+          .toList(),
+    );
+  }
+
+  factory PluginMarketIndexes.unsupported(String reason) =>
+      PluginMarketIndexes(supported: false, reason: reason);
+}
+
+/// issue #175 P3：一个市场条目的某个可用版本（安装目标由**宿主**算好）。
+class PluginMarketVersion {
+  final String version;
+  final bool prerelease;
+  final String deprecated;
+
+  /// 宿主 `marketInstallTarget()` 算出的安装 spec；App 原样交给 P2 的 install。
+  final String spec;
+
+  /// 该版本会优先问的源（可为 null = 宿主解析顺序）。
+  final String registry;
+
+  final bool compatible;
+  final List<String> incompatibleRequirements;
+  final bool update;
+
+  const PluginMarketVersion({
+    required this.version,
+    this.prerelease = false,
+    this.deprecated = '',
+    this.spec = '',
+    this.registry = '',
+    this.compatible = true,
+    this.incompatibleRequirements = const [],
+    this.update = false,
+  });
+
+  factory PluginMarketVersion.fromJson(Object? json) {
+    if (json is! Map) return const PluginMarketVersion(version: '');
+    return PluginMarketVersion(
+      version: (json['version'] as String?)?.trim() ?? '',
+      prerelease: json['prerelease'] == true,
+      deprecated: (json['deprecated'] as String?)?.trim() ?? '',
+      spec: (json['install'] as Map?)?['spec'] as String? ?? '',
+      registry: (json['install'] as Map?)?['registry'] as String? ?? '',
+      compatible: json['compatible'] == true,
+      incompatibleRequirements: (json['incompatibleRequirements'] as List? ?? const [])
+          .map((value) => value?.toString() ?? '')
+          .where((value) => value.isNotEmpty)
+          .toList(),
+      update: json['update'] == true,
+    );
+  }
+
+  /// 可安装 = 兼容 + 宿主给了 spec。
+  bool get installable => compatible && spec.isNotEmpty;
+}
+
+/// issue #175 P3：市场搜索返回的一个条目。
+class PluginMarketEntry {
+  final String name;
+  final String title;
+  final String description;
+  final String category;
+  final List<String> labels;
+  final String defaultVersion;
+
+  /// `installed` / `update-available` / `different-version` / `not-installed` / `provided`。
+  final String installationStatus;
+  final String installedVersion;
+  final List<PluginMarketVersion> versions;
+
+  const PluginMarketEntry({
+    required this.name,
+    this.title = '',
+    this.description = '',
+    this.category = '',
+    this.labels = const [],
+    this.defaultVersion = '',
+    this.installationStatus = 'not-installed',
+    this.installedVersion = '',
+    this.versions = const [],
+  });
+
+  factory PluginMarketEntry.fromJson(Object? json) {
+    if (json is! Map) return const PluginMarketEntry(name: '');
+    return PluginMarketEntry(
+      name: (json['name'] as String?)?.trim() ?? '',
+      title: (json['title'] as String?)?.trim() ?? '',
+      description: (json['description'] as String?)?.trim() ?? '',
+      category: (json['category'] as String?)?.trim() ?? '',
+      labels: (json['labels'] as List? ?? const [])
+          .map((value) => value?.toString() ?? '')
+          .where((value) => value.isNotEmpty)
+          .toList(),
+      defaultVersion: (json['defaultVersion'] as String?)?.trim() ?? '',
+      installationStatus:
+          ((json['installation'] as Map?)?['status'] as String?)?.trim() ??
+              'not-installed',
+      installedVersion:
+          ((json['installation'] as Map?)?['installedVersion'] as String?)?.trim() ??
+              '',
+      versions: (json['versions'] as List? ?? const [])
+          .map(PluginMarketVersion.fromJson)
+          .toList(),
+    );
+  }
+
+  String get displayName => title.isNotEmpty ? title : name;
+
+  /// 默认要装的版本：优先宿主给的 `defaultVersion`，否则第一个可安装版本。
+  PluginMarketVersion? get defaultTarget {
+    if (defaultVersion.isNotEmpty) {
+      for (final version in versions) {
+        if (version.version == defaultVersion && version.installable) return version;
+      }
+    }
+    for (final version in versions) {
+      if (version.installable) return version;
+    }
+    return null;
+  }
+
+  bool get installed => installationStatus == 'installed';
+  bool get hasUpdate => installationStatus == 'update-available';
+}
+
+/// issue #175 P3：一页市场搜索结果。
+class PluginMarketPage {
+  final String url;
+  final String title;
+  final String description;
+  final int fetchedAt;
+  final int total;
+  final int? nextOffset;
+  final List<PluginMarketEntry> entries;
+
+  const PluginMarketPage({
+    this.url = '',
+    this.title = '',
+    this.description = '',
+    this.fetchedAt = 0,
+    this.total = 0,
+    this.nextOffset,
+    this.entries = const [],
+  });
+
+  factory PluginMarketPage.fromJson(Object? json) {
+    if (json is! Map) return const PluginMarketPage();
+    final next = json['nextOffset'];
+    return PluginMarketPage(
+      url: (json['url'] as String?)?.trim() ?? '',
+      title: (json['title'] as String?)?.trim() ?? '',
+      description: (json['description'] as String?)?.trim() ?? '',
+      fetchedAt: (json['fetchedAt'] as num?)?.toInt() ?? 0,
+      total: (json['total'] as num?)?.toInt() ?? 0,
+      nextOffset: next is num ? next.toInt() : null,
+      entries: (json['entries'] as List? ?? const [])
+          .map(PluginMarketEntry.fromJson)
+          .toList(),
+    );
+  }
+
+  bool get hasMore => nextOffset != null;
+}

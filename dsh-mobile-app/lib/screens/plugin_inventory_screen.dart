@@ -13,6 +13,7 @@ import '../store.dart';
 import '../theme.dart';
 import 'plugin_install_source_screen.dart';
 import 'plugin_management_widgets.dart';
+import 'plugin_market_screen.dart';
 import 'plugin_spec_install_screen.dart';
 import 'plugin_update_scan.dart';
 import 'sheets.dart';
@@ -61,6 +62,9 @@ class PluginInventoryActions {
   final Future<PluginOperation> Function(String spec, String? registry)?
   installBySpec;
 
+  /// issue #175 P3：插件市场（`null` = 入口不显示）。
+  final PluginMarketActions? market;
+
   const PluginInventoryActions({
     required this.checkVersions,
     required this.install,
@@ -76,6 +80,7 @@ class PluginInventoryActions {
     this.registries,
     this.inspectSpec,
     this.installBySpec,
+    this.market,
   });
 
   factory PluginInventoryActions.fromApi(Api api) => PluginInventoryActions(
@@ -97,11 +102,15 @@ class PluginInventoryActions {
         api.pluginInspectSpec(spec, registry: registry),
     installBySpec: (spec, registry) =>
         api.pluginInstallBySpec(spec, registry: registry),
+    market: PluginMarketActions.fromApi(api),
   );
 
   /// issue #175 P2：宿主/注入方是否支持「手动安装任意 spec」。
   bool get supportsManualInstall =>
       inspectSpec != null && installBySpec != null;
+
+  /// issue #175 P3：是否显示市场入口。
+  bool get supportsMarket => market != null;
 
   /// 检查更新（有 `*At` 钩子时带源，否则退回无源版本）。
   Future<PluginVersionCheck> checkVersionsWith(
@@ -318,6 +327,14 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
               icon: const Icon(Icons.add_circle_outline, size: 20),
               onPressed: _loading ? null : _openManualInstall,
             ),
+          // issue #175 P3：插件市场（索引管理 + 搜索 + 从市场安装）。
+          if (_actions.supportsMarket)
+            IconButton(
+              key: const ValueKey('plugin-market'),
+              tooltip: L10n.t('插件市场', 'Plugin market'),
+              icon: const Icon(Icons.storefront_outlined, size: 20),
+              onPressed: _loading ? null : _openMarket,
+            ),
           // issue #174：两者原来的 `Icons.sync` / `Icons.refresh` 都是圆形循环箭头，
           // 形状几乎一样、权重也相同，分不出「查更新」和「刷清单」。
           // 现在：「检查全部更新」= `system_update_alt`（与详情页「检查更新」同图标）
@@ -393,6 +410,21 @@ class _PluginInventoryScreenState extends State<PluginInventoryScreen> {
     );
     if (!mounted) return;
     // 与 #146/#153 一致：安装可能已改宿主状态，返回后对齐清单与能力。
+    await _refresh();
+    unawaited((widget.refreshAll ?? widget.store.refreshAll)());
+  }
+
+  /// issue #175 P3：打开插件市场页（索引管理 + 搜索 + 安装）。
+  Future<void> _openMarket() async {
+    final market = _actions.market;
+    if (market == null) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => PluginMarketScreen(actions: market, store: widget.store),
+      ),
+    );
+    if (!mounted) return;
+    // 市场里可能装过插件：返回后对齐清单与能力。
     await _refresh();
     unawaited((widget.refreshAll ?? widget.store.refreshAll)());
   }

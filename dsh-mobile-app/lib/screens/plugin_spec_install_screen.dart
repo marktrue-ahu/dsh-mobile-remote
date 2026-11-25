@@ -54,6 +54,23 @@ class PluginSpecInstallScreen extends StatefulWidget {
   /// 本机偏好（记住上次选择的源）。`null` = 不记忆。
   final AppStore? store;
 
+  /// issue #175 P3：进入页面时**已经确定**的预校验结果（例如从市场条目点安装）。
+  ///
+  /// 有值时直接显示「可以安装」，跳过首次预校验（宿主市场条目已经给出了确定的
+  /// `install.spec`，再校验一次只是多一次网络往返）。安装仍由宿主完整校验。
+  /// `null` = 原有行为（用户先填地址再预校验），P2 路径完全不变。
+  final PluginSpecInspection? initialInspection;
+
+  /// 有 `initialInspection` 时，用这个地址预填输入框（**仅显示用途**，不是校验依据）。
+  final String initialSpec;
+
+  /// issue #175 P3：**锁定**一个由宿主给定的 registry（市场条目的 `install.registry`）。
+  ///
+  /// 市场条目的安装目标自带「装哪个源」，用户在这里改源会与索引声明不一致
+  /// （可能装到另一个源上的同名包）。因此从市场进入时锁定该源，且隐藏源选择器。
+  /// `null` = 不锁定（P2 的手动安装路径完全不变，仍可自由选源）。
+  final String? lockedRegistry;
+
   const PluginSpecInstallScreen({
     super.key,
     required this.inspect,
@@ -62,6 +79,9 @@ class PluginSpecInstallScreen extends StatefulWidget {
     this.poll,
     this.cancel,
     this.store,
+    this.initialInspection,
+    this.initialSpec = '',
+    this.lockedRegistry,
   });
 
   @override
@@ -97,6 +117,12 @@ class _PluginSpecInstallScreenState extends State<PluginSpecInstallScreen> {
     super.initState();
     _restoreSelection();
     _loadRegistries();
+    // issue #175 P3：从市场条目进来时已知道确定目标，直接呈现可安装态。
+    final seeded = widget.initialInspection;
+    if (seeded != null) {
+      _inspection = seeded;
+      if (widget.initialSpec.isNotEmpty) _specController.text = widget.initialSpec;
+    }
   }
 
   @override
@@ -154,8 +180,14 @@ class _PluginSpecInstallScreenState extends State<PluginSpecInstallScreen> {
   }
 
   /// 把当前 UI 的选源状态同步进共享记忆并取本次的 `registry` 参数。
-  String? get _registryForThisInstall =>
-      _syncMemoryFromUi().registryFor(_registries);
+  ///
+  /// issue #175 P3：市场条目锁定了源时，**以锁定值为准**——索引声明了「从哪个源装」，
+  /// 用户在这里改源会导致装到另一个源上的同名包。
+  String? get _registryForThisInstall {
+    final locked = widget.lockedRegistry;
+    if (locked != null && locked.isNotEmpty) return locked;
+    return _syncMemoryFromUi().registryFor(_registries);
+  }
 
   String get _registryLabel => _syncMemoryFromUi().labelFor(_registries);
 
@@ -411,7 +443,11 @@ class _PluginSpecInstallScreenState extends State<PluginSpecInstallScreen> {
               _operationCard(context, _operation!),
             ],
             const SizedBox(height: 16),
-            _registrySection(context),
+            // 市场条目锁定了源：不显示源选择器（改了会与索引声明不一致）。
+            if (widget.lockedRegistry != null && widget.lockedRegistry!.isNotEmpty)
+              _lockedRegistryNote(context)
+            else
+              _registrySection(context),
             const SizedBox(height: 16),
             Text(
               L10n.t(
@@ -788,6 +824,36 @@ class _PluginSpecInstallScreenState extends State<PluginSpecInstallScreen> {
               style: TextStyle(fontSize: 12, height: 1.45, color: DshColors.ink2(context)),
             ),
           ],
+        ],
+      ),
+    );
+  }
+
+  /// 市场条目锁定源的说明（替代源选择器）。
+  Widget _lockedRegistryNote(BuildContext context) {
+    final registry = widget.lockedRegistry ?? '';
+    final display = Uri.tryParse(registry)?.host ?? registry;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+      decoration: BoxDecoration(
+        color: DshColors.surface(context),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: DshColors.line(context)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.lock_outline, size: 16, color: DshColors.ink3(context)),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              L10n.t(
+                '安装源由市场索引指定：$display（不可在此更改）',
+                'The install source is set by the market index: $display (cannot be changed here)',
+              ),
+              style: TextStyle(fontSize: 12, height: 1.4, color: DshColors.ink2(context)),
+            ),
+          ),
         ],
       ),
     );
