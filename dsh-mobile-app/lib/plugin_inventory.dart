@@ -1098,11 +1098,16 @@ class PluginMarketIndexes {
   final String reason;
   final List<PluginMarketIndex> indexes;
 
+  /// issue #178：电脑端当前生效的抓取超时（毫秒）；`null` = 宿主未提供。
+  /// **只读**——改配置只能在电脑端，App 没有写入口。
+  final int? fetchTimeoutMs;
+
   const PluginMarketIndexes({
     this.supported = false,
     this.writable = false,
     this.reason = '',
     this.indexes = const [],
+    this.fetchTimeoutMs,
   });
 
   factory PluginMarketIndexes.fromJson(Object? json) {
@@ -1116,11 +1121,16 @@ class PluginMarketIndexes {
       indexes: (json['indexes'] as List? ?? const [])
           .map(PluginMarketIndex.fromJson)
           .toList(),
+      fetchTimeoutMs: (json['fetchTimeoutMs'] as num?)?.toInt(),
     );
   }
 
   factory PluginMarketIndexes.unsupported(String reason) =>
       PluginMarketIndexes(supported: false, reason: reason);
+
+  /// 超时的人类可读秒数（用于提示；`null` 时不显示）。
+  String get fetchTimeoutLabel =>
+      fetchTimeoutMs == null ? '' : '${(fetchTimeoutMs! / 1000).toStringAsFixed(fetchTimeoutMs! % 1000 == 0 ? 0 : 1)}s';
 }
 
 /// issue #175 P3：一个市场条目的某个可用版本（安装目标由**宿主**算好）。

@@ -661,4 +661,97 @@ void main() {
       });
     }
   });
+  // ------------------------------------------------------- issue #178
+  group('#178 市场搜索失败：超时与 HTTP 失败分开', () {
+    testWidgets('index-fetch-timeout → 文案说「超时」并提到 fetchTimeoutMs', (tester) async {
+      final backend = FakeMarket(
+        searchError: ApiException(
+          'timeout',
+          code: 'index-fetch-timeout',
+          status: 504,
+          body: const {'error': 'index-fetch-timeout'},
+        ),
+      );
+      await pumpMarket(tester, backend: backend);
+      expect(find.textContaining('索引抓取超时'), findsOneWidget);
+      expect(find.textContaining('fetchTimeoutMs'), findsOneWidget,
+          reason: '要告诉用户可去电脑端调大');
+      expect(find.textContaining('抓取该索引失败'), findsNothing,
+          reason: '超时不该复用 HTTP 失败的文案');
+    });
+
+    testWidgets('index-fetch-failed → 仍是「检查网络或索引地址」，不提超时', (tester) async {
+      final backend = FakeMarket(
+        searchError: ApiException(
+          'failed',
+          code: 'index-fetch-failed',
+          status: 502,
+          body: const {'error': 'index-fetch-failed'},
+        ),
+      );
+      await pumpMarket(tester, backend: backend);
+      expect(find.textContaining('抓取该索引失败'), findsOneWidget);
+      expect(find.textContaining('索引抓取超时'), findsNothing);
+    });
+
+    testWidgets('未知错误码仍给通用兜底（不冒充超时）', (tester) async {
+      final backend = FakeMarket(
+        searchError: ApiException('boom', code: 'plugin-market-unavailable', status: 503,
+            body: const {'error': 'plugin-market-unavailable'}),
+      );
+      await pumpMarket(tester, backend: backend);
+      expect(find.textContaining('搜索失败，请重试'), findsOneWidget);
+      expect(find.textContaining('索引抓取超时'), findsNothing);
+    });
+
+    test('PluginMarketIndexes 解析 fetchTimeoutMs；缺失时为 null（不猜默认值）', () {
+      final withValue = PluginMarketIndexes.fromJson({
+        'supported': true,
+        'writable': true,
+        'indexes': [],
+        'fetchTimeoutMs': 60000,
+      });
+      expect(withValue.fetchTimeoutMs, 60000);
+      expect(withValue.fetchTimeoutLabel, '60s');
+
+      final fractional = PluginMarketIndexes.fromJson({
+        'supported': true,
+        'indexes': [],
+        'fetchTimeoutMs': 1500,
+      });
+      expect(fractional.fetchTimeoutLabel, '1.5s');
+
+      final missing = PluginMarketIndexes.fromJson({'supported': true, 'indexes': []});
+      expect(missing.fetchTimeoutMs, isNull);
+      expect(missing.fetchTimeoutLabel, '', reason: '宿主没给就不显示，不猜默认 15s');
+    });
+
+    testWidgets('索引管理页只读展示当前超时，且**没有**任何修改入口', (tester) async {
+      await pumpIndexScreen(
+        tester,
+        initial: indexes([index(_urlA, title: 'A')]),
+        save: (urls) async => indexes([for (final url in urls) index(url)]),
+      );
+      // initial 里没设 fetchTimeoutMs → 不显示；这里验证「不猜默认值」。
+      expect(find.textContaining('电脑端当前抓取超时'), findsNothing,
+          reason: '宿主未提供时不得凭空显示一个默认值');
+
+      await tester.pumpWidget(const SizedBox());
+      await pumpIndexScreen(
+        tester,
+        initial: const PluginMarketIndexes(
+          supported: true,
+          writable: true,
+          indexes: [PluginMarketIndex(url: _urlA)],
+          fetchTimeoutMs: 60000,
+        ),
+        save: (urls) async => indexes([for (final url in urls) index(url)]),
+      );
+      expect(find.textContaining('电脑端当前抓取超时：60s'), findsOneWidget);
+      expect(find.textContaining('只读'), findsOneWidget);
+      // 没有可编辑超时的控件（App 不写电脑端配置）。
+      expect(find.byKey(const ValueKey('market-timeout-input')), findsNothing);
+    });
+  });
+
 }

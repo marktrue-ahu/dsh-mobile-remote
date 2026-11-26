@@ -219,6 +219,12 @@ class _PluginMarketScreenState extends State<PluginMarketScreen> {
       'This index is currently unusable (the desktop reports an error).',
     ),
     'invalid-query' => L10n.t('搜索参数无效。', 'Invalid search parameters.'),
+    // #178：超时与 HTTP 失败分开——用户能做的应对不同（等一下重试 vs 查地址/网络）。
+    'index-fetch-timeout' => L10n.t(
+      '索引抓取超时，请稍后重试。若经常超时，可在电脑端调大插件市场的 fetchTimeoutMs。',
+      'Fetching the index timed out; retry later. If this keeps happening, raise the desktop '
+          'plugin market fetchTimeoutMs.',
+    ),
     'index-fetch-failed' => L10n.t(
       '电脑端抓取该索引失败，请检查电脑端网络或索引地址。',
       'The desktop could not fetch this index; check its network or the index address.',
@@ -960,6 +966,17 @@ class _PluginMarketIndexScreenState extends State<PluginMarketIndexScreen> {
               ),
               style: TextStyle(fontSize: 11, height: 1.45, color: DshColors.ink3(context)),
             ),
+            // issue #178：只读展示当前抓取超时；改值只能在电脑端。
+            if (widget.initial.fetchTimeoutLabel.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text(
+                L10n.t(
+                  '电脑端当前抓取超时：${widget.initial.fetchTimeoutLabel}（只读，需在电脑端调整）。',
+                  'Desktop fetch timeout: ${widget.initial.fetchTimeoutLabel} (read-only; change it on the desktop).',
+                ),
+                style: TextStyle(fontSize: 11, height: 1.45, color: DshColors.ink3(context)),
+              ),
+            ],
           ],
         ),
       ),

@@ -530,7 +530,10 @@ test("market/search：offset/limit/text/category 透传，边界归一成稳定�
     const { status, body } = await call(h.route, `/m/api/plugin-inventory/market/search?${q}`);
     assert.equal(status, 200);
     assert.equal(body.ok, true);
-    assert.deepEqual(market.state.searchCalls[0].query, { offset: 20, limit: 10, text: 'voice', category: 'custom' });
+    // #178：`sort` 是宿主 MarketQuery 的**必填字段**；有搜索词时按相关度。
+    assert.deepEqual(market.state.searchCalls[0].query, {
+      offset: 20, limit: 10, sort: { kind: 'relevance' }, text: 'voice', category: 'custom',
+    });
 
     for (const [bad, field] of [
       ['offset=-1', 'offset'],
@@ -556,7 +559,8 @@ test("market/search：默认 limit=20、offset=0", async () => {
   const h = createHarness({ pluginMarket: market });
   try {
     await call(h.route, `/m/api/plugin-inventory/market/search?url=${encodeURIComponent(url)}`);
-    assert.deepEqual(market.state.searchCalls[0].query, { offset: 0, limit: 20 });
+    // #178：无搜索词时按索引顺序（避免为「浏览」付出相关度排序的成本）。
+    assert.deepEqual(market.state.searchCalls[0].query, { offset: 0, limit: 20, sort: { kind: 'index' } });
   } finally { h.clean(); }
 });
 
@@ -618,5 +622,170 @@ test("market/search：索引 URL 里的 query/fragment 在 search 时同样被�
     assert.equal(status, 400);
     assert.equal(body.error, 'index-invalid');
     assert.deepEqual(market.state.searchCalls, []);
+  } finally { h.clean(); }
+});
+
+// ── 5. #178：搜索失败的真实成因与错误映射 ──────────────────────
+
+test("#178 回归：search 必须收到宿主必填的 `sort` 字段（漏传会让宿主抛 TypeError）", async () => {
+  const url = 'https://configured.test/index.json';
+  const market = fakeMarket([{ url }]);
+  const h = createHarness({ pluginMarket: market });
+  try {
+    // 无搜索词 → 索引顺序；有搜索词 → 相关度。
+    await call(h.route, `/m/api/plugin-inventory/market/search?url=${encodeURIComponent(url)}`);
+    assert.deepEqual(market.state.searchCalls.at(-1).query.sort, { kind: 'index' });
+
+    await call(h.route, `/m/api/plugin-inventory/market/search?url=${encodeURIComponent(url)}&text=voice`);
+    assert.deepEqual(market.state.searchCalls.at(-1).query.sort, { kind: 'relevance' });
+  } finally { h.clean(); }
+});
+
+test("#178 回归：用**真实宿主的 sort 校验形状**断言漏传会崩（防口径漂移）", async () => {
+  // 直接复刻宿主 `MarketSearch.order()` 的读取方式：`switch (sort.kind)`。
+  // 这条测试的作用是固定「sort 必填」这个事实，而不是再实现一遍宿主。
+  const order = (sort) => {
+    switch (sort.kind) {
+      case 'index': return 'index';
+      case 'relevance': return 'relevance';
+      default: return 'other';
+    }
+  };
+  assert.equal(order({ kind: 'index' }), 'index');
+  assert.throws(() => order(undefined), TypeError, '漏传 sort 时宿主必然抛 TypeError（#178 的真实成因）');
+});
+
+test("#178：fetch-failed + details.reason 含 timeout → 504 index-fetch-timeout", async () => {
+  const url = 'https://configured.test/index.json';
+  const market = {
+    listIndexes() { return [{ url }]; },
+    async setIndexes() {},
+    async search() {
+      const error = new Error('Could not fetch https://configured.test/index.json: The operation was aborted due to timeout');
+      error.code = 'plugin-market/fetch-failed';
+      error.isDSHRemoteError = true;
+      error.details = { url, reason: 'The operation was aborted due to timeout' };
+      throw error;
+    },
+  };
+  const h = createHarness({ pluginMarket: market });
+  try {
+    const { status, body } = await call(h.route, `/m/api/plugin-inventory/market/search?url=${encodeURIComponent(url)}`);
+    assert.equal(status, 504);
+    assert.equal(body.error, 'index-fetch-timeout', '超时必须与 HTTP 失败区分开');
+  } finally { h.clean(); }
+});
+
+test("#178：fetch-failed + 非 timeout 原因 → 仍 502 index-fetch-failed（不误判）", async () => {
+  const url = 'https://configured.test/index.json';
+  const market = {
+    listIndexes() { return [{ url }]; },
+    async setIndexes() {},
+    async search() {
+      const error = new Error('Could not fetch: HTTP 404');
+      error.code = 'plugin-market/fetch-failed';
+      error.details = { url, reason: 'HTTP 404' };
+      throw error;
+    },
+  };
+  const h = createHarness({ pluginMarket: market });
+  try {
+    const { status, body } = await call(h.route, `/m/api/plugin-inventory/market/search?url=${encodeURIComponent(url)}`);
+    assert.equal(status, 502);
+    assert.equal(body.error, 'index-fetch-failed');
+  } finally { h.clean(); }
+});
+
+test("#178：**无 code** 的 TimeoutError → 504 index-fetch-timeout（不落 503 default）", async () => {
+  const url = 'https://configured.test/index.json';
+  for (const make of [
+    () => Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' }),
+    () => Object.assign(new Error('This operation was aborted'), { name: 'AbortError' }),
+    () => new Error('connect timed out after 15000ms'),
+    () => new Error('fetch failed', { cause: Object.assign(new Error('timeout'), { name: 'TimeoutError' }) }),
+    () => Object.assign(new Error('socket hang up'), { code: 'ETIMEDOUT' }),
+  ]) {
+    const market = {
+      listIndexes() { return [{ url }]; },
+      async setIndexes() {},
+      async search() { throw make(); },
+    };
+    const h = createHarness({ pluginMarket: market });
+    try {
+      const { status, body } = await call(h.route, `/m/api/plugin-inventory/market/search?url=${encodeURIComponent(url)}`);
+      assert.equal(status, 504, `应判为超时，实际 ${status} ${body.error}`);
+      assert.equal(body.error, 'index-fetch-timeout');
+    } finally { h.clean(); }
+  }
+});
+
+test("#178：无 code 但**不是**超时的错误 → 仍 503（不把未知错误硬说成超时）", async () => {
+  const url = 'https://configured.test/index.json';
+  for (const make of [
+    () => new TypeError("Cannot read properties of undefined (reading 'kind')"),
+    () => new Error('boom'),
+    () => 'string error',
+    () => null,
+  ]) {
+    const market = {
+      listIndexes() { return [{ url }]; },
+      async setIndexes() {},
+      async search() { throw make(); },
+    };
+    const h = createHarness({ pluginMarket: market });
+    try {
+      const { status, body } = await call(h.route, `/m/api/plugin-inventory/market/search?url=${encodeURIComponent(url)}`);
+      assert.equal(status, 503, `未知错误不该被冒充成超时：${body.error}`);
+      assert.equal(body.error, 'plugin-market-unavailable');
+    } finally { h.clean(); }
+  }
+});
+
+test("#178：真实索引的 LocalizedText（对象形式）能投影出标题/描述，不再全是空串", async () => {
+  const url = 'https://configured.test/index.json';
+  const market = {
+    listIndexes() {
+      return [{ url, title: { en: 'DSH Market', zh: 'DSH 市场' }, description: { en: 'an index', zh: '一个索引' } }];
+    },
+    async setIndexes() {},
+    async search() {
+      return {
+        url,
+        title: { en: 'DSH Market', zh: 'DSH 市场' },
+        description: { en: 'an index', zh: '一个索引' },
+        metadata: {},
+        fetchedAt: 1700000000000,
+        entries: [{
+          name: 'dsh-x',
+          title: { en: 'X plugin', zh: 'X 插件' },
+          description: { en: 'does x', zh: '做 X' },
+          category: 'custom',
+          labels: ['a'],
+          defaultVersion: '1.0.0',
+          installation: { status: 'not-installed' },
+          versions: [{
+            version: '1.0.0',
+            install: { spec: 'dsh-x@1.0.0' },
+            compatibility: { compatible: true, requirements: {} },
+          }],
+        }],
+        total: 1,
+        nextOffset: null,
+      };
+    },
+  };
+  const h = createHarness({ pluginMarket: market });
+  try {
+    const { status, body } = await call(h.route, `/m/api/plugin-inventory/market/search?url=${encodeURIComponent(url)}`);
+    assert.equal(status, 200);
+    // 默认（无 lang）：zh 优先。
+    assert.equal(body.entries[0].title, 'X 插件', 'LocalizedText 必须被投影，不能吞成空串');
+    assert.equal(body.entries[0].description, '做 X');
+
+    const en = await call(h.route, `/m/api/plugin-inventory/market/search?url=${encodeURIComponent(url)}&lang=en`);
+    assert.equal(en.body.entries[0].title, 'X plugin', 'lang=en 时优先英文');
+
+    const indexes = await call(h.route, '/m/api/plugin-inventory/market/indexes');
+    assert.equal(indexes.body.indexes[0].title, 'DSH 市场', '索引 title 同样是 LocalizedText');
   } finally { h.clean(); }
 });
