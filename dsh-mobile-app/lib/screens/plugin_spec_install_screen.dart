@@ -481,14 +481,30 @@ class _PluginSpecInstallScreenState extends State<PluginSpecInstallScreen> {
             style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
           ),
           const SizedBox(height: 8),
+          // issue #179：修复点击后弹「安全键盘 / 密码键盘」。
+          //
+          // 根因（Flutter 引擎源码，非猜测）：
+          // `engine/.../plugin/editing/TextInputPlugin.java`
+          //   if (!enableSuggestions) {
+          //     textType |= TYPE_TEXT_FLAG_NO_SUGGESTIONS;
+          //     textType |= TYPE_TEXT_VARIATION_VISIBLE_PASSWORD;  // ← 安全键盘
+          //   }
+          // 即 `enableSuggestions: false` 会把输入类型变成 VISIBLE_PASSWORD。
+          // 对照：本页的 `spec-manual-registry` 与市场的 `market-search` 都未设该参数
+          // （默认 true），键盘正常。
+          //
+          // `maxLines: 3` 只加 `TYPE_TEXT_FLAG_MULTI_LINE`（普通多行标志，与安全键盘无关），
+          // 但本框内容（包名/URL/路径/tarball）本就是单行短文本，顺手改单行更符合语义，
+          // 并避免 `keyboardType` 被 TextField 默认推导成 `multiline`。
+          //
+          // `autocorrect: false` 保留：只影响 AUTO_CORRECT 标志，不触发安全键盘；
+          // 包名/路径也确实不该自动更正。
           TextField(
             key: const ValueKey('spec-input'),
             controller: _specController,
             enabled: !_installing,
-            minLines: 1,
-            maxLines: 3,
+            keyboardType: TextInputType.text,
             autocorrect: false,
-            enableSuggestions: false,
             decoration: InputDecoration(
               isDense: true,
               hintText: L10n.t('包名 / GitHub 地址 / 电脑上的绝对路径 / tarball 链接', 'Package / GitHub URL / desktop path / tarball'),
