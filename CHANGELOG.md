@@ -1,5 +1,24 @@
 # Changelog
 
+## v3.3.1-alpha.5（build 68，issues #178/#179）— 市场搜索修复与输入键盘修复
+
+> 插件 `3.3.1-alpha.5` / App `3.3.1+68` / 载体 `3.3.1-alpha.5-app`。
+
+### 修复
+
+- **#178 插件市场搜索失败（核心 bug）**：真实根因是**上一版漏传宿主 `MarketQuery` 的必填字段 `sort`**，不是索引抓取超时。宿主 `MarketSearch.order()` 读 `sort.kind` 时抛 `TypeError`（该错误没有 `code`），落进错误映射的兜底分支并对外表现为 `503 plugin-market-unavailable`。现已补 `sort`：无搜索词按索引顺序（`index`）、有搜索词按相关度（`relevance`）。在**源码树**上用真实索引实测恢复为 `HTTP 200`、`total=16256`（**非已部署宿主**：运行中的 instance 需部署并重启后才生效）。
+  - **顺带修掉同源缺陷**：真实索引的 `title` / `description` 是 `LocalizedText`（`string` 或按语言的对象），上一版按纯字符串投影导致**所有标题/描述被吞成空串**。现按语言（`?lang=zh|en`，默认 zh→en→任一）正确投影。
+  - **超时错误映射补全**：新增稳定错误码 `index-fetch-timeout`（HTTP 504），与 `index-fetch-failed`（502）区分；识别 `TimeoutError` / `AbortError` / `ETIMEDOUT` / `UND_ERR_CONNECT_TIMEOUT` / 明确的超时措辞及 `cause` 链，**无 code 的超时不再落 503 兜底**。无超时特征的未知错误仍为 503，不冒充超时。
+  - **可诊断性**：`GET/POST market/indexes` 新增只读 `fetchTimeoutMs`，索引管理页显示「电脑端当前抓取超时：Ns（只读，需在电脑端调整）」，便于判断是否与超时有关。
+
+- **#179 手动安装输入栏弹出安全键盘**：`spec-input` 原来设了 `enableSuggestions: false`，Flutter Android 引擎在该参数为假时会加 `TYPE_TEXT_VARIATION_VISIBLE_PASSWORD`，使普通输入框弹出「安全键盘 / 密码键盘」。现改为显式 `keyboardType: TextInputType.text` 并移除该参数。同页的 registry 输入框与市场搜索框均未设该参数（源码可核）。输入内容（包名 / Git 地址 / 路径 / tarball）与功能不受影响。
+
+### 已知限制 / 未验证
+
+- #178 的真实链路**仅在源码树上**用真实索引验证过（`HTTP 200`，`total=16256`），**未在已部署宿主上验证**；运行中的宿主需部署并重启后才会生效。
+- **#179 未做真机验证**：widget 测试只能证明控件属性不再触发 `VISIBLE_PASSWORD`，实际弹出哪种键盘取决于设备输入法，需用户升级后确认。
+
+
 ## v3.3.1-alpha.4（build 67，issues #164/#173/#174/#175/#176/#177）— 插件安装能力扩张与提问卡修复
 
 > 插件 `3.3.1-alpha.4` / App `3.3.1+67` / 载体 `3.3.1-alpha.4-app`。
