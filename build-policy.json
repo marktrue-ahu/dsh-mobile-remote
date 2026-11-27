@@ -450,6 +450,15 @@
       "createdAt": "2026-11-27T03:51:50.939Z",
       "note": "dist-tags verified",
       "updatedAt": "2026-11-27T03:58:44.689Z"
+    },
+    {
+      "tag": "v3.3.1-rc.1",
+      "pluginVersion": "3.3.1-rc.1",
+      "carrierVersion": "3.3.1-rc.1-app",
+      "build": 69,
+      "integrity": "sha512-fHPG/+VaIEGFWg2pVrV8IC/2syaG58QAUYk+lBrkO63MHGSAbfoyiKJOC3dY6NWpg/bGJBmtna+6opN1mZoabg==",
+      "status": "submitted",
+      "createdAt": "2026-11-27T05:53:56.396Z"
     }
   ]
 }
